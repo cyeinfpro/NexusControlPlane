@@ -19,7 +19,7 @@ from realmctl import (
     count_connections,
 )
 
-APP_VERSION = "18.0"
+APP_VERSION = "19.0"
 
 app = FastAPI(title="Realm Agent", version=APP_VERSION)
 

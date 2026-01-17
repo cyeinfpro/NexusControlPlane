@@ -17,7 +17,7 @@ from starlette.middleware.sessions import SessionMiddleware
 
 from db import init_db, list_nodes, get_node, add_node, delete_node, save_pair, get_pair, purge_pairs
 
-APP_VERSION = "18.0"
+APP_VERSION = "19.0"
 
 PANEL_USER = os.environ.get("PANEL_USER", "admin")
 PANEL_PASS_HASH = os.environ.get("PANEL_PASS_HASH", "")

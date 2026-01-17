@@ -1,77 +1,78 @@
-# Realm Pro Suite v18
+# Realm Pro Suite (v19)
 
-> 一套可在多台 Debian/Ubuntu 服务器上部署的 **Realm 转发管理套件**：
-> - **Agent**：被控机 API（管理 Realm 规则、生成配置、应用重启、状态/连接数）
-> - **Panel**：Web 管理面板（登录鉴权、节点管理、规则增删改、暂停、日志查看、WSS 配对码）
+一套可上生产的 `Realm` 转发管理套件：
 
-## 仓库结构（必须是这个结构）
+- **Agent**：部署在每台被控机上，提供 HTTP API，负责写入 `realm.toml`、暂停/删除规则、查看目标健康状态等。
+- **Panel**：部署在管理机上，通过 Web UI 管理多个 Agent 节点，支持 **WSS 配对码自动填参**。
+
+---
+
+## 目录结构（请保持不变）
 
 ```
 .
-├── agent/
-│   ├── app/
-│   ├── requirements.txt
-│   └── systemd/realm-agent.service
-├── panel/
-│   ├── app/
-│   ├── requirements.txt
-│   └── systemd/realm-panel.service
-├── realm_agent.sh
-└── realm_panel.sh
+├─ agent/
+├─ panel/
+├─ realm_agent.sh
+└─ realm_panel.sh
 ```
 
-> 说明：安装脚本通过 **GitHub Archive** 下载仓库源码，自动识别 `agent/` 与 `panel/` 目录。
+---
 
-## 一键安装
-
-### 1) 在被控机安装 Agent
+## 安装 Agent（被控机）
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/cyeinfpro/Realm/refs/heads/main/realm_agent.sh | bash
+bash <(curl -fsSL https://raw.githubusercontent.com/cyeinfpro/Realm/refs/heads/main/realm_agent.sh)
 ```
 
 安装完成后会输出：
-- Agent API 地址（如 `http://IP:18700`）
-- Token
+- Agent 监听地址（默认端口：18700）
+- Agent Token（添加节点时需要）
 
-### 2) 在主控机安装 Panel
+---
+
+## 安装 Panel（管理机）
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/cyeinfpro/Realm/refs/heads/main/realm_panel.sh | bash
+bash <(curl -fsSL https://raw.githubusercontent.com/cyeinfpro/Realm/refs/heads/main/realm_panel.sh)
 ```
 
 安装过程中会要求输入：
-- 面板端口
-- 登录用户名
-- 登录密码
+- 面板端口（默认 6080）
+- 用户名（默认 admin）
+- 密码（必须设置）
 
-### 3) 在面板中添加节点
+---
 
-打开：`http://<PanelIP>:6080`
-- 节点名称
-- Agent 地址
-- Agent Token
+## 配对码说明（非常重要）
 
-即可管理。
+**配对码用于 WSS 发送端自动获取 WSS 参数（host/path/sni/insecure），不是用来“链接机器”的。**
 
-## WSS 配对码逻辑（关键）
+- 当你在 Panel 创建 **WSS 接收端（wss_recv）** 规则时，会生成一个配对码
+- 之后创建 **WSS 发送端（wss_send）** 规则时，填入该配对码即可自动回填参数
 
-- **配对码不是用来链接机器的。**
-- 配对码用于：当你创建 **WSS 接收端** 时，自动生成一个配对码；之后创建 **WSS 发送端** 时，粘贴该配对码即可自动填充 `Host/Path/SNI/Insecure`。
+---
 
-## 排错
+## Fork 后如何替换仓库地址
 
-- 面板日志：
-  ```bash
-  journalctl -u realm-panel -n 200 --no-pager
-  ```
+如果你 fork 了仓库，只需要在两个安装脚本开头修改下面三行：
 
-- Agent 日志：
-  ```bash
-  journalctl -u realm-agent -n 200 --no-pager
-  ```
+```bash
+REPO_OWNER="你的用户名"
+REPO_NAME="你的仓库名"
+REPO_BRANCH="main"
+```
 
-- Realm 日志：
-  ```bash
-  journalctl -u realm -n 200 --no-pager
-  ```
+不要修改其它路径。
+
+---
+
+## 常用命令
+
+```bash
+systemctl status realm-agent --no-pager
+journalctl -u realm-agent -n 200 --no-pager
+
+systemctl status realm-panel --no-pager
+journalctl -u realm-panel -n 200 --no-pager
+```
