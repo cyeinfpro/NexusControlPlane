@@ -1,5 +1,5 @@
 [Unit]
-Description=Realm Pro Web Panel
+Description=Realm Panel Web UI
 After=network-online.target
 Wants=network-online.target
 

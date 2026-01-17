@@ -1,89 +1,48 @@
-# Realm Pro Suite v14
+# Realm Pro Suite v15
 
-这是一套 **可直接丢进 GitHub 的完整代码包**（Panel + Agent），包含：
+此版本重点修复/调整：
 
-- ✅ 全新 UI 设计（高级玻璃拟态 + 统一交互）
-- ✅ 配对码逻辑重做（防重复 / 可过期 / 一键生成）
-- ✅ Panel 统一代理管理 Agent（无需浏览器直接访问 Agent）
-- ✅ 规则新增 / 编辑 / 删除 / 暂停 / 应用 / 查看日志
-- ✅ 目标健康探测（通/断）+ Realm 连接数统计（入站/出站）
-- ✅ WSS 支持：客户端 / 服务端 两种模式（可自签证书）
+- ✅ **安装不再要求设置用户名/密码**：默认无登录界面，打开即用。
+- ✅ **配对码只用于 WSS 参数同步**：不再用于“绑定/链接机器”。
 
----
+## 组件说明
 
-## 你需要替换哪里的仓库地址？
+- **Agent**：运行在每台节点上，提供本地 API（Bearer Token 鉴权）。
+- **Panel**：统一 Web 管理面板，可管理多个 Agent。
 
-仓库 RAW 地址只出现在 **两个安装脚本**的顶部：
+## 快速安装
 
-1) `realm_panel.sh`
-2) `realm_agent.sh`
-
-找到这行并替换：
-
-```bash
-REPO_RAW_BASE="https://raw.githubusercontent.com/cyeinfpro/Realm/refs/heads/main"
-```
-
-（你已经给了这个地址，因此本包已替换好。）
-
----
-
-## Panel 一键安装
-
-```bash
-bash realm_panel.sh
-```
-
-安装后默认监听：`http://服务器IP:18750`
-
-默认管理员：
-- 用户名：admin
-- 密码：admin
-
-（可在安装时改，也可编辑 `/etc/realm-panel/panel.env` 后重启）
-
----
-
-## Agent 一键安装（并配对）
-
-在被控机执行：
+### 1) 安装 Agent
 
 ```bash
 bash realm_agent.sh
 ```
 
-你会被提示输入：
-- Panel 地址（例如 `http://10.0.0.2:18750`）
-- 配对码（在 Panel 仪表盘生成）
+脚本会输出一个 `Agent Token`，请复制保存。
 
-配对成功后，Panel 就能管理该 Agent。
-
----
-
-## 目录结构
-
-- `panel/`  Web 面板源代码
-- `agent/`  Agent API 源代码
-- `realm_panel.sh` 一键安装 Panel
-- `realm_agent.sh` 一键安装 Agent
-
----
-
-## 常用命令
-
-### Panel
+### 2) 安装 Panel
 
 ```bash
-systemctl status realm-panel --no-pager
-systemctl restart realm-panel
-journalctl -u realm-panel -n 100 --no-pager
+bash realm_panel.sh
 ```
 
-### Agent
+安装完成后会提示访问地址。
 
-```bash
-systemctl status realm-agent --no-pager
-systemctl restart realm-agent
-journalctl -u realm-agent -n 100 --no-pager
-```
+### 3) 在面板添加节点
+
+打开面板首页 → **添加节点**，填入：
+
+- 节点名称：随便写（例如 `HK-1`）
+- Agent 地址：例如 `http://10.0.0.2:6080`
+- Token：粘贴 Agent 安装脚本输出的 token
+- TLS 验证：如果你用自签证书跑 https，可以取消勾选（默认勾选）
+
+添加完成后，点击节点即可进入规则管理。
+
+## WSS 对接码如何用
+
+- 在 **WSS 服务端（Server）** 创建规则后，面板会返回一个 **对接码**。
+- 在 **WSS 客户端（Client）** 创建规则时，填写这个对接码，面板会自动把 Host/Path/SNI/Insecure 参数填好。
+
+> 对接码只用于 WSS 参数同步，与“链接机器/绑定 Agent”无关。
 

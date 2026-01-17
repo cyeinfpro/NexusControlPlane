@@ -1,378 +1,376 @@
-// Realm Pro Panel v14 - minimal vanilla JS
+// Realm Pro Panel Frontend JS (v15.1)
 
-const $ = (sel, el=document) => el.querySelector(sel);
-const $$ = (sel, el=document) => Array.from(el.querySelectorAll(sel));
+function qs(sel, el=document){return el.querySelector(sel)}
+function qsa(sel, el=document){return Array.from(el.querySelectorAll(sel))}
 
-function toast(msg, type='') {
-  const t = $('#toast');
-  t.textContent = msg;
-  t.hidden = false;
-  t.className = `toast ${type}`;
-  clearTimeout(window.__toastTimer);
-  window.__toastTimer = setTimeout(() => { t.hidden = true; }, 2600);
-}
-
-async function api(url, opts={}) {
-  const r = await fetch(url, {
-    headers: { 'Content-Type': 'application/json' },
-    ...opts,
-  });
-  if (!r.ok) {
-    const txt = await r.text();
-    throw new Error(txt || `HTTP ${r.status}`);
-  }
-  const ct = r.headers.get('content-type') || '';
-  return ct.includes('application/json') ? r.json() : r.text();
-}
-
-function copyText(text) {
-  navigator.clipboard.writeText(text).then(() => toast('已复制'), () => toast('复制失败', 'bad'));
-}
-
-function escapeHtml(s='') {
-  return String(s)
-    .replaceAll('&','&amp;')
-    .replaceAll('<','&lt;')
-    .replaceAll('>','&gt;')
+function escapeHtml(s){
+  return (s||"")
+    .replaceAll("&","&amp;")
+    .replaceAll("<","&lt;")
+    .replaceAll(">","&gt;")
     .replaceAll('"','&quot;')
-    .replaceAll("'",'&#39;');
 }
 
-function openModal(title, innerHtml, actionsHtml='') {
-  const root = $('#modalRoot');
-  root.hidden = false;
-  root.innerHTML = `
-    <div class="modal" role="dialog" aria-modal="true">
-      <div class="modal-head">
-        <div class="modal-title">${escapeHtml(title)}</div>
-        <button class="btn ghost" id="_mClose">关闭</button>
+function showToast(msg){
+  const t = qs('#toast')
+  if(!t){
+    alert(msg)
+    return
+  }
+  t.textContent = msg
+  t.classList.remove('hidden')
+  setTimeout(()=>t.classList.add('hidden'), 2600)
+}
+
+async function api(url, method='GET', body=null){
+  const opt = { method, headers: {} }
+  if(body !== null){
+    opt.headers['Content-Type'] = 'application/json'
+    opt.body = JSON.stringify(body)
+  }
+  const res = await fetch(url, opt)
+  const ct = res.headers.get('content-type')||''
+  let data = null
+  if(ct.includes('application/json')){
+    data = await res.json().catch(()=>null)
+  }else{
+    data = await res.text().catch(()=>null)
+  }
+  if(!res.ok){
+    const msg = (data && data.detail) ? data.detail : (typeof data === 'string' ? data : '请求失败')
+    throw new Error(msg)
+  }
+  return data
+}
+
+function badgeDot(ok){
+  if(ok===true) return '<span class="dot ok"></span><span class="small" style="color:rgba(167,255,207,0.85)">在线</span>'
+  if(ok===false) return '<span class="dot bad"></span><span class="small" style="color:rgba(255,159,159,0.85)">离线</span>'
+  return '<span class="dot warn"></span><span class="small">未知</span>'
+}
+
+function ruleTypeLabel(t){
+  if(t==='tcp_udp') return 'TCP/UDP'
+  if(t==='wss_client') return 'WSS 客户端'
+  if(t==='wss_server') return 'WSS 服务端'
+  return t || '-'
+}
+
+function renderTargets(targets){
+  if(!targets || targets.length===0) return '<span class="small">(无目标)</span>'
+  return targets.map(t=>`<span class="pill">${escapeHtml(t)}</span>`).join(' ')
+}
+
+function getPort(listen){
+  if(!listen) return ''
+  const idx = listen.lastIndexOf(':')
+  return idx>=0 ? listen.slice(idx+1) : listen
+}
+
+function sumOutbound(outbound){
+  if(!outbound) return 0
+  try{
+    return Object.values(outbound).reduce((a,b)=>a + (typeof b==='number'?b:0), 0)
+  }catch(_){
+    return 0
+  }
+}
+
+function renderRuleCard(rule, service){
+  const enabled = !!rule.enabled
+  const statusPill = enabled ? '<span class="pill" style="border-color:rgba(34,197,94,.35)">运行</span>' : '<span class="pill" style="border-color:rgba(245,158,11,.35)">暂停</span>'
+
+  const conn = service && service.connections ? service.connections[rule.id] : null
+  const inbound = conn && typeof conn.inbound==='number' ? conn.inbound : 0
+  const outSum = conn ? sumOutbound(conn.outbound) : 0
+
+  const tstat = service && service.target_status ? service.target_status[rule.id] : null
+  const tstatHtml = tstat ? Object.entries(tstat).map(([t,ok])=>{
+    const c = ok ? 'ok' : 'bad'
+    return `<span class="pill ${c}">${escapeHtml(t)} ${ok?'通':'断'}</span>`
+  }).join(' ') : ''
+
+  return `
+    <div class="glass" style="padding:12px; margin-bottom:10px;">
+      <div class="row" style="justify-content:space-between; gap:10px; flex-wrap:wrap;">
+        <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+          ${statusPill}
+          <span class="mono">${escapeHtml(rule.listen)}</span>
+          <span class="pill">${escapeHtml(ruleTypeLabel(rule.type))}</span>
+          <span class="small" style="opacity:.85;">${escapeHtml(rule.name||'')}</span>
+        </div>
+        <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+          <span class="mono">入:${inbound} 出:${outSum}</span>
+          <button class="btn" data-action="toggle" data-rule-id="${escapeHtml(rule.id)}">${enabled ? '暂停' : '启用'}</button>
+          <button class="btn danger" data-action="delete" data-rule-id="${escapeHtml(rule.id)}">删除</button>
+        </div>
       </div>
-      <div class="modal-body">${innerHtml}</div>
-      <div class="modal-actions">${actionsHtml}</div>
+      <div style="margin-top:10px; display:flex; flex-wrap:wrap; gap:6px;">
+        ${renderTargets(rule.targets)}
+      </div>
+      ${tstatHtml ? `<div style="margin-top:10px; display:flex; flex-wrap:wrap; gap:6px;">${tstatHtml}</div>` : ''}
     </div>
-  `;
-  $('#_mClose', root).onclick = closeModal;
-  root.onclick = (e) => {
-    if (e.target === root) closeModal();
-  };
+  `
 }
 
-function closeModal() {
-  const root = $('#modalRoot');
-  root.hidden = true;
-  root.innerHTML = '';
-}
+// ------------------------
+// Index page
+// ------------------------
+async function refreshIndex(){
+  const list = qs('#agentsList')
+  if(!list) return
 
-// ---------------- Dashboard ----------------
+  let data
+  try{
+    data = await api('/api/agents')
+  }catch(e){
+    return
+  }
 
-async function initDashboard() {
-  const btn = $('#btnNewPair');
-  if (!btn) return;
-
-  btn.onclick = async () => {
-    try {
-      const res = await api('/api/pair_codes', { method: 'POST', body: JSON.stringify({ ttl: 900 }) });
-      openModal('配对码已生成', `
-        <div class="hint">在 <b>Agent 安装脚本</b> 中输入以下配对码完成绑定：</div>
-        <div class="code">${escapeHtml(res.code)}</div>
-        <div class="row" style="gap:10px; margin-top:10px;">
-          <button class="btn" id="mCopy">一键复制</button>
-          <button class="btn ghost" id="mClose2">关闭</button>
-        </div>
-        <div class="kv" style="margin-top:12px;">
-          <div><span>有效期：</span>${Math.round((res.expires_at - Date.now()/1000))} 秒</div>
-        </div>
-      `);
-      $('#mCopy').onclick = () => copyText(res.code);
-      $('#mClose2').onclick = closeModal;
-    } catch (e) {
-      toast('生成失败：' + e.message, 'bad');
+  const agents = data.agents || []
+  await Promise.allSettled(agents.map(async (a)=>{
+    const id = a.id
+    const stEl = qs(`[data-agent-status="${id}"]`)
+    const lastEl = qs(`[data-agent-last="${id}"]`)
+    if(stEl) stEl.innerHTML = badgeDot(null) + '<span class="small" style="margin-left:8px">检测中</span>'
+    try{
+      const s = await api(`/api/agents/${id}/service`)
+      if(stEl) stEl.innerHTML = `<div style="display:flex; align-items:center; gap:8px;">${badgeDot(true)}<span class="mono">${escapeHtml(s.realm_status||'-')}</span></div>`
+      if(lastEl) lastEl.textContent = new Date((s.now||Date.now()/1000)*1000).toLocaleString()
+    }catch(_){
+      if(stEl) stEl.innerHTML = `<div style="display:flex; align-items:center; gap:8px;">${badgeDot(false)}<span class="small">连接失败</span></div>`
     }
-  };
-
-  $$('.copy').forEach((b) => {
-    b.onclick = () => {
-      const val = b.getAttribute('data-copy') || '';
-      copyText(val);
-    };
-  });
-
-  $$('.agent-card').forEach((card) => {
-    card.onclick = () => {
-      const id = card.getAttribute('data-agent');
-      if (id) window.location.href = `/agents/${id}`;
-    };
-  });
+  }))
 }
 
-// ---------------- Agent Detail ----------------
-
-function pill(ok, labelOk='通', labelBad='断') {
-  return ok ? `<span class="pill ok">${labelOk}</span>` : `<span class="pill bad">${labelBad}</span>`;
+// ------------------------
+// Agent detail page
+// ------------------------
+function openModal(){
+  const m = qs('#ruleModal')
+  if(!m) return
+  m.classList.remove('hidden')
+  m.classList.add('open')
+  document.body.style.overflow = 'hidden'
+}
+function closeModal(){
+  const m = qs('#ruleModal')
+  if(!m) return
+  m.classList.remove('open')
+  m.classList.add('hidden')
+  document.body.style.overflow = 'auto'
 }
 
-function ruleTypeLabel(t) {
-  if (t === 'wss_server') return 'WSS 接收';
-  if (t === 'wss_client') return 'WSS 客户端';
-  return 'TCP/UDP';
+function syncRuleFields(){
+  const type = qs('#ruleType')?.value || 'tcp_udp'
+  const wssBox = qs('#wssBox')
+  const pairBox = qs('#pairCodeBox')
+  const lbBox = qs('#lbBox')
+
+  // WSS 参数
+  if(wssBox) wssBox.classList.toggle('hidden', !(type==='wss_client' || type==='wss_server'))
+  if(pairBox) pairBox.classList.toggle('hidden', !(type==='wss_client'))
+
+  // 负载均衡算法：仅 TCP/UDP 且多目标时才显示
+  if(lbBox){
+    lbBox.classList.toggle('hidden', type!=='tcp_udp')
+  }
 }
 
-async function initAgentDetail() {
-  const el = $('#rulesMount');
-  if (!el) return;
-  const agentId = el.getAttribute('data-agent');
+async function refreshAgentDetail(){
+  const root = qs('[data-agent-id]')
+  if(!root) return
+  const agentId = root.getAttribute('data-agent-id')
 
-  const btnAdd = $('#btnAddRule');
-  const btnApply = $('#btnApply');
-  const btnLogs = $('#btnLogs');
+  let service
+  try{
+    service = await api(`/api/agents/${agentId}/service`)
+  }catch(e){
+    showToast(e.message || '获取服务状态失败')
+    return
+  }
 
-  async function refresh() {
-    el.innerHTML = '<div class="muted">加载中...</div>';
-    try {
-      const [rules, st] = await Promise.all([
-        api(`/api/agents/${agentId}/rules`),
-        api(`/api/agents/${agentId}/status`),
-      ]);
+  // service summary
+  const online = service.realm_active === true
+  const onlineDot = qs('#svOnline')
+  if(onlineDot){
+    onlineDot.classList.remove('ok','bad','warn')
+    onlineDot.classList.add(online ? 'ok' : 'bad')
+  }
+  const setTxt = (id, txt)=>{ const el = qs('#'+id); if(el) el.textContent = txt }
+  setTxt('svRealm', service.realm_status || '-')
+  setTxt('svRules', `${service.rules_enabled||0}/${service.rules_total||0}`)
+  setTxt('svUpdated', new Date((service.now||Date.now()/1000)*1000).toLocaleString())
 
-      const conn = st.conn_counts || {};
-      const targetStatus = st.target_status || {};
+  // rules
+  let rulesData
+  try{
+    rulesData = await api(`/api/agents/${agentId}/rules`)
+  }catch(e){
+    showToast(e.message || '获取规则失败')
+    return
+  }
 
-      if (!rules.length) {
-        el.innerHTML = '<div class="muted">暂无规则。点击右上角“新增规则”。</div>';
-        return;
+  const rules = rulesData.rules || []
+  const wrap = qs('#rulesWrap')
+  if(wrap){
+    if(rules.length===0){
+      wrap.innerHTML = '<div class="small" style="opacity:.8; padding:6px 2px;">暂无规则，点击「添加规则」开始。</div>'
+    }else{
+      wrap.innerHTML = rules.map(r=>renderRuleCard(r, service)).join('')
+      // bind actions
+      qsa('button[data-action]', wrap).forEach(btn=>{
+        btn.addEventListener('click', async ()=>{
+          const act = btn.getAttribute('data-action')
+          const rid = btn.getAttribute('data-rule-id')
+          try{
+            if(act==='toggle'){
+              const toEnable = btn.textContent.trim() === '启用'
+              await api(`/api/agents/${agentId}/rules/${rid}/toggle`, 'POST', {enabled: toEnable})
+              showToast('已更新规则状态')
+              await refreshAgentDetail()
+            }else if(act==='delete'){
+              if(!confirm('确定删除这条规则？')) return
+              await api(`/api/agents/${agentId}/rules/${rid}`, 'DELETE')
+              showToast('已删除规则')
+              await refreshAgentDetail()
+            }
+          }catch(e){
+            showToast(e.message || '操作失败')
+          }
+        })
+      })
+    }
+  }
+}
+
+async function bindRuleModal(){
+  const root = qs('[data-agent-id]')
+  if(!root) return
+  const agentId = root.getAttribute('data-agent-id')
+
+  const btnAdd = qs('#btnAddRule')
+  if(btnAdd) btnAdd.addEventListener('click', ()=>{ openModal(); syncRuleFields() })
+
+  const btnClose = qs('#btnCloseModal')
+  if(btnClose) btnClose.addEventListener('click', closeModal)
+
+  const btnCancel = qs('#btnCancel')
+  if(btnCancel) btnCancel.addEventListener('click', closeModal)
+
+  const backdrop = qs('#modalBackdrop')
+  if(backdrop) backdrop.addEventListener('click', (e)=>{
+    if(e.target === backdrop) closeModal()
+  })
+
+  const typeSel = qs('#ruleType')
+  if(typeSel) typeSel.addEventListener('change', syncRuleFields)
+
+  const form = qs('#ruleForm')
+  if(!form) return
+
+  form.addEventListener('submit', async (ev)=>{
+    ev.preventDefault()
+    try{
+      const get = (name)=> (form.elements.namedItem(name)?.value || '').trim()
+      const getBool = (name)=> !!(form.elements.namedItem(name)?.checked)
+
+      const name = get('name') || 'Rule'
+      const listenPort = parseInt(get('listen_port'), 10)
+      const type = get('type') || 'tcp_udp'
+      const protocol = get('protocol') || 'tcp+udp'
+      const balance = get('balance') || 'roundrobin'
+      const enabled = getBool('enabled')
+
+      if(!listenPort || listenPort<1 || listenPort>65535) throw new Error('本地端口不正确')
+
+      const targetsRaw = get('targets')
+      const targets = targetsRaw ? targetsRaw.split(/\n+/).map(s=>s.trim()).filter(Boolean) : []
+      if(type !== 'wss_server' && targets.length===0) throw new Error('请至少填写一个目标地址')
+
+      const payload = { name, listen_port: listenPort, type, protocol, targets, balance, enabled }
+
+      if(type === 'wss_client'){
+        const pair = get('pair_code')
+        if(pair) payload.wss_pair_code = pair
+        payload.wss_host = get('wss_host') || null
+        payload.wss_path = get('wss_path') || null
+        payload.wss_sni = get('wss_sni') || null
+        payload.wss_insecure = getBool('wss_insecure')
+      }
+      if(type === 'wss_server'){
+        payload.wss_host = get('wss_host') || null
+        payload.wss_path = get('wss_path') || null
+        payload.wss_sni = get('wss_sni') || null
+        payload.wss_insecure = getBool('wss_insecure')
       }
 
-      const rows = rules.map((r) => {
-        const cs = conn[r.id] || { inbound: 0, outbound: {} };
-        const ts = targetStatus[r.id] || {};
-        const targets = (r.targets || []).map((t) => {
-          const up = (t in ts) ? ts[t] : null;
-          const outCnt = (cs.outbound && cs.outbound[t]) ? cs.outbound[t] : 0;
-          return `
-            <div class="target">
-              ${up === null ? '<span class="pill">?</span>' : pill(!!up)}
-              <span class="mono">${escapeHtml(t)}</span>
-              <span class="muted">连接:${outCnt}</span>
-            </div>
-          `;
-        }).join('');
+      const res = await api(`/api/agents/${agentId}/rules`, 'POST', payload)
 
-        return `
-          <tr>
-            <td>
-              <div class="rule-name">${escapeHtml(r.name)}</div>
-              <div class="muted">${ruleTypeLabel(r.type)} · <span class="mono">${escapeHtml(r.listen)}</span></div>
-            </td>
-            <td>
-              <div class="muted">入站连接：<b>${cs.inbound || 0}</b></div>
-              <div class="targets">${targets || '<span class="muted">无目标</span>'}</div>
-            </td>
-            <td style="width:120px;">
-              <label class="switch">
-                <input type="checkbox" ${r.enabled ? 'checked' : ''} data-act="toggle" data-id="${r.id}" />
-                <span class="slider"></span>
-              </label>
-            </td>
-            <td style="width:210px; text-align:right;">
-              <button class="btn ghost" data-act="edit" data-id="${r.id}">编辑</button>
-              <button class="btn ghost" data-act="clone" data-id="${r.id}">克隆</button>
-              <button class="btn danger" data-act="del" data-id="${r.id}">删除</button>
-            </td>
-          </tr>
-        `;
-      }).join('');
-
-      el.innerHTML = `
-        <div class="table">
-          <table>
-            <thead>
-              <tr>
-                <th>规则</th>
-                <th>目标状态</th>
-                <th>启用</th>
-                <th style="text-align:right">操作</th>
-              </tr>
-            </thead>
-            <tbody>${rows}</tbody>
-          </table>
-        </div>
-      `;
-
-      $$('input[data-act="toggle"]', el).forEach((i) => {
-        i.onchange = async () => {
-          try {
-            await api(`/api/agents/${agentId}/rules/${i.getAttribute('data-id')}/toggle?enabled=${i.checked}`, { method: 'POST' });
-            toast('已更新');
-            refresh();
-          } catch (e) {
-            toast('更新失败：' + e.message, 'bad');
-          }
-        };
-      });
-
-      $$('button[data-act="del"]', el).forEach((b) => {
-        b.onclick = async () => {
-          const rid = b.getAttribute('data-id');
-          if (!confirm('确定删除该规则？')) return;
-          try {
-            await api(`/api/agents/${agentId}/rules/${rid}`, { method: 'DELETE' });
-            toast('已删除');
-            refresh();
-          } catch (e) {
-            toast('删除失败：' + e.message, 'bad');
-          }
-        };
-      });
-
-      $$('button[data-act="edit"]', el).forEach((b) => {
-        b.onclick = () => showRuleModal('edit', rules.find(x => x.id === b.getAttribute('data-id')));
-      });
-
-      $$('button[data-act="clone"]', el).forEach((b) => {
-        b.onclick = () => showRuleModal('clone', rules.find(x => x.id === b.getAttribute('data-id')));
-      });
-
-    } catch (e) {
-      el.innerHTML = `<div class="muted">加载失败：${escapeHtml(e.message)}</div>`;
-    }
-  }
-
-  function ruleFormHtml(mode, rule) {
-    const r = rule || { name:'', type:'tcp_udp', listen:'0.0.0.0:80', protocol:'tcp+udp', targets:['1.1.1.1:80'], balance:'roundrobin', enabled:true, wss_host:'', wss_path:'', wss_sni:'', wss_insecure:false };
-    const targetsText = (r.targets || []).join('\n');
-    return `
-      <div class="form">
-        <div class="field">
-          <label>规则名称</label>
-          <input id="f_name" value="${escapeHtml(r.name || '')}" placeholder="例如：Web 80" />
-        </div>
-        <div class="field">
-          <label>类型</label>
-          <select id="f_type">
-            <option value="tcp_udp" ${r.type==='tcp_udp'?'selected':''}>TCP/UDP</option>
-            <option value="wss_client" ${r.type==='wss_client'?'selected':''}>WSS 客户端（发起）</option>
-            <option value="wss_server" ${r.type==='wss_server'?'selected':''}>WSS 接收（服务端）</option>
-          </select>
-        </div>
-        <div class="field">
-          <label>监听地址</label>
-          <input id="f_listen" value="${escapeHtml(r.listen || '')}" placeholder="0.0.0.0:443" />
-        </div>
-        <div class="field">
-          <label>协议</label>
-          <select id="f_proto">
-            <option value="tcp" ${r.protocol==='tcp'?'selected':''}>TCP</option>
-            <option value="udp" ${r.protocol==='udp'?'selected':''}>UDP</option>
-            <option value="tcp+udp" ${r.protocol==='tcp+udp'?'selected':''}>TCP+UDP</option>
-          </select>
-          <div class="hint">WSS 规则一般使用 TCP</div>
-        </div>
-        <div class="field">
-          <label>目标地址（每行一个 host:port）</label>
-          <textarea id="f_targets" rows="5" placeholder="1.2.3.4:80\n5.6.7.8:80">${escapeHtml(targetsText)}</textarea>
-          <div class="hint">多个目标会自动负载均衡</div>
-        </div>
-        <div class="field">
-          <label>负载算法</label>
-          <select id="f_balance">
-            <option value="roundrobin" ${r.balance==='roundrobin'?'selected':''}>Round Robin</option>
-            <option value="iphash" ${r.balance==='iphash'?'selected':''}>IP Hash</option>
-          </select>
-        </div>
-        <div class="split"></div>
-        <div class="field">
-          <label>WSS Host（可选）</label>
-          <input id="f_whost" value="${escapeHtml(r.wss_host || '')}" placeholder="例如：www.bing.com" />
-        </div>
-        <div class="field">
-          <label>WSS Path（可选）</label>
-          <input id="f_wpath" value="${escapeHtml(r.wss_path || '')}" placeholder="例如：/ws" />
-        </div>
-        <div class="field">
-          <label>WSS SNI（可选）</label>
-          <input id="f_wsni" value="${escapeHtml(r.wss_sni || '')}" placeholder="默认等于 Host" />
-        </div>
-        <div class="row between">
-          <div class="muted">启用该规则</div>
-          <label class="switch">
-            <input id="f_enabled" type="checkbox" ${r.enabled ? 'checked' : ''} />
-            <span class="slider"></span>
-          </label>
-        </div>
-      </div>
-    `;
-  }
-
-  async function showRuleModal(mode, rule) {
-    const title = mode === 'edit' ? '编辑规则' : (mode === 'clone' ? '克隆规则' : '新增规则');
-    openModal(title, ruleFormHtml(mode, rule), `
-      <button class="btn ghost" id="mCancel">取消</button>
-      <button class="btn" id="mSave">保存</button>
-    `);
-    $('#mCancel').onclick = closeModal;
-
-    $('#f_type').onchange = () => {
-      const t = $('#f_type').value;
-      if (t !== 'tcp_udp') $('#f_proto').value = 'tcp';
-    };
-
-    $('#mSave').onclick = async () => {
-      try {
-        const payload = {
-          name: $('#f_name').value.trim() || 'Rule',
-          type: $('#f_type').value,
-          listen: $('#f_listen').value.trim(),
-          protocol: $('#f_proto').value,
-          targets: $('#f_targets').value.split(/\n+/).map(x => x.trim()).filter(Boolean),
-          balance: $('#f_balance').value,
-          enabled: $('#f_enabled').checked,
-          wss_host: $('#f_whost').value.trim() || null,
-          wss_path: $('#f_wpath').value.trim() || null,
-          wss_sni: $('#f_wsni').value.trim() || null,
-        };
-
-        if (mode === 'edit') {
-          await api(`/api/agents/${agentId}/rules/${rule.id}`, { method: 'PUT', body: JSON.stringify(payload) });
-          toast('已保存');
-        } else {
-          await api(`/api/agents/${agentId}/rules`, { method: 'POST', body: JSON.stringify(payload) });
-          toast(mode === 'clone' ? '已克隆' : '已新增');
-        }
-        closeModal();
-        refresh();
-      } catch (e) {
-        toast('保存失败：' + e.message, 'bad');
+      // show pair code if returned (WSS server auto created)
+      const pairBox = qs('#pairResult')
+      if(pairBox){
+        pairBox.classList.add('hidden')
       }
-    };
+
+      if(res && res.pair_code){
+        const codeEl = qs('#pairCode')
+        if(codeEl) codeEl.textContent = res.pair_code
+        if(pairBox) pairBox.classList.remove('hidden')
+      }
+
+      showToast('规则已创建')
+      closeModal()
+      await refreshAgentDetail()
+
+      // Reset
+      form.reset()
+      // Keep default values
+      qs('#ruleType').value = 'tcp_udp'
+      syncRuleFields()
+
+    }catch(e){
+      showToast(e.message || '创建失败')
+    }
+  })
+
+  const btnApply = qs('#btnApply')
+  if(btnApply){
+    btnApply.addEventListener('click', async ()=>{
+      try{
+        await api(`/api/agents/${agentId}/apply`, 'POST', {})
+        showToast('已应用配置并重启 realm')
+        await refreshAgentDetail()
+      }catch(e){
+        showToast(e.message || '应用失败')
+      }
+    })
   }
 
-  btnAdd && (btnAdd.onclick = () => showRuleModal('new', null));
-
-  btnApply && (btnApply.onclick = async () => {
-    try {
-      const res = await api(`/api/agents/${agentId}/apply`, { method: 'POST' });
-      toast(res.ok ? '已应用并重启 Realm' : ('应用失败：' + res.message), res.ok ? '' : 'bad');
-      refresh();
-    } catch (e) {
-      toast('应用失败：' + e.message, 'bad');
-    }
-  });
-
-  btnLogs && (btnLogs.onclick = async () => {
-    try {
-      const res = await api(`/api/agents/${agentId}/logs/realm?lines=200`);
-      openModal('Realm 日志（最近 200 行）', `<pre class="logs">${escapeHtml((res.lines||[]).join('\n'))}</pre>`, `<button class="btn" id="mOk">关闭</button>`);
-      $('#mOk').onclick = closeModal;
-    } catch (e) {
-      toast('获取日志失败：' + e.message, 'bad');
-    }
-  });
-
-  refresh();
+  const btnCopy = qs('#btnCopy')
+  if(btnCopy){
+    btnCopy.addEventListener('click', async ()=>{
+      try{
+        const code = qs('#pairCode')?.textContent || ''
+        await navigator.clipboard.writeText(code)
+        showToast('已复制对接码')
+      }catch(_){
+        showToast('复制失败，请手动复制')
+      }
+    })
+  }
 }
 
-// Init
-window.addEventListener('DOMContentLoaded', () => {
-  initDashboard();
-  initAgentDetail();
-});
+window.addEventListener('DOMContentLoaded', async ()=>{
+  try{
+    await refreshIndex()
+    await refreshAgentDetail()
+    await bindRuleModal()
+
+    // periodic refresh
+    if(qs('#agentsList')) setInterval(()=>refreshIndex().catch(()=>{}), 4500)
+    if(qs('[data-agent-id]')) setInterval(()=>refreshAgentDetail().catch(()=>{}), 2600)
+  }catch(_){
+    // ignore
+  }
+})

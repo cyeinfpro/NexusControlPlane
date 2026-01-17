@@ -1,11 +1,8 @@
 from __future__ import annotations
 
-import asyncio
 import os
 import time
 from typing import Any, Dict, List
-
-import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
@@ -14,7 +11,7 @@ from .models import ApplyResult, LogsResponse, Rule, RuleCreate, RuleUpdate, Ser
 from .storage import create_rule, delete_rule, load_rules, toggle_rule, update_rule
 from .realmctl import build_realm_config, journal_tail, restart_realm, status_snapshot, write_realm_config
 
-app = FastAPI(title="Realm Agent API", version="14.0")
+app = FastAPI(title="Realm Agent API", version="15.0")
 
 
 def _auth_dep(request: Request) -> None:
@@ -133,30 +130,10 @@ async def logs(unit: str, lines: int = 200) -> LogsResponse:
     return LogsResponse(unit=u, lines=data)
 
 
-# --------- Agent heartbeat to panel ---------
-
-async def _heartbeat_loop() -> None:
-    if not CFG.panel_url or not CFG.agent_id or not CFG.token:
-        return
-
-    url = CFG.panel_url.rstrip("/") + "/api/agent/heartbeat"
-    async with httpx.AsyncClient(verify=CFG.panel_verify_tls, timeout=10.0) as client:
-        while True:
-            try:
-                await client.post(
-                    url,
-                    json={"agent_id": CFG.agent_id, "ts": int(time.time())},
-                    headers={"Authorization": f"Bearer {CFG.token}"},
-                )
-            except Exception:
-                pass
-            await asyncio.sleep(CFG.heartbeat_interval)
-
-
 @app.on_event("startup")
 async def on_startup() -> None:
-    # Start heartbeat in background
-    asyncio.create_task(_heartbeat_loop())
+    # v15: no panel heartbeat; panel will actively query agent status
+    return
 
 
 @app.exception_handler(Exception)
