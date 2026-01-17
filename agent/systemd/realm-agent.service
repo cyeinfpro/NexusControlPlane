@@ -1,16 +1,15 @@
 [Unit]
-Description=Realm Agent API Service
+Description=Realm Pro Agent API
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-EnvironmentFile=/etc/realm-agent/agent.env
-WorkingDirectory=/opt/realm-agent
-ExecStart=/opt/realm-agent/start.sh
+EnvironmentFile=/etc/realm-agent/env
+WorkingDirectory=/opt/realm-agent/agent/app
+ExecStart=/opt/realm-agent/venv/bin/uvicorn main:app --host 0.0.0.0 --port ${AGENT_PORT}
 Restart=always
 RestartSec=2
-LimitNOFILE=1048576
 
 [Install]
 WantedBy=multi-user.target

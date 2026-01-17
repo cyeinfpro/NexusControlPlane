@@ -1,80 +1,77 @@
-# Realm Pro Suite (Stable Build)
+# Realm Pro Suite v18
 
-此版本已修复你遇到的两个关键问题：
+> 一套可在多台 Debian/Ubuntu 服务器上部署的 **Realm 转发管理套件**：
+> - **Agent**：被控机 API（管理 Realm 规则、生成配置、应用重启、状态/连接数）
+> - **Panel**：Web 管理面板（登录鉴权、节点管理、规则增删改、暂停、日志查看、WSS 配对码）
 
-- ✅ **安装时会要求设置面板用户名/密码**（你想要的行为）
-- ✅ **配对码只用于 WSS 参数同步**（用于自动回填 Host/Path/SNI/Insecure，不再用于“链接机器/绑定节点”）
-- ✅ **安装脚本不再依赖固定目录名（v15/v16）**：会自动识别 `panel/`、`agent/` 或 `realm-pro-suite-vXX/panel`、`realm-pro-suite-vXX/agent`
-
----
-
-## 目录结构（建议）
-
-把下面这些放在仓库根目录：
+## 仓库结构（必须是这个结构）
 
 ```
-Realm/
-  realm_panel.sh
-  realm_agent.sh
-  panel/
-  agent/
+.
+├── agent/
+│   ├── app/
+│   ├── requirements.txt
+│   └── systemd/realm-agent.service
+├── panel/
+│   ├── app/
+│   ├── requirements.txt
+│   └── systemd/realm-panel.service
+├── realm_agent.sh
+└── realm_panel.sh
 ```
 
-> 如果你保留版本目录（例如 `realm-pro-suite-v16/panel`），安装脚本也能自动识别。
+> 说明：安装脚本通过 **GitHub Archive** 下载仓库源码，自动识别 `agent/` 与 `panel/` 目录。
 
----
+## 一键安装
 
-## 组件说明
-
-- **Agent**：运行在每台节点上，提供本地 API（Bearer Token 鉴权）。
-- **Panel**：统一 Web 管理面板，可管理多个 Agent。
-
----
-
-## 快速安装
-
-### 1) 安装 Agent
+### 1) 在被控机安装 Agent
 
 ```bash
-bash realm_agent.sh
+curl -fsSL https://raw.githubusercontent.com/cyeinfpro/Realm/refs/heads/main/realm_agent.sh | bash
 ```
 
-脚本会输出：
+安装完成后会输出：
+- Agent API 地址（如 `http://IP:18700`）
+- Token
 
-- Agent API 地址
-- Agent Token（添加节点时需要）
-
----
-
-### 2) 安装 Panel
+### 2) 在主控机安装 Panel
 
 ```bash
-bash realm_panel.sh
+curl -fsSL https://raw.githubusercontent.com/cyeinfpro/Realm/refs/heads/main/realm_panel.sh | bash
 ```
 
-安装过程中会要求你输入：
+安装过程中会要求输入：
+- 面板端口
+- 登录用户名
+- 登录密码
 
-- 面板端口（默认 18750）
-- 面板用户名（默认 admin）
-- 面板密码（必填）
+### 3) 在面板中添加节点
 
-安装完成会提示面板访问地址。
+打开：`http://<PanelIP>:6080`
+- 节点名称
+- Agent 地址
+- Agent Token
 
----
+即可管理。
 
-## WSS 对接码如何用（重点）
+## WSS 配对码逻辑（关键）
 
-### ✅ 你要的逻辑：对接码 = 自动获取 WSS 服务端参数
+- **配对码不是用来链接机器的。**
+- 配对码用于：当你创建 **WSS 接收端** 时，自动生成一个配对码；之后创建 **WSS 发送端** 时，粘贴该配对码即可自动填充 `Host/Path/SNI/Insecure`。
 
-1) 在 **WSS 服务端（Server）** 创建规则
-- 创建成功后，面板会返回一个 **对接码（6位数字）**
+## 排错
 
-2) 在 **WSS 客户端（Client）** 创建规则
-- 填入这个 **对接码**
-- 面板会自动回填：
-  - Host
-  - Path
-  - SNI
-  - Insecure
+- 面板日志：
+  ```bash
+  journalctl -u realm-panel -n 200 --no-pager
+  ```
 
-> 对接码只用于 **参数同步**，与“绑定节点/链接机器”无关。
+- Agent 日志：
+  ```bash
+  journalctl -u realm-agent -n 200 --no-pager
+  ```
+
+- Realm 日志：
+  ```bash
+  journalctl -u realm -n 200 --no-pager
+  ```

@@ -1,177 +1,142 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Realm Pro Panel Installer (stable)
-# Repo raw base (your repo):
-REPO_RAW_BASE="https://raw.githubusercontent.com/cyeinfpro/Realm/refs/heads/main"
-# Repo archive (faster & fewer requests):
-REPO_ARCHIVE_URL="https://github.com/cyeinfpro/Realm/archive/refs/heads/main.tar.gz"
+# Realm Pro Panel Installer (v18)
+# Repo: https://github.com/cyeinfpro/Realm
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-NC='\033[0m'
+REPO_OWNER="cyeinfpro"
+REPO_NAME="Realm"
+REPO_BRANCH="main"
 
-info(){ echo -e "${GREEN}[INFO]${NC} $*"; }
-warn(){ echo -e "${YELLOW}[WARN]${NC} $*"; }
-err(){ echo -e "${RED}[ERR ]${NC} $*"; }
+ARCHIVE_URL="https://github.com/${REPO_OWNER}/${REPO_NAME}/archive/refs/heads/${REPO_BRANCH}.tar.gz"
+
+PANEL_HOME="/opt/realm-panel"
+ETC_DIR="/etc/realm-panel"
+
+_red(){ echo -e "\033[31m$*\033[0m"; }
+_green(){ echo -e "\033[32m$*\033[0m"; }
+_yellow(){ echo -e "\033[33m$*\033[0m"; }
 
 need_root(){
-  if [[ "$(id -u)" -ne 0 ]]; then
-    err "请使用 root 运行：sudo bash $0"
+  if [[ $EUID -ne 0 ]]; then
+    _red "[ERR] 请用 root 运行：sudo bash realm_panel.sh"
     exit 1
   fi
 }
 
-apt_install(){
-  export DEBIAN_FRONTEND=noninteractive
-  apt-get update -y
-  apt-get install -y --no-install-recommends \
-    ca-certificates curl git python3 python3-venv python3-pip \
-    jq iproute2
-}
+pick_source(){
+  local tmp
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "${tmp}"' EXIT
 
-fetch_repo(){
-  local tmpdir
-  tmpdir="$(mktemp -d)"
-  info "拉取仓库源码（归档下载）..."
-  curl -fsSL "$REPO_ARCHIVE_URL" -o "$tmpdir/repo.tar.gz"
-  tar -xzf "$tmpdir/repo.tar.gz" -C "$tmpdir"
+  _yellow "[1/5] 下载面板文件..."
+  curl -fsSL "$ARCHIVE_URL" -o "${tmp}/src.tgz"
+  tar -xzf "${tmp}/src.tgz" -C "$tmp"
 
+  # Find repo root that contains panel/requirements.txt
   local root
-  root="$(find "$tmpdir" -maxdepth 1 -type d -name 'Realm-*' | head -n 1)"
-  if [[ -z "${root:-}" ]]; then
-    err "解压仓库失败"
+  root="$(find "$tmp" -maxdepth 4 -type f -path '*/panel/requirements.txt' -print -quit | sed 's|/panel/requirements.txt||')"
+  if [[ -z "$root" || ! -d "$root/panel" ]]; then
+    _red "[ERR] 找不到 panel 目录。请确认仓库里包含 panel/requirements.txt"
+    _red "[ERR] 当前下载：$ARCHIVE_URL"
     exit 1
   fi
   echo "$root"
 }
 
-pbkdf2_hash(){
-  local pass="$1"
-  P="$pass" python3 - <<'PY'
-import os, hashlib
-pwd = os.environ.get('P','')
+hash_password(){
+  local pw="$1"
+  python3 - <<PY
+import base64, os, hashlib
+pw = """$pw""".encode('utf-8')
+it = 200000
 salt = os.urandom(16)
-iters = 200000
-dk = hashlib.pbkdf2_hmac('sha256', pwd.encode('utf-8'), salt, iters)
-print(f"pbkdf2_sha256${iters}${salt.hex()}${dk.hex()}")
+dk = hashlib.pbkdf2_hmac('sha256', pw, salt, it)
+print('pbkdf2_sha256$%d$%s$%s' % (
+  it,
+  base64.urlsafe_b64encode(salt).decode().rstrip('='),
+  base64.urlsafe_b64encode(dk).decode().rstrip('='),
+))
 PY
 }
 
-rand_secret(){
-  python3 - <<'PY'
+install_panel(){
+  local src_root="$1"
+
+  mkdir -p "$PANEL_HOME" "$ETC_DIR" /var/log/realm-panel
+
+  _yellow "[2/5] 拷贝面板文件到 $PANEL_HOME ..."
+  rm -rf "$PANEL_HOME/panel"
+  cp -a "$src_root/panel" "$PANEL_HOME/panel"
+
+  _yellow "[3/5] 创建 Python 虚拟环境并安装依赖..."
+  apt-get update -y >/dev/null
+  apt-get install -y python3 python3-venv python3-pip ca-certificates curl >/dev/null
+
+  python3 -m venv "$PANEL_HOME/venv"
+  "$PANEL_HOME/venv/bin/pip" -q install --upgrade pip
+  "$PANEL_HOME/venv/bin/pip" -q install -r "$PANEL_HOME/panel/requirements.txt"
+
+  _yellow "[4/5] 写入配置 & Systemd 服务..."
+  chmod 700 "$ETC_DIR"
+
+  local port user pw hash secret
+  read -rp "面板端口 (默认 6080) > " port
+  port="${port:-6080}"
+
+  while true; do
+    read -rp "面板登录用户名 (默认 admin) > " user
+    user="${user:-admin}"
+    [[ -n "$user" ]] && break
+  done
+
+  while true; do
+    read -rsp "面板登录密码（不会回显）> " pw
+    echo
+    [[ -n "$pw" ]] && break
+    _red "密码不能为空"
+  done
+
+  hash="$(hash_password "$pw")"
+  secret="$(python3 - <<'PY'
 import secrets
-print(secrets.token_urlsafe(32))
+print(secrets.token_hex(32))
 PY
-}
+)"
 
-find_panel_src(){
-  local root="$1"
+  cat > "$ETC_DIR/env" <<ENV
+PANEL_PORT=${port}
+PANEL_USER=${user}
+PANEL_PASS_HASH=${hash}
+PANEL_SECRET=${secret}
+ENV
+  chmod 600 "$ETC_DIR/env"
 
-  # Preferred layout: repo_root/panel
-  if [[ -d "$root/panel" ]]; then
-    echo "$root/panel"
-    return 0
+  # install service
+  cp -a "$PANEL_HOME/panel/systemd/realm-panel.service" /etc/systemd/system/realm-panel.service
+
+  systemctl daemon-reload
+  systemctl enable realm-panel --now
+
+  _yellow "[5/5] 启动检查..."
+  sleep 1
+  if systemctl is-active --quiet realm-panel; then
+    _green "[OK] 面板已启动"
+  else
+    _red "[ERR] 面板启动失败，请查看：journalctl -u realm-panel -n 120 --no-pager"
+    exit 1
   fi
 
-  # Versioned layout: repo_root/realm-pro-suite-vXX/panel
-  local candidate
-  candidate="$(find "$root" -maxdepth 4 -type d -path '*/realm-pro-suite-v*/panel' 2>/dev/null | sort -V | tail -n 1)"
-  if [[ -n "${candidate:-}" && -d "$candidate" ]]; then
-    echo "$candidate"
-    return 0
-  fi
-
-  # Any nested panel folder (last resort)
-  candidate="$(find "$root" -maxdepth 6 -type d -name panel 2>/dev/null | head -n 1)"
-  if [[ -n "${candidate:-}" && -d "$candidate" ]]; then
-    echo "$candidate"
-    return 0
-  fi
-
-  return 1
+  _green "\n访问地址：http://<服务器IP>:${port}"
+  _green "用户名：${user}"
+  _green "（密码为你刚刚输入的密码）"
 }
 
 main(){
   need_root
-  info "Realm Pro Panel 安装开始"
-
-  apt_install
-
-  read -r -p "面板监听端口 (默认 18750): " PANEL_PORT
-  PANEL_PORT="${PANEL_PORT:-18750}"
-
-  echo
-  read -r -p "设置面板登录用户名 (默认 admin): " ADMIN_USER
-  ADMIN_USER="${ADMIN_USER:-admin}"
-
-  while true; do
-    read -r -s -p "设置面板登录密码 (必填): " ADMIN_PASS
-    echo
-    if [[ -n "${ADMIN_PASS:-}" ]]; then
-      break
-    fi
-    echo "密码不能为空，请重新输入。"
-  done
-
-  local ADMIN_PASS_HASH
-  ADMIN_PASS_HASH="$(pbkdf2_hash "$ADMIN_PASS")"
-
-  local PANEL_SECRET_KEY
-  PANEL_SECRET_KEY="$(rand_secret)"
-
-  local repo_root
-  repo_root="$(fetch_repo)"
-
-  local panel_src
-  if ! panel_src="$(find_panel_src "$repo_root")"; then
-    err "找不到 panel 目录。请确认仓库里包含 panel/ 或 realm-pro-suite-vXX/panel/"
-    err "建议仓库结构：仓库根目录/panel  或  仓库根目录/realm-pro-suite-v16/panel"
-    exit 1
-  fi
-
-  info "使用面板源码路径：$panel_src"
-
-  info "写入面板文件到 /opt/realm-panel"
-  rm -rf /opt/realm-panel
-  mkdir -p /opt/realm-panel
-  cp -a "$panel_src"/* /opt/realm-panel/
-
-  info "创建环境文件 /etc/realm-panel/panel.env"
-  mkdir -p /etc/realm-panel
-
-  cat > /etc/realm-panel/panel.env <<ENV
-REALM_PANEL_HOST=0.0.0.0
-REALM_PANEL_PORT=$PANEL_PORT
-REALM_PANEL_DB=/etc/realm-panel/panel.db
-REALM_REPO_RAW_BASE=$REPO_RAW_BASE
-PANEL_AUTH_ENABLED=1
-PANEL_ADMIN_USER=$ADMIN_USER
-PANEL_ADMIN_PASS_HASH=$ADMIN_PASS_HASH
-PANEL_SECRET_KEY=$PANEL_SECRET_KEY
-ENV
-
-  info "创建 Python venv"
-  python3 -m venv /opt/realm-panel/venv
-  /opt/realm-panel/venv/bin/pip install -U pip
-  /opt/realm-panel/venv/bin/pip install -r /opt/realm-panel/requirements.txt
-
-  info "安装 systemd 服务"
-  cp /opt/realm-panel/systemd/realm-panel.service /etc/systemd/system/realm-panel.service
-  systemctl daemon-reload
-  systemctl enable realm-panel.service
-  systemctl restart realm-panel.service
-
-  info "安装完成"
-  local ip
-  ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
-  echo
-  echo "面板地址: http://${ip}:${PANEL_PORT}"
-  echo "面板服务: systemctl status realm-panel --no-pager"
-  echo
-  echo "登录账号: ${ADMIN_USER}"
-  echo "登录密码: (安装时输入的密码)"
+  local root
+  root="$(pick_source)"
+  install_panel "$root"
 }
 
 main "$@"

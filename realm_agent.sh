@@ -1,146 +1,154 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Realm Pro Agent Installer (stable)
-# Repo raw base (your repo):
-REPO_RAW_BASE="https://raw.githubusercontent.com/cyeinfpro/Realm/refs/heads/main"
-# Repo archive (faster & fewer requests):
-REPO_ARCHIVE_URL="https://github.com/cyeinfpro/Realm/archive/refs/heads/main.tar.gz"
+# Realm Pro Agent Installer (v18)
+# Repo: https://github.com/cyeinfpro/Realm
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-NC='\033[0m'
+REPO_OWNER="cyeinfpro"
+REPO_NAME="Realm"
+REPO_BRANCH="main"
 
-info(){ echo -e "${GREEN}[INFO]${NC} $*"; }
-warn(){ echo -e "${YELLOW}[WARN]${NC} $*"; }
-err(){ echo -e "${RED}[ERR ]${NC} $*"; }
+ARCHIVE_URL="https://github.com/${REPO_OWNER}/${REPO_NAME}/archive/refs/heads/${REPO_BRANCH}.tar.gz"
+
+AGENT_HOME="/opt/realm-agent"
+ETC_DIR="/etc/realm-agent"
+
+_red(){ echo -e "\033[31m$*\033[0m"; }
+_green(){ echo -e "\033[32m$*\033[0m"; }
+_yellow(){ echo -e "\033[33m$*\033[0m"; }
 
 need_root(){
-  if [[ "$(id -u)" -ne 0 ]]; then
-    err "请使用 root 运行：sudo bash $0"
+  if [[ $EUID -ne 0 ]]; then
+    _red "[ERR] 请用 root 运行：sudo bash realm_agent.sh"
     exit 1
   fi
 }
 
-apt_install(){
-  export DEBIAN_FRONTEND=noninteractive
-  apt-get update -y
-  apt-get install -y --no-install-recommends \
-    ca-certificates curl git python3 python3-venv python3-pip \
-    jq iproute2
-}
+pick_source(){
+  local tmp
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "${tmp}"' EXIT
 
-fetch_repo(){
-  local tmpdir
-  tmpdir="$(mktemp -d)"
-  info "拉取仓库源码（归档下载）..."
-  curl -fsSL "$REPO_ARCHIVE_URL" -o "$tmpdir/repo.tar.gz"
-  tar -xzf "$tmpdir/repo.tar.gz" -C "$tmpdir"
+  _yellow "[1/6] 下载 Agent 文件..."
+  curl -fsSL "$ARCHIVE_URL" -o "${tmp}/src.tgz"
+  tar -xzf "${tmp}/src.tgz" -C "$tmp"
 
   local root
-  root="$(find "$tmpdir" -maxdepth 1 -type d -name 'Realm-*' | head -n 1)"
-  if [[ -z "${root:-}" ]]; then
-    err "解压仓库失败"
+  root="$(find "$tmp" -maxdepth 4 -type f -path '*/agent/requirements.txt' -print -quit | sed 's|/agent/requirements.txt||')"
+  if [[ -z "$root" || ! -d "$root/agent" ]]; then
+    _red "[ERR] 找不到 agent 目录。请确认仓库里包含 agent/requirements.txt"
+    _red "[ERR] 当前下载：$ARCHIVE_URL"
     exit 1
   fi
   echo "$root"
 }
 
-rand_token(){
-  python3 - <<'PY'
-import secrets
-print(secrets.token_urlsafe(24))
-PY
+ensure_realm(){
+  if command -v realm >/dev/null 2>&1; then
+    return 0
+  fi
+  _yellow "[2/6] 未检测到 realm 二进制，尝试安装..."
+  # Best effort install (Debian)
+  apt-get update -y >/dev/null
+  apt-get install -y curl ca-certificates >/dev/null
+  # Try GitHub release
+  local url
+  url="https://github.com/zhboner/realm/releases/latest/download/realm-x86_64-unknown-linux-gnu.tar.gz"
+  mkdir -p /tmp/realm-install
+  curl -fsSL "$url" -o /tmp/realm-install/realm.tgz || true
+  if [[ -f /tmp/realm-install/realm.tgz ]]; then
+    tar -xzf /tmp/realm-install/realm.tgz -C /tmp/realm-install
+    if [[ -f /tmp/realm-install/realm ]]; then
+      install -m 0755 /tmp/realm-install/realm /usr/local/bin/realm
+      _green "[OK] realm 已安装到 /usr/local/bin/realm"
+      return 0
+    fi
+  fi
+  _yellow "[WARN] realm 安装失败（可忽略），你也可以自行安装 realm"
 }
 
-find_agent_src(){
-  local root="$1"
+install_agent(){
+  local src_root="$1"
 
-  # Preferred layout: repo_root/agent
-  if [[ -d "$root/agent" ]]; then
-    echo "$root/agent"
-    return 0
+  mkdir -p "$AGENT_HOME" "$ETC_DIR" /var/log/realm-agent
+
+  _yellow "[3/6] 拷贝 Agent 文件到 $AGENT_HOME ..."
+  rm -rf "$AGENT_HOME/agent"
+  cp -a "$src_root/agent" "$AGENT_HOME/agent"
+
+  _yellow "[4/6] 创建 Python 虚拟环境并安装依赖..."
+  apt-get update -y >/dev/null
+  apt-get install -y python3 python3-venv python3-pip ca-certificates curl iproute2 >/dev/null
+
+  python3 -m venv "$AGENT_HOME/venv"
+  "$AGENT_HOME/venv/bin/pip" -q install --upgrade pip
+  "$AGENT_HOME/venv/bin/pip" -q install -r "$AGENT_HOME/agent/requirements.txt"
+
+  _yellow "[5/6] 写入配置 & Systemd 服务..."
+  chmod 700 "$ETC_DIR"
+
+  local port public_host token
+  read -rp "Agent 端口 (默认 18700) > " port
+  port="${port:-18700}"
+
+  read -rp "此机器外网域名/IP (用于生成 WSS 配对参数，可留空自动探测) > " public_host
+  if [[ -z "$public_host" ]]; then
+    public_host="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}' | head -n1)"
+    public_host="${public_host:-127.0.0.1}"
   fi
 
-  # Versioned layout: repo_root/realm-pro-suite-vXX/agent
-  local candidate
-  candidate="$(find "$root" -maxdepth 4 -type d -path '*/realm-pro-suite-v*/agent' 2>/dev/null | sort -V | tail -n 1)"
-  if [[ -n "${candidate:-}" && -d "$candidate" ]]; then
-    echo "$candidate"
-    return 0
+  token="$(python3 - <<'PY'
+import secrets
+print(secrets.token_urlsafe(32))
+PY
+)"
+
+  mkdir -p "$ETC_DIR"
+  cat > "$ETC_DIR/env" <<ENV
+AGENT_PORT=${port}
+ENV
+  chmod 600 "$ETC_DIR/env"
+
+  cat > "$ETC_DIR/config.json" <<JSON
+{
+  "token": "${token}",
+  "public_host": "${public_host}"
+}
+JSON
+  chmod 600 "$ETC_DIR/config.json"
+
+  # rules file init
+  if [[ ! -f "$ETC_DIR/rules.json" ]]; then
+    echo '[]' > "$ETC_DIR/rules.json"
+    chmod 600 "$ETC_DIR/rules.json"
   fi
 
-  # Any nested agent folder (last resort)
-  candidate="$(find "$root" -maxdepth 6 -type d -name agent 2>/dev/null | head -n 1)"
-  if [[ -n "${candidate:-}" && -d "$candidate" ]]; then
-    echo "$candidate"
-    return 0
+  cp -a "$AGENT_HOME/agent/systemd/realm-agent.service" /etc/systemd/system/realm-agent.service
+
+  systemctl daemon-reload
+  systemctl enable realm-agent --now
+
+  _yellow "[6/6] 启动检查..."
+  sleep 1
+  if systemctl is-active --quiet realm-agent; then
+    _green "[OK] Agent 已启动"
+  else
+    _red "[ERR] Agent 启动失败，请查看：journalctl -u realm-agent -n 120 --no-pager"
+    exit 1
   fi
 
-  return 1
+  _green "\nAgent API:  http://<服务器IP>:${port}"
+  _green "Token:      ${token}"
+  _green "PublicHost: ${public_host}"
+  _yellow "把上面的 Agent 地址 + Token 填到面板里即可管理此节点。"
 }
 
 main(){
   need_root
-  info "Realm Pro Agent 安装开始"
-
-  apt_install
-
-  read -r -p "Agent API 监听端口 (默认 6080): " AGENT_PORT
-  AGENT_PORT="${AGENT_PORT:-6080}"
-
-  read -r -p "Agent Token (回车自动生成): " AGENT_TOKEN
-  if [[ -z "${AGENT_TOKEN:-}" ]]; then
-    AGENT_TOKEN="$(rand_token)"
-  fi
-
-  local repo_root
-  repo_root="$(fetch_repo)"
-
-  local agent_src
-  if ! agent_src="$(find_agent_src "$repo_root")"; then
-    err "找不到 agent 目录。请确认仓库里包含 agent/ 或 realm-pro-suite-vXX/agent/"
-    err "建议仓库结构：仓库根目录/agent  或  仓库根目录/realm-pro-suite-v16/agent"
-    exit 1
-  fi
-
-  info "使用 Agent 源码路径：$agent_src"
-
-  info "写入 Agent 文件到 /opt/realm-agent"
-  rm -rf /opt/realm-agent
-  mkdir -p /opt/realm-agent
-  cp -a "$agent_src"/* /opt/realm-agent/
-
-  info "创建环境文件 /etc/realm-agent/agent.env"
-  mkdir -p /etc/realm-agent
-  cat > /etc/realm-agent/agent.env <<ENV
-REALM_AGENT_HOST=0.0.0.0
-REALM_AGENT_PORT=$AGENT_PORT
-REALM_AGENT_TOKEN=$AGENT_TOKEN
-# realm 配置位置（兼容旧脚本）
-REALM_RULES_PATH=/etc/realm/rules.json
-REALM_TOML_PATH=/etc/realm/config.toml
-ENV
-
-  info "创建 Python venv"
-  python3 -m venv /opt/realm-agent/venv
-  /opt/realm-agent/venv/bin/pip install -U pip
-  /opt/realm-agent/venv/bin/pip install -r /opt/realm-agent/requirements.txt
-
-  info "安装 systemd 服务"
-  cp /opt/realm-agent/systemd/realm-agent.service /etc/systemd/system/realm-agent.service
-  systemctl daemon-reload
-  systemctl enable realm-agent.service
-  systemctl restart realm-agent.service
-
-  echo
-  echo -e "${GREEN}✅ Agent 安装完成${NC}"
-  echo "- Agent API:  http://$(hostname -I 2>/dev/null | awk '{print $1}'):${AGENT_PORT}"
-  echo "- Token:      ${AGENT_TOKEN}"
-  echo "- 查看状态:   systemctl status realm-agent --no-pager"
-  echo
-  echo "下一步：到 Panel -> 添加节点，把上面的 API 地址 + Token 填进去即可。"
+  local root
+  root="$(pick_source)"
+  ensure_realm || true
+  install_agent "$root"
 }
 
 main "$@"
