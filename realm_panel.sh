@@ -45,6 +45,10 @@ trap cleanup EXIT
 extract_repo(){
   local mode="$1"; local zip_path="$2"
   TMPDIR="$(mktemp -d)"
+  if [[ -z "$TMPDIR" || ! -d "$TMPDIR" ]]; then
+    err "创建临时目录失败"
+    exit 1
+  fi
   if [[ "$mode" == "online" ]]; then
     local url="${REPO_ZIP_URL:-$REPO_ZIP_URL_DEFAULT}"
     info "正在下载仓库..."
@@ -78,6 +82,10 @@ find_agent_dir(){
 
 prepare_agent_bundle(){
   local extract_root="$1"
+  if [[ -z "$extract_root" || ! -d "$extract_root" ]]; then
+    err "解压目录不存在：$extract_root"
+    exit 1
+  fi
   local agent_dir
   agent_dir="$(find_agent_dir "$extract_root")"
   info "生成 Agent 离线包..."
@@ -132,6 +140,10 @@ install_panel(){
   apt_install
 
   extract_repo "$mode" "$zip_path"
+  if [[ -z "$EXTRACT_ROOT" || ! -d "$EXTRACT_ROOT" ]]; then
+    err "解压目录不存在：$EXTRACT_ROOT"
+    exit 1
+  fi
   ok "panel 目录：$PANEL_DIR"
 
   local user pass port
@@ -192,6 +204,10 @@ update_panel(){
   fi
   apt_install
   extract_repo "$mode" "$zip_path"
+  if [[ -z "$EXTRACT_ROOT" || ! -d "$EXTRACT_ROOT" ]]; then
+    err "解压目录不存在：$EXTRACT_ROOT"
+    exit 1
+  fi
   ok "panel 目录：$PANEL_DIR"
   info "更新面板文件..."
   rm -rf /opt/realm-panel/panel
