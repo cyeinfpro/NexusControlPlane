@@ -1,37 +1,29 @@
 {% extends "base.html" %}
-{% block title %}登录 - Realm Pro Panel{% endblock %}
-{% block body %}
+{% block content %}
+  <div class="grid">
+    <section class="card">
+      <h1>登录</h1>
+      <p class="muted">请输入面板管理员账号密码</p>
 
-<div class="grid" style="grid-template-columns: 1fr; max-width:520px; margin:0 auto;">
-  <div class="card">
-    <div class="title">登录面板</div>
-    <div class="small" style="margin-top:6px;">请输入安装时设置的用户名和密码。</div>
+      {% if error %}
+      <div class="alert">{{ error }}</div>
+      {% endif %}
 
-    {% if error %}
-      <div class="error" style="margin-top:12px;">{{error}}</div>
-    {% endif %}
+      <form method="post" action="/login" class="form">
+        <label>用户名</label>
+        <input name="username" placeholder="admin" required />
+        <label>密码</label>
+        <input name="password" placeholder="••••••••" type="password" required />
+        <button class="btn" type="submit">登录</button>
+      </form>
+    </section>
 
-    <form method="post" action="/login" style="margin-top:14px;">
-      <input type="hidden" name="next" value="{{next}}" />
-      <div class="grid" style="grid-template-columns: 1fr; gap:10px;">
-        <div>
-          <label>用户名</label>
-          <input name="username" placeholder="admin" autocomplete="username" required />
-        </div>
-        <div>
-          <label>密码</label>
-          <input name="password" type="password" placeholder="******" autocomplete="current-password" required />
-        </div>
-      </div>
-      <div class="row" style="justify-content:flex-end; margin-top:14px;">
-        <button class="btn primary" type="submit">登录</button>
-      </div>
-    </form>
-
-    <div class="small" style="margin-top:10px; opacity:.85;">
-      忘记密码？请在服务器上编辑 <span class="mono">/etc/realm-panel/env</span> 并重启面板。
-    </div>
+    <section class="card card-hint">
+      <h2>提示</h2>
+      <ul>
+        <li>登录账号由安装脚本写入 <code>/etc/realm-panel/env</code></li>
+        <li>配对码用于同步 WSS 参数，不用于绑定节点</li>
+      </ul>
+    </section>
   </div>
-</div>
-
 {% endblock %}

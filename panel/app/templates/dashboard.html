@@ -1,95 +1,83 @@
 {% extends "base.html" %}
-{% set header_title = '仪表盘' %}
-
-{% block top_actions %}
-  <button class="btn" id="btnNewPair">生成配对码</button>
-{% endblock %}
-
 {% block content %}
-<div class="grid">
-  <div class="card">
-    <div class="card-title">Agent 总数</div>
-    <div class="card-num">{{ stats.agents_total }}</div>
-  </div>
-  <div class="card">
-    <div class="card-title">在线 Agent</div>
-    <div class="card-num">{{ stats.agents_online }}</div>
-  </div>
-  <div class="card">
-    <div class="card-title">最近配对码</div>
-    <div class="card-desc">可用于 Agent 绑定面板</div>
-    <div class="pair-list">
-      {% for p in stats.pair_codes %}
-        <div class="pair-item">
-          <div class="pair-code">{{ p.code }}</div>
-          <div class="pair-meta">
-            {% if p.used == 1 %}<span class="tag tag-muted">已使用</span>{% else %}<span class="tag tag-ok">可用</span>{% endif %}
-            <span class="muted">过期：{{ p.expires_at }}</span>
-          </div>
-          <button class="btn btn-ghost" onclick="copyText('{{ p.code }}')">复制</button>
+  <div class="grid">
+    <section class="card">
+      <div class="row">
+        <div>
+          <h1>控制台</h1>
+          <p class="muted">节点管理 & 快速配对码</p>
         </div>
+        <button class="btn" onclick="location.reload()">刷新</button>
+      </div>
+
+      <h2>添加节点</h2>
+      <form class="form" onsubmit="return addNode(event)">
+        <label>节点名称</label>
+        <input name="name" placeholder="VM-1" required />
+        <label>Agent 地址</label>
+        <input name="base_url" placeholder="http://1.2.3.4:18700" required />
+        <label>Agent Token</label>
+        <input name="token" placeholder="xxxxx" required />
+        <button class="btn" type="submit">添加</button>
+      </form>
+
+      <div class="sep"></div>
+
+      <h2>节点列表</h2>
+      {% if nodes|length == 0 %}
+        <p class="muted">暂无节点，请先添加。</p>
       {% else %}
-        <div class="muted">暂无配对码</div>
-      {% endfor %}
-    </div>
-  </div>
-</div>
-
-<div class="card mt">
-  <div class="card-row">
-    <div>
-      <div class="card-title">Agent 列表</div>
-      <div class="card-desc">点击进入可视化管理规则 / 编辑 / 暂停 / 删除 / 查看日志</div>
-    </div>
-    <button class="btn btn-ghost" onclick="location.reload()">刷新</button>
-  </div>
-
-  <div class="agent-list">
-    {% for a in agents %}
-      {% set online = (stats.agents_online and ( (a.last_seen|int) > 0 ) ) %}
-      <a class="agent-card" href="/agents/{{ a.id }}">
-        <div class="agent-top">
-          <div class="agent-name">{{ a.name }}</div>
-          <div class="dot {{ 'dot-ok' if (a.last_seen|int) > 0 and ( (stats and true) ) else 'dot-muted' }}"></div>
+        <div class="table">
+          <div class="thead">
+            <div>名称</div>
+            <div>地址</div>
+            <div>操作</div>
+          </div>
+          {% for n in nodes %}
+          <div class="trow">
+            <div class="mono">{{ n.name }}</div>
+            <div class="mono">{{ n.base_url }}</div>
+            <div class="actions">
+              <a class="btn btn-ghost" href="/node/{{ n.id }}">打开</a>
+              <button class="btn btn-danger" onclick="deleteNode({{ n.id }})">删除</button>
+            </div>
+          </div>
+          {% endfor %}
         </div>
-        <div class="agent-meta">
-          <div class="muted">{{ a.api_url }}</div>
-          <div class="muted">LastSeen: {{ a.last_seen }}</div>
-        </div>
-      </a>
-    {% else %}
-      <div class="empty">
-        <div class="empty-title">还没有绑定任何 Agent</div>
-        <div class="empty-desc">点击右上角 <b>生成配对码</b>，然后在被控机安装 Agent 时输入该配对码即可。</div>
-      </div>
-    {% endfor %}
-  </div>
-</div>
+      {% endif %}
+    </section>
 
-<!-- Pair code modal -->
-<div class="modal" id="modalPair" hidden>
-  <div class="modal-card">
-    <div class="modal-header">
-      <div>
-        <div class="modal-title">生成配对码</div>
-        <div class="muted">默认有效期 10 分钟，可改成更长</div>
-      </div>
-      <button class="icon" onclick="UI.close('modalPair')">✕</button>
-    </div>
-    <div class="modal-body">
-      <label class="field">
-        <span>有效期（秒）</span>
-        <input id="pairTtl" type="number" value="600" min="60" />
-      </label>
-      <div class="pair-result" id="pairResult" hidden>
-        <div class="pair-big" id="pairCode">000000</div>
-        <button class="btn" id="btnCopyPair">一键复制</button>
-      </div>
-    </div>
-    <div class="modal-footer">
-      <button class="btn" id="btnGenPair">生成</button>
-      <button class="btn ghost" onclick="UI.close('modalPair')">关闭</button>
-    </div>
+    <section class="card">
+      <h1>WSS 配对码</h1>
+      <p class="muted">用于同步 WSS Sender 端参数：Host / Path / SNI / Insecure</p>
+
+      <form class="form" onsubmit="return createPair(event)">
+        <label>WSS Host（可留空=随机）</label>
+        <input name="host" placeholder="www.bing.com" />
+        <label>WSS Path（可留空=随机）</label>
+        <input name="path" placeholder="/ws" />
+        <label>SNI（可留空=与 Host 相同）</label>
+        <input name="sni" placeholder="www.bing.com" />
+        <label>Insecure (TLS 证书跳过验证)</label>
+        <select name="insecure">
+          <option value="false" selected>false</option>
+          <option value="true">true</option>
+        </select>
+        <button class="btn" type="submit">生成配对码</button>
+      </form>
+
+      <div id="pairResult" class="pair"></div>
+
+      <div class="sep"></div>
+
+      <h2>解析配对码</h2>
+      <form class="form" onsubmit="return resolvePair(event)">
+        <label>配对码</label>
+        <input name="code" placeholder="例如：A1B2C3" required />
+        <button class="btn" type="submit">解析</button>
+      </form>
+
+      <div id="pairResolve" class="pair"></div>
+    </section>
   </div>
-</div>
 {% endblock %}

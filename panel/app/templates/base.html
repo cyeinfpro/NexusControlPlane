@@ -3,33 +3,36 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>{% block title %}Realm Pro Panel{% endblock %}</title>
-  <link rel="stylesheet" href="/static/app.css?v={{version}}" />
+  <title>{{ app_name }}</title>
+  <link rel="stylesheet" href="/static/style.css" />
+  <script defer src="/static/app.js"></script>
 </head>
 <body>
-  <div class="bg-grid"></div>
+  <div class="bg"></div>
 
-  <div class="nav">
-    <div class="container nav-inner">
-      <div class="nav-left">
-        <a class="brand" href="/">Realm Pro Panel</a>
-        <span class="small">v{{version}}</span>
-      </div>
-      <div class="nav-right">
-        <a class="link" href="/">节点</a>
-        {% if auth_enabled %}
-          <span class="small" style="opacity:.8">{{ user or '' }}</span>
-          <a class="link" href="/logout">退出</a>
-        {% endif %}
+  <header class="topbar">
+    <div class="brand">
+      <div class="logo"></div>
+      <div>
+        <div class="title">Realm</div>
+        <div class="sub">Panel</div>
       </div>
     </div>
-  </div>
 
-  <div class="container" style="padding:18px 0 40px;">
-    {% block body %}{% endblock %}
-  </div>
+    <nav class="nav">
+      {% if user %}
+        <a href="/" class="navlink">控制台</a>
+        <a href="/logout" class="navlink">退出</a>
+      {% endif %}
+    </nav>
+  </header>
 
-  <div id="toast" class="toast hidden"></div>
-  <script src="/static/app.js?v={{version}}"></script>
+  <main class="container">
+    {% block content %}{% endblock %}
+  </main>
+
+  <footer class="footer">
+    <span>Realm Panel v21</span>
+  </footer>
 </body>
 </html>

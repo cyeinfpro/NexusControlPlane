@@ -1,80 +1,55 @@
-# Realm Pro Suite (Stable Build)
+# Realm Pro Suite v21
 
-此版本已修复你遇到的两个关键问题：
+Web Panel + Agent for managing `realm` forwarding rules.
 
-- ✅ **安装时会要求设置面板用户名/密码**（你想要的行为）
-- ✅ **配对码只用于 WSS 参数同步**（用于自动回填 Host/Path/SNI/Insecure，不再用于“链接机器/绑定节点”）
-- ✅ **安装脚本不再依赖固定目录名（v15/v16）**：会自动识别 `panel/`、`agent/` 或 `realm-pro-suite-vXX/panel`、`realm-pro-suite-vXX/agent`
+## ✅ Key behaviors
 
----
+- Panel install asks for **login username & password**.
+- **Pairing Code** is used **ONLY** for syncing WSS sender parameters (Host / Path / SNI / Insecure).
+- Linking a machine to Panel is done with **Agent Token** (NOT pairing code).
 
-## 目录结构（建议）
-
-把下面这些放在仓库根目录：
+## ✅ Repo layout (MUST be in repo root)
 
 ```
-Realm/
-  realm_panel.sh
-  realm_agent.sh
-  panel/
-  agent/
+.
+├── agent/
+├── panel/
+├── realm_agent.sh
+├── realm_panel.sh
+└── README.md
 ```
 
-> 如果你保留版本目录（例如 `realm-pro-suite-v16/panel`），安装脚本也能自动识别。
+## Install
 
----
-
-## 组件说明
-
-- **Agent**：运行在每台节点上，提供本地 API（Bearer Token 鉴权）。
-- **Panel**：统一 Web 管理面板，可管理多个 Agent。
-
----
-
-## 快速安装
-
-### 1) 安装 Agent
+### Panel (controller)
 
 ```bash
-bash realm_agent.sh
+bash <(curl -fsSL https://raw.githubusercontent.com/<OWNER>/<REPO>/refs/heads/<BRANCH>/realm_panel.sh)
 ```
 
-脚本会输出：
-
-- Agent API 地址
-- Agent Token（添加节点时需要）
-
----
-
-### 2) 安装 Panel
+### Agent (node)
 
 ```bash
-bash realm_panel.sh
+bash <(curl -fsSL https://raw.githubusercontent.com/<OWNER>/<REPO>/refs/heads/<BRANCH>/realm_agent.sh)
 ```
 
-安装过程中会要求你输入：
+## Change your GitHub repo address
 
-- 面板端口（默认 18750）
-- 面板用户名（默认 admin）
-- 面板密码（必填）
+Edit the top of these two files:
 
-安装完成会提示面板访问地址。
+- `realm_panel.sh`
+- `realm_agent.sh`
 
----
+Change:
 
-## WSS 对接码如何用（重点）
+```bash
+REPO_OWNER="cyeinfpro"
+REPO_NAME="Realm"
+REPO_BRANCH="main"
+```
 
-### ✅ 你要的逻辑：对接码 = 自动获取 WSS 服务端参数
+## Ports
 
-1) 在 **WSS 服务端（Server）** 创建规则
-- 创建成功后，面板会返回一个 **对接码（6位数字）**
+- Panel default: `6080`
+- Agent default: `18700`
 
-2) 在 **WSS 客户端（Client）** 创建规则
-- 填入这个 **对接码**
-- 面板会自动回填：
-  - Host
-  - Path
-  - SNI
-  - Insecure
-
-> 对接码只用于 **参数同步**，与“绑定节点/链接机器”无关。
