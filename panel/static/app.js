@@ -87,8 +87,10 @@ function readWssFields(){
   const ex = {};
   if(mode === 'wss_send'){
     ex.remote_transport = 'ws';
+    ex.listen_transport = 'tcp';
   } else if(mode === 'wss_recv'){
     ex.listen_transport = 'ws';
+    ex.remote_transport = 'tcp';
   }
   if(mode !== 'tcp'){
     if(host) ex.ws_host = host;
@@ -119,6 +121,76 @@ function showWssBox(){
   q('wssBox').style.display = (mode === 'tcp') ? 'none' : 'block';
 }
 
+function encodePairingCode(data){
+  return btoa(unescape(encodeURIComponent(JSON.stringify(data))));
+}
+
+function decodePairingCode(code){
+  const text = decodeURIComponent(escape(atob(code.trim())));
+  return JSON.parse(text);
+}
+
+function buildPairingPayload(){
+  return {
+    mode: q('f_type').value,
+    host: q('f_wss_host').value.trim(),
+    path: q('f_wss_path').value.trim(),
+    sni: q('f_wss_sni').value.trim(),
+    tls: q('f_wss_tls').value === '1',
+    insecure: q('f_wss_insecure').value === '1',
+  };
+}
+
+function applyPairingPayload(payload){
+  if(!payload) return;
+  if(payload.mode === 'wss_send' || payload.mode === 'wss_recv'){
+    q('f_type').value = payload.mode;
+  }
+  setField('f_wss_host', payload.host || '');
+  setField('f_wss_path', payload.path || '');
+  setField('f_wss_sni', payload.sni || '');
+  q('f_wss_tls').value = payload.tls === false ? '0' : '1';
+  q('f_wss_insecure').value = payload.insecure === true ? '1' : '0';
+  showWssBox();
+}
+
+function applyPairingCode(){
+  const code = q('f_pairing').value.trim();
+  if(!code){
+    q('modalMsg').textContent = '请先粘贴配对码';
+    return;
+  }
+  try{
+    const payload = decodePairingCode(code);
+    applyPairingPayload(payload);
+    q('modalMsg').textContent = '配对码已解析并填充';
+  }catch(e){
+    q('modalMsg').textContent = '配对码格式无效';
+  }
+}
+
+function openPairingModal(code){
+  const modal = q('pairingModal');
+  const text = q('pairingCodeText');
+  text.textContent = code;
+  modal.style.display = 'flex';
+}
+
+function closePairingModal(){
+  q('pairingModal').style.display = 'none';
+}
+
+function randomizeWss(){
+  const hosts = ['cdn.example.com', 'edge.example.com', 'gw.example.net'];
+  const pick = hosts[Math.floor(Math.random() * hosts.length)];
+  const token = Math.random().toString(36).slice(2, 8);
+  setField('f_wss_host', pick);
+  setField('f_wss_path', `/ws/${token}`);
+  setField('f_wss_sni', pick);
+  q('f_wss_tls').value = '1';
+  q('f_wss_insecure').value = '0';
+}
+
 function parseWeights(text){
   if(!text) return [];
   return text.split(/[,，]/).map(x=>x.trim()).filter(Boolean).map(x=>Number(x));
@@ -138,6 +210,7 @@ function newRule(){
   q('f_balance').value = 'roundrobin';
   setField('f_weights','');
   q('f_type').value = 'tcp';
+  setField('f_pairing','');
   fillWssFields({});
   showWssBox();
   openModal();
@@ -154,6 +227,7 @@ function editRule(idx){
   q('f_balance').value = balance.startsWith('iphash') ? 'iphash' : 'roundrobin';
   const weights = balance.startsWith('roundrobin:') ? balance.split(':').slice(1).join(':').trim().split(',').map(x=>x.trim()).filter(Boolean) : [];
   setField('f_weights', weights.join(','));
+  setField('f_pairing','');
   fillWssFields(e);
   showWssBox();
   openModal();
@@ -198,6 +272,12 @@ async function saveRule(){
   }
 
   const typeSel = q('f_type').value;
+  if(typeSel === 'wss_send' || typeSel === 'wss_recv'){
+    if(!q('f_wss_host').value.trim() || !q('f_wss_path').value.trim()){
+      q('modalMsg').textContent='WSS Host 与 Path 不能为空';
+      return;
+    }
+  }
   const ex = readWssFields();
 
   const endpoint = {
@@ -217,6 +297,10 @@ async function saveRule(){
   try{
     await savePool('保存成功');
     closeModal();
+    if(typeSel === 'wss_send'){
+      const code = encodePairingCode(buildPairingPayload());
+      openPairingModal(code);
+    }
   }catch(e){
     q('modalMsg').textContent = e.message;
   }
@@ -367,3 +451,6 @@ window.toggleRule = toggleRule;
 window.deleteRule = deleteRule;
 window.applyNow = applyNow;
 window.renderLB = renderLB;
+window.applyPairingCode = applyPairingCode;
+window.closePairingModal = closePairingModal;
+window.randomizeWss = randomizeWss;
