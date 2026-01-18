@@ -125,11 +125,20 @@
       <label class="label">隧道模式</label>
       <select class="select" id="f_type">
         <option value="tcp">TCP/UDP</option>
-        <option value="wss_send">WSS 发送（remote_transport=ws）</option>
-        <option value="wss_recv">WSS 接收（listen_transport=ws）</option>
+        <option value="wss_send">WSS 发送端（remote_transport=ws）</option>
+        <option value="wss_recv">WSS 接收端（listen_transport=ws）</option>
       </select>
 
       <div id="wssBox" style="display:none;">
+        <div class="row" style="gap:12px;align-items:center;">
+          <div class="col">
+            <label class="label">配对码（粘贴后自动填充）</label>
+            <textarea class="textarea" id="f_pairing" rows="3" placeholder="在另一端生成配对码后粘贴"></textarea>
+          </div>
+          <div class="col right">
+            <button class="btn ghost" type="button" onclick="applyPairingCode()">解析配对码</button>
+          </div>
+        </div>
         <div class="row" style="gap:12px;">
           <div class="col">
             <label class="label">WSS Host</label>
@@ -138,6 +147,14 @@
           <div class="col">
             <label class="label">WSS Path</label>
             <input class="input" id="f_wss_path" placeholder="/ws">
+          </div>
+        </div>
+        <div class="row" style="gap:12px;align-items:center;">
+          <div class="col">
+            <div class="help">建议与服务端证书域名保持一致，TLS 不可用时可关闭。</div>
+          </div>
+          <div class="col right">
+            <button class="btn ghost" type="button" onclick="randomizeWss()">随机生成参数</button>
           </div>
         </div>
         <div class="row" style="gap:12px;">
@@ -186,6 +203,20 @@
   </div>
 </div>
 {% endif %}
+
+<div id="pairingModal" class="modal" style="display:none;">
+  <div class="modal-inner">
+    <div class="row">
+      <div class="col"><div class="h2">WSS 配对码</div></div>
+      <div class="col right"><button class="btn ghost" onclick="closePairingModal()">关闭</button></div>
+    </div>
+    <p class="muted">将此配对码粘贴到另一端的 WSS 接收端，可自动填充参数。</p>
+    <pre class="code-block" id="pairingCodeText"></pre>
+    <div class="row" style="justify-content:flex-end;">
+      <button class="btn" data-copy-target="pairingCodeText">复制配对码</button>
+    </div>
+  </div>
+</div>
 {% endblock %}
 
 {% block scripts %}
