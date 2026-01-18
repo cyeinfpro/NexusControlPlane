@@ -1,78 +1,80 @@
-# Realm Pro Suite (v19)
+# Realm Pro Suite (Stable Build)
 
-一套可上生产的 `Realm` 转发管理套件：
+此版本已修复你遇到的两个关键问题：
 
-- **Agent**：部署在每台被控机上，提供 HTTP API，负责写入 `realm.toml`、暂停/删除规则、查看目标健康状态等。
-- **Panel**：部署在管理机上，通过 Web UI 管理多个 Agent 节点，支持 **WSS 配对码自动填参**。
-
----
-
-## 目录结构（请保持不变）
-
-```
-.
-├─ agent/
-├─ panel/
-├─ realm_agent.sh
-└─ realm_panel.sh
-```
+- ✅ **安装时会要求设置面板用户名/密码**（你想要的行为）
+- ✅ **配对码只用于 WSS 参数同步**（用于自动回填 Host/Path/SNI/Insecure，不再用于“链接机器/绑定节点”）
+- ✅ **安装脚本不再依赖固定目录名（v15/v16）**：会自动识别 `panel/`、`agent/` 或 `realm-pro-suite-vXX/panel`、`realm-pro-suite-vXX/agent`
 
 ---
 
-## 安装 Agent（被控机）
+## 目录结构（建议）
+
+把下面这些放在仓库根目录：
+
+```
+Realm/
+  realm_panel.sh
+  realm_agent.sh
+  panel/
+  agent/
+```
+
+> 如果你保留版本目录（例如 `realm-pro-suite-v16/panel`），安装脚本也能自动识别。
+
+---
+
+## 组件说明
+
+- **Agent**：运行在每台节点上，提供本地 API（Bearer Token 鉴权）。
+- **Panel**：统一 Web 管理面板，可管理多个 Agent。
+
+---
+
+## 快速安装
+
+### 1) 安装 Agent
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/cyeinfpro/Realm/refs/heads/main/realm_agent.sh)
+bash realm_agent.sh
 ```
 
-安装完成后会输出：
-- Agent 监听地址（默认端口：18700）
+脚本会输出：
+
+- Agent API 地址
 - Agent Token（添加节点时需要）
 
 ---
 
-## 安装 Panel（管理机）
+### 2) 安装 Panel
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/cyeinfpro/Realm/refs/heads/main/realm_panel.sh)
+bash realm_panel.sh
 ```
 
-安装过程中会要求输入：
-- 面板端口（默认 6080）
-- 用户名（默认 admin）
-- 密码（必须设置）
+安装过程中会要求你输入：
+
+- 面板端口（默认 18750）
+- 面板用户名（默认 admin）
+- 面板密码（必填）
+
+安装完成会提示面板访问地址。
 
 ---
 
-## 配对码说明（非常重要）
+## WSS 对接码如何用（重点）
 
-**配对码用于 WSS 发送端自动获取 WSS 参数（host/path/sni/insecure），不是用来“链接机器”的。**
+### ✅ 你要的逻辑：对接码 = 自动获取 WSS 服务端参数
 
-- 当你在 Panel 创建 **WSS 接收端（wss_recv）** 规则时，会生成一个配对码
-- 之后创建 **WSS 发送端（wss_send）** 规则时，填入该配对码即可自动回填参数
+1) 在 **WSS 服务端（Server）** 创建规则
+- 创建成功后，面板会返回一个 **对接码（6位数字）**
 
----
+2) 在 **WSS 客户端（Client）** 创建规则
+- 填入这个 **对接码**
+- 面板会自动回填：
+  - Host
+  - Path
+  - SNI
+  - Insecure
 
-## Fork 后如何替换仓库地址
-
-如果你 fork 了仓库，只需要在两个安装脚本开头修改下面三行：
-
-```bash
-REPO_OWNER="你的用户名"
-REPO_NAME="你的仓库名"
-REPO_BRANCH="main"
-```
-
-不要修改其它路径。
-
----
-
-## 常用命令
-
-```bash
-systemctl status realm-agent --no-pager
-journalctl -u realm-agent -n 200 --no-pager
-
-systemctl status realm-panel --no-pager
-journalctl -u realm-panel -n 200 --no-pager
-```
+> 对接码只用于 **参数同步**，与“绑定节点/链接机器”无关。

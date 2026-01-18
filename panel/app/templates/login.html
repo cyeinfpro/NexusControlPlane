@@ -1,26 +1,37 @@
-<!doctype html>
-<html lang="zh-CN">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Realm Pro Panel - 登录</title>
-  <link rel="stylesheet" href="/static/app.css" />
-</head>
-<body>
-  <div class="center">
-    <div class="card login-card">
-      <div class="brand">Realm<span class="badge">Pro</span></div>
-      <div class="subtitle">管理面板登录</div>
-      {% if error %}<div class="alert">{{ error }}</div>{% endif %}
-      <form method="post" action="/login">
-        <label>用户名</label>
-        <input name="username" placeholder="admin" required />
-        <label>密码</label>
-        <input name="password" type="password" placeholder="••••••••" required />
+{% extends "base.html" %}
+{% block title %}登录 - Realm Pro Panel{% endblock %}
+{% block body %}
+
+<div class="grid" style="grid-template-columns: 1fr; max-width:520px; margin:0 auto;">
+  <div class="card">
+    <div class="title">登录面板</div>
+    <div class="small" style="margin-top:6px;">请输入安装时设置的用户名和密码。</div>
+
+    {% if error %}
+      <div class="error" style="margin-top:12px;">{{error}}</div>
+    {% endif %}
+
+    <form method="post" action="/login" style="margin-top:14px;">
+      <input type="hidden" name="next" value="{{next}}" />
+      <div class="grid" style="grid-template-columns: 1fr; gap:10px;">
+        <div>
+          <label>用户名</label>
+          <input name="username" placeholder="admin" autocomplete="username" required />
+        </div>
+        <div>
+          <label>密码</label>
+          <input name="password" type="password" placeholder="******" autocomplete="current-password" required />
+        </div>
+      </div>
+      <div class="row" style="justify-content:flex-end; margin-top:14px;">
         <button class="btn primary" type="submit">登录</button>
-      </form>
-      <div class="muted small">v{{ version }}</div>
+      </div>
+    </form>
+
+    <div class="small" style="margin-top:10px; opacity:.85;">
+      忘记密码？请在服务器上编辑 <span class="mono">/etc/realm-panel/env</span> 并重启面板。
     </div>
   </div>
-</body>
-</html>
+</div>
+
+{% endblock %}
