@@ -1,13 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="v31"
+VERSION="v32"
 REPO_ZIP_URL_DEFAULT="https://github.com/cyeinfpro/Realm/archive/refs/heads/main.zip"
 
-info(){ printf "[提示] %s\n" "$*"; }
-ok(){ printf "[OK] %s\n" "$*"; }
-err(){ printf "[ERR ] %s\n" "$*" >&2; }
-
+info(){ echo -e "\033[33m[提示]\033[0m $*" >&2; }
+ok(){ echo -e "\033[32m[OK]\033[0m $*" >&2; }
+err(){ echo -e "\033[31m[ERR]\033[0m $*" >&2; }
 need_root(){
   if [[ "$(id -u)" -ne 0 ]]; then
     err "请使用 root 运行：sudo -i"
