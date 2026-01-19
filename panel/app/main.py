@@ -292,10 +292,12 @@ async def node_detail(request: Request, node_id: int, user: str = Depends(requir
     )
     uninstall_cmd = (
         "sudo -E bash -c \""
-        "systemctl disable --now realm-agent.service >/dev/null 2>&1 || true; "
-        "rm -f /etc/systemd/system/realm-agent.service; "
+        "systemctl disable --now realm-agent.service realm-agent-https.service realm.service realm "
+        ">/dev/null 2>&1 || true; "
+        "rm -f /etc/systemd/system/realm-agent.service /etc/systemd/system/realm-agent-https.service "
+        "/etc/systemd/system/realm.service; "
         "systemctl daemon-reload; "
-        "rm -rf /opt/realm-agent /etc/realm-agent"
+        "rm -rf /opt/realm-agent /etc/realm-agent /etc/realm /opt/realm /usr/local/bin/realm /usr/bin/realm"
         "\""
     )
     return templates.TemplateResponse(
