@@ -43,15 +43,7 @@ install_realm(){
     *) err "不支持的架构：${arch}，请手动安装 realm"; exit 1 ;;
   esac
 
-  local urls=()
-  if [[ -n "${REALM_AGENT_REALM_BASE_URL:-}" ]]; then
-    local base="${REALM_AGENT_REALM_BASE_URL%/}"
-    urls+=(
-      "${base}/realm-${arch}-unknown-linux-gnu.tar.gz"
-      "${base}/realm-${arch}-unknown-linux-musl.tar.gz"
-    )
-  fi
-  urls+=(
+  local urls=(
     "https://github.com/zhboner/realm/releases/latest/download/realm-${arch}-unknown-linux-gnu.tar.gz"
     "https://github.com/zhboner/realm/releases/latest/download/realm-${arch}-unknown-linux-musl.tar.gz"
     "https://github.com/zhboner/realm/releases/latest/download/realm-${arch}-unknown-linux-gnu"
