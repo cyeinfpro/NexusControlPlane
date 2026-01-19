@@ -132,7 +132,7 @@ function renderRules(){
   table.style.display = '';
 }
 
-function openModal(){ q('modal').style.display = 'block'; }
+function openModal(){ q('modal').style.display = 'flex'; }
 function closeModal(){ q('modal').style.display = 'none'; q('modalMsg').textContent=''; }
 
 function openCommandModal(title, text){
