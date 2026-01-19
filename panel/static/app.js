@@ -126,16 +126,19 @@ function readWssFields(){
   if(mode === 'wss_send'){
     ex.remote_transport = 'ws';
     ex.listen_transport = 'tcp';
+    if(host) ex.remote_ws_host = host;
+    if(path) ex.remote_ws_path = path;
+    if(sni) ex.remote_tls_sni = sni;
+    ex.remote_tls_enabled = tls;
+    ex.remote_tls_insecure = insecure;
   } else if(mode === 'wss_recv'){
     ex.listen_transport = 'ws';
     ex.remote_transport = 'tcp';
-  }
-  if(mode !== 'tcp'){
-    if(host) ex.ws_host = host;
-    if(path) ex.ws_path = path;
-    if(sni) ex.ws_sni = sni;
-    ex.ws_tls = tls;
-    ex.ws_insecure = insecure;
+    if(host) ex.listen_ws_host = host;
+    if(path) ex.listen_ws_path = path;
+    if(sni) ex.listen_tls_servername = sni;
+    ex.listen_tls_enabled = tls;
+    ex.listen_tls_insecure = insecure;
   }
   return ex;
 }
@@ -147,11 +150,18 @@ function fillWssFields(e){
   else if(mode === 'WSS接收') q('f_type').value = 'wss_recv';
   else q('f_type').value = 'tcp';
 
-  setField('f_wss_host', ex.ws_host || '');
-  setField('f_wss_path', ex.ws_path || '');
-  setField('f_wss_sni', ex.ws_sni || '');
-  q('f_wss_tls').value = (ex.ws_tls === false) ? '0' : '1';
-  q('f_wss_insecure').value = (ex.ws_insecure === true) ? '1' : '0';
+  const isSend = mode === 'WSS发送';
+  const host = isSend ? ex.remote_ws_host : ex.listen_ws_host;
+  const path = isSend ? ex.remote_ws_path : ex.listen_ws_path;
+  const sni = isSend ? ex.remote_tls_sni : ex.listen_tls_servername;
+  const tls = isSend ? ex.remote_tls_enabled : ex.listen_tls_enabled;
+  const insecure = isSend ? ex.remote_tls_insecure : ex.listen_tls_insecure;
+
+  setField('f_wss_host', host || '');
+  setField('f_wss_path', path || '');
+  setField('f_wss_sni', sni || '');
+  q('f_wss_tls').value = (tls === false) ? '0' : '1';
+  q('f_wss_insecure').value = (insecure === true) ? '1' : '0';
 }
 
 function showWssBox(){
@@ -247,6 +257,7 @@ function newRule(){
   q('f_disabled').value = '0';
   q('f_balance').value = 'roundrobin';
   setField('f_weights','');
+  q('f_protocol').value = 'tcp+udp';
   q('f_type').value = 'tcp';
   setField('f_pairing','');
   fillWssFields({});
@@ -265,6 +276,7 @@ function editRule(idx){
   q('f_balance').value = balance.startsWith('iphash') ? 'iphash' : 'roundrobin';
   const weights = balance.startsWith('roundrobin:') ? balance.split(':').slice(1).join(':').trim().split(',').map(x=>x.trim()).filter(Boolean) : [];
   setField('f_weights', weights.join(','));
+  q('f_protocol').value = e.protocol || 'tcp+udp';
   setField('f_pairing','');
   fillWssFields(e);
   showWssBox();
@@ -310,6 +322,7 @@ async function saveRule(){
   }
 
   const typeSel = q('f_type').value;
+  const protocolSel = q('f_protocol').value;
   if(typeSel === 'wss_send' || typeSel === 'wss_recv'){
     if(!q('f_wss_host').value.trim() || !q('f_wss_path').value.trim()){
       q('modalMsg').textContent='WSS Host 与 Path 不能为空';
@@ -322,6 +335,7 @@ async function saveRule(){
     listen,
     disabled,
     balance,
+    protocol: protocolSel || 'tcp+udp',
     remotes,
     extra_config: ex,
   };
