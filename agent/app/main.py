@@ -13,6 +13,7 @@ API_KEY_FILE = Path('/etc/realm-agent/api.key')
 POOL_FULL = Path('/etc/realm/pool_full.json')
 POOL_ACTIVE = Path('/etc/realm/pool.json')
 POOL_RUN_FILTER = Path('/etc/realm/pool_to_run.jq')
+FALLBACK_RUN_FILTER = Path(__file__).resolve().parents[1] / 'pool_to_run.jq'
 REALM_CONFIG = Path('/etc/realm/config.json')
 
 
@@ -65,9 +66,16 @@ def _restart_realm() -> None:
 
 def _apply_pool_to_config() -> None:
     if not POOL_RUN_FILTER.exists():
-        raise RuntimeError(f'缺少JQ过滤器: {POOL_RUN_FILTER}')
+        if FALLBACK_RUN_FILTER.exists():
+            _write_text(POOL_RUN_FILTER, FALLBACK_RUN_FILTER.read_text(encoding='utf-8').strip() + '\n')
+        else:
+            raise RuntimeError(f'缺少JQ过滤器: {POOL_RUN_FILTER}')
     if not POOL_FULL.exists():
-        raise RuntimeError(f'缺少pool_full.json: {POOL_FULL}')
+        active = _read_json(POOL_ACTIVE, {'endpoints': []})
+        eps = active.get('endpoints') or []
+        for e in eps:
+            e.setdefault('disabled', False)
+        _write_json(POOL_FULL, {'endpoints': eps})
 
     # jq -c -f filter pool_full.json > /etc/realm/config.json
     cmd = ['jq', '-c', '-f', str(POOL_RUN_FILTER), str(POOL_FULL)]
@@ -180,9 +188,12 @@ def api_pool_save(payload: Dict[str, Any], _: None = Depends(_api_key_required))
 
 @app.post('/api/v1/apply')
 def api_apply(_: None = Depends(_api_key_required)) -> Dict[str, Any]:
-    _sync_active_pool()
-    _apply_pool_to_config()
-    _restart_realm()
+    try:
+        _sync_active_pool()
+        _apply_pool_to_config()
+        _restart_realm()
+    except Exception as exc:
+        return {'ok': False, 'error': str(exc)}
     return {'ok': True}
 
 
