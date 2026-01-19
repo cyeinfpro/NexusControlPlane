@@ -243,6 +243,8 @@
 <script src="/static/app.js"></script>
 <script>
 window.__NODE_ID__ = {{ node.id }};
+window.__INSTALL_CMD__ = {{ install_cmd|tojson }};
+window.__UNINSTALL_CMD__ = {{ uninstall_cmd|tojson }};
 initNodePage();
 document.querySelectorAll('[data-copy-target]').forEach((btn)=>{
   btn.addEventListener('click', async ()=>{

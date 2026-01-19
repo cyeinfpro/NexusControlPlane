@@ -541,6 +541,22 @@ function initNodePage(){
       if(name === 'traffic') renderTraffic();
     });
   });
+  const installBtn = q('installCmdBtn');
+  if(installBtn){
+    installBtn.addEventListener('click', ()=>{
+      openCommandModal('一键接入命令', window.__INSTALL_CMD__);
+    });
+  }
+  const uninstallBtn = q('uninstallCmdBtn');
+  if(uninstallBtn){
+    uninstallBtn.addEventListener('click', ()=>{
+      openCommandModal('一键卸载 Agent', window.__UNINSTALL_CMD__);
+    });
+  }
+  const restoreBtn = q('restoreRulesBtn');
+  if(restoreBtn){
+    restoreBtn.addEventListener('click', triggerRestore);
+  }
   q('f_type').addEventListener('change', showWssBox);
   loadPool();
 }
