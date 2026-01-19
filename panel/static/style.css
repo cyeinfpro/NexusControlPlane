@@ -78,6 +78,7 @@ body{
   font-size:13px;
   font-weight:600;
   letter-spacing:0.2px;
+  text-decoration:none;
   cursor:pointer;
   color:#fff;
   border:1px solid rgba(148,163,184,0.25);
