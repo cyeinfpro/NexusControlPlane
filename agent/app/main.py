@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import socket
 import subprocess
 from datetime import datetime
@@ -56,11 +57,14 @@ def _service_is_active(name: str) -> bool:
     r = subprocess.run(['systemctl', 'is-active', name], capture_output=True, text=True)
     if r.returncode == 0 and r.stdout.strip() == 'active':
         return True
-    r = subprocess.run(['service', name, 'status'], capture_output=True, text=True)
-    if r.returncode == 0:
-        return True
-    r = subprocess.run(['rc-service', name, 'status'], capture_output=True, text=True)
-    return r.returncode == 0
+    if shutil.which('service'):
+        r = subprocess.run(['service', name, 'status'], capture_output=True, text=True)
+        if r.returncode == 0:
+            return True
+    if shutil.which('rc-service'):
+        r = subprocess.run(['rc-service', name, 'status'], capture_output=True, text=True)
+        return r.returncode == 0
+    return False
 
 
 def _restart_realm() -> None:
@@ -76,16 +80,18 @@ def _restart_realm() -> None:
         if r.returncode == 0:
             return
         errors.append(f"systemctl {svc}: {r.stderr.strip() or r.stdout.strip()}")
-    for svc in services:
-        r = subprocess.run(['service', svc, 'restart'], capture_output=True, text=True)
-        if r.returncode == 0:
-            return
-        errors.append(f"service {svc}: {r.stderr.strip() or r.stdout.strip()}")
-    for svc in services:
-        r = subprocess.run(['rc-service', svc, 'restart'], capture_output=True, text=True)
-        if r.returncode == 0:
-            return
-        errors.append(f"rc-service {svc}: {r.stderr.strip() or r.stdout.strip()}")
+    if shutil.which('service'):
+        for svc in services:
+            r = subprocess.run(['service', svc, 'restart'], capture_output=True, text=True)
+            if r.returncode == 0:
+                return
+            errors.append(f"service {svc}: {r.stderr.strip() or r.stdout.strip()}")
+    if shutil.which('rc-service'):
+        for svc in services:
+            r = subprocess.run(['rc-service', svc, 'restart'], capture_output=True, text=True)
+            if r.returncode == 0:
+                return
+            errors.append(f"rc-service {svc}: {r.stderr.strip() or r.stdout.strip()}")
     detail = "; ".join([e for e in errors if e]) or "unknown error"
     raise RuntimeError(f'无法重启 realm 服务（尝试 {", ".join(services)} 失败）：{detail}')
 
