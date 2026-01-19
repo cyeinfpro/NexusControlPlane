@@ -122,3 +122,44 @@ async function fillWssFromCode(inputEl) {
     // ignore
   }
 }
+
+function renderNodeStatus(cell, ok, detail) {
+  if (!cell) return;
+  const statusLabel = ok ? '在线' : '离线';
+  const dotClass = ok ? 'dot ok' : 'dot danger';
+  cell.innerHTML = `<span class="badge"><span class="${dotClass}"></span>${statusLabel}</span>`;
+  if (detail) cell.title = detail;
+}
+
+async function refreshNodeStatus(nodeId) {
+  const cell = document.querySelector(`[data-node-status="${nodeId}"]`);
+  const last = document.querySelector(`[data-node-last="${nodeId}"]`);
+  renderNodeStatus(cell, false, '');
+  try {
+    const data = await api(`/api/nodes/${nodeId}/ping`);
+    if (data && data.ok) {
+      renderNodeStatus(cell, true, '');
+      if (last) last.textContent = data.time || '刚刚';
+    } else {
+      renderNodeStatus(cell, false, data && data.error ? data.error : '离线');
+      if (last) last.textContent = '-';
+    }
+  } catch (e) {
+    renderNodeStatus(cell, false, e.message);
+    if (last) last.textContent = '-';
+  }
+}
+
+function refreshAllNodeStatuses() {
+  const nodes = document.querySelectorAll('[data-node-status]');
+  nodes.forEach((node) => {
+    const nodeId = node.getAttribute('data-node-status');
+    if (nodeId) refreshNodeStatus(nodeId);
+  });
+}
+
+window.addEventListener('DOMContentLoaded', () => {
+  if (document.querySelector('[data-node-status]')) {
+    refreshAllNodeStatuses();
+  }
+});

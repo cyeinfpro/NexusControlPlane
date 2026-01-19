@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 {% block title %}Realm Pro Panel - 节点{% endblock %}
-{% block body %}
+{% block content %}
 
 <div class="grid" style="grid-template-columns: 1.2fr 0.8fr;">
   <div class="card">
@@ -26,29 +26,25 @@
           </tr>
         </thead>
         <tbody>
-        {% for a in agents %}
-          <tr data-agent-row="{{a.id}}">
+        {% for n in nodes %}
+          <tr data-node-row="{{n.id}}">
             <td>
-              <a class="link" href="/agents/{{a.id}}">{{a.name}}</a>
-              <div class="small mono">{{a.id}}</div>
+              <a class="link" href="/nodes/{{n.id}}">{{n.name}}</a>
+              <div class="small mono">{{n.id}}</div>
             </td>
-            <td class="mono">{{a.api_url}}</td>
-            <td class="agent-status" data-agent-status="{{a.id}}"><span class="badge warn">加载中</span></td>
-            <td class="small" data-agent-last="{{a.id}}">
-              {% if a.last_seen %}
-                {{a.last_seen}}
-              {% else %}
-                -
-              {% endif %}
+            <td class="mono">{{n.base_url}}</td>
+            <td class="agent-status" data-node-status="{{n.id}}">
+              <span class="badge"><span class="dot"></span>加载中</span>
             </td>
+            <td class="small" data-node-last="{{n.id}}">-</td>
             <td style="text-align:right;">
-              <form method="post" action="/agents/{{a.id}}/delete" style="display:inline" onsubmit="return confirm('确定删除该节点？')">
+              <form method="post" action="/nodes/{{n.id}}/delete" style="display:inline" onsubmit="return confirm('确定删除该节点？')">
                 <button class="btn" type="submit">删除</button>
               </form>
             </td>
           </tr>
         {% endfor %}
-        {% if agents|length == 0 %}
+        {% if nodes|length == 0 %}
           <tr>
             <td colspan="5" class="small">暂无节点。请右侧添加 Agent。</td>
           </tr>
@@ -67,7 +63,7 @@
       <div class="error" style="margin-top:12px;">{{error}}</div>
     {% endif %}
 
-    <form method="post" action="/agents/add" style="margin-top:12px;" autocomplete="off">
+    <form method="post" action="/nodes/add" style="margin-top:12px;" autocomplete="off">
       <div class="grid" style="grid-template-columns: 1fr; gap:10px;">
         <div>
           <label>名称</label>
@@ -75,12 +71,12 @@
         </div>
         <div>
           <label>API 地址</label>
-          <input name="api_url" placeholder="http://10.0.0.2:6080" required />
+          <input name="base_url" placeholder="http://10.0.0.2:6080" required />
           <div class="small">支持 http / https。若 Agent 开启 TLS，请写 https。</div>
         </div>
         <div>
           <label>Token</label>
-          <input name="token" placeholder="粘贴 Agent Token" required />
+          <input name="api_key" placeholder="粘贴 Agent Token" required />
         </div>
         <div class="row" style="justify-content:space-between;">
           <label class="row" style="gap:8px; align-items:center;">

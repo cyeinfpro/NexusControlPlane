@@ -50,6 +50,10 @@ def _generate_api_key() -> str:
     return secrets.token_hex(16)
 
 
+def _node_verify_tls(node: Dict[str, Any]) -> bool:
+    return bool(node.get("verify_tls", 0))
+
+
 def require_login(request: Request) -> str:
     user = request.session.get("user")
     if not user:
@@ -159,6 +163,7 @@ async def node_new_action(
     name: str = Form(""),
     ip_address: str = Form(...),
     api_key: str = Form(""),
+    verify_tls: Optional[str] = Form(None),
 ):
     user = request.session.get("user")
     if not user:
@@ -171,9 +176,31 @@ async def node_new_action(
         return RedirectResponse(url="/nodes/new", status_code=303)
     base_url = f"http://{ip_address}:18700"
 
-    node_id = add_node(name or base_url, base_url, api_key)
+    node_id = add_node(name or base_url, base_url, api_key, verify_tls=bool(verify_tls))
     request.session["show_install_cmd"] = True
     _set_flash(request, "已添加机器")
+    return RedirectResponse(url=f"/nodes/{node_id}", status_code=303)
+
+
+@app.post("/nodes/add")
+async def node_add_action(
+    request: Request,
+    name: str = Form(""),
+    base_url: str = Form(...),
+    api_key: str = Form(...),
+    verify_tls: Optional[str] = Form(None),
+):
+    if not request.session.get("user"):
+        return RedirectResponse(url="/login", status_code=303)
+
+    base_url = base_url.strip()
+    api_key = api_key.strip()
+    if not base_url or not api_key:
+        _set_flash(request, "API 地址与 Token 不能为空")
+        return RedirectResponse(url="/", status_code=303)
+
+    node_id = add_node(name or base_url, base_url, api_key, verify_tls=bool(verify_tls))
+    _set_flash(request, "已添加节点")
     return RedirectResponse(url=f"/nodes/{node_id}", status_code=303)
 
 
@@ -225,7 +252,7 @@ async def api_ping(request: Request, node_id: int, user: str = Depends(require_l
     node = get_node(node_id)
     if not node:
         return JSONResponse({"ok": False, "error": "node not found"}, status_code=404)
-    info = await agent_ping(node["base_url"], node["api_key"])
+    info = await agent_ping(node["base_url"], node["api_key"], _node_verify_tls(node))
     if info.get("error"):
         return {"ok": False, "error": info["error"]}
     info["ok"] = True
@@ -238,7 +265,7 @@ async def api_pool_get(request: Request, node_id: int, user: str = Depends(requi
     if not node:
         return JSONResponse({"ok": False, "error": "node not found"}, status_code=404)
     try:
-        data = await agent_get(node["base_url"], node["api_key"], "/api/v1/pool")
+        data = await agent_get(node["base_url"], node["api_key"], "/api/v1/pool", _node_verify_tls(node))
         return data
     except Exception as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
@@ -250,7 +277,13 @@ async def api_pool_set(request: Request, node_id: int, payload: Dict[str, Any], 
     if not node:
         return JSONResponse({"ok": False, "error": "node not found"}, status_code=404)
     try:
-        data = await agent_post(node["base_url"], node["api_key"], "/api/v1/pool", payload)
+        data = await agent_post(
+            node["base_url"],
+            node["api_key"],
+            "/api/v1/pool",
+            payload,
+            _node_verify_tls(node),
+        )
         return data
     except Exception as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
@@ -262,7 +295,13 @@ async def api_apply(request: Request, node_id: int, user: str = Depends(require_
     if not node:
         return JSONResponse({"ok": False, "error": "node not found"}, status_code=404)
     try:
-        data = await agent_post(node["base_url"], node["api_key"], "/api/v1/apply", {})
+        data = await agent_post(
+            node["base_url"],
+            node["api_key"],
+            "/api/v1/apply",
+            {},
+            _node_verify_tls(node),
+        )
         return data
     except Exception as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
@@ -274,7 +313,7 @@ async def api_stats(request: Request, node_id: int, user: str = Depends(require_
     if not node:
         return JSONResponse({"ok": False, "error": "node not found"}, status_code=404)
     try:
-        data = await agent_get(node["base_url"], node["api_key"], "/api/v1/stats")
+        data = await agent_get(node["base_url"], node["api_key"], "/api/v1/stats", _node_verify_tls(node))
         return data
     except Exception as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
@@ -286,7 +325,7 @@ async def api_graph(request: Request, node_id: int, user: str = Depends(require_
     if not node:
         return JSONResponse({"ok": False, "error": "node not found"}, status_code=404)
     try:
-        data = await agent_get(node["base_url"], node["api_key"], "/api/v1/pool")
+        data = await agent_get(node["base_url"], node["api_key"], "/api/v1/pool", _node_verify_tls(node))
     except Exception as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
 

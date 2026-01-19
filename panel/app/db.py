@@ -11,6 +11,7 @@ CREATE TABLE IF NOT EXISTS nodes (
   name TEXT NOT NULL,
   base_url TEXT NOT NULL,
   api_key TEXT NOT NULL,
+  verify_tls INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 """
@@ -31,6 +32,11 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> None:
 
 def ensure_db(db_path: str = DEFAULT_DB_PATH) -> None:
     init_db(db_path)
+    with connect(db_path) as conn:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(nodes)").fetchall()}
+        if "verify_tls" not in columns:
+            conn.execute("ALTER TABLE nodes ADD COLUMN verify_tls INTEGER NOT NULL DEFAULT 0")
+            conn.commit()
 
 
 @contextmanager
@@ -56,11 +62,17 @@ def get_node(node_id: int, db_path: str = DEFAULT_DB_PATH) -> Optional[Dict[str,
     return dict(row) if row else None
 
 
-def add_node(name: str, base_url: str, api_key: str, db_path: str = DEFAULT_DB_PATH) -> int:
+def add_node(
+    name: str,
+    base_url: str,
+    api_key: str,
+    verify_tls: bool = False,
+    db_path: str = DEFAULT_DB_PATH,
+) -> int:
     with connect(db_path) as conn:
         cur = conn.execute(
-            "INSERT INTO nodes(name, base_url, api_key) VALUES(?,?,?)",
-            (name.strip(), base_url.strip().rstrip('/'), api_key.strip()),
+            "INSERT INTO nodes(name, base_url, api_key, verify_tls) VALUES(?,?,?,?)",
+            (name.strip(), base_url.strip().rstrip('/'), api_key.strip(), 1 if verify_tls else 0),
         )
         conn.commit()
         return int(cur.lastrowid)
