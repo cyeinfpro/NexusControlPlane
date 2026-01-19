@@ -21,6 +21,10 @@
       +(if (x.listen_tls_servername//"")!="" then ";servername="+x.listen_tls_servername else "" end)
       +(if (x.listen_tls_insecure//false) then ";insecure" else "" end))
     else null end;
+   def protocol_net(p):
+    if (p//"")=="udp" then { no_tcp: true, use_udp: true }
+    elif (p//"")=="tcp" then { no_tcp: false, use_udp: false }
+    else { no_tcp: false, use_udp: true } end;
 
   {
     log: {level: "off", output: "stdout"},
@@ -45,7 +49,7 @@
                 + (if ($e.through//"")!="" then {through: $e.through} else {} end)
                 + (if ($e.interface//"")!="" then {interface: $e.interface} else {} end)
                 + (if ($e.listen_interface//"")!="" then {listen_interface: $e.listen_interface} else {} end)
-                + { network: { no_tcp: false, use_udp: true } }
+                + { network: protocol_net($e.protocol) }
                 + (if ($e.accept_proxy!=null) then {accept_proxy: $e.accept_proxy} else {} end)
                 + (if ($e.send_proxy!=null) then {send_proxy: $e.send_proxy} else {} end)
                 + (if ($e.listen_transport//"")!="" then {listen_transport:$e.listen_transport}

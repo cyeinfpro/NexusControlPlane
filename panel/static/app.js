@@ -257,6 +257,7 @@ function newRule(){
   q('f_disabled').value = '0';
   q('f_balance').value = 'roundrobin';
   setField('f_weights','');
+  q('f_protocol').value = 'tcp+udp';
   q('f_type').value = 'tcp';
   setField('f_pairing','');
   fillWssFields({});
@@ -275,6 +276,7 @@ function editRule(idx){
   q('f_balance').value = balance.startsWith('iphash') ? 'iphash' : 'roundrobin';
   const weights = balance.startsWith('roundrobin:') ? balance.split(':').slice(1).join(':').trim().split(',').map(x=>x.trim()).filter(Boolean) : [];
   setField('f_weights', weights.join(','));
+  q('f_protocol').value = e.protocol || 'tcp+udp';
   setField('f_pairing','');
   fillWssFields(e);
   showWssBox();
@@ -320,6 +322,7 @@ async function saveRule(){
   }
 
   const typeSel = q('f_type').value;
+  const protocolSel = q('f_protocol').value;
   if(typeSel === 'wss_send' || typeSel === 'wss_recv'){
     if(!q('f_wss_host').value.trim() || !q('f_wss_path').value.trim()){
       q('modalMsg').textContent='WSS Host 与 Path 不能为空';
@@ -332,6 +335,7 @@ async function saveRule(){
     listen,
     disabled,
     balance,
+    protocol: protocolSel || 'tcp+udp',
     remotes,
     extra_config: ex,
   };
