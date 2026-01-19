@@ -18,6 +18,7 @@ function q(id){ return document.getElementById(id); }
 let CURRENT_POOL = null;
 let CURRENT_EDIT_INDEX = null;
 let CURRENT_STATS = null;
+let PENDING_COMMAND_TEXT = '';
 
 function showTab(name){
   document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
@@ -133,6 +134,22 @@ function renderRules(){
 
 function openModal(){ q('modal').style.display = 'block'; }
 function closeModal(){ q('modal').style.display = 'none'; q('modalMsg').textContent=''; }
+
+function openCommandModal(title, text){
+  const modal = q('commandModal');
+  if(!modal) return;
+  q('commandTitle').textContent = title || '命令';
+  const commandText = q('commandText');
+  PENDING_COMMAND_TEXT = String(text || '');
+  commandText.textContent = PENDING_COMMAND_TEXT;
+  modal.style.display = 'flex';
+}
+
+function closeCommandModal(){
+  const modal = q('commandModal');
+  if(!modal) return;
+  modal.style.display = 'none';
+}
 
 function setField(id, v){ q(id).value = v==null?'':String(v); }
 
@@ -399,15 +416,32 @@ function toast(text){
   setTimeout(()=>{t.style.display='none';}, 1800);
 }
 
-async function applyNow(){
+async function restoreRules(file){
+  if(!file) return;
   const id = window.__NODE_ID__;
-  const btns = document.querySelectorAll('button');
+  const formData = new FormData();
+  formData.append('file', file);
   try{
-    toast('正在应用…');
-    await fetchJSON(`/api/nodes/${id}/apply`, {method:'POST'});
-    toast('已应用并重启');
+    toast('正在还原…');
+    const res = await fetch(`/api/nodes/${id}/restore`, {
+      method: 'POST',
+      body: formData,
+      credentials: 'same-origin',
+    });
+    const text = await res.text();
+    if(!res.ok){
+      let detail = text;
+      try{ detail = JSON.parse(text).error || text; }catch(e){}
+      throw new Error(detail || `HTTP ${res.status}`);
+    }
+    const data = text ? JSON.parse(text) : {};
+    if(!data.ok){
+      throw new Error(data.error || '还原失败');
+    }
+    await loadPool();
+    toast('还原成功');
   }catch(e){
-    alert('应用失败：'+e.message);
+    alert('还原失败：' + e.message);
   }
 }
 
