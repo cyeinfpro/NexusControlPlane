@@ -347,6 +347,7 @@ async def api_pool_set(request: Request, node_id: int, payload: Dict[str, Any], 
     node = get_node(node_id)
     if not node:
         return JSONResponse({"ok": False, "error": "node not found"}, status_code=404)
+    apply_data: Dict[str, Any] = {}
     try:
         data = await agent_post(
             node["base_url"],
