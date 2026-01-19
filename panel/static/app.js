@@ -17,6 +17,7 @@ function q(id){ return document.getElementById(id); }
 
 let CURRENT_POOL = null;
 let CURRENT_EDIT_INDEX = null;
+let CURRENT_STATS = null;
 
 function showTab(name){
   document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
@@ -44,20 +45,57 @@ function statusPill(e){
   return '<span class="pill ok">运行</span>';
 }
 
+function escapeHtml(text){
+  return String(text || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+function buildStatsLookup(){
+  const lookup = { byIdx: {}, byListen: {}, error: null };
+  if(!CURRENT_STATS) return lookup;
+  if(CURRENT_STATS.error) lookup.error = CURRENT_STATS.error;
+  const rules = Array.isArray(CURRENT_STATS.rules) ? CURRENT_STATS.rules : [];
+  rules.forEach((r)=>{
+    if(typeof r.idx === 'number') lookup.byIdx[r.idx] = r;
+    if(r.listen) lookup.byListen[r.listen] = r;
+  });
+  return lookup;
+}
+
+function renderHealth(healthList, statsError){
+  if(statsError){
+    return `<span class="muted">检测失败：${escapeHtml(statsError)}</span>`;
+  }
+  if(!Array.isArray(healthList) || healthList.length === 0){
+    return '<span class="muted">暂无检测数据</span>';
+  }
+  return healthList.map((item)=>{
+    const ok = !!item.ok;
+    const label = ok ? '可达' : '不可达';
+    return `<div class="row" style="gap:6px;align-items:center;">
+      <span class="pill ${ok ? 'ok' : 'bad'}">${label}</span>
+      <span class="mono">${escapeHtml(item.target)}</span>
+    </div>`;
+  }).join('');
+}
+
 function renderRules(){
   q('rulesLoading').style.display = 'none';
   const table = q('rulesTable');
   const tbody = q('rulesBody');
   tbody.innerHTML = '';
   const eps = (CURRENT_POOL && CURRENT_POOL.endpoints) ? CURRENT_POOL.endpoints : [];
+  const statsLookup = buildStatsLookup();
   eps.forEach((e, idx)=>{
     const rs = Array.isArray(e.remotes) ? e.remotes : (e.remote ? [e.remote] : []);
+    const stats = statsLookup.byIdx[idx] || statsLookup.byListen[e.listen] || {};
+    const healthHtml = renderHealth(stats.health, statsLookup.error);
     const tr = document.createElement('tr');
     tr.innerHTML = `
       <td>${idx+1}</td>
       <td>${statusPill(e)}</td>
-      <td><div class="mono">${(e.listen||'').replace(/</g,'&lt;')}</div></td>
-      <td><div class="mono">${rs.map(x=>x.replace(/</g,'&lt;')).join('<br>')}</div></td>
+      <td><div class="mono">${escapeHtml(e.listen)}</div></td>
+      <td><div class="mono">${rs.map(escapeHtml).join('<br>')}</div></td>
+      <td>${healthHtml}</td>
       <td>${endpointType(e)}</td>
       <td>${e.balance || 'roundrobin'}</td>
       <td>
@@ -417,10 +455,18 @@ function renderGraph(elements){
 async function loadPool(){
   const id = window.__NODE_ID__;
   q('rulesLoading').style.display = '';
+  q('rulesLoading').textContent = '正在加载规则…';
   try{
     const data = await fetchJSON(`/api/nodes/${id}/pool`);
+    let statsData = null;
+    try{
+      statsData = await fetchJSON(`/api/nodes/${id}/stats`);
+    }catch(e){
+      statsData = { ok: false, error: e.message, rules: [] };
+    }
     CURRENT_POOL = data.pool;
     if(!CURRENT_POOL.endpoints) CURRENT_POOL.endpoints = [];
+    CURRENT_STATS = statsData;
     renderRules();
   }catch(e){
     q('rulesLoading').textContent = '加载失败：' + e.message;
