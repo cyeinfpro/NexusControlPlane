@@ -228,42 +228,61 @@ def _scan_ss_once(target_ports: set[int]) -> tuple[Dict[int, Dict[str, int]], st
     # 记录本次仍存活的连接 key，用于清理已断开的连接
     seen_by_port: Dict[int, set[str]] = {p: set() for p in target_ports}
 
-    for line in (r.stdout or '').splitlines():
-        parts = line.split()
-        if len(parts) < 5:
-            continue
-        local = parts[3]
-        peer = parts[4]
-        port = _addr_to_port(local)
-        if port not in target_ports:
-            continue
-
-        # 当前连接数
-        result[port]['connections'] += 1
-
-        # 增量累计流量
-        key = f"{local}->{peer}"
-        seen_by_port[port].add(key)
-
-        rx_matches = re.findall(r"bytes_received:(\d+)", line)
-        tx_matches = re.findall(r"bytes_acked:(\d+)", line)
+    def apply_bytes(line_text: str, target_port: int, conn_key: str) -> bool:
+        rx_matches = re.findall(r"bytes_received:(\d+)", line_text)
+        tx_matches = re.findall(r"bytes_acked:(\d+)", line_text)
         if not tx_matches:
-            tx_matches = re.findall(r"bytes_sent:(\d+)", line)
+            tx_matches = re.findall(r"bytes_sent:(\d+)", line_text)
+        if not rx_matches and not tx_matches:
+            return False
+
         rx_value = int(rx_matches[-1]) if rx_matches else 0
         tx_value = int(tx_matches[-1]) if tx_matches else 0
 
-        totals = TRAFFIC_TOTALS.setdefault(port, {'sum_rx': 0, 'sum_tx': 0, 'conns': {}})
+        totals = TRAFFIC_TOTALS.setdefault(target_port, {'sum_rx': 0, 'sum_tx': 0, 'conns': {}})
         conns: Dict[str, Dict[str, int]] = totals['conns']
-        last = conns.get(key)
+        last = conns.get(conn_key)
         if last is None:
             totals['sum_rx'] += rx_value
             totals['sum_tx'] += tx_value
-            conns[key] = {'last_rx': rx_value, 'last_tx': tx_value}
+            conns[conn_key] = {'last_rx': rx_value, 'last_tx': tx_value}
         else:
             totals['sum_rx'] += rx_value - last['last_rx'] if rx_value >= last['last_rx'] else rx_value
             totals['sum_tx'] += tx_value - last['last_tx'] if tx_value >= last['last_tx'] else tx_value
             last['last_rx'] = rx_value
             last['last_tx'] = tx_value
+        return True
+
+    pending: tuple[int, str] | None = None
+
+    for raw_line in (r.stdout or '').splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        parts = line.split()
+        if len(parts) >= 5:
+            local = parts[3]
+            peer = parts[4]
+            port = _addr_to_port(local)
+            if port not in target_ports:
+                pending = None
+                continue
+
+            # 当前连接数
+            result[port]['connections'] += 1
+
+            # 增量累计流量
+            key = f"{local}->{peer}"
+            seen_by_port[port].add(key)
+            pending = (port, key)
+            if apply_bytes(raw_line, port, key):
+                pending = None
+            continue
+
+        if pending is not None:
+            port, key = pending
+            if apply_bytes(raw_line, port, key):
+                pending = None
 
     # 清理断开的连接，避免 conns 膨胀
     for p, seen in seen_by_port.items():
