@@ -5,6 +5,7 @@ import re
 import shutil
 import socket
 import subprocess
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List
@@ -20,6 +21,7 @@ POOL_RUN_FILTER = Path('/etc/realm/pool_to_run.jq')
 FALLBACK_RUN_FILTER = Path(__file__).resolve().parents[1] / 'pool_to_run.jq'
 REALM_CONFIG = Path(CFG.realm_config_file)
 TRAFFIC_TOTALS: Dict[int, Dict[str, Any]] = {}
+TCPING_TIMEOUT = 2.0
 
 
 def _read_text(p: Path) -> str:
@@ -206,12 +208,46 @@ def _traffic_bytes(port: int) -> tuple[int, int]:
     return totals['sum_rx'], totals['sum_tx']
 
 
-def _tcp_probe(host: str, port: int, timeout: float = 0.8) -> bool:
+def _parse_tcping_latency(output: str) -> float | None:
+    match = re.search(r"time[=<]?\s*([0-9.]+)\s*ms", output, re.IGNORECASE)
+    if not match:
+        return None
+    return float(match.group(1))
+
+
+def _tcp_probe(host: str, port: int, timeout: float = 0.8) -> tuple[bool, float | None]:
+    tcping = shutil.which("tcping")
+    if tcping:
+        cmd = [
+            tcping,
+            "-c",
+            "1",
+            "-t",
+            str(int(TCPING_TIMEOUT)),
+            host,
+            str(port),
+        ]
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=TCPING_TIMEOUT + 1,
+            )
+        except Exception:
+            return False, None
+        output = (result.stdout or "") + (result.stderr or "")
+        latency = _parse_tcping_latency(output)
+        if latency is not None:
+            return True, round(latency, 2)
+        return False, None
+    start = time.monotonic()
     try:
         with socket.create_connection((host, port), timeout=timeout):
-            return True
+            latency_ms = (time.monotonic() - start) * 1000
+            return True, round(latency_ms, 2)
     except Exception:
-        return False
+        return False, None
 
 
 def _split_hostport(addr: str) -> tuple[str, int]:
@@ -309,10 +345,14 @@ def api_stats(_: None = Depends(_api_key_required)) -> Dict[str, Any]:
         for r in remotes[:8]:  # 限制探测数量
             try:
                 h, p = _split_hostport(r)
-                ok = _tcp_probe(h, p)
+                ok, latency_ms = _tcp_probe(h, p)
             except Exception:
                 ok = False
-            health.append({'target': r, 'ok': ok})
+                latency_ms = None
+            payload = {'target': r, 'ok': ok}
+            if latency_ms is not None:
+                payload['latency_ms'] = latency_ms
+            health.append(payload)
         rx_bytes, tx_bytes = _traffic_bytes(port)
         rules.append({
             'idx': idx,
