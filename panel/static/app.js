@@ -93,7 +93,8 @@ function renderHealth(healthList, statsError){
   }
   return healthList.map((item)=>{
     const ok = !!item.ok;
-    const label = ok ? '可达' : '不可达';
+    const latencyMs = item && item.latency_ms != null ? item.latency_ms : item && item.latency != null ? item.latency : null;
+    const label = ok ? (latencyMs != null ? `${latencyMs} ms` : '在线') : '离线';
     return `<div class="row" style="gap:6px;align-items:center;">
       <span class="pill ${ok ? 'ok' : 'bad'}">${label}</span>
       <span class="mono">${escapeHtml(item.target)}</span>
