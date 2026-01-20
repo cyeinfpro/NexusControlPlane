@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="v32"
+VERSION="v33"
 REPO_ZIP_URL_DEFAULT="https://github.com/cyeinfpro/Realm/archive/refs/heads/main.zip"
 DEFAULT_MODE="1"
 DEFAULT_PORT="18700"
@@ -173,18 +173,22 @@ fetch_repo(){
     unzip -q "${zip_path}" -d "${tmpdir}"
   else
     local url
-    # 如果机器上已存在 Agent，则默认进入“自动更新”逻辑：
-    # - 不再询问用户 URL
-    # - 强制拉取默认 main.zip
-    # - 增加 cache bust，避免 CDN/代理缓存导致下载到旧包
-    if [[ -d /opt/realm-agent/agent || "${REALM_AGENT_FORCE_UPDATE:-}" == "1" ]]; then
-      url="${REPO_ZIP_URL_DEFAULT}"
-      info "检测到已安装 Agent，将自动更新到最新版本：${url}"
-    else
-      url="${REALM_AGENT_REPO_ZIP_URL:-}"
-      if [[ -z "${url}" ]]; then
+    # ✅ 自定义 ZIP 地址（例如从面板 /static/realm-agent.zip 拉取）永远优先
+    #    这样即便机器无法连接 GitHub，也能稳定更新。
+    url="${REALM_AGENT_REPO_ZIP_URL:-}"
+
+    # 如果没有指定自定义 URL：
+    # - 已安装或强制更新时：默认拉取官方 main.zip（GitHub）
+    # - 否则：询问用户（回车=默认）
+    if [[ -z "${url}" ]]; then
+      if [[ -d /opt/realm-agent/agent || "${REALM_AGENT_FORCE_UPDATE:-}" == "1" ]]; then
+        url="${REPO_ZIP_URL_DEFAULT}"
+        info "检测到已安装 Agent，将自动更新到最新版本：${url}"
+      else
         url=$(ask "仓库 ZIP 下载地址（回车=默认）: " "${REPO_ZIP_URL_DEFAULT}")
       fi
+    else
+      info "使用自定义仓库 ZIP 地址：${url}"
     fi
 
     local bust
