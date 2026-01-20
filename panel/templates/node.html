@@ -28,12 +28,7 @@
   </div>
 </div>
 
-<div class="tabs">
-  <button class="tab active" data-tab="rules">规则列表</button>
-  <button class="tab" data-tab="traffic">流量统计</button>
-</div>
-
-<section id="tab-rules" class="tabpane show">
+<section>
   <div class="card">
     <div class="row">
       <div class="col">
@@ -64,12 +59,8 @@
       </thead>
       <tbody id="rulesBody"></tbody>
     </table>
-  </div>
-</section>
 
-<section id="tab-traffic" class="tabpane">
-  <div class="card">
-    <div class="row">
+    <div class="row" style="margin-top:24px; border-top:1px solid var(--line); padding-top:20px;">
       <div class="col">
         <h2 class="h2">规则流量统计</h2>
         <p class="muted">展示每条规则的连接数与累计流量</p>
