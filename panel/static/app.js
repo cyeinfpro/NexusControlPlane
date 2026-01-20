@@ -92,11 +92,12 @@ function renderHealth(healthList, statsError){
     return '<span class="muted">暂无检测数据</span>';
   }
   return healthList.map((item)=>{
+    const isUnknown = item && item.ok == null;
     const ok = !!item.ok;
     const latencyMs = item && item.latency_ms != null ? item.latency_ms : item && item.latency != null ? item.latency : null;
-    const label = ok ? `${latencyMs != null ? latencyMs : '—'} ms` : '离线';
+    const label = isUnknown ? (item.message || '不可检测') : (ok ? `${latencyMs != null ? latencyMs : '—'} ms` : '离线');
     return `<div class="row" style="gap:6px;align-items:center;">
-      <span class="pill ${ok ? 'ok' : 'bad'}">${label}</span>
+      <span class="pill ${isUnknown ? 'warn' : (ok ? 'ok' : 'bad')}">${label}</span>
       <span class="mono">${escapeHtml(item.target)}</span>
     </div>`;
   }).join('');
