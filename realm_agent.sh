@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="v31"
+VERSION="v32"
 REPO_ZIP_URL_DEFAULT="https://github.com/cyeinfpro/Realm/archive/refs/heads/main.zip"
 DEFAULT_MODE="1"
 DEFAULT_PORT="18700"
@@ -232,7 +232,11 @@ atomic_update_agent(){
   info "创建虚拟环境（staging）..."
   python3 -m venv "${stage}/venv"
   "${stage}/venv/bin/pip" install -U pip wheel setuptools >/dev/null
-  "${stage}/venv/bin/pip" install -r "${stage}/agent/requirements.txt" >/dev/null
+  # 先装 requirements（仓库内）
+  "${stage}/venv/bin/pip" install -r "${stage}/agent/requirements.txt" >/dev/null || true
+  # 兜底确保核心依赖一定存在（避免 requirements 缺失/变更导致服务无法启动）
+  "${stage}/venv/bin/python" -c "import fastapi,uvicorn" >/dev/null 2>&1 || \
+    "${stage}/venv/bin/pip" install -U "fastapi" "uvicorn[standard]" "requests" >/dev/null
 
   # 生成 API Key（持久化不变）
   mkdir -p /etc/realm-agent
@@ -255,7 +259,10 @@ After=network.target
 [Service]
 Type=simple
 WorkingDirectory=${base}/agent
-ExecStart=${base}/venv/bin/uvicorn app.main:app --host ${host} --port ${port} --workers 1
+# ⚠️ 不要直接 ExecStart=.../uvicorn：因为本脚本使用 staging venv 再切换，
+#    uvicorn 入口脚本的 shebang 可能指向 staging 路径，导致 systemd 报 203/EXEC。
+# ✅ 使用 python -m uvicorn 永远可用（只要 venv 的 python 存在）
+ExecStart=${base}/venv/bin/python -m uvicorn app.main:app --host ${host} --port ${port} --workers 1
 Restart=always
 RestartSec=2
 
@@ -280,6 +287,24 @@ EOF
   echo "${VERSION}" > "${base}/agent/.installer_version" || true
 
   restart_service realm-agent.service
+
+  # 最终兜底：若启动失败，自动重建 venv 并改用 python -m uvicorn 再拉起
+  if command_exists systemctl; then
+    if ! systemctl is-active --quiet realm-agent.service 2>/dev/null; then
+      err "Agent 服务启动失败，尝试自动修复（重建 venv + 重新安装核心依赖）..."
+      systemctl stop realm-agent.service >/dev/null 2>&1 || true
+      rm -rf "${base}/venv" || true
+      python3 -m venv "${base}/venv"
+      "${base}/venv/bin/pip" install -U pip wheel setuptools >/dev/null
+      "${base}/venv/bin/pip" install -U "fastapi" "uvicorn[standard]" "requests" >/dev/null
+      # 尝试安装 requirements（若存在）
+      if [[ -f "${base}/agent/requirements.txt" ]]; then
+        "${base}/venv/bin/pip" install -r "${base}/agent/requirements.txt" >/dev/null || true
+      fi
+      systemctl daemon-reload
+      systemctl restart realm-agent.service >/dev/null 2>&1 || true
+    fi
+  fi
 }
 
 find_agent_dir(){
