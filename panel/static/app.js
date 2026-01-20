@@ -128,18 +128,123 @@ function renderHealth(healthList, statsError){
   return `<div class="health-wrap">${chips}${more}</div>`;
 }
 
+function renderHealthMobile(healthList, statsError, idx){
+  // Mobile: 更易读的纵向排版，目标可换行，离线原因直接展示
+  if(statsError){
+    return `<span class="muted">检测失败：${escapeHtml(statsError)}</span>`;
+  }
+  if(!Array.isArray(healthList) || healthList.length === 0){
+    return '<span class="muted">暂无检测数据</span>';
+  }
+
+  const MAX_SHOW = 2;
+  function friendlyError(err){
+    const s = String(err || '').trim();
+    if(!s) return '';
+    const t = s.toLowerCase();
+    if(t.includes('timed out') || t.includes('timeout')) return '超时';
+    if(t.includes('refused')) return '拒绝连接';
+    if(t.includes('no route')) return '无路由';
+    if(t.includes('name or service not known') || t.includes('temporary failure in name resolution')) return 'DNS失败';
+    if(t.includes('network is unreachable')) return '网络不可达';
+    if(t.includes('permission denied')) return '无权限';
+    return s.length > 28 ? (s.slice(0, 28) + '…') : s;
+  }
+
+  const shown = healthList.slice(0, MAX_SHOW);
+  const hiddenCount = Math.max(0, healthList.length - MAX_SHOW);
+  const chips = shown.map((item)=>{
+    const isUnknown = item && item.ok == null;
+    const ok = !!item.ok;
+    const latencyMs = item && item.latency_ms != null ? item.latency_ms : item && item.latency != null ? item.latency : null;
+    const label = isUnknown ? (item.message || '不可检测') : (ok ? `${latencyMs != null ? latencyMs : '—'} ms` : '离线');
+    const reason = (!isUnknown && !ok) ? friendlyError(item.error || item.message) : '';
+    const title = (!isUnknown && !ok) ? `离线原因：${String(item.error || item.message || '').trim()}` : '';
+
+    return `<div class="health-item mobile" title="${escapeHtml(title)}">
+      <span class="pill ${isUnknown ? 'warn' : (ok ? 'ok' : 'bad')}">${escapeHtml(label)}</span>
+      <div class="health-meta">
+        <div class="mono health-target" title="${escapeHtml(item.target)}">${escapeHtml(item.target)}</div>
+        ${reason ? `<div class="health-reason">${escapeHtml(reason)}</div>` : ''}
+      </div>
+    </div>`;
+  }).join('');
+
+  const more = hiddenCount > 0 ? `<button class="pill ghost health-more" type="button" onclick="showHealthDetail(${idx})">+${hiddenCount}</button>` : '';
+  return `<div class="health-wrap mobile">${chips}${more}</div>`;
+}
+
+function showHealthDetail(idx){
+  // 使用现有命令弹窗作为“详情弹窗”，避免移动端挤压显示
+  try{
+    const statsLookup = buildStatsLookup();
+    const eps = (CURRENT_POOL && CURRENT_POOL.endpoints) ? CURRENT_POOL.endpoints : [];
+    const stats = (statsLookup.byIdx[idx] || statsLookup.byListen[eps[idx]?.listen] || {});
+    const list = Array.isArray(stats.health) ? stats.health : [];
+    const lines = list.map((it)=>{
+      const ok = it && it.ok === true;
+      const isUnknown = it && it.ok == null;
+      const latency = it && it.latency_ms != null ? `${it.latency_ms} ms` : (it && it.latency != null ? `${it.latency} ms` : '—');
+      const state = isUnknown ? '不可检测' : (ok ? '在线' : '离线');
+      const reason = (!isUnknown && !ok) ? (it.error || it.message || '') : '';
+      return `${state}  ${latency}  ${it.target}${reason ? `\n  原因：${reason}` : ''}`;
+    });
+    openCommandModal('连通检测详情', lines.join('\n\n'));
+  }catch(e){
+    openCommandModal('连通检测详情', '暂无详情');
+  }
+}
+
+function renderRuleCard(e, idx, stats, statsError){
+  const rx = statsError ? null : (stats.rx_bytes || 0);
+  const tx = statsError ? null : (stats.tx_bytes || 0);
+  const total = (rx == null || tx == null) ? null : rx + tx;
+  const conn = statsError ? '—' : (stats.connections ?? 0);
+  const totalStr = total == null ? '—' : formatBytes(total);
+  const healthHtml = renderHealthMobile(stats.health, statsError, idx);
+  return `
+  <div class="rule-card">
+    <div class="rule-head">
+      <div class="rule-left">
+        <div class="rule-topline">
+          <span class="rule-idx">#${idx+1}</span>
+          ${statusPill(e)}
+        </div>
+        <div class="rule-listen mono">${escapeHtml(e.listen)}</div>
+        <div class="rule-sub muted sm">${endpointType(e)}</div>
+      </div>
+      <div class="rule-right">
+        <span class="pill ghost">${escapeHtml(conn)} 连接</span>
+        <span class="pill ghost">${escapeHtml(totalStr)}</span>
+      </div>
+    </div>
+    <div class="rule-health-block">
+      ${healthHtml}
+    </div>
+    <div class="rule-actions">
+      <button class="btn sm ghost" onclick="editRule(${idx})">编辑</button>
+      <button class="btn sm" onclick="toggleRule(${idx})">${e.disabled?'启用':'暂停'}</button>
+      <button class="btn sm ghost" onclick="deleteRule(${idx})">删除</button>
+    </div>
+  </div>`;
+}
+
 function renderRules(){
   q('rulesLoading').style.display = 'none';
   const table = q('rulesTable');
   const tbody = q('rulesBody');
+  const mobileWrap = q('rulesMobile');
   tbody.innerHTML = '';
+  if(mobileWrap) mobileWrap.innerHTML = '';
   const eps = (CURRENT_POOL && CURRENT_POOL.endpoints) ? CURRENT_POOL.endpoints : [];
   const statsLookup = buildStatsLookup();
   const statsLoading = q('statsLoading');
+  const isMobile = window.matchMedia && window.matchMedia('(max-width: 720px)').matches;
   if(!eps.length){
     q('rulesLoading').style.display = '';
     q('rulesLoading').textContent = '暂无规则';
     table.style.display = 'none';
+    if(mobileWrap) mobileWrap.style.display = 'none';
     if(statsLoading){
       statsLoading.style.display = 'none';
     }
@@ -155,33 +260,48 @@ function renderRules(){
   }
   eps.forEach((e, idx)=>{
     const stats = statsLookup.byIdx[idx] || statsLookup.byListen[e.listen] || {};
-    const healthHtml = renderHealth(stats.health, statsLookup.error);
     const statsError = statsLookup.error;
-    const rx = statsError ? null : (stats.rx_bytes || 0);
-    const tx = statsError ? null : (stats.tx_bytes || 0);
-    const total = (rx == null || tx == null) ? null : rx + tx;
-    const tr = document.createElement('tr');
-    tr.innerHTML = `
-      <td>${idx+1}</td>
-      <td>${statusPill(e)}</td>
-      <td class="listen">
-        <div class="mono">${escapeHtml(e.listen)}</div>
-        <div class="muted sm">${endpointType(e)}</div>
-      </td>
-      <td class="health">${healthHtml}</td>
-      <td class="stat">${statsError ? '—' : (stats.connections ?? 0)}</td>
-      <td class="stat">${total == null ? '—' : formatBytes(total)}</td>
-      <td class="actions">
-        <div class="rules-actions">
-          <button class="btn sm ghost" onclick="editRule(${idx})">编辑</button>
-          <button class="btn sm" onclick="toggleRule(${idx})">${e.disabled?'启用':'暂停'}</button>
-          <button class="btn sm ghost" onclick="deleteRule(${idx})">删除</button>
-        </div>
-      </td>
-    `;
-    tbody.appendChild(tr);
+
+    if(isMobile && mobileWrap){
+      // Mobile: card list
+      const card = document.createElement('div');
+      card.innerHTML = renderRuleCard(e, idx, stats, statsError);
+      mobileWrap.appendChild(card.firstElementChild);
+    }else{
+      // Desktop: table
+      const healthHtml = renderHealth(stats.health, statsLookup.error);
+      const rx = statsError ? null : (stats.rx_bytes || 0);
+      const tx = statsError ? null : (stats.tx_bytes || 0);
+      const total = (rx == null || tx == null) ? null : rx + tx;
+      const tr = document.createElement('tr');
+      tr.innerHTML = `
+        <td>${idx+1}</td>
+        <td>${statusPill(e)}</td>
+        <td class="listen">
+          <div class="mono">${escapeHtml(e.listen)}</div>
+          <div class="muted sm">${endpointType(e)}</div>
+        </td>
+        <td class="health">${healthHtml}</td>
+        <td class="stat">${statsError ? '—' : (stats.connections ?? 0)}</td>
+        <td class="stat">${total == null ? '—' : formatBytes(total)}</td>
+        <td class="actions">
+          <div class="rules-actions">
+            <button class="btn sm ghost" onclick="editRule(${idx})">编辑</button>
+            <button class="btn sm" onclick="toggleRule(${idx})">${e.disabled?'启用':'暂停'}</button>
+            <button class="btn sm ghost" onclick="deleteRule(${idx})">删除</button>
+          </div>
+        </td>
+      `;
+      tbody.appendChild(tr);
+    }
   });
-  table.style.display = '';
+  if(isMobile && mobileWrap){
+    mobileWrap.style.display = '';
+    table.style.display = 'none';
+  }else{
+    if(mobileWrap) mobileWrap.style.display = 'none';
+    table.style.display = '';
+  }
 }
 
 function openModal(){ q('modal').style.display = 'flex'; }

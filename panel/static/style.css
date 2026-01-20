@@ -133,6 +133,10 @@ body{
 .pill.ok{color:var(--ok);border-color:rgba(34,197,94,0.35);background:rgba(34,197,94,0.08)}
 .pill.bad{color:var(--bad);border-color:rgba(239,68,68,0.35);background:rgba(239,68,68,0.08)}
 .pill.warn{color:var(--warn);border-color:rgba(245,158,11,0.35);background:rgba(245,158,11,0.10)}
+.pill.ghost{color:rgba(226,232,240,0.92);border-color:rgba(148,163,184,0.22);background:rgba(148,163,184,0.10)}
+
+/* 小按钮（用于规则操作） */
+.btn.sm{min-height:34px;padding:7px 12px;border-radius:10px;font-size:12px}
 .table{width:100%;border-collapse:collapse;margin-top:12px}
 .table th,.table td{padding:10px 8px;border-bottom:1px solid var(--line);text-align:left;font-size:13px}
 .table th{color:var(--muted);font-weight:600}
@@ -145,6 +149,32 @@ body{
 .rules-table th.stat,.rules-table td.stat{min-width:90px}
 .rules-table th.actions,.rules-table td.actions{text-align:right;min-width:190px}
 .rules-actions{display:flex;gap:8px;flex-wrap:nowrap;justify-content:flex-end}
+
+/* Mobile rules (card layout) */
+.rules-mobile{display:flex;flex-direction:column;gap:12px;margin-top:12px}
+.rule-card{
+  background:var(--panel);
+  border:1px solid var(--line);
+  border-radius:16px;
+  padding:14px;
+  backdrop-filter:blur(18px);
+  box-shadow:var(--glow);
+}
+.rule-head{display:flex;justify-content:space-between;gap:12px;align-items:flex-start}
+.rule-left{flex:1;min-width:0}
+.rule-topline{display:flex;gap:10px;align-items:center;margin-bottom:6px}
+.rule-idx{color:var(--muted);font-size:12px}
+.rule-listen{font-size:16px;font-weight:700;word-break:break-all}
+.rule-right{display:flex;flex-direction:column;gap:8px;align-items:flex-end;flex-shrink:0}
+.rule-health-block{margin-top:12px}
+.rule-actions{display:grid;grid-template-columns:repeat(3, 1fr);gap:10px;margin-top:12px}
+
+/* Mobile health list */
+.health-wrap.mobile{flex-direction:column;align-items:stretch}
+.health-item.mobile{display:flex;gap:10px;align-items:flex-start;max-width:100%}
+.health-item.mobile .health-meta{display:flex;flex-direction:column;gap:2px;min-width:0;flex:1}
+.health-item.mobile .health-target{max-width:none;white-space:normal;overflow:visible;text-overflow:unset;word-break:break-all}
+.health-item.mobile .health-reason{font-size:11px;color:var(--muted)}
 
 /* 连通检测：更紧凑的排版（支持多目标 & 显示离线原因） */
 .health-wrap{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
@@ -244,42 +274,6 @@ code{font-family:ui-monospace,Menlo,Monaco,Consolas,monospace}
   .table{
     display:block;
     overflow-x:auto;
-  }
-  .rules-table{
-    min-width:0;
-  }
-  .rules-table th,
-  .rules-table td{
-    padding:8px 6px;
-    font-size:12px;
-    white-space:normal;
-  }
-  .rules-table th.listen,
-  .rules-table td.listen,
-  .rules-table th.health,
-  .rules-table td.health{
-    min-width:0;
-  }
-  .rules-table th.actions,
-  .rules-table td.actions{
-    min-width:0;
-    text-align:left;
-  }
-  .rules-actions{
-    flex-wrap:wrap;
-    justify-content:flex-start;
-  }
-  .health-wrap{
-    flex-direction:column;
-    align-items:flex-start;
-  }
-  .health-item{
-    max-width:100%;
-  }
-  .health-target{
-    max-width:100%;
-    white-space:normal;
-    word-break:break-all;
   }
   .card{
     padding:16px;
