@@ -357,8 +357,13 @@ def api_stats(_: None = Depends(_api_key_required)) -> Dict[str, Any]:
             remotes += [str(x) for x in e.get('extra_remotes') if x]
         seen = set()
         remotes = [r for r in remotes if not (r in seen or seen.add(r))]
+        protocol = str(e.get('protocol') or 'tcp+udp').lower()
+        tcp_probe_enabled = 'tcp' in protocol
         health = []
         for r in remotes[:8]:  # 限制探测数量
+            if not tcp_probe_enabled:
+                health.append({'target': r, 'ok': None, 'message': '协议不支持探测'})
+                continue
             try:
                 h, p = _split_hostport(r)
                 ok, latency_ms = _tcp_probe(h, p)
