@@ -8,16 +8,19 @@ import subprocess
 import time
 import os
 import threading
+import hashlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List
 
 from fastapi import Depends, FastAPI, HTTPException, Request
+import requests
 
 from .config import CFG
 
 API_KEY_FILE = Path('/etc/realm-agent/api.key')
+ACK_VER_FILE = Path('/etc/realm-agent/panel_ack.version')
 POOL_FULL = Path('/etc/realm/pool_full.json')
 POOL_ACTIVE = Path('/etc/realm/pool.json')
 POOL_RUN_FILTER = Path('/etc/realm/pool_to_run.jq')
@@ -55,8 +58,25 @@ def _read_json(p: Path, default: Any) -> Any:
         return json.loads(_read_text(p))
     except FileNotFoundError:
         return default
+
+
+def _read_int(p: Path, default: int = 0) -> int:
+    try:
+        return int(_read_text(p).strip())
     except Exception:
         return default
+
+
+def _write_int(p: Path, value: int) -> None:
+    _write_text(p, str(int(value)))
+
+
+def _sha256_of_obj(obj: Any) -> str:
+    try:
+        s = json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(s.encode("utf-8")).hexdigest()
+    except Exception:
+        return ""
 
 
 def _write_json(p: Path, data: Any) -> None:
@@ -829,6 +849,192 @@ app = FastAPI(title='Realm Agent', version='31')
 REALM_SERVICE_NAMES = [s for s in [CFG.realm_service, 'realm.service', 'realm'] if s]
 
 
+# ------------------------ Agent -> Panel Push Report ------------------------
+# 目标：让面板不再主动访问 Agent（被控机）端口。
+# Agent 以固定间隔（默认 3s）向面板上报：
+#   - info / pool / stats 等快照
+# 面板按上报数据渲染。
+# 当面板侧产生规则变更（desired_pool_version > ack_version）时，
+# 面板会在上报响应里返回 commands（例如 sync_pool）。
+# Agent 在下一次上报后立即执行同步并回写 ack_version。
+
+PANEL_URL = os.environ.get('REALM_PANEL_URL', '').strip().rstrip('/')
+try:
+    AGENT_ID = int(os.environ.get('REALM_AGENT_ID', '0') or '0')
+except Exception:
+    AGENT_ID = 0
+try:
+    HEARTBEAT_INTERVAL = max(1.0, float(os.environ.get('REALM_AGENT_HEARTBEAT_INTERVAL', '3') or '3'))
+except Exception:
+    HEARTBEAT_INTERVAL = 3.0
+
+_PUSH_STOP = threading.Event()
+_PUSH_THREAD: threading.Thread | None = None
+_PUSH_LOCK = threading.Lock()  # 避免与 API 同时写 pool 文件导致竞争
+_LAST_SYNC_ERROR: str | None = None
+
+
+def _read_agent_api_key() -> str:
+    try:
+        return _read_text(API_KEY_FILE).strip()
+    except Exception:
+        return ''
+
+
+def _panel_report_url() -> str:
+    if not PANEL_URL:
+        return ''
+    return f"{PANEL_URL}/api/agent/report"
+
+
+def _build_push_report() -> Dict[str, Any]:
+    """构建上报快照。
+
+    注意：这个快照会以默认 3s 周期调用。
+    - 连通探测/连接统计已经做了短缓存与并发，避免规则多时卡死
+    - 如果你希望更轻量，可将 interval 调大（例如 5-10s）
+    """
+    info: Dict[str, Any] = {
+        'ok': True,
+        'time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'hostname': socket.gethostname(),
+        'realm_active': any(_service_is_active(name) for name in REALM_SERVICE_NAMES),
+    }
+    pool = _load_full_pool()
+    stats = _build_stats_snapshot()
+    rep: Dict[str, Any] = {
+        'time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'info': info,
+        'pool': pool,
+        'stats': stats,
+    }
+    if _LAST_SYNC_ERROR:
+        rep['sync_error'] = _LAST_SYNC_ERROR
+    return rep
+
+
+def _apply_sync_pool_cmd(cmd: Dict[str, Any]) -> None:
+    """执行面板下发的 pool 同步命令。成功后更新 ack_version。"""
+    global _LAST_SYNC_ERROR
+    try:
+        ver = int(cmd.get('version') or 0)
+    except Exception:
+        ver = 0
+    if ver <= 0:
+        return
+    ack = _read_int(ACK_VER_FILE, 0)
+    if ver <= ack:
+        return
+
+    pool = cmd.get('pool')
+    if not isinstance(pool, dict):
+        _LAST_SYNC_ERROR = 'sync_pool: pool not dict'
+        return
+
+    do_apply = bool(cmd.get('apply', True))
+    with _PUSH_LOCK:
+        try:
+            # 写入 full pool
+            _write_json(POOL_FULL, pool)
+            _sync_active_pool()
+
+            if do_apply:
+                _apply_pool_to_config()
+                _restart_realm()
+
+            # ✅ 只有成功才 ack
+            _write_int(ACK_VER_FILE, ver)
+            _LAST_SYNC_ERROR = None
+        except Exception as exc:
+            _LAST_SYNC_ERROR = f"sync_pool failed: {exc}"
+
+
+def _handle_panel_commands(cmds: Any) -> None:
+    if not isinstance(cmds, list) or not cmds:
+        return
+    for cmd in cmds:
+        if not isinstance(cmd, dict):
+            continue
+        t = str(cmd.get('type') or '').strip()
+        if t == 'sync_pool':
+            _apply_sync_pool_cmd(cmd)
+
+
+def _push_loop() -> None:
+    """后台上报线程。"""
+    url = _panel_report_url()
+    if not url or AGENT_ID <= 0:
+        return
+
+    api_key = _read_agent_api_key()
+    if not api_key:
+        return
+
+    sess = requests.Session()
+    headers = {
+        'X-API-Key': api_key,
+        'User-Agent': f"realm-agent/{app.version} push-report",
+    }
+
+    # 失败退避：连续失败会指数退避，避免刷爆日志/网络
+    backoff = 0.0
+    max_backoff = 30.0
+
+    while not _PUSH_STOP.is_set():
+        started = time.time()
+        try:
+            ack = _read_int(ACK_VER_FILE, 0)
+            payload = {
+                'node_id': AGENT_ID,
+                'ack_version': ack,
+                'report': _build_push_report(),
+            }
+            r = sess.post(url, json=payload, headers=headers, timeout=3)
+            if r.status_code == 200:
+                data = r.json() if r.content else {}
+                _handle_panel_commands(data.get('commands'))
+                backoff = 0.0
+            else:
+                backoff = min(max_backoff, backoff * 2 + 1.0) if backoff else 2.0
+        except Exception:
+            backoff = min(max_backoff, backoff * 2 + 1.0) if backoff else 2.0
+
+        # 维持固定节奏：interval - 耗时 + 退避
+        cost = time.time() - started
+        sleep_s = max(0.1, HEARTBEAT_INTERVAL - cost)
+        if backoff:
+            sleep_s = max(sleep_s, backoff)
+        _PUSH_STOP.wait(timeout=sleep_s)
+
+
+def _start_push_reporter() -> None:
+    global _PUSH_THREAD
+    if _PUSH_THREAD and _PUSH_THREAD.is_alive():
+        return
+    if not PANEL_URL or AGENT_ID <= 0:
+        return
+    _PUSH_STOP.clear()
+    th = threading.Thread(target=_push_loop, name='realm-agent-push', daemon=True)
+    th.start()
+    _PUSH_THREAD = th
+
+
+def _stop_push_reporter() -> None:
+    _PUSH_STOP.set()
+
+
+@app.on_event('startup')
+def _on_startup() -> None:
+    # Agent 启动后自动开启上报（若配置了 REALM_PANEL_URL + REALM_AGENT_ID）
+    _start_push_reporter()
+
+
+@app.on_event('shutdown')
+def _on_shutdown() -> None:
+    _stop_push_reporter()
+
+
+
 @app.get('/api/v1/info')
 def api_info(_: None = Depends(_api_key_required)) -> Dict[str, Any]:
     return {
@@ -836,6 +1042,13 @@ def api_info(_: None = Depends(_api_key_required)) -> Dict[str, Any]:
         'time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
         'hostname': socket.gethostname(),
         'realm_active': any(_service_is_active(name) for name in REALM_SERVICE_NAMES),
+        'push_report': {
+            'enabled': bool(PANEL_URL and AGENT_ID > 0),
+            'panel_url': PANEL_URL or None,
+            'agent_id': AGENT_ID or None,
+            'interval_s': HEARTBEAT_INTERVAL,
+            'ack_version': _read_int(ACK_VER_FILE, 0),
+        },
     }
 
 
@@ -884,15 +1097,16 @@ def api_apply(_: None = Depends(_api_key_required)) -> Dict[str, Any]:
     return {'ok': True}
 
 
-@app.get('/api/v1/stats')
-def api_stats(_: None = Depends(_api_key_required)) -> Dict[str, Any]:
+def _build_stats_snapshot() -> Dict[str, Any]:
     """规则统计 + 连通探测。
 
-    旧版本逐条、逐目标串行探测，规则多时很容易让面板的 /stats 调用超时，从而表现为
-    “连通检测不起作用”。这里改成：
+    旧版本逐条、逐目标串行探测，规则多时很容易让面板的 /stats 调用超时。
+    这里做了：
     - 全部目标并发探测
     - 短缓存复用探测结果
     - WSS 规则补充探测 WSS Host（显示真实外层延迟）
+
+    NOTE: 该函数同时被 /api/v1/stats 与面板 push-report 复用。
     """
     full = _load_full_pool()
     eps = full.get('endpoints') or []
@@ -1043,3 +1257,8 @@ def api_stats(_: None = Depends(_api_key_required)) -> Dict[str, Any]:
     if ss_err:
         resp['warning'] = ss_err
     return resp
+
+
+@app.get('/api/v1/stats')
+def api_stats(_: None = Depends(_api_key_required)) -> Dict[str, Any]:
+    return _build_stats_snapshot()

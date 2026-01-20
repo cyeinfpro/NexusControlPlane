@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="v33"
+VERSION="v34"
 REPO_ZIP_URL_DEFAULT="https://github.com/cyeinfpro/Realm/archive/refs/heads/main.zip"
 DEFAULT_MODE="1"
 DEFAULT_PORT="18700"
@@ -254,6 +254,17 @@ atomic_update_agent(){
     cp -a "${stage}/agent/pool_to_run.jq" /etc/realm/pool_to_run.jq
   fi
 
+  # Push-report 配置（Agent -> Panel）
+  # 通过面板一键安装时，会注入这些环境变量；这里持久化到文件供 systemd 读取。
+  mkdir -p /etc/realm-agent
+  if [[ -n "${REALM_PANEL_URL:-}" && -n "${REALM_AGENT_ID:-}" ]]; then
+    cat > /etc/realm-agent/panel.env <<EOF
+REALM_PANEL_URL=${REALM_PANEL_URL}
+REALM_AGENT_ID=${REALM_AGENT_ID}
+REALM_AGENT_HEARTBEAT_INTERVAL=${REALM_AGENT_HEARTBEAT_INTERVAL:-3}
+EOF
+  fi
+
   info "写入/更新 systemd 服务..."
   cat > /etc/systemd/system/realm-agent.service <<EOF
 [Unit]
@@ -263,6 +274,7 @@ After=network.target
 [Service]
 Type=simple
 WorkingDirectory=${base}/agent
+EnvironmentFile=-/etc/realm-agent/panel.env
 # ⚠️ 不要直接 ExecStart=.../uvicorn：因为本脚本使用 staging venv 再切换，
 #    uvicorn 入口脚本的 shebang 可能指向 staging 路径，导致 systemd 报 203/EXEC。
 # ✅ 使用 python -m uvicorn 永远可用（只要 venv 的 python 存在）

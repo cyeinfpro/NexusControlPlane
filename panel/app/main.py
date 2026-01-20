@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import secrets
+from datetime import datetime
 from urllib.parse import urlparse
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -14,7 +15,17 @@ from fastapi.templating import Jinja2Templates
 from starlette.middleware.sessions import SessionMiddleware
 
 from .auth import ensure_secret_key, load_credentials, save_credentials, verify_login
-from .db import add_node, delete_node, ensure_db, get_node, list_nodes
+from .db import (
+    add_node,
+    delete_node,
+    ensure_db,
+    get_node,
+    get_desired_pool,
+    get_last_report,
+    list_nodes,
+    set_desired_pool,
+    update_node_report,
+)
 from .agents import agent_get, agent_post, agent_ping
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -35,6 +46,17 @@ templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
 
 # DB init
 ensure_db()
+
+
+def _is_report_fresh(node: Dict[str, Any], max_age_sec: int = 15) -> bool:
+    ts = node.get("last_seen_at")
+    if not ts:
+        return False
+    try:
+        dt = datetime.strptime(str(ts), "%Y-%m-%d %H:%M:%S")
+        return (datetime.now() - dt).total_seconds() <= max_age_sec
+    except Exception:
+        return False
 
 
 def _flash(request: Request) -> Optional[str]:
@@ -300,6 +322,14 @@ async def node_detail(request: Request, node_id: int, user: str = Depends(requir
         f"REALM_AGENT_MODE=1 REALM_AGENT_PORT={agent_port} REALM_AGENT_ASSUME_YES=1 bash"
         "\""
     )
+    # Agent push-report mode (agent -> panel)
+    # - REALM_PANEL_URL: panel base url
+    # - REALM_AGENT_ID:  node id in panel DB
+    # - REALM_AGENT_HEARTBEAT_INTERVAL: default 3s
+    install_cmd = install_cmd.replace(
+        " REALM_AGENT_ASSUME_YES=1 bash\"",
+        f" REALM_AGENT_ASSUME_YES=1 REALM_PANEL_URL={base_url} REALM_AGENT_ID={node_id} REALM_AGENT_HEARTBEAT_INTERVAL=3 bash\"",
+    )
     uninstall_cmd = (
         "sudo -E bash -c \""
         "systemctl disable --now realm-agent.service realm-agent-https.service realm.service realm "
@@ -326,6 +356,70 @@ async def node_detail(request: Request, node_id: int, user: str = Depends(requir
     )
 
 
+# ------------------------ Agent push-report API (no login) ------------------------
+
+
+@app.post("/api/agent/report")
+async def api_agent_report(request: Request, payload: Dict[str, Any]):
+    """Agent主动上报接口。
+
+    认证：HTTP Header `X-API-Key: <node.api_key>`。
+    载荷：至少包含 node_id 字段。
+
+    返回：commands（例如同步规则池）。
+    """
+
+    api_key = (request.headers.get("x-api-key") or request.headers.get("X-API-Key") or "").strip()
+    node_id_raw = payload.get("node_id")
+    try:
+        node_id = int(node_id_raw)
+    except Exception:
+        return JSONResponse({"ok": False, "error": "invalid node_id"}, status_code=400)
+
+    node = get_node(node_id)
+    if not node:
+        return JSONResponse({"ok": False, "error": "node not found"}, status_code=404)
+    if not api_key or api_key != node.get("api_key"):
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=403)
+
+    # report_json：尽量只保存 report 字段（更干净），但也兼容直接上报全量
+    report = payload.get("report") if isinstance(payload, dict) else None
+    if report is None:
+        report = payload
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    ack_version = payload.get("ack_version")
+    try:
+        update_node_report(
+            node_id=node_id,
+            report_json=json.dumps(report, ensure_ascii=False),
+            last_seen_at=now,
+            agent_ack_version=int(ack_version) if ack_version is not None else None,
+        )
+    except Exception:
+        # 不要让写库失败影响 agent
+        pass
+
+    # 若面板尚无 desired_pool，则尝试把 agent 当前 pool 作为初始 desired_pool
+    desired_ver, desired_pool = get_desired_pool(node_id)
+    if desired_pool is None:
+        rep_pool = None
+        if isinstance(report, dict):
+            rep_pool = report.get("pool")
+        if isinstance(rep_pool, dict):
+            desired_ver, desired_pool = set_desired_pool(node_id, rep_pool)
+
+    # 下发命令：规则池同步
+    cmds: list[dict[str, Any]] = []
+    try:
+        agent_ack = int(ack_version) if ack_version is not None else 0
+    except Exception:
+        agent_ack = 0
+    if isinstance(desired_pool, dict) and desired_ver > agent_ack:
+        cmds.append({"type": "sync_pool", "version": desired_ver, "pool": desired_pool, "apply": True})
+
+    return {"ok": True, "server_time": now, "desired_version": desired_ver, "commands": cmds}
+
+
 # ------------------------ API (needs login) ------------------------
 
 @app.get("/api/nodes/{node_id}/ping")
@@ -333,6 +427,19 @@ async def api_ping(request: Request, node_id: int, user: str = Depends(require_l
     node = get_node(node_id)
     if not node:
         return JSONResponse({"ok": False, "error": "node not found"}, status_code=404)
+
+    # Push-report mode: agent has reported recently -> online (no need panel->agent reachability)
+    if _is_report_fresh(node):
+        rep = get_last_report(node_id)
+        info = rep.get("info") if isinstance(rep, dict) else None
+        # keep兼容旧前端：ping 只关心 ok + latency_ms
+        return {
+            "ok": True,
+            "source": "report",
+            "last_seen_at": node.get("last_seen_at"),
+            "info": info,
+        }
+
     info = await agent_ping(node["base_url"], node["api_key"], _node_verify_tls(node))
     if not info.get("ok"):
         return {"ok": False, "error": info.get("error", "offline")}
@@ -344,6 +451,16 @@ async def api_pool_get(request: Request, node_id: int, user: str = Depends(requi
     node = get_node(node_id)
     if not node:
         return JSONResponse({"ok": False, "error": "node not found"}, status_code=404)
+
+    # Push-report mode: prefer desired pool stored on panel
+    desired_ver, desired_pool = get_desired_pool(node_id)
+    if isinstance(desired_pool, dict):
+        return {"ok": True, "pool": desired_pool, "desired_version": desired_ver, "source": "panel_desired"}
+
+    # If no desired pool, try last report snapshot
+    rep = get_last_report(node_id)
+    if isinstance(rep, dict) and isinstance(rep.get("pool"), dict):
+        return {"ok": True, "pool": rep.get("pool"), "source": "report_cache"}
     try:
         data = await agent_get(node["base_url"], node["api_key"], "/api/v1/pool", _node_verify_tls(node))
         return data
@@ -356,10 +473,19 @@ async def api_backup(request: Request, node_id: int, user: str = Depends(require
     node = get_node(node_id)
     if not node:
         return JSONResponse({"ok": False, "error": "node not found"}, status_code=404)
-    try:
-        data = await agent_get(node["base_url"], node["api_key"], "/api/v1/pool", _node_verify_tls(node))
-    except Exception as exc:
-        return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
+    # Prefer panel-desired pool (push mode), then cached report, then pull from agent
+    desired_ver, desired_pool = get_desired_pool(node_id)
+    if isinstance(desired_pool, dict):
+        data = {"ok": True, "pool": desired_pool, "desired_version": desired_ver, "source": "panel_desired"}
+    else:
+        rep = get_last_report(node_id)
+        if isinstance(rep, dict) and isinstance(rep.get("pool"), dict):
+            data = {"ok": True, "pool": rep.get("pool"), "source": "report_cache"}
+        else:
+            try:
+                data = await agent_get(node["base_url"], node["api_key"], "/api/v1/pool", _node_verify_tls(node))
+            except Exception as exc:
+                return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
     filename = f"realm-rules-node-{node_id}.json"
     payload = json.dumps(data, ensure_ascii=False, indent=2)
     headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
@@ -386,6 +512,8 @@ async def api_restore(
         pool = payload
     if not isinstance(pool, dict):
         return JSONResponse({"ok": False, "error": "backup missing pool data"}, status_code=400)
+    # Store on panel and attempt immediate apply if agent reachable.
+    desired_ver, _ = set_desired_pool(node_id, pool)
     try:
         data = await agent_post(
             node["base_url"],
@@ -394,23 +522,11 @@ async def api_restore(
             {"pool": pool},
             _node_verify_tls(node),
         )
-        if not data.get("ok", True):
-            return JSONResponse({"ok": False, "error": data.get("error", "agent pool apply failed")}, status_code=502)
-        apply_data = await agent_post(
-            node["base_url"],
-            node["api_key"],
-            "/api/v1/apply",
-            {},
-            _node_verify_tls(node),
-        )
-        if not apply_data.get("ok", True):
-            return JSONResponse(
-                {"ok": False, "error": apply_data.get("error", "agent apply failed")},
-                status_code=502,
-            )
-        return {"ok": True}
-    except Exception as exc:
-        return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
+        if data.get("ok", True):
+            await agent_post(node["base_url"], node["api_key"], "/api/v1/apply", {}, _node_verify_tls(node))
+        return {"ok": True, "desired_version": desired_ver, "queued": True}
+    except Exception:
+        return {"ok": True, "desired_version": desired_ver, "queued": True}
 
 
 @app.post("/api/nodes/{node_id}/pool")
@@ -418,38 +534,26 @@ async def api_pool_set(request: Request, node_id: int, payload: Dict[str, Any], 
     node = get_node(node_id)
     if not node:
         return JSONResponse({"ok": False, "error": "node not found"}, status_code=404)
-    apply_data: Dict[str, Any] = {}
+    pool = payload.get("pool") if isinstance(payload, dict) else None
+    if pool is None and isinstance(payload, dict):
+        # some callers may post the pool dict directly
+        pool = payload
+    if not isinstance(pool, dict):
+        return JSONResponse({"ok": False, "error": "missing pool"}, status_code=400)
+
+    # Store desired pool on panel. Agent will pull it on next report.
+    desired_ver, _ = set_desired_pool(node_id, pool)
+
+    # Best-effort immediate apply if panel can still reach agent
     try:
-        data = await agent_post(
-            node["base_url"],
-            node["api_key"],
-            "/api/v1/pool",
-            payload,
-            _node_verify_tls(node),
-        )
-        if not data.get("ok", True):
-            return JSONResponse({"ok": False, "error": data.get("error", "agent pool apply failed")}, status_code=502)
-        apply_data = await agent_post(
-            node["base_url"],
-            node["api_key"],
-            "/api/v1/apply",
-            {},
-            _node_verify_tls(node),
-        )
-        if not apply_data.get("ok", True):
-            return JSONResponse(
-                {"ok": False, "error": apply_data.get("error", "agent apply failed")},
-                status_code=502,
-            )
-        pool_data = await agent_get(
-            node["base_url"],
-            node["api_key"],
-            "/api/v1/pool",
-            _node_verify_tls(node),
-        )
-        return pool_data
-    except Exception as exc:
-        return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
+        data = await agent_post(node["base_url"], node["api_key"], "/api/v1/pool", {"pool": pool}, _node_verify_tls(node))
+        if data.get("ok", True):
+            await agent_post(node["base_url"], node["api_key"], "/api/v1/apply", {}, _node_verify_tls(node))
+            return {"ok": True, "pool": pool, "desired_version": desired_ver, "applied": True}
+    except Exception:
+        pass
+
+    return {"ok": True, "pool": pool, "desired_version": desired_ver, "queued": True, "note": "waiting agent report"}
 
 
 @app.post("/api/nodes/{node_id}/apply")
@@ -468,8 +572,13 @@ async def api_apply(request: Request, node_id: int, user: str = Depends(require_
         if not data.get("ok", True):
             return JSONResponse({"ok": False, "error": data.get("error", "agent apply failed")}, status_code=502)
         return data
-    except Exception as exc:
-        return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
+    except Exception:
+        # Push-report fallback: bump desired version to trigger a re-sync/apply on agent
+        desired_ver, desired_pool = get_desired_pool(node_id)
+        if isinstance(desired_pool, dict):
+            new_ver, _ = set_desired_pool(node_id, desired_pool)
+            return {"ok": True, "queued": True, "desired_version": new_ver}
+        return {"ok": False, "error": "agent unreachable and no desired pool found"}
 
 
 @app.get("/api/nodes/{node_id}/stats")
@@ -477,6 +586,14 @@ async def api_stats(request: Request, node_id: int, user: str = Depends(require_
     node = get_node(node_id)
     if not node:
         return JSONResponse({"ok": False, "error": "node not found"}, status_code=404)
+
+    # Push-report cache
+    if _is_report_fresh(node):
+        rep = get_last_report(node_id)
+        if isinstance(rep, dict) and isinstance(rep.get("stats"), dict):
+            out = rep["stats"]
+            out["source"] = "report"
+            return out
     try:
         data = await agent_get(node["base_url"], node["api_key"], "/api/v1/stats", _node_verify_tls(node))
         return data
@@ -493,12 +610,20 @@ async def api_graph(request: Request, node_id: int, user: str = Depends(require_
     node = get_node(node_id)
     if not node:
         return JSONResponse({"ok": False, "error": "node not found"}, status_code=404)
-    try:
-        data = await agent_get(node["base_url"], node["api_key"], "/api/v1/pool", _node_verify_tls(node))
-    except Exception as exc:
-        return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
+    desired_ver, desired_pool = get_desired_pool(node_id)
+    pool = desired_pool if isinstance(desired_pool, dict) else None
 
-    pool = data.get("pool") if isinstance(data, dict) else None
+    if pool is None and _is_report_fresh(node):
+        rep = get_last_report(node_id)
+        if isinstance(rep, dict) and isinstance(rep.get("pool"), dict):
+            pool = rep["pool"]
+
+    if pool is None:
+        try:
+            data = await agent_get(node["base_url"], node["api_key"], "/api/v1/pool", _node_verify_tls(node))
+            pool = data.get("pool") if isinstance(data, dict) else None
+        except Exception as exc:
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
     endpoints = pool.get("endpoints", []) if isinstance(pool, dict) else []
     elements: list[dict[str, Any]] = []
     for idx, endpoint in enumerate(endpoints):
