@@ -209,10 +209,15 @@ def _traffic_bytes(port: int) -> tuple[int, int]:
 
 
 def _parse_tcping_latency(output: str) -> float | None:
-    match = re.search(r"time[=<]?\s*([0-9.]+)\s*ms", output, re.IGNORECASE)
-    if not match:
-        return None
-    return float(match.group(1))
+    patterns = [
+        r"time[=<]?\s*([0-9.]+)\s*ms",
+        r"avg\s*=?\s*([0-9.]+)\s*ms",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, output, re.IGNORECASE)
+        if match:
+            return float(match.group(1))
+    return None
 
 
 def _tcp_probe(host: str, port: int, timeout: float = 0.8) -> tuple[bool, float | None]:
@@ -240,6 +245,8 @@ def _tcp_probe(host: str, port: int, timeout: float = 0.8) -> tuple[bool, float 
         latency = _parse_tcping_latency(output)
         if latency is not None:
             return True, round(latency, 2)
+        if result.returncode == 0:
+            return True, None
         return False, None
     start = time.monotonic()
     try:
