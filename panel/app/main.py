@@ -481,7 +481,11 @@ async def api_stats(request: Request, node_id: int, user: str = Depends(require_
         data = await agent_get(node["base_url"], node["api_key"], "/api/v1/stats", _node_verify_tls(node))
         return data
     except Exception as exc:
-        return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
+        # 注意：这里不要返回 502。
+        # 1) 浏览器端 fetch 会把非 2xx 视为失败，导致只能显示“HTTP 502”这类笼统信息；
+        # 2) 部分反代会把 502 的 body 替换为空/HTML，进一步丢失真实原因。
+        # 因此用 200 + ok=false 的方式，把失败原因稳定传给前端。
+        return {"ok": False, "error": str(exc), "rules": []}
 
 
 @app.get("/api/nodes/{node_id}/graph")

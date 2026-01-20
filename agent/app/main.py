@@ -161,68 +161,159 @@ def _parse_listen_port(listen: str) -> int:
     return int(listen.rsplit(':', 1)[-1])
 
 
-def _conn_count(port: int) -> int:
-    if port <= 0:
-        return 0
-    if not shutil.which('ss'):
-        return 0
-    # 只统计 TCP established（足够用了）
-    cmd = ['bash', '-lc', f"ss -Htan state established sport = :{port} 2>/dev/null | wc -l"]
-    r = subprocess.run(cmd, capture_output=True, text=True)
-    if r.returncode != 0:
+# --- 连接数与流量统计：一次 ss 扫描，避免每条规则都跑 ss 导致偶发超时 ---
+# 现象：规则多/连接多时，/api/v1/stats 会触发大量 subprocess.run(ss...)，
+# 可能短时间卡住，面板侧会表现为“HTTP 502 / 检测失败”。
+# 方案：
+# 1) 每次 stats 只扫描一次 `ss -Htin state established`，并按端口聚合；
+# 2) 增量累计 bytes，保证总流量可持续增长；
+# 3) 给 ss 加 timeout + 短缓存，确保接口稳定快速返回。
+
+_SS_CACHE_LOCK = threading.Lock()
+_SS_CACHE_TS = 0.0
+_SS_CACHE_DATA: Dict[int, Dict[str, int]] = {}
+_SS_CACHE_ERR: str | None = None
+SS_CACHE_TTL = float(os.environ.get('REALM_SS_CACHE_TTL', '0.6'))
+SS_RUN_TIMEOUT = float(os.environ.get('REALM_SS_TIMEOUT', '1.0'))
+
+
+def _addr_to_port(addr: str) -> int:
+    """从 ss 输出的地址字段解析端口。支持：
+    - 1.2.3.4:443
+    - [::1]:443
+    - *:443
+    """
+    if not addr:
         return 0
     try:
-        return int(r.stdout.strip())
+        if addr.startswith('[') and ']' in addr:
+            # [::1]:443
+            return int(addr.split(']:')[-1])
+        return int(addr.rsplit(':', 1)[-1])
     except Exception:
         return 0
 
 
-def _traffic_bytes(port: int) -> tuple[int, int]:
-    if port <= 0:
-        return 0, 0
+def _scan_ss_once(target_ports: set[int]) -> tuple[Dict[int, Dict[str, int]], str | None]:
+    """扫描一次 ss 并聚合为：{port: {connections, rx_bytes, tx_bytes}}。
+
+    备注：rx/tx 使用 TRAFFIC_TOTALS 做增量累计；connections 为当前 established 连接数。
+    """
+    if not target_ports:
+        return {}, None
     if not shutil.which('ss'):
-        return 0, 0
-    cmd = ['bash', '-lc', f"ss -Htin state established sport = :{port} 2>/dev/null"]
-    r = subprocess.run(cmd, capture_output=True, text=True)
+        # 没有 ss，退化为 0
+        out = {p: {'connections': 0, 'rx_bytes': 0, 'tx_bytes': 0} for p in target_ports}
+        return out, '缺少 ss 命令'
+
+    # 初始化返回数据（即使 ss 失败也能有结构）
+    result: Dict[int, Dict[str, int]] = {}
+    for p in target_ports:
+        totals = TRAFFIC_TOTALS.get(p) or {'sum_rx': 0, 'sum_tx': 0, 'conns': {}}
+        result[p] = {
+            'connections': 0,
+            'rx_bytes': int(totals.get('sum_rx') or 0),
+            'tx_bytes': int(totals.get('sum_tx') or 0),
+        }
+
+    cmd = ['bash', '-lc', 'ss -Htin state established 2>/dev/null']
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=SS_RUN_TIMEOUT)
+    except Exception as exc:
+        return result, f'ss 执行失败: {exc}'
+
     if r.returncode != 0:
-        return 0, 0
-    totals = TRAFFIC_TOTALS.setdefault(port, {'sum_rx': 0, 'sum_tx': 0, 'conns': {}})
-    conns: Dict[str, Dict[str, int]] = totals['conns']
-    seen = set()
-    for line in r.stdout.splitlines():
+        return result, 'ss 返回非 0'
+
+    # 记录本次仍存活的连接 key，用于清理已断开的连接
+    seen_by_port: Dict[int, set[str]] = {p: set() for p in target_ports}
+
+    for line in (r.stdout or '').splitlines():
         parts = line.split()
         if len(parts) < 5:
             continue
         local = parts[3]
         peer = parts[4]
+        port = _addr_to_port(local)
+        if port not in target_ports:
+            continue
+
+        # 当前连接数
+        result[port]['connections'] += 1
+
+        # 增量累计流量
         key = f"{local}->{peer}"
-        seen.add(key)
+        seen_by_port[port].add(key)
+
         rx_matches = re.findall(r"bytes_received:(\d+)", line)
         tx_matches = re.findall(r"bytes_acked:(\d+)", line)
         if not tx_matches:
             tx_matches = re.findall(r"bytes_sent:(\d+)", line)
         rx_value = int(rx_matches[-1]) if rx_matches else 0
         tx_value = int(tx_matches[-1]) if tx_matches else 0
+
+        totals = TRAFFIC_TOTALS.setdefault(port, {'sum_rx': 0, 'sum_tx': 0, 'conns': {}})
+        conns: Dict[str, Dict[str, int]] = totals['conns']
         last = conns.get(key)
         if last is None:
             totals['sum_rx'] += rx_value
             totals['sum_tx'] += tx_value
             conns[key] = {'last_rx': rx_value, 'last_tx': tx_value}
         else:
-            if rx_value >= last['last_rx']:
-                totals['sum_rx'] += rx_value - last['last_rx']
-            else:
-                totals['sum_rx'] += rx_value
-            if tx_value >= last['last_tx']:
-                totals['sum_tx'] += tx_value - last['last_tx']
-            else:
-                totals['sum_tx'] += tx_value
+            totals['sum_rx'] += rx_value - last['last_rx'] if rx_value >= last['last_rx'] else rx_value
+            totals['sum_tx'] += tx_value - last['last_tx'] if tx_value >= last['last_tx'] else tx_value
             last['last_rx'] = rx_value
             last['last_tx'] = tx_value
-    for key in list(conns.keys()):
-        if key not in seen:
-            del conns[key]
-    return totals['sum_rx'], totals['sum_tx']
+
+    # 清理断开的连接，避免 conns 膨胀
+    for p, seen in seen_by_port.items():
+        totals = TRAFFIC_TOTALS.get(p)
+        if not totals:
+            continue
+        conns = totals.get('conns') or {}
+        for k in list(conns.keys()):
+            if k not in seen:
+                del conns[k]
+
+        # 回写累计值到 result
+        result[p]['rx_bytes'] = int(totals.get('sum_rx') or 0)
+        result[p]['tx_bytes'] = int(totals.get('sum_tx') or 0)
+
+    return result, None
+
+
+def _collect_conn_traffic(target_ports: set[int]) -> tuple[Dict[int, Dict[str, int]], str | None]:
+    """带短缓存的 ss 聚合结果。"""
+    global _SS_CACHE_TS, _SS_CACHE_DATA, _SS_CACHE_ERR
+    now = time.monotonic()
+    with _SS_CACHE_LOCK:
+        if _SS_CACHE_DATA and (now - _SS_CACHE_TS) <= SS_CACHE_TTL:
+            # 直接复用缓存（并按需过滤端口）
+            filtered = {p: _SS_CACHE_DATA.get(p, {'connections': 0, 'rx_bytes': 0, 'tx_bytes': 0}) for p in target_ports}
+            return filtered, _SS_CACHE_ERR
+
+        data, err = _scan_ss_once(target_ports)
+        _SS_CACHE_TS = now
+        _SS_CACHE_DATA = data
+        _SS_CACHE_ERR = err
+        return data, err
+
+
+def _conn_count(port: int) -> int:
+    """兼容旧调用：优先使用缓存的 ss 聚合结果。"""
+    if port <= 0:
+        return 0
+    data, _ = _collect_conn_traffic({port})
+    return int((data.get(port) or {}).get('connections') or 0)
+
+
+def _traffic_bytes(port: int) -> tuple[int, int]:
+    """兼容旧调用：优先使用缓存的 ss 聚合结果。"""
+    if port <= 0:
+        return 0, 0
+    data, _ = _collect_conn_traffic({port})
+    d = data.get(port) or {}
+    return int(d.get('rx_bytes') or 0), int(d.get('tx_bytes') or 0)
 
 
 def _parse_tcping_latency(output: str) -> float | None:
@@ -587,6 +678,19 @@ def api_stats(_: None = Depends(_api_key_required)) -> Dict[str, Any]:
                 except Exception as exc:
                     probe_results[key] = {'ok': None, 'message': f'探测异常: {exc}'}
 
+    # 连接数/流量：一次性聚合（避免每条规则重复调用 ss）
+    listen_ports: set[int] = set()
+    for e in eps:
+        listen = (e.get('listen') or '').strip()
+        try:
+            p = _parse_listen_port(listen)
+        except Exception:
+            p = 0
+        if p > 0:
+            listen_ports.add(p)
+
+    conn_traffic_map, ss_err = _collect_conn_traffic(listen_ports)
+
     # 组装规则统计
     rules: List[Dict[str, Any]] = []
     for idx, e in enumerate(eps):
@@ -596,7 +700,9 @@ def api_stats(_: None = Depends(_api_key_required)) -> Dict[str, Any]:
         except Exception:
             port = 0
 
-        rx_bytes, tx_bytes = _traffic_bytes(port)
+        ct = conn_traffic_map.get(port) or {'connections': 0, 'rx_bytes': 0, 'tx_bytes': 0}
+        rx_bytes = int(ct.get('rx_bytes') or 0)
+        tx_bytes = int(ct.get('tx_bytes') or 0)
 
         health: List[Dict[str, Any]] = []
         entries = per_rule_entries[idx] if idx < len(per_rule_entries) else []
@@ -635,10 +741,13 @@ def api_stats(_: None = Depends(_api_key_required)) -> Dict[str, Any]:
             'idx': idx,
             'listen': listen,
             'disabled': bool(e.get('disabled')),
-            'connections': _conn_count(port),
+            'connections': int(ct.get('connections') or 0),
             'rx_bytes': rx_bytes,
             'tx_bytes': tx_bytes,
             'health': health,
         })
 
-    return {'ok': True, 'rules': rules}
+    resp: Dict[str, Any] = {'ok': True, 'rules': rules}
+    if ss_err:
+        resp['warning'] = ss_err
+    return resp
