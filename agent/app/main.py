@@ -6,6 +6,9 @@ import shutil
 import socket
 import subprocess
 import time
+import os
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List
@@ -22,6 +25,19 @@ FALLBACK_RUN_FILTER = Path(__file__).resolve().parents[1] / 'pool_to_run.jq'
 REALM_CONFIG = Path(CFG.realm_config_file)
 TRAFFIC_TOTALS: Dict[int, Dict[str, Any]] = {}
 TCPING_TIMEOUT = 2.0
+
+# 规则连通探测（面板「连通检测」）
+# 目标：
+# 1) 永远返回可渲染的数据（不因为探测阻塞导致 /stats 超时）
+# 2) 返回稳定的延迟（ms），优先使用 socket 直连测量
+# 3) 支持并发探测 + 短缓存，避免规则多时整页卡死
+PROBE_CACHE_TTL = float(os.getenv('REALM_AGENT_PROBE_TTL', '5'))  # seconds
+PROBE_TIMEOUT = float(os.getenv('REALM_AGENT_PROBE_TIMEOUT', '0.65'))  # per attempt
+PROBE_RETRIES = int(os.getenv('REALM_AGENT_PROBE_RETRIES', '2'))
+PROBE_MAX_WORKERS = int(os.getenv('REALM_AGENT_PROBE_WORKERS', '32'))
+
+_PROBE_CACHE: Dict[str, Dict[str, Any]] = {}
+_PROBE_LOCK = threading.Lock()
 
 
 def _read_text(p: Path) -> str:
@@ -231,39 +247,90 @@ def _parse_tcping_result(output: str, returncode: int) -> tuple[bool, float | No
     return False, None
 
 
-def _tcp_probe(host: str, port: int, timeout: float = 0.8) -> tuple[bool, float | None]:
-    tcping = shutil.which("tcping")
-    if tcping:
-        cmd = [
-            tcping,
-            "-c",
-            "1",
-            "-t",
-            str(int(TCPING_TIMEOUT)),
-            host,
-            str(port),
-        ]
-        try:
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=TCPING_TIMEOUT + 1,
-            )
-        except Exception:
-            return False, None
-        output = (result.stdout or "") + (result.stderr or "")
-        ok, latency = _parse_tcping_result(output, result.returncode)
-        if ok:
-            return True, round(latency, 2) if latency is not None else None
-        # tcping output is unreliable on some distros, fall back to socket probe
+def _probe_cache_key(host: str, port: int) -> str:
+    # host 可能是域名 / IPv4 / IPv6(不带[])
+    return f"{host}:{port}"
+
+
+def _cache_get(key: str) -> Dict[str, Any] | None:
+    now = time.monotonic()
+    with _PROBE_LOCK:
+        item = _PROBE_CACHE.get(key)
+        if not item:
+            return None
+        if now - float(item.get('ts', 0)) > PROBE_CACHE_TTL:
+            _PROBE_CACHE.pop(key, None)
+            return None
+        return dict(item)
+
+
+def _cache_set(key: str, ok: bool, latency_ms: float | None, error: str | None = None) -> None:
+    with _PROBE_LOCK:
+        _PROBE_CACHE[key] = {
+            'ts': time.monotonic(),
+            'ok': bool(ok),
+            'latency_ms': latency_ms,
+            'error': error,
+        }
+
+
+def _tcp_probe_uncached(host: str, port: int, timeout: float = PROBE_TIMEOUT) -> tuple[bool, float | None, str | None]:
+    """尽可能稳定的 TCP 探测：
+
+    - 优先用 socket 直连测延迟（ms），更稳定
+    - tcping 若存在仅作为补充（有些系统输出不稳定）
+    """
+    # 先尝试 socket（最快、最稳定）
     start = time.monotonic()
     try:
         with socket.create_connection((host, port), timeout=timeout):
             latency_ms = (time.monotonic() - start) * 1000
-            return True, round(latency_ms, 2)
-    except Exception:
-        return False, None
+            return True, round(latency_ms, 2), None
+    except Exception as exc:
+        sock_err = str(exc)
+
+    # 再尝试 tcping（如果安装了），有时能在某些网络下更快给出“open/connected”
+    tcping = shutil.which('tcping')
+    if not tcping:
+        return False, None, sock_err
+    cmd = [tcping, '-c', '1', '-t', str(max(1, int(TCPING_TIMEOUT))), host, str(port)]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=TCPING_TIMEOUT + 1)
+    except Exception as exc:
+        return False, None, sock_err or str(exc)
+    output = (result.stdout or '') + (result.stderr or '')
+    ok, latency = _parse_tcping_result(output, result.returncode)
+    if ok:
+        return True, round(latency, 2) if latency is not None else None, None
+    return False, None, sock_err
+
+
+def _tcp_probe(host: str, port: int, timeout: float = PROBE_TIMEOUT) -> tuple[bool, float | None]:
+    """带短缓存 + 重试的 TCP 探测。
+
+    这个函数 **绝不抛异常**，确保 /api/v1/stats 不会因为探测报错或阻塞而失败。
+    """
+    key = _probe_cache_key(host, port)
+    cached = _cache_get(key)
+    if cached is not None:
+        return bool(cached.get('ok')), cached.get('latency_ms')
+
+    last_err: str | None = None
+    best_latency: float | None = None
+    for i in range(max(1, PROBE_RETRIES)):
+        per_timeout = timeout if i == 0 else min(timeout * 1.4, 1.2)
+        ok, latency_ms, err = _tcp_probe_uncached(host, port, per_timeout)
+        if ok:
+            if latency_ms is not None:
+                best_latency = latency_ms if best_latency is None else min(best_latency, latency_ms)
+            else:
+                best_latency = best_latency if best_latency is not None else None
+            _cache_set(key, True, best_latency, None)
+            return True, best_latency
+        last_err = err or last_err
+
+    _cache_set(key, False, None, last_err)
+    return False, None
 
 
 def _split_hostport(addr: str) -> tuple[str, int]:
@@ -319,6 +386,49 @@ def _build_health_entries(rule: Dict[str, Any], remotes: List[str]) -> List[Dict
             payload['latency_ms'] = latency_ms
         health.append(payload)
     return health
+
+
+_TRANSPORT_HOST_RE = re.compile(r"host=([^;]+)")
+
+
+def _parse_transport_host(transport: str) -> str | None:
+    if not transport:
+        return None
+    m = _TRANSPORT_HOST_RE.search(transport)
+    if not m:
+        return None
+    return m.group(1).strip() or None
+
+
+def _wss_probe_entries(rule: Dict[str, Any]) -> List[Dict[str, str]]:
+    """为 WSS 隧道补充探测目标。
+
+    面板常见困扰：WSS 规则的 remote 目标并不是「真正要连的公网域名/端口」，
+    导致探测永远离线。这里补一个 “WSS Host” 探测，至少能反映隧道外层是否可达。
+    """
+    ex = rule.get('extra_config') or {}
+    listen = str(rule.get('listen') or '')
+    entries: List[Dict[str, str]] = []
+
+    # remote_transport: ws;host=xxx;path=/ws;tls;...
+    remote_transport = str(rule.get('remote_transport') or ex.get('remote_transport') or '')
+    remote_ws_host = str(ex.get('remote_ws_host') or '').strip() or _parse_transport_host(remote_transport)
+    if remote_ws_host:
+        tls = bool(ex.get('remote_tls_enabled')) or ('tls' in remote_transport)
+        port = 443 if tls else 80
+        entries.append({'key': f"{remote_ws_host}:{port}", 'label': f"WSS {remote_ws_host}:{port}"})
+
+    # listen_transport: ws;...  => 探测本机 listen 端口是否在监听（避免显示空白）
+    listen_transport = str(rule.get('listen_transport') or ex.get('listen_transport') or '')
+    if ('ws' in listen_transport) or ex.get('listen_ws_host'):
+        try:
+            lp = _parse_listen_port(listen)
+        except Exception:
+            lp = 0
+        if lp > 0:
+            entries.append({'key': f"127.0.0.1:{lp}", 'label': f"LISTEN 127.0.0.1:{lp}"})
+
+    return entries
 
 
 app = FastAPI(title='Realm Agent', version='31')
@@ -382,16 +492,30 @@ def api_apply(_: None = Depends(_api_key_required)) -> Dict[str, Any]:
 
 @app.get('/api/v1/stats')
 def api_stats(_: None = Depends(_api_key_required)) -> Dict[str, Any]:
+    """规则统计 + 连通探测。
+
+    旧版本逐条、逐目标串行探测，规则多时很容易让面板的 /stats 调用超时，从而表现为
+    “连通检测不起作用”。这里改成：
+    - 全部目标并发探测
+    - 短缓存复用探测结果
+    - WSS 规则补充探测 WSS Host（显示真实外层延迟）
+    """
     full = _load_full_pool()
     eps = full.get('endpoints') or []
-    rules = []
-    for idx, e in enumerate(eps):
-        listen = (e.get('listen') or '').strip()
-        port = 0
-        try:
-            port = _parse_listen_port(listen)
-        except Exception:
-            port = 0
+
+    # 收集每条规则要渲染的 health entries（label/key），同时汇总全局需要探测的 key
+    per_rule_entries: List[List[Dict[str, str]]] = []
+    all_probe_keys: List[str] = []
+    all_probe_set: set[str] = set()
+
+    for e in eps:
+        entries: List[Dict[str, str]] = []
+        if e.get('disabled'):
+            # 规则暂停：无需探测，但仍保证面板有可渲染内容
+            entries.append({'key': '—', 'label': '—', 'message': '规则已暂停'})
+            per_rule_entries.append(entries)
+            continue
+
         remotes: List[str] = []
         if isinstance(e.get('remote'), str) and e.get('remote'):
             remotes.append(e['remote'])
@@ -399,10 +523,98 @@ def api_stats(_: None = Depends(_api_key_required)) -> Dict[str, Any]:
             remotes += [str(x) for x in e.get('remotes') if x]
         if isinstance(e.get('extra_remotes'), list):
             remotes += [str(x) for x in e.get('extra_remotes') if x]
+
+        # 去重 + 限制数量（防止规则过多时探测过载）
         seen = set()
-        remotes = [r for r in remotes if not (r in seen or seen.add(r))]
-        health = _build_health_entries(e, remotes[:8])
+        remotes = [r for r in remotes if r and not (r in seen or seen.add(r))][:8]
+
+        if not remotes:
+            entries.append({'key': '—', 'label': '—', 'message': '未配置目标'})
+        else:
+            for r in remotes:
+                entries.append({'key': r, 'label': r})
+                if r not in all_probe_set:
+                    all_probe_set.add(r)
+                    all_probe_keys.append(r)
+
+        # WSS 规则补充探测项（WSS Host / LISTEN 本地端口）
+        for extra in _wss_probe_entries(e):
+            entries.append(extra)
+            k = extra.get('key')
+            if k and k not in all_probe_set:
+                all_probe_set.add(k)
+                all_probe_keys.append(k)
+
+        per_rule_entries.append(entries)
+
+    # 并发探测所有目标（总耗时约等于最慢目标的超时）
+    probe_results: Dict[str, Dict[str, Any]] = {}
+    if all_probe_keys:
+        max_workers = max(4, min(PROBE_MAX_WORKERS, len(all_probe_keys)))
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            fut_map = {}
+            for key in all_probe_keys:
+                # key 可能是 "—" 或格式不合法，先做保护
+                try:
+                    host, port = _split_hostport(key)
+                except Exception:
+                    probe_results[key] = {'ok': None, 'message': '目标格式无效'}
+                    continue
+                fut = ex.submit(_tcp_probe, host, port, PROBE_TIMEOUT)
+                fut_map[fut] = key
+
+            for fut in as_completed(fut_map):
+                key = fut_map[fut]
+                try:
+                    ok, latency_ms = fut.result(timeout=PROBE_TIMEOUT * max(1, PROBE_RETRIES) + 0.5)
+                    payload: Dict[str, Any] = {'ok': bool(ok)}
+                    if latency_ms is not None:
+                        payload['latency_ms'] = latency_ms
+                    probe_results[key] = payload
+                except Exception as exc:
+                    probe_results[key] = {'ok': None, 'message': f'探测异常: {exc}'}
+
+    # 组装规则统计
+    rules: List[Dict[str, Any]] = []
+    for idx, e in enumerate(eps):
+        listen = (e.get('listen') or '').strip()
+        try:
+            port = _parse_listen_port(listen)
+        except Exception:
+            port = 0
+
         rx_bytes, tx_bytes = _traffic_bytes(port)
+
+        health: List[Dict[str, Any]] = []
+        entries = per_rule_entries[idx] if idx < len(per_rule_entries) else []
+        protocol = str(e.get('protocol') or 'tcp+udp').lower()
+        tcp_probe_enabled = ('tcp' in protocol) and (not bool(e.get('disabled')))
+
+        for it in entries:
+            label = it.get('label', '—')
+            key = it.get('key', label)
+            # 特殊占位项（暂停 / 无目标等）
+            if it.get('message'):
+                health.append({'target': label, 'ok': None, 'message': it['message']})
+                continue
+
+            if not tcp_probe_enabled:
+                # UDP-only 或其他协议，不做 TCP 探测
+                health.append({'target': label, 'ok': None, 'message': '协议不支持探测'})
+                continue
+
+            res = probe_results.get(key)
+            if not res:
+                health.append({'target': label, 'ok': None, 'message': '暂无检测数据'})
+                continue
+            if res.get('ok') is None:
+                health.append({'target': label, 'ok': None, 'message': res.get('message', '不可检测')})
+                continue
+            payload: Dict[str, Any] = {'target': label, 'ok': bool(res.get('ok'))}
+            if res.get('latency_ms') is not None:
+                payload['latency_ms'] = res.get('latency_ms')
+            health.append(payload)
+
         rules.append({
             'idx': idx,
             'listen': listen,
@@ -412,4 +624,5 @@ def api_stats(_: None = Depends(_api_key_required)) -> Dict[str, Any]:
             'tx_bytes': tx_bytes,
             'health': health,
         })
+
     return {'ok': True, 'rules': rules}
