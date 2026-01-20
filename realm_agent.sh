@@ -21,7 +21,8 @@ need_root(){
 apt_install(){
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -y
-  apt-get install -y curl ca-certificates unzip jq python3 python3-venv python3-pip
+  # rsync 用于更稳的覆盖更新（避免部分文件未更新）
+  apt-get install -y curl ca-certificates unzip jq python3 python3-venv python3-pip rsync
 }
 
 command_exists(){
@@ -172,20 +173,113 @@ fetch_repo(){
     unzip -q "${zip_path}" -d "${tmpdir}"
   else
     local url
-    if [[ "${REALM_AGENT_FORCE_UPDATE:-}" == "1" ]]; then
+    # 如果机器上已存在 Agent，则默认进入“自动更新”逻辑：
+    # - 不再询问用户 URL
+    # - 强制拉取默认 main.zip
+    # - 增加 cache bust，避免 CDN/代理缓存导致下载到旧包
+    if [[ -d /opt/realm-agent/agent || "${REALM_AGENT_FORCE_UPDATE:-}" == "1" ]]; then
       url="${REPO_ZIP_URL_DEFAULT}"
-      info "已启用强制更新，使用最新仓库包：${url}"
+      info "检测到已安装 Agent，将自动更新到最新版本：${url}"
     else
       url="${REALM_AGENT_REPO_ZIP_URL:-}"
       if [[ -z "${url}" ]]; then
         url=$(ask "仓库 ZIP 下载地址（回车=默认）: " "${REPO_ZIP_URL_DEFAULT}")
       fi
     fi
-    info "正在下载仓库..."
-    curl -fsSL "${url}" -o "${tmpdir}/repo.zip"
+
+    local bust
+    bust="ts=$(date +%s)"
+    info "正在下载仓库（强制不走缓存）..."
+    if ! curl -fsSL \
+      -H 'Cache-Control: no-cache' \
+      -H 'Pragma: no-cache' \
+      "${url}?${bust}" -o "${tmpdir}/repo.zip"; then
+      # 兜底：不带 query 重新拉一次
+      curl -fsSL "${url}" -o "${tmpdir}/repo.zip"
+    fi
     info "解压中..."
     unzip -q "${tmpdir}/repo.zip" -d "${tmpdir}"
   fi
+}
+
+stop_service_if_running(){
+  if command_exists systemctl; then
+    if systemctl is-active --quiet realm-agent.service 2>/dev/null; then
+      info "停止旧 Agent 服务..."
+      systemctl stop realm-agent.service >/dev/null 2>&1 || true
+    fi
+  fi
+}
+
+atomic_update_agent(){
+  # 将新版本先部署到 staging，成功后再整体替换，避免“更新不到位 / 半更新”
+  local src_agent_dir="$1"
+  local host="$2"
+  local port="$3"
+
+  local base="/opt/realm-agent"
+  local stage="${base}/.staging"
+  local bak="${base}/.bak.$(date +%s)"
+
+  rm -rf "${stage}" || true
+  mkdir -p "${stage}"
+
+  info "准备更新包（staging）..."
+  mkdir -p "${stage}/agent"
+  # 用 rsync 强制覆盖 + 删除旧文件，保证“全量更新到最新”
+  rsync -a --delete "${src_agent_dir%/}/" "${stage}/agent/"
+
+  info "创建虚拟环境（staging）..."
+  python3 -m venv "${stage}/venv"
+  "${stage}/venv/bin/pip" install -U pip wheel setuptools >/dev/null
+  "${stage}/venv/bin/pip" install -r "${stage}/agent/requirements.txt" >/dev/null
+
+  # 生成 API Key（持久化不变）
+  mkdir -p /etc/realm-agent
+  if [[ ! -f /etc/realm-agent/api.key ]]; then
+    head -c 32 /dev/urandom | xxd -p -c 32 > /etc/realm-agent/api.key
+  fi
+
+  # jq filter
+  mkdir -p /etc/realm
+  if [[ -f "${stage}/agent/pool_to_run.jq" ]]; then
+    cp -a "${stage}/agent/pool_to_run.jq" /etc/realm/pool_to_run.jq
+  fi
+
+  info "写入/更新 systemd 服务..."
+  cat > /etc/systemd/system/realm-agent.service <<EOF
+[Unit]
+Description=Realm Pro Agent API Service
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=${base}/agent
+ExecStart=${base}/venv/bin/uvicorn app.main:app --host ${host} --port ${port} --workers 1
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  stop_service_if_running
+
+  info "切换到最新版本（原子替换）..."
+  mkdir -p "${bak}"
+  if [[ -d "${base}/agent" ]]; then mv "${base}/agent" "${bak}/agent"; fi
+  if [[ -d "${base}/venv" ]]; then mv "${base}/venv" "${bak}/venv"; fi
+
+  mkdir -p "${base}"
+  mv "${stage}/agent" "${base}/agent"
+  mv "${stage}/venv" "${base}/venv"
+  rm -rf "${stage}" || true
+
+  # 写入标记，方便你一眼知道“是否已更新到这次执行”
+  date -u +"%Y-%m-%dT%H:%M:%SZ" > "${base}/agent/.installed_at" || true
+  echo "${VERSION}" > "${base}/agent/.installer_version" || true
+
+  restart_service realm-agent.service
 }
 
 find_agent_dir(){
@@ -285,52 +379,13 @@ main(){
   agent_dir=$(find_agent_dir "${tmpdir}")
   ok "agent 目录：${agent_dir}"
 
-  if [[ -d /opt/realm-agent/agent ]]; then
-    info "检测到已安装的 Agent，将覆盖更新文件"
-  fi
+  # ✅ 再次执行脚本时，自动全量更新到最新（无需卸载重装）
+  # - staging + 原子替换，避免“半更新/更新不到位”
+  # - 自动 cache-bust，避免下载到旧包
+  atomic_update_agent "${agent_dir}" "${host}" "${port}"
 
-  info "部署到 /opt/realm-agent ..."
-  mkdir -p /opt/realm-agent
-  rm -rf /opt/realm-agent/agent
-  cp -a "${agent_dir}" /opt/realm-agent/agent
-
-  info "创建虚拟环境..."
-  python3 -m venv /opt/realm-agent/venv
-  /opt/realm-agent/venv/bin/pip install -U pip wheel setuptools >/dev/null
-  /opt/realm-agent/venv/bin/pip install -r /opt/realm-agent/agent/requirements.txt >/dev/null
-
-  info "生成 API Key..."
-  mkdir -p /etc/realm-agent
-  if [[ ! -f /etc/realm-agent/api.key ]]; then
-    head -c 32 /dev/urandom | xxd -p -c 32 > /etc/realm-agent/api.key
-  fi
   local api_key
   api_key=$(cat /etc/realm-agent/api.key)
-
-  # jq filter
-  mkdir -p /etc/realm
-  if [[ -f /opt/realm-agent/agent/pool_to_run.jq ]]; then
-    cp -a /opt/realm-agent/agent/pool_to_run.jq /etc/realm/pool_to_run.jq
-  fi
-
-  info "创建 systemd 服务..."
-  cat > /etc/systemd/system/realm-agent.service <<EOF
-[Unit]
-Description=Realm Pro Agent API Service
-After=network.target
-
-[Service]
-Type=simple
-WorkingDirectory=/opt/realm-agent/agent
-ExecStart=/opt/realm-agent/venv/bin/uvicorn app.main:app --host ${host} --port ${port} --workers 1
-Restart=always
-RestartSec=2
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-  restart_service realm-agent.service
 
   ok "Agent 已安装并启动"
   local ipv4 ipv6
