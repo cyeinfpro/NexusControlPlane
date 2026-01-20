@@ -245,6 +245,42 @@ code{font-family:ui-monospace,Menlo,Monaco,Consolas,monospace}
     display:block;
     overflow-x:auto;
   }
+  .rules-table{
+    min-width:0;
+  }
+  .rules-table th,
+  .rules-table td{
+    padding:8px 6px;
+    font-size:12px;
+    white-space:normal;
+  }
+  .rules-table th.listen,
+  .rules-table td.listen,
+  .rules-table th.health,
+  .rules-table td.health{
+    min-width:0;
+  }
+  .rules-table th.actions,
+  .rules-table td.actions{
+    min-width:0;
+    text-align:left;
+  }
+  .rules-actions{
+    flex-wrap:wrap;
+    justify-content:flex-start;
+  }
+  .health-wrap{
+    flex-direction:column;
+    align-items:flex-start;
+  }
+  .health-item{
+    max-width:100%;
+  }
+  .health-target{
+    max-width:100%;
+    white-space:normal;
+    word-break:break-all;
+  }
   .card{
     padding:16px;
   }
