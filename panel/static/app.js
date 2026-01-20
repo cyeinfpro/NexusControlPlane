@@ -199,7 +199,9 @@ function renderRuleCard(e, idx, stats, statsError){
   const rx = statsError ? null : (stats.rx_bytes || 0);
   const tx = statsError ? null : (stats.tx_bytes || 0);
   const total = (rx == null || tx == null) ? null : rx + tx;
-  const conn = statsError ? '—' : (stats.connections ?? 0);
+  const connActive = statsError ? 0 : (stats.connections_active ?? stats.connections ?? 0);
+  const connTotal = statsError ? 0 : (stats.connections_total ?? 0);
+  const connText = statsError ? '—' : `${connActive}/${connTotal}`;
   const totalStr = total == null ? '—' : formatBytes(total);
   const healthHtml = renderHealthMobile(stats.health, statsError, idx);
   return `
@@ -214,7 +216,7 @@ function renderRuleCard(e, idx, stats, statsError){
         <div class="rule-sub muted sm">${endpointType(e)}</div>
       </div>
       <div class="rule-right">
-        <span class="pill ghost">${escapeHtml(conn)} 连接</span>
+        <span class="pill ghost">活跃/累计 ${escapeHtml(connText)}</span>
         <span class="pill ghost">${escapeHtml(totalStr)}</span>
       </div>
     </div>
@@ -273,6 +275,9 @@ function renderRules(){
       const rx = statsError ? null : (stats.rx_bytes || 0);
       const tx = statsError ? null : (stats.tx_bytes || 0);
       const total = (rx == null || tx == null) ? null : rx + tx;
+      const connActive = statsError ? 0 : (stats.connections_active ?? stats.connections ?? 0);
+      const connTotal = statsError ? 0 : (stats.connections_total ?? 0);
+      const connText = statsError ? '—' : `${connActive}/${connTotal}`;
       const tr = document.createElement('tr');
       tr.innerHTML = `
         <td>${idx+1}</td>
@@ -282,7 +287,7 @@ function renderRules(){
           <div class="muted sm">${endpointType(e)}</div>
         </td>
         <td class="health">${healthHtml}</td>
-        <td class="stat">${statsError ? '—' : (stats.connections ?? 0)}</td>
+        <td class="stat">${statsError ? '—' : escapeHtml(connText)}</td>
         <td class="stat">${total == null ? '—' : formatBytes(total)}</td>
         <td class="actions">
           <div class="rules-actions">

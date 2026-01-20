@@ -187,15 +187,12 @@ IPT_RUN_TIMEOUT = float(os.environ.get('REALM_IPT_TIMEOUT', '1.2'))
 IPT_TABLE = os.environ.get('REALM_IPT_TABLE', 'mangle')
 IPT_CHAIN_IN = os.environ.get('REALM_IPT_CHAIN_IN', 'REALMCOUNT_IN')
 IPT_CHAIN_OUT = os.environ.get('REALM_IPT_CHAIN_OUT', 'REALMCOUNT_OUT')
-
-IPT_CONN_CHAIN_IN = os.environ.get('REALM_IPT_CONN_CHAIN_IN', 'REALMCONN_IN')
-IPT_CONN_CHAIN_OUT = os.environ.get('REALM_IPT_CONN_CHAIN_OUT', 'REALMCONN_OUT')
+IPT_CHAIN_CONN_IN = os.environ.get('REALM_IPT_CHAIN_CONN_IN', 'REALMCONN_IN')
 
 _IPT_CACHE_LOCK = threading.Lock()
 _IPT_READY_TS = 0.0
+_IPT_CONN_READY_TS = 0.0
 IPT_READY_TTL = float(os.environ.get('REALM_IPT_READY_TTL', '5.0'))
-
-CONNECTIONS_DISPLAY = os.environ.get('REALM_CONNECTIONS_DISPLAY', 'auto').strip().lower()  # auto/active/total/both
 
 
 def _iptables_available() -> bool:
@@ -231,13 +228,103 @@ def _ipt_ensure_port_rule(table: str, chain: str, proto: str, flag: str, port: i
 
 
 
-def _ipt_ensure_conn_rule(table: str, chain: str, proto: str, flag: str, port: int) -> None:
-    # 规则形如：-p tcp --dport 443 -m conntrack --ctstate NEW -j RETURN
-    args = ['-t', table, '-C', chain, '-p', proto, flag, str(port), '-m', 'conntrack', '--ctstate', 'NEW', '-j', 'RETURN']
+
+def _ipt_ensure_conn_new_rule(table: str, chain: str, proto: str, port: int) -> None:
+    """Ensure a NEW-connection counter rule exists for the port.
+
+    We count *cumulative* connections by counting packets in conntrack NEW state.
+    For TCP we additionally match SYN to reduce noise.
+    """
+    base = ['-t', table, '-C', chain, '-p', proto]
+    if proto == 'tcp':
+        # SYN only + NEW state
+        args = base + ['-m', 'conntrack', '--ctstate', 'NEW', '-m', 'tcp', '--syn', '--dport', str(port), '-j', 'RETURN']
+        rc, _, _ = _run_iptables(args)
+        if rc != 0:
+            _run_iptables(['-t', table, '-A', chain, '-p', proto, '-m', 'conntrack', '--ctstate', 'NEW', '-m', 'tcp', '--syn', '--dport', str(port), '-j', 'RETURN'])
+        return
+
+    # UDP: use conntrack NEW state
+    args = base + ['-m', 'conntrack', '--ctstate', 'NEW', '--dport', str(port), '-j', 'RETURN']
     rc, _, _ = _run_iptables(args)
     if rc != 0:
-        _run_iptables(['-t', table, '-A', chain, '-p', proto, flag, str(port), '-m', 'conntrack', '--ctstate', 'NEW', '-j', 'RETURN'])
+        _run_iptables(['-t', table, '-A', chain, '-p', proto, '-m', 'conntrack', '--ctstate', 'NEW', '--dport', str(port), '-j', 'RETURN'])
 
+
+def _ensure_conn_counters(target_ports: set[int]) -> str | None:
+    """Ensure conn counter chain/rules exist.
+
+    Return None on success, otherwise a warning string.
+    """
+    if not target_ports:
+        return None
+    if TRAFFIC_COUNTER_MODE == 'off':
+        return 'traffic counter disabled'
+    if not _iptables_available():
+        return 'iptables not available'
+
+    global _IPT_CONN_READY_TS
+    with _IPT_CACHE_LOCK:
+        now = time.monotonic()
+        if (now - _IPT_CONN_READY_TS) <= IPT_READY_TTL:
+            return None
+
+        _ipt_ensure_chain(IPT_TABLE, IPT_CHAIN_CONN_IN)
+        _ipt_ensure_jump(IPT_TABLE, 'PREROUTING', IPT_CHAIN_CONN_IN)
+
+        for p in sorted(target_ports):
+            if p <= 0:
+                continue
+            for proto in ('tcp', 'udp'):
+                _ipt_ensure_conn_new_rule(IPT_TABLE, IPT_CHAIN_CONN_IN, proto, p)
+
+        _IPT_CONN_READY_TS = now
+    return None
+
+
+def _parse_iptables_chain_pkts(stdout: str, want: set[int], match_token: str) -> dict[int, int]:
+    """Parse `iptables -nvxL <CHAIN>` output and return {port: pkts}."""
+    out: dict[int, int] = {p: 0 for p in want}
+    for line in (stdout or '').splitlines():
+        s = line.strip()
+        if not s or s.startswith('Chain ') or s.startswith('pkts ') or s.startswith('num '):
+            continue
+        parts = s.split()
+        if len(parts) < 2:
+            continue
+        try:
+            pk = int(parts[0])
+        except Exception:
+            continue
+        m = re.search(rf"\b{re.escape(match_token)}(\d+)\b", s)
+        if not m:
+            continue
+        try:
+            port = int(m.group(1))
+        except Exception:
+            continue
+        if port in out:
+            out[port] += pk
+    return out
+
+
+def _read_conn_counters(target_ports: set[int]) -> tuple[dict[int, int], str | None]:
+    """Read cumulative NEW-connection counters from iptables.
+
+    Returns ({port: total_connections}, warning_or_none)
+    """
+    if not target_ports:
+        return {}, None
+    warn = _ensure_conn_counters(target_ports)
+    if warn:
+        return {p: 0 for p in target_ports}, warn
+
+    rc, out1, err1 = _run_iptables(['-t', IPT_TABLE, '-nvxL', IPT_CHAIN_CONN_IN])
+    if rc != 0:
+        return {p: 0 for p in target_ports}, (err1 or 'iptables list failed')
+
+    pkt_map = _parse_iptables_chain_pkts(out1, target_ports, 'dpt:')
+    return {p: int(pkt_map.get(p, 0)) for p in target_ports}, None
 def _ensure_traffic_counters(target_ports: set[int]) -> str | None:
     """确保计数链/规则存在。
 
@@ -257,11 +344,6 @@ def _ensure_traffic_counters(target_ports: set[int]) -> str | None:
             _ipt_ensure_chain(IPT_TABLE, IPT_CHAIN_OUT)
             _ipt_ensure_jump(IPT_TABLE, 'PREROUTING', IPT_CHAIN_IN)
             _ipt_ensure_jump(IPT_TABLE, 'OUTPUT', IPT_CHAIN_OUT)
-            # ensure conn chains (cumulative new connections)
-            _ipt_ensure_chain(IPT_TABLE, IPT_CONN_CHAIN_IN)
-            _ipt_ensure_chain(IPT_TABLE, IPT_CONN_CHAIN_OUT)
-            _ipt_ensure_jump(IPT_TABLE, 'PREROUTING', IPT_CONN_CHAIN_IN)
-            _ipt_ensure_jump(IPT_TABLE, 'OUTPUT', IPT_CONN_CHAIN_OUT)
             # 端口规则
             for p in sorted(target_ports):
                 if p <= 0:
@@ -269,8 +351,6 @@ def _ensure_traffic_counters(target_ports: set[int]) -> str | None:
                 for proto in ('tcp', 'udp'):
                     _ipt_ensure_port_rule(IPT_TABLE, IPT_CHAIN_IN, proto, '--dport', p)
                     _ipt_ensure_port_rule(IPT_TABLE, IPT_CHAIN_OUT, proto, '--sport', p)
-                    _ipt_ensure_conn_rule(IPT_TABLE, IPT_CONN_CHAIN_IN, proto, '--dport', p)
-                    _ipt_ensure_conn_rule(IPT_TABLE, IPT_CONN_CHAIN_OUT, proto, '--sport', p)
             globals()['_IPT_READY_TS'] = now
         return None
     return 'iptables not available'
@@ -305,58 +385,6 @@ def _parse_iptables_chain_bytes(stdout: str, want: set[int], match_token: str) -
             out[port] += b
     return out
 
-
-
-def _parse_iptables_chain_pkts(stdout: str, want: set[int], match_token: str) -> dict[int, int]:
-    """解析 `iptables -nvxL <CHAIN>` 输出，返回 {port: pkts}。
-
-    pkts 为累计包数。配合 conntrack NEW 规则时，pkts 可近似视为累计连接数（短连接也不会漏）。
-    """
-    out: dict[int, int] = {p: 0 for p in want}
-    for line in (stdout or '').splitlines():
-        s = line.strip()
-        if not s or s.startswith('Chain ') or s.startswith('pkts ') or s.startswith('num '):
-            continue
-        parts = s.split()
-        if len(parts) < 2:
-            continue
-        try:
-            pk = int(parts[0])
-        except Exception:
-            continue
-        m = re.search(rf"\b{re.escape(match_token)}(\d+)\b", s)
-        if not m:
-            continue
-        try:
-            port = int(m.group(1))
-        except Exception:
-            continue
-        if port in out:
-            out[port] += pk
-    return out
-
-
-
-def _read_conn_counters(target_ports: set[int]) -> tuple[dict[int, int], str | None]:
-    """读取 iptables NEW 连接计数（累计）。返回 {port: connections_total}。
-
-    说明：
-    - 通过 conntrack NEW 规则统计包数，TCP 近似等于建立连接次数（SYN）；
-    - UDP 为每个新 flow 首包；
-    - 该计数是内核累计，不会漏短连接。
-    """
-    if not target_ports:
-        return {}, None
-    warn = _ensure_traffic_counters(target_ports)
-    if warn and TRAFFIC_COUNTER_MODE == 'iptables':
-        return {p: 0 for p in target_ports}, warn
-    if warn and TRAFFIC_COUNTER_MODE in ('auto', 'ss'):
-        return {p: 0 for p in target_ports}, warn
-    rc, out, err = _run_iptables(['-t', IPT_TABLE, '-nvxL', IPT_CONN_CHAIN_IN])
-    if rc != 0:
-        return {p: 0 for p in target_ports}, (err or 'iptables list failed')
-    mp = _parse_iptables_chain_pkts(out, target_ports, 'dpt:')
-    return {p: int(mp.get(p, 0)) for p in target_ports}, None
 
 def _read_traffic_counters(target_ports: set[int]) -> tuple[dict[int, dict[str, int]], str | None]:
     """读取 iptables 计数器。返回 {port: {rx_bytes, tx_bytes}}。"""
@@ -411,7 +439,7 @@ def _scan_ss_once(target_ports: set[int]) -> tuple[Dict[int, Dict[str, int]], st
         return {}, None
     if not shutil.which('ss'):
         # 没有 ss，退化为 0
-        out = {p: {'connections': 0, 'rx_bytes': 0, 'tx_bytes': 0} for p in target_ports}
+        out = {p: {'connections': 0, 'connections_active': 0, 'connections_total': 0, 'rx_bytes': 0, 'tx_bytes': 0} for p in target_ports}
         return out, '缺少 ss 命令'
 
     # 初始化返回数据（即使 ss 失败也能有结构）
@@ -420,17 +448,11 @@ def _scan_ss_once(target_ports: set[int]) -> tuple[Dict[int, Dict[str, int]], st
         totals = TRAFFIC_TOTALS.get(p) or {'sum_rx': 0, 'sum_tx': 0, 'conns': {}}
         result[p] = {
             'connections': 0,
+            'connections_active': 0,
+            'connections_total': 0,
             'rx_bytes': int(totals.get('sum_rx') or 0),
             'tx_bytes': int(totals.get('sum_tx') or 0),
         }
-
-    # 同时读取累计连接数（基于 conntrack NEW 计数，不会漏短连接）
-    conn_map, conn_warn = _read_conn_counters(target_ports)
-    for p in target_ports:
-        try:
-            result[p]['connections_total'] = int(conn_map.get(p, 0))
-        except Exception:
-            result[p]['connections_total'] = 0
 
     # 先尝试用 iptables 读取累计流量（不会漏掉短连接）。
     # 成功时会直接覆盖 rx/tx；失败则保留 ss 增量累计（兼容旧环境）。
@@ -447,6 +469,20 @@ def _scan_ss_once(target_ports: set[int]) -> tuple[Dict[int, Dict[str, int]], st
                 if 'tx_bytes' in d:
                     result[p]['tx_bytes'] = int(d.get('tx_bytes') or 0)
 
+    
+
+    # iptables NEW-conn counters: cumulative connections since rule creation
+    if _iptables_available():
+        conn_total_map, conn_warn = _read_conn_counters(target_ports)
+        if conn_warn is None and isinstance(conn_total_map, dict):
+            for p in target_ports:
+                result[p]['connections_total'] = int(conn_total_map.get(p, 0) or 0)
+        else:
+            # keep default 0
+            pass
+        # merge warning info
+        if conn_warn and not ipt_warning:
+            ipt_warning = conn_warn
     cmd = ['bash', '-lc', 'ss -Htin state established 2>/dev/null']
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=SS_RUN_TIMEOUT)
@@ -530,28 +566,8 @@ def _scan_ss_once(target_ports: set[int]) -> tuple[Dict[int, Dict[str, int]], st
             result[p]['rx_bytes'] = int(totals.get('sum_rx') or 0)
             result[p]['tx_bytes'] = int(totals.get('sum_tx') or 0)
 
-
-    # 连接数展示策略：ss=活跃连接；iptables NEW=累计连接
     for p in target_ports:
-        active = int(result.get(p, {}).get('connections') or 0)
-        total = int(result.get(p, {}).get('connections_total') or 0)
-        # 额外返回，便于前端/排障（不影响现有字段）
-        try:
-            result[p]['connections_active'] = active
-        except Exception:
-            pass
-
-        mode = (CONNECTIONS_DISPLAY or 'auto').lower()
-        if mode == 'active':
-            result[p]['connections'] = active
-        elif mode == 'total':
-            result[p]['connections'] = total
-        elif mode == 'both':
-            # 兼容前端显示：返回字符串 '活跃/累计'
-            result[p]['connections'] = f"{active}/{total}" if total else str(active)
-        else:
-            # auto：有活跃就显示活跃，否则显示累计（避免短连接导致一直 0）
-            result[p]['connections'] = active if active > 0 else total
+        result[p]['connections_active'] = int(result[p].get('connections') or 0)
 
     return result, ipt_warning
 
@@ -563,7 +579,7 @@ def _collect_conn_traffic(target_ports: set[int]) -> tuple[Dict[int, Dict[str, i
     with _SS_CACHE_LOCK:
         if _SS_CACHE_DATA and (now - _SS_CACHE_TS) <= SS_CACHE_TTL:
             # 直接复用缓存（并按需过滤端口）
-            filtered = {p: _SS_CACHE_DATA.get(p, {'connections': 0, 'rx_bytes': 0, 'tx_bytes': 0}) for p in target_ports}
+            filtered = {p: _SS_CACHE_DATA.get(p, {'connections': 0, 'connections_active': 0, 'connections_total': 0, 'rx_bytes': 0, 'tx_bytes': 0}) for p in target_ports}
             return filtered, _SS_CACHE_ERR
 
         data, err = _scan_ss_once(target_ports)
@@ -974,7 +990,7 @@ def api_stats(_: None = Depends(_api_key_required)) -> Dict[str, Any]:
         except Exception:
             port = 0
 
-        ct = conn_traffic_map.get(port) or {'connections': 0, 'rx_bytes': 0, 'tx_bytes': 0}
+        ct = conn_traffic_map.get(port) or {'connections': 0, 'connections_active': 0, 'connections_total': 0, 'rx_bytes': 0, 'tx_bytes': 0}
         rx_bytes = int(ct.get('rx_bytes') or 0)
         tx_bytes = int(ct.get('tx_bytes') or 0)
 
@@ -1016,6 +1032,8 @@ def api_stats(_: None = Depends(_api_key_required)) -> Dict[str, Any]:
             'listen': listen,
             'disabled': bool(e.get('disabled')),
             'connections': int(ct.get('connections') or 0),
+            'connections_active': int(ct.get('connections_active') or ct.get('connections') or 0),
+            'connections_total': int(ct.get('connections_total') or 0),
             'rx_bytes': rx_bytes,
             'tx_bytes': tx_bytes,
             'health': health,
