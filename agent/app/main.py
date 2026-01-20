@@ -21,7 +21,7 @@ POOL_RUN_FILTER = Path('/etc/realm/pool_to_run.jq')
 FALLBACK_RUN_FILTER = Path(__file__).resolve().parents[1] / 'pool_to_run.jq'
 REALM_CONFIG = Path(CFG.realm_config_file)
 TRAFFIC_TOTALS: Dict[int, Dict[str, Any]] = {}
-TCPING_TIMEOUT = 2.0
+TCPING_TIMEOUT = 3.0
 
 
 def _read_text(p: Path) -> str:
@@ -209,24 +209,19 @@ def _traffic_bytes(port: int) -> tuple[int, int]:
 
 
 def _parse_tcping_latency(output: str) -> float | None:
+    matches = re.findall(r"([0-9]+(?:\.[0-9]+)?)\s*ms", output, re.IGNORECASE)
+    if matches:
+        return float(matches[-1])
     match = re.search(r"time[=<]?\s*([0-9.]+)\s*ms", output, re.IGNORECASE)
-    if not match:
-        return None
-    return float(match.group(1))
+    if match:
+        return float(match.group(1))
+    return None
 
 
-def _tcp_probe(host: str, port: int, timeout: float = 0.8) -> tuple[bool, float | None]:
+def _tcp_probe(host: str, port: int, timeout: float = 1.5) -> tuple[bool, float | None]:
     tcping = shutil.which("tcping")
     if tcping:
-        cmd = [
-            tcping,
-            "-c",
-            "1",
-            "-t",
-            str(int(TCPING_TIMEOUT)),
-            host,
-            str(port),
-        ]
+        cmd = [tcping, "-c", "1", host, str(port)]
         try:
             result = subprocess.run(
                 cmd,
@@ -240,7 +235,17 @@ def _tcp_probe(host: str, port: int, timeout: float = 0.8) -> tuple[bool, float 
         latency = _parse_tcping_latency(output)
         if latency is not None:
             return True, round(latency, 2)
-        return False, None
+        if result.returncode == 0 or re.search(r"\bopen\b", output, re.IGNORECASE):
+            return True, None
+        # tcping occasionally returns non-zero even when the port is reachable
+        # fallback to a direct socket probe for reliability.
+        try:
+            start = time.monotonic()
+            with socket.create_connection((host, port), timeout=timeout):
+                latency_ms = (time.monotonic() - start) * 1000
+                return True, round(latency_ms, 2)
+        except Exception:
+            return False, None
     start = time.monotonic()
     try:
         with socket.create_connection((host, port), timeout=timeout):
