@@ -89,7 +89,7 @@
                 <th>状态</th>
                 <th class="listen">Listen</th>
                 <th class="health">连通</th>
-                <th class="stat">活跃（30s）</th>
+                <th class="stat">活跃</th>
                 <th class="stat">流量</th>
                 <th class="actions">操作</th>
               </tr>
@@ -320,7 +320,7 @@
 {% endblock %}
 
 {% block scripts %}
-<script src="/static/app.js?v=33.2"></script>
+<script src="/static/app.js?v=33.3"></script>
 <script>
 window.__NODE_ID__ = {{ node.id }};
 window.__NODE_IP__ = {{ (node.display_ip or node.name)|tojson }};

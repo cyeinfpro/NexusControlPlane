@@ -202,7 +202,10 @@ details.menu summary::-webkit-details-marker{display:none}
 .rules-table th.listen,.rules-table td.listen{min-width:170px;white-space:normal}
 .rules-table th.health,.rules-table td.health{min-width:260px;white-space:normal}
 .rules-table th.stat,.rules-table td.stat{text-align:right;min-width:88px}
-.rules-table th.actions,.rules-table td.actions{text-align:right;min-width:140px}
+.rules-table th.actions,.rules-table td.actions{text-align:right;min-width:120px}
+
+/* Inline action buttons (no dropdown) */
+.action-inline{display:inline-flex;align-items:center;justify-content:flex-end;gap:10px}
 .rules-actions{display:flex;gap:6px;flex-wrap:nowrap;justify-content:flex-end}
 
 /* Rules: mobile cards */

@@ -383,7 +383,7 @@ function renderRuleCard(e, idx, rowNo, stats, statsError){
         <div class="rule-sub muted sm">${endpointType(e)}</div>
       </div>
       <div class="rule-right">
-        <span class="pill ghost" ${activeTitle}>活跃(30s) ${escapeHtml(connActive)}</span>
+        <span class="pill ghost" ${activeTitle}>活跃 ${escapeHtml(connActive)}</span>
         <span class="pill ghost">${escapeHtml(totalStr)}</span>
       </div>
     </div>
@@ -477,15 +477,11 @@ ${endpointType(e)}`.toLowerCase();
         <td class="stat" title="当前已建立连接：${escapeHtml(est)}">${statsError ? '—' : escapeHtml(connActive)}</td>
         <td class="stat">${total == null ? '—' : formatBytes(total)}</td>
         <td class="actions">
-          <details class="menu">
-            <summary class="btn xs icon ghost icon-btn" title="操作">⋯</summary>
-            <div class="menu-pop">
-              <button class="menu-item" type="button" onclick="editRule(${idx}); this.closest('details').removeAttribute('open');">编辑</button>
-              <button class="menu-item" type="button" onclick="toggleRule(${idx}); this.closest('details').removeAttribute('open');">${e.disabled?'启用':'暂停'}</button>
-              <div class="menu-sep"></div>
-              <button class="menu-item danger" type="button" onclick="deleteRule(${idx}); this.closest('details').removeAttribute('open');">删除</button>
-            </div>
-          </details>
+          <div class="action-inline">
+            <button class="btn xs icon ghost" title="编辑" onclick="editRule(${idx})">✎</button>
+            <button class="btn xs icon" title="${e.disabled?'启用':'暂停'}" onclick="toggleRule(${idx})">${e.disabled?'▶':'⏸'}</button>
+            <button class="btn xs icon ghost" title="删除" onclick="deleteRule(${idx})">🗑</button>
+          </div>
         </td>
       `;
       tbody.appendChild(tr);
