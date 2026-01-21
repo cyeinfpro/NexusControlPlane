@@ -364,6 +364,33 @@ function renderRules(){
 function openModal(){ q('modal').style.display = 'flex'; }
 function closeModal(){ q('modal').style.display = 'none'; q('modalMsg').textContent=''; }
 
+// Basic loading state helper (used by WSS auto-sync operations)
+// - Disable the modal save button to prevent double submit
+// - Show a short message in the modal
+function setLoading(on){
+  try{
+    const modal = q('modal');
+    if(modal){
+      const btns = modal.querySelectorAll('button');
+      btns.forEach(b=>{
+        if(b && b.textContent && b.textContent.trim() === '保存') b.disabled = !!on;
+      });
+    }
+    const msg = q('modalMsg');
+    if(msg){
+      if(on){
+        msg.textContent = '处理中…';
+      }else{
+        // keep existing msg if any
+        if(msg.textContent === '处理中…') msg.textContent = '';
+      }
+    }
+    document.body.style.cursor = on ? 'progress' : '';
+  }catch(e){
+    // ignore
+  }
+}
+
 function openCommandModal(title, text){
   const modal = q('commandModal');
   if(!modal) return;
@@ -382,30 +409,36 @@ function closeCommandModal(){
 
 function setField(id, v){ q(id).value = v==null?'':String(v); }
 
+// Read WSS params from the form.
+// IMPORTANT: This must match panel backend API expectations:
+// {host, path, sni, tls, insecure}
 function readWssFields(){
-  const mode = q('f_type').value;
-  const host = q('f_wss_host').value.trim();
-  const path = q('f_wss_path').value.trim();
-  const sni = q('f_wss_sni').value.trim();
-  const tls = q('f_wss_tls').value === '1';
-  const insecure = q('f_wss_insecure').value === '1';
+  return {
+    host: q('f_wss_host').value.trim(),
+    path: q('f_wss_path').value.trim(),
+    sni: q('f_wss_sni').value.trim(),
+    tls: q('f_wss_tls').value === '1',
+    insecure: q('f_wss_insecure').value === '1',
+  };
+}
+
+// Convert WSS params into endpoint.extra_config for single-node/manual mode
+function buildWssExtra(mode, wss){
   const ex = {};
   if(mode === 'wss_send'){
     ex.remote_transport = 'ws';
-    ex.listen_transport = 'tcp';
-    if(host) ex.remote_ws_host = host;
-    if(path) ex.remote_ws_path = path;
-    if(sni) ex.remote_tls_sni = sni;
-    ex.remote_tls_enabled = tls;
-    ex.remote_tls_insecure = insecure;
+    if(wss.host) ex.remote_ws_host = wss.host;
+    if(wss.path) ex.remote_ws_path = wss.path;
+    if(wss.sni) ex.remote_tls_sni = wss.sni;
+    ex.remote_tls_enabled = !!wss.tls;
+    ex.remote_tls_insecure = !!wss.insecure;
   } else if(mode === 'wss_recv'){
     ex.listen_transport = 'ws';
-    ex.remote_transport = 'tcp';
-    if(host) ex.listen_ws_host = host;
-    if(path) ex.listen_ws_path = path;
-    if(sni) ex.listen_tls_servername = sni;
-    ex.listen_tls_enabled = tls;
-    ex.listen_tls_insecure = insecure;
+    if(wss.host) ex.listen_ws_host = wss.host;
+    if(wss.path) ex.listen_ws_path = wss.path;
+    if(wss.sni) ex.listen_tls_servername = wss.sni;
+    ex.listen_tls_enabled = !!wss.tls;
+    ex.listen_tls_insecure = !!wss.insecure;
   }
   return ex;
 }
@@ -811,12 +844,30 @@ async function savePool(msg){
   }
 }
 
-function toast(text){
+function toast(text, isError=false){
+  const msg = String(text || '').trim();
+  if(!msg) return;
+
+  // Prefer a toast bar if present
   const t = q('toast');
-  if(!t) return;
-  t.textContent = text;
-  t.style.display = 'block';
-  setTimeout(()=>{t.style.display='none';}, 1800);
+  if(t){
+    t.textContent = msg;
+    t.style.display = 'block';
+    t.classList.toggle('error', !!isError);
+    setTimeout(()=>{ t.style.display='none'; }, 1800);
+    return;
+  }
+
+  // Fallback: show inside modal message area
+  const m = q('modalMsg');
+  if(m){
+    m.textContent = msg;
+    m.style.color = isError ? '#ff6b6b' : '';
+    return;
+  }
+
+  // Last resort
+  alert(msg);
 }
 
 async function restoreRules(file){
