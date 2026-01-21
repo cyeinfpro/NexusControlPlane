@@ -15,8 +15,9 @@
   <div class="card">
     <div class="row">
       <div class="col">
-        <div class="h2">{{ n.display_ip or n.name }}</div>
-        <div class="muted">上报：{{ n.last_seen_at or "-" }}</div>
+        <div class="h2">{{ n.name or ("节点-" ~ n.id) }}</div>
+        <div class="muted">IP：{{ n.display_ip or "-" }}</div>
+        <div class="muted">上报：{{ n.last_seen_at or "-" }}{% if n.agent_version %} · {{ n.agent_version }}{% endif %}</div>
       </div>
       <div class="col right">
         <a class="btn-secondary" href="/nodes/{{ n.id }}">打开</a>

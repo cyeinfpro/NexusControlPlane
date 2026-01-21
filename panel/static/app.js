@@ -762,7 +762,12 @@ function initNodePage(){
     restoreBtn.addEventListener('click', triggerRestore);
   }
   q('f_type').addEventListener('change', showWssBox);
-  loadPool();
+  // Load once, then enable auto-refresh by default
+  loadPool().finally(()=>{
+    try{
+      if(!AUTO_REFRESH_TIMER) toggleAutoRefresh();
+    }catch(e){}
+  });
 }
 
 window.initNodePage = initNodePage;
