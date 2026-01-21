@@ -52,7 +52,7 @@ function populateReceiverSelect(){
 function q(id){ return document.getElementById(id); }
 
 let CURRENT_POOL = null;
-let CURRENT_EDIT_INDEX = null;
+let CURRENT_EDIT_INDEX = -1;
 let CURRENT_STATS = null;
 let PENDING_COMMAND_TEXT = '';
 let NODES_LIST = [];
@@ -580,7 +580,7 @@ function formatWeights(weights){
 }
 
 function newRule(){
-  CURRENT_EDIT_INDEX = null;
+  CURRENT_EDIT_INDEX = -1;
   q('modalTitle').textContent = '新增规则';
   setField('f_listen','0.0.0.0:443');
   setField('f_remotes','');
