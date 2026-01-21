@@ -275,9 +275,9 @@ function renderRuleCard(e, idx, stats, statsError){
       ${healthHtml}
     </div>
     <div class="rule-actions">
-      <button class="btn xs ghost" onclick="editRule(${idx})">编辑</button>
-      <button class="btn xs" onclick="toggleRule(${idx})">${e.disabled?'启用':'暂停'}</button>
-      <button class="btn xs ghost" onclick="deleteRule(${idx})">删除</button>
+      <button class="btn xs icon ghost" title="编辑" onclick="editRule(${idx})">✎</button>
+      <button class="btn xs icon" title="${e.disabled?'启用':'暂停'}" onclick="toggleRule(${idx})">${e.disabled?'▶':'⏸'}</button>
+      <button class="btn xs icon ghost" title="删除" onclick="deleteRule(${idx})">🗑</button>
     </div>
   </div>`;
 }
@@ -292,8 +292,8 @@ function renderRules(){
   const eps = (CURRENT_POOL && CURRENT_POOL.endpoints) ? CURRENT_POOL.endpoints : [];
   const statsLookup = buildStatsLookup();
   const statsLoading = q('statsLoading');
-  // 统一使用「卡片」展示（所有设备一致）
-  const isMobile = true;
+  // 小屏用卡片，大屏用表格（更紧凑，空间利用率更高）
+  const isMobile = window.matchMedia('(max-width: 1024px)').matches;
   if(!eps.length){
     q('rulesLoading').style.display = '';
     q('rulesLoading').textContent = '暂无规则';
@@ -343,9 +343,9 @@ function renderRules(){
         <td class="stat">${total == null ? '—' : formatBytes(total)}</td>
         <td class="actions">
           <div class="rules-actions">
-            <button class="btn xs ghost" onclick="editRule(${idx})">编辑</button>
-            <button class="btn xs" onclick="toggleRule(${idx})">${e.disabled?'启用':'暂停'}</button>
-            <button class="btn xs ghost" onclick="deleteRule(${idx})">删除</button>
+            <button class="btn xs icon ghost" title="编辑" onclick="editRule(${idx})">✎</button>
+            <button class="btn xs icon" title="${e.disabled?'启用':'暂停'}" onclick="toggleRule(${idx})">${e.disabled?'▶':'⏸'}</button>
+            <button class="btn xs icon ghost" title="删除" onclick="deleteRule(${idx})">🗑</button>
           </div>
         </td>
       `;

@@ -49,13 +49,13 @@ body{
 .nav{display:flex;gap:12px}
 .nav-link{color:var(--muted);text-decoration:none;padding:8px 12px;border-radius:12px;border:1px solid transparent;transition:all .2s ease}
 .nav-link:hover{border-color:var(--line);background:var(--panel2);color:var(--text)}
-.container{max-width:1100px;margin:0 auto;padding:18px}
-.footer{max-width:1100px;margin:0 auto;padding:16px 18px;color:var(--muted);font-size:12px}
+.container{max-width:1280px;margin:0 auto;padding:16px}
+.footer{max-width:1280px;margin:0 auto;padding:14px 16px;color:var(--muted);font-size:12px}
 .card{
   background:var(--panel);
   border:1px solid var(--line);
   border-radius:16px;
-  padding:18px;
+  padding:16px;
   backdrop-filter:blur(20px);
   box-shadow:var(--glow);
 }
@@ -63,7 +63,7 @@ body{
 .card.compact{padding:14px}
 .toolbar-row{display:flex;gap:12px;align-items:center;justify-content:space-between}
 .toolbar-actions{display:flex;gap:8px;align-items:center;justify-content:flex-end;flex-wrap:wrap}
-.grid{display:grid;grid-template-columns:repeat(auto-fit, minmax(260px,1fr));gap:14px;margin-top:14px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit, minmax(220px,1fr));gap:12px;margin-top:14px}
 .row{display:flex;gap:14px;align-items:center}
 .col{flex:1}
 .right{text-align:right;display:flex;gap:10px;justify-content:flex-end;align-items:center}
@@ -77,8 +77,8 @@ body{
   align-items:center;
   justify-content:center;
   gap:6px;
-  min-height:40px;
-  padding:9px 16px;
+  min-height:38px;
+  padding:8px 14px;
   border-radius:12px;
   font-size:13px;
   font-weight:600;
@@ -108,8 +108,8 @@ body{
   align-items:center;
   justify-content:center;
   gap:6px;
-  min-height:40px;
-  padding:9px 16px;
+  min-height:38px;
+  padding:8px 14px;
   border-radius:12px;
   font-size:13px;
   font-weight:600;
@@ -140,8 +140,62 @@ body{
 .pill.ghost{color:rgba(226,232,240,0.92);border-color:rgba(148,163,184,0.22);background:rgba(148,163,184,0.10)}
 
 /* 小按钮（用于规则操作） */
-.btn.sm{min-height:34px;padding:7px 12px;border-radius:10px;font-size:12px}
-.btn.xs{min-height:28px;padding:5px 10px;border-radius:10px;font-size:11px}
+.btn.sm{min-height:32px;padding:6px 12px;border-radius:10px;font-size:12px}
+.btn.xs{min-height:26px;padding:4px 10px;border-radius:10px;font-size:11px}
+
+/* 图标按钮：更紧凑 */
+.btn.icon{
+  padding:0;
+  width:32px;
+  min-width:32px;
+  height:32px;
+  min-height:32px;
+  border-radius:10px;
+  justify-content:center;
+}
+.btn.icon.xs{
+  width:28px;
+  min-width:28px;
+  height:28px;
+  min-height:28px;
+  border-radius:10px;
+  font-size:12px;
+}
+
+/* 下拉菜单（更多操作） */
+details.menu{position:relative;display:inline-block}
+details.menu summary{list-style:none}
+details.menu summary::-webkit-details-marker{display:none}
+.menu-pop{
+  position:absolute;
+  right:0;
+  top:calc(100% + 8px);
+  min-width:180px;
+  background:rgba(15,23,42,0.92);
+  border:1px solid var(--line);
+  border-radius:14px;
+  padding:8px;
+  box-shadow:var(--shadow);
+  backdrop-filter:blur(18px);
+  z-index:30;
+}
+.menu-item{
+  width:100%;
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:10px;
+  padding:8px 10px;
+  border-radius:12px;
+  border:1px solid transparent;
+  background:transparent;
+  color:var(--text);
+  cursor:pointer;
+  text-decoration:none;
+  font-size:12px;
+}
+.menu-item:hover{background:rgba(148,163,184,0.14);border-color:rgba(148,163,184,0.22)}
+.menu-sep{height:1px;background:rgba(148,163,184,0.18);margin:6px 4px}
 .table{width:100%;border-collapse:collapse;margin-top:12px}
 .table th,.table td{padding:10px 8px;border-bottom:1px solid var(--line);text-align:left;font-size:13px}
 .table th{color:var(--muted);font-weight:600}
@@ -173,7 +227,7 @@ body{
   background:var(--panel);
   border:1px solid var(--line);
   border-radius:14px;
-  padding:10px;
+  padding:9px;
   backdrop-filter:blur(18px);
   box-shadow:var(--glow);
 }
@@ -184,7 +238,42 @@ body{
 .rule-listen{font-size:15px;font-weight:700;word-break:break-all}
 .rule-right{display:flex;flex-direction:column;gap:8px;align-items:flex-end;flex-shrink:0}
 .rule-health-block{margin-top:10px}
-.rule-actions{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end;margin-top:10px}
+.rule-actions{display:flex;gap:6px;flex-wrap:nowrap;justify-content:flex-end;margin-top:10px}
+
+/* 小菜单（更多操作） */
+.menu{position:relative}
+.menu > summary{list-style:none}
+.menu > summary::-webkit-details-marker{display:none}
+.menu-pop{
+  position:absolute;
+  right:0;
+  top:calc(100% + 8px);
+  min-width:180px;
+  background:var(--panel-strong);
+  border:1px solid var(--line);
+  border-radius:14px;
+  padding:8px;
+  box-shadow:var(--shadow);
+  backdrop-filter:blur(18px);
+  z-index:60;
+}
+.menu-item{
+  width:100%;
+  display:flex;
+  align-items:center;
+  justify-content:flex-start;
+  gap:8px;
+  padding:10px 10px;
+  border-radius:12px;
+  border:1px solid transparent;
+  background:transparent;
+  color:var(--text);
+  cursor:pointer;
+  text-decoration:none;
+  font-size:12px;
+}
+.menu-item:hover{background:rgba(148,163,184,0.12);border-color:rgba(148,163,184,0.25)}
+.menu-sep{height:1px;background:var(--line);margin:6px 4px}
 
 /* Mobile health list */
 .health-wrap.mobile{flex-direction:column;align-items:stretch}
@@ -263,28 +352,25 @@ code{font-family:ui-monospace,Menlo,Monaco,Consolas,monospace}
 }
 @media (max-width: 720px){
   .topbar{
-    flex-direction:column;
-    align-items:flex-start;
-    gap:12px;
-    padding:14px 16px;
+    flex-direction:row;
+    align-items:center;
+    justify-content:space-between;
+    flex-wrap:wrap;
+    gap:10px;
+    padding:12px 14px;
   }
   .nav{
-    width:100%;
+    width:auto;
     flex-wrap:wrap;
   }
   .container{padding:14px}
   .footer{padding:14px 16px}
-  .row{
-    flex-direction:column;
-    align-items:stretch;
-  }
-  .right{
-    justify-content:flex-start;
-    width:100%;
-  }
-  .btn,.btn-secondary{
-    width:100%;
-  }
+  /* 默认行：保持横向并允许换行，避免按钮被强制占满整行 */
+  .row{flex-direction:row;flex-wrap:wrap;align-items:center}
+  .right{justify-content:flex-end;width:auto;flex:0 0 auto}
+
+  /* 表单里的行仍然纵向堆叠，更适合输入 */
+  .form .row{flex-direction:column;align-items:stretch}
   .grid{
     grid-template-columns:1fr;
   }
@@ -292,9 +378,7 @@ code{font-family:ui-monospace,Menlo,Monaco,Consolas,monospace}
     display:block;
     overflow-x:auto;
   }
-  .card{
-    padding:16px;
-  }
+  .card{padding:12px}
   .modal-inner{
     width:100%;
   }
