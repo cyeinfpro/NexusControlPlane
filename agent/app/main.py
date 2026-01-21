@@ -9,6 +9,7 @@ import time
 import os
 import threading
 import hashlib
+import hmac
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
@@ -77,6 +78,29 @@ def _sha256_of_obj(obj: Any) -> str:
         return hashlib.sha256(s.encode("utf-8")).hexdigest()
     except Exception:
         return ""
+
+
+
+def _canonical_json(obj: Any) -> str:
+    return json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _cmd_signature(secret: str, cmd: Dict[str, Any]) -> str:
+    """Return hex HMAC-SHA256 signature for cmd (excluding sig field)."""
+    data = {k: v for k, v in cmd.items() if k != "sig"}
+    msg = _canonical_json(data).encode("utf-8")
+    return hmac.new(secret.encode("utf-8"), msg, hashlib.sha256).hexdigest()
+
+
+def _verify_cmd_sig(cmd: Dict[str, Any], api_key: str) -> bool:
+    sig = str(cmd.get("sig") or "").strip()
+    if not sig:
+        return False
+    expect = _cmd_signature(api_key, cmd)
+    try:
+        return hmac.compare_digest(sig, expect)
+    except Exception:
+        return sig == expect
 
 
 def _write_json(p: Path, data: Any) -> None:
@@ -949,16 +973,127 @@ def _apply_sync_pool_cmd(cmd: Dict[str, Any]) -> None:
             _LAST_SYNC_ERROR = f"sync_pool failed: {exc}"
 
 
+
+
+def _apply_pool_patch_cmd(cmd: Dict[str, Any]) -> None:
+    """Apply single-rule incremental patch from panel.
+
+    cmd format:
+      {type:'pool_patch', version:int, base_version:int, ops:[...], apply:bool, sig:str}
+    """
+    global _LAST_SYNC_ERROR
+    try:
+        ver = int(cmd.get('version') or 0)
+    except Exception:
+        ver = 0
+    if ver <= 0:
+        return
+
+    ack = _read_int(ACK_VER_FILE, 0)
+    if ver <= ack:
+        return
+
+    try:
+        base_ver = int(cmd.get('base_version') or 0)
+    except Exception:
+        base_ver = 0
+
+    # Patch only allowed when agent is exactly at base_version
+    if ack != base_ver:
+        _LAST_SYNC_ERROR = f'pool_patch: base_version mismatch (ack={ack}, base={base_ver})'
+        return
+
+    ops = cmd.get('ops')
+    if not isinstance(ops, list) or len(ops) != 1:
+        _LAST_SYNC_ERROR = 'pool_patch: ops invalid'
+        return
+
+    do_apply = bool(cmd.get('apply', True))
+
+    with _PUSH_LOCK:
+        try:
+            full = _load_full_pool()
+            eps = full.get('endpoints') or []
+            if not isinstance(eps, list):
+                eps = []
+
+            # index by listen, preserve order
+            def _key(ep: Any) -> str:
+                if not isinstance(ep, dict):
+                    return ''
+                return str(ep.get('listen') or '').strip()
+
+            base_order = [_key(e) for e in eps if _key(e)]
+            mp = {k: e for e in eps if (k := _key(e))}
+
+            op = ops[0]
+            typ = str(op.get('op') or '').strip().lower()
+            if typ == 'upsert':
+                ep = op.get('endpoint')
+                if not isinstance(ep, dict) or not str(ep.get('listen') or '').strip():
+                    _LAST_SYNC_ERROR = 'pool_patch: endpoint invalid'
+                    return
+                ep.setdefault('disabled', False)
+                mp[str(ep.get('listen')).strip()] = ep
+            elif typ == 'remove':
+                listen = str(op.get('listen') or '').strip()
+                if not listen:
+                    _LAST_SYNC_ERROR = 'pool_patch: listen invalid'
+                    return
+                mp.pop(listen, None)
+                base_order = [x for x in base_order if x != listen]
+            else:
+                _LAST_SYNC_ERROR = f'pool_patch: unknown op {typ}'
+                return
+
+            # rebuild endpoints list preserving prior order
+            new_eps = []
+            seen = set()
+            for k in base_order:
+                if k in mp:
+                    new_eps.append(mp[k])
+                    seen.add(k)
+            # append new ones
+            for k, v in mp.items():
+                if k not in seen:
+                    new_eps.append(v)
+
+            new_full = dict(full)
+            new_full['endpoints'] = new_eps
+            _write_json(POOL_FULL, new_full)
+            _sync_active_pool()
+
+            if do_apply:
+                _apply_pool_to_config()
+                _restart_realm()
+
+            _write_int(ACK_VER_FILE, ver)
+            _LAST_SYNC_ERROR = None
+        except Exception as exc:
+            _LAST_SYNC_ERROR = f"pool_patch failed: {exc}"
+
 def _handle_panel_commands(cmds: Any) -> None:
     if not isinstance(cmds, list) or not cmds:
         return
+
+    api_key = _read_agent_api_key()
     for cmd in cmds:
         if not isinstance(cmd, dict):
             continue
+
+        # Signature required for rule sync commands
         t = str(cmd.get('type') or '').strip()
+        if t in ('sync_pool', 'pool_patch'):
+            if not api_key or not _verify_cmd_sig(cmd, api_key):
+                # do not crash; keep reporting error for UI
+                global _LAST_SYNC_ERROR
+                _LAST_SYNC_ERROR = f'{t}: bad signature'
+                continue
+
         if t == 'sync_pool':
             _apply_sync_pool_cmd(cmd)
-
+        elif t == 'pool_patch':
+            _apply_pool_patch_cmd(cmd)
 
 def _push_loop() -> None:
     """后台上报线程。"""

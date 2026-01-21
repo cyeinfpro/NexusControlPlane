@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import json
 import os
+import time
+import hmac
+import hashlib
 import secrets
 from datetime import datetime
 from urllib.parse import urlparse
@@ -47,6 +50,81 @@ templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
 
 # DB init
 ensure_db()
+
+
+# ------------------------ Command signing (HMAC-SHA256) ------------------------
+
+
+def _canonical_json(obj: Any) -> str:
+    return json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _cmd_signature(secret: str, cmd: Dict[str, Any]) -> str:
+    """Return hex HMAC-SHA256 signature for cmd (excluding sig field)."""
+    data = {k: v for k, v in cmd.items() if k != "sig"}
+    msg = _canonical_json(data).encode("utf-8")
+    return hmac.new(secret.encode("utf-8"), msg, hashlib.sha256).hexdigest()
+
+
+def _sign_cmd(secret: str, cmd: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(cmd)
+    # always include ts so signature cannot be replayed across long time windows
+    out.setdefault("ts", int(time.time()))
+    out["sig"] = _cmd_signature(secret, out)
+    return out
+
+
+# ------------------------ Pool diff: single-rule incremental patch ------------------------
+
+
+def _single_rule_ops(base_pool: Dict[str, Any], desired_pool: Dict[str, Any]) -> Optional[list[Dict[str, Any]]]:
+    """Return ops when there is exactly ONE rule change between base_pool and desired_pool.
+
+    ops format:
+      - {op: 'upsert', endpoint: {...}}
+      - {op: 'remove', listen: '0.0.0.0:443'}
+
+    If there are 0 changes -> returns []
+    If changes > 1 -> returns None
+    """
+
+    def key_of(ep: Any) -> str:
+        if not isinstance(ep, dict):
+            return ""
+        return str(ep.get("listen") or "").strip()
+
+    base_eps = base_pool.get("endpoints") if isinstance(base_pool, dict) else None
+    desired_eps = desired_pool.get("endpoints") if isinstance(desired_pool, dict) else None
+    if not isinstance(base_eps, list) or not isinstance(desired_eps, list):
+        return None
+
+    base_map = {key_of(e): e for e in base_eps if key_of(e)}
+    desired_map = {key_of(e): e for e in desired_eps if key_of(e)}
+
+    changes: list[tuple[str, Any]] = []
+
+    # add or update
+    for listen, ep in desired_map.items():
+        if listen not in base_map:
+            changes.append(("upsert", ep))
+        else:
+            if _canonical_json(ep) != _canonical_json(base_map[listen]):
+                changes.append(("upsert", ep))
+
+    # remove
+    for listen in base_map.keys():
+        if listen not in desired_map:
+            changes.append(("remove", listen))
+
+    if len(changes) == 0:
+        return []
+    if len(changes) != 1:
+        return None
+
+    op, payload = changes[0]
+    if op == "upsert":
+        return [{"op": "upsert", "endpoint": payload}]
+    return [{"op": "remove", "listen": payload}]
 
 
 def _is_report_fresh(node: Dict[str, Any], max_age_sec: int = 15) -> bool:
@@ -501,7 +579,33 @@ async def api_agent_report(request: Request, payload: Dict[str, Any]):
     except Exception:
         agent_ack = 0
     if isinstance(desired_pool, dict) and desired_ver > agent_ack:
-        cmds.append({"type": "sync_pool", "version": desired_ver, "pool": desired_pool, "apply": True})
+        # ✅ 单条规则增量下发：仅当 agent 落后 1 个版本，且报告中存在当前 pool 时才尝试 patch
+        base_pool = None
+        if isinstance(report, dict):
+            base_pool = report.get("pool") if isinstance(report.get("pool"), dict) else None
+
+        cmd: Dict[str, Any]
+        ops = None
+        if desired_ver == agent_ack + 1 and isinstance(base_pool, dict):
+            ops = _single_rule_ops(base_pool, desired_pool)
+
+        if isinstance(ops, list) and len(ops) == 1:
+            cmd = {
+                "type": "pool_patch",
+                "version": desired_ver,
+                "base_version": agent_ack,
+                "ops": ops,
+                "apply": True,
+            }
+        else:
+            cmd = {
+                "type": "sync_pool",
+                "version": desired_ver,
+                "pool": desired_pool,
+                "apply": True,
+            }
+
+        cmds.append(_sign_cmd(str(node.get("api_key") or ""), cmd))
 
     return {"ok": True, "server_time": now, "desired_version": desired_ver, "commands": cmds}
 
