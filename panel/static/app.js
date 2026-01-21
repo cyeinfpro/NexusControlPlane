@@ -39,13 +39,20 @@ function wssMode(e){
 }
 
 function endpointType(e){
+  const ex = e.extra_config || {};
   const mode = wssMode(e);
-  if(mode === 'wss_recv') return 'WSS接收';
-  if(mode === 'wss_send') return 'WSS发送';
+  const managed = ex.wss_managed === true;
+  if(mode === 'wss_send') return 'WSS 隧道';
+  if(mode === 'wss_recv') return managed ? 'WSS 接收(同步)' : 'WSS 接收';
   return 'TCP/UDP';
 }
 
 function formatRemote(e){
+  const ex = e.extra_config || {};
+  const mode = wssMode(e);
+  if(mode === 'wss_send' && Array.isArray(ex.wss_targets) && ex.wss_targets.length){
+    return ex.wss_targets.join('\n');
+  }
   const rs = Array.isArray(e.remotes) ? e.remotes : (e.remote ? [e.remote] : []);
   return rs.join('\n');
 }
@@ -196,39 +203,51 @@ function showHealthDetail(idx){
 }
 
 function renderRuleCard(e, idx, stats, statsError){
-  const rx = statsError ? null : (stats.rx_bytes || 0);
-  const tx = statsError ? null : (stats.tx_bytes || 0);
-  const total = (rx == null || tx == null) ? null : rx + tx;
-  const connActive = statsError ? 0 : (stats.connections_active ?? stats.connections ?? 0);
-  const connTotal = statsError ? 0 : (stats.connections_total ?? 0);
-  const connText = statsError ? '—' : `${connActive}/${connTotal}`;
-  const totalStr = total == null ? '—' : formatBytes(total);
-  const healthHtml = renderHealthMobile(stats.health, statsError, idx);
+  const disabled = !!e.disabled;
+  const type = endpointType(e);
+
+  const connKey = endpointConnKey(e);
+  const conn = stats?.connections_by_endpoint?.[connKey];
+  const connText = conn ? `${conn.active}/${conn.total}` : '—';
+
+  const total = stats?.connections_total;
+  const totalStr = total != null ? String(total) : '—';
+
+  const ex = e.extra_config || {};
+  const managed = ex.wss_managed === true;
+  const fromName = ex.wss_from_node_name ? escapeHtml(ex.wss_from_node_name) : '';
+
+  const actions = managed
+    ? `<span class="pill warn">同步 · 只读</span>`
+    : `
+        <button class="btn sm ${disabled?'':'primary'}" onclick="toggleRule(${idx})">${disabled?'启用':'禁用'}</button>
+        <button class="btn sm" onclick="editRule(${idx})">编辑</button>
+        <button class="btn sm danger" onclick="deleteRule(${idx})">删除</button>
+      `;
+
+  const origin = managed && fromName
+    ? `<div class="muted" style="font-size:12px;margin-top:6px;">来自：${fromName}</div>`
+    : '';
+
   return `
-  <div class="rule-card">
-    <div class="rule-head">
-      <div class="rule-left">
-        <div class="rule-topline">
-          <span class="rule-idx">#${idx+1}</span>
-          ${statusPill(e)}
+    <div class="rule-card ${disabled?'disabled':''}">
+      <div class="rule-top">
+        <div>
+          <div class="rule-type">${escapeHtml(type)}</div>
+          <div class="rule-listen mono">${escapeHtml(e.listen)}</div>
+          ${origin}
         </div>
-        <div class="rule-listen mono">${escapeHtml(e.listen)}</div>
-        <div class="rule-sub muted sm">${endpointType(e)}</div>
+        <div class="rule-actions">
+          ${actions}
+        </div>
       </div>
-      <div class="rule-right">
+
+      <div class="rule-bottom">
         <span class="pill ghost">活跃/累计 ${escapeHtml(connText)}</span>
         <span class="pill ghost">${escapeHtml(totalStr)}</span>
       </div>
     </div>
-    <div class="rule-health-block">
-      ${healthHtml}
-    </div>
-    <div class="rule-actions">
-      <button class="btn sm ghost" onclick="editRule(${idx})">编辑</button>
-      <button class="btn sm" onclick="toggleRule(${idx})">${e.disabled?'启用':'暂停'}</button>
-      <button class="btn sm ghost" onclick="deleteRule(${idx})">删除</button>
-    </div>
-  </div>`;
+  `;
 }
 
 function renderRules(){
@@ -279,6 +298,8 @@ function renderRules(){
       const connActive = statsError ? 0 : (stats.connections_active ?? stats.connections ?? 0);
       const connTotal = statsError ? 0 : (stats.connections_total ?? 0);
       const connText = statsError ? '—' : `${connActive}/${connTotal}`;
+      const managed = (e.extra_config && e.extra_config.wss_managed === true);
+      const fromName = managed && e.extra_config.wss_from_node_name ? escapeHtml(e.extra_config.wss_from_node_name) : '';
       const tr = document.createElement('tr');
       tr.innerHTML = `
         <td>${idx+1}</td>
@@ -291,13 +312,16 @@ function renderRules(){
         <td class="stat">${statsError ? '—' : escapeHtml(connText)}</td>
         <td class="stat">${total == null ? '—' : formatBytes(total)}</td>
         <td class="actions">
+          ${managed ? `<div class="rules-actions"><span class="pill warn">同步 · 只读</span></div>` : `
           <div class="rules-actions">
             <button class="btn sm ghost" onclick="editRule(${idx})">编辑</button>
             <button class="btn sm" onclick="toggleRule(${idx})">${e.disabled?'启用':'暂停'}</button>
             <button class="btn sm ghost" onclick="deleteRule(${idx})">删除</button>
           </div>
+          `}
         </td>
       `;
+
       tbody.appendChild(tr);
     }
   });
@@ -331,56 +355,81 @@ function closeCommandModal(){
 
 function setField(id, v){ q(id).value = v==null?'':String(v); }
 
-function readWssFields(){
-  const mode = q('f_type').value;
+function genLinkId(){
+  return `wss_${Math.random().toString(16).slice(2)}${Date.now().toString(16)}`;
+}
+
+function readWssFields(mode){
+  if(mode === 'tcp') return {};
   const host = q('f_wss_host').value.trim();
-  const path = q('f_wss_path').value.trim();
+  const path = q('f_wss_path').value.trim() || '/ws';
   const sni = q('f_wss_sni').value.trim();
   const tls = q('f_wss_tls').value === '1';
   const insecure = q('f_wss_insecure').value === '1';
-  const ex = {};
+
+  // WSS 发送（自动配对）=> remote_transport=ws + receiver metadata
   if(mode === 'wss_send'){
-    ex.remote_transport = 'ws';
-    ex.listen_transport = 'tcp';
-    if(host) ex.remote_ws_host = host;
-    if(path) ex.remote_ws_path = path;
-    if(sni) ex.remote_tls_sni = sni;
-    ex.remote_tls_enabled = tls;
-    ex.remote_tls_insecure = insecure;
-  } else if(mode === 'wss_recv'){
-    ex.listen_transport = 'ws';
-    ex.remote_transport = 'tcp';
-    if(host) ex.listen_ws_host = host;
-    if(path) ex.listen_ws_path = path;
-    if(sni) ex.listen_tls_servername = sni;
-    ex.listen_tls_enabled = tls;
-    ex.listen_tls_insecure = insecure;
+    const rid = parseInt(q('f_wss_receiver')?.value || '') || 0;
+    const rport = parseInt(q('f_wss_receiver_port')?.value || '443') || 443;
+
+    const curLink = q('f_wss_link_id')?.value?.trim();
+    const linkId = curLink || genLinkId();
+    if(q('f_wss_link_id')) q('f_wss_link_id').value = linkId;
+
+    return {
+      remote_transport: 'ws',
+      remote_ws_host: host,
+      remote_ws_path: path,
+      remote_tls_enabled: tls,
+      remote_tls_sni: sni,
+      remote_tls_insecure: insecure,
+      wss_role: 'sender',
+      wss_link_id: linkId,
+      wss_receiver_node_id: rid || null,
+      wss_receiver_port: rport || 443,
+    };
   }
-  return ex;
+
+  // WSS 接收（手动）=> listen_transport=ws
+  return {
+    listen_transport: 'ws',
+    listen_ws_host: host,
+    listen_ws_path: path,
+    listen_tls_enabled: tls,
+    listen_tls_servername: sni,
+    listen_tls_insecure: insecure,
+  };
 }
 
-function fillWssFields(e){
-  const ex = e.extra_config || {};
-  const mode = wssMode(e);
-  q('f_type').value = mode;
+function fillWssFields(ex){
+  ex = ex || {};
+  const mode = q('f_type').value;
 
-  const isSend = mode === 'wss_send';
-  const host = isSend ? ex.remote_ws_host : ex.listen_ws_host;
-  const path = isSend ? ex.remote_ws_path : ex.listen_ws_path;
-  const sni = isSend ? ex.remote_tls_sni : ex.listen_tls_servername;
-  const tls = isSend ? ex.remote_tls_enabled : ex.listen_tls_enabled;
-  const insecure = isSend ? ex.remote_tls_insecure : ex.listen_tls_insecure;
+  // defaults
+  q('f_wss_host').value = ex.remote_ws_host || ex.listen_ws_host || 'www.bing.com';
+  q('f_wss_path').value = ex.remote_ws_path || ex.listen_ws_path || '/ws';
+  q('f_wss_sni').value = ex.remote_tls_sni || ex.listen_tls_servername || 'www.microsoft.com';
+  q('f_wss_tls').value = ((ex.remote_tls_enabled ?? ex.listen_tls_enabled) === false) ? '0' : '1';
+  q('f_wss_insecure').value = ((ex.remote_tls_insecure ?? ex.listen_tls_insecure) === true) ? '1' : '0';
 
-  setField('f_wss_host', host || '');
-  setField('f_wss_path', path || '');
-  setField('f_wss_sni', sni || '');
-  q('f_wss_tls').value = (tls === false) ? '0' : '1';
-  q('f_wss_insecure').value = (insecure === true) ? '1' : '0';
+  if(q('f_wss_link_id')) q('f_wss_link_id').value = ex.wss_link_id || '';
+
+  if(mode === 'wss_send'){
+    if(q('f_wss_receiver')) q('f_wss_receiver').value = (ex.wss_receiver_node_id ?? '') || '';
+    if(q('f_wss_receiver_port')) q('f_wss_receiver_port').value = (ex.wss_receiver_port ?? 443) || 443;
+  }else{
+    if(q('f_wss_receiver')) q('f_wss_receiver').value = '';
+    if(q('f_wss_receiver_port')) q('f_wss_receiver_port').value = 443;
+  }
 }
 
 function showWssBox(){
   const mode = q('f_type').value;
-  q('wssBox').style.display = (mode === 'tcp') ? 'none' : 'block';
+  q('wssBox').style.display = (mode === 'tcp') ? 'none' : '';
+  const autoRow = q('wssAutoRow');
+  const pairingRow = q('pairingRow');
+  if(autoRow) autoRow.style.display = (mode === 'wss_send') ? '' : 'none';
+  if(pairingRow) pairingRow.style.display = (mode === 'wss_recv') ? '' : 'none';
 }
 
 function encodePairingCode(data){
@@ -531,7 +580,7 @@ async function deleteRule(idx){
   await savePool('已删除规则');
 }
 
-async function saveRule(){
+async async function saveRule(){
   const listen = q('f_listen').value.trim();
   const remotesText = q('f_remotes').value.trim();
   const remotes = remotesText ? remotesText.split(/\n+/).map(x=>x.trim()).filter(Boolean) : [];
@@ -559,19 +608,38 @@ async function saveRule(){
 
   const typeSel = q('f_type').value;
   const protocolSel = q('f_protocol').value;
+  let protocol = protocolSel || 'tcp+udp';
+  if(typeSel === 'wss_send' || typeSel === 'wss_recv') protocol = 'tcp';
+
   if(typeSel === 'wss_send' || typeSel === 'wss_recv'){
     if(!q('f_wss_host').value.trim() || !q('f_wss_path').value.trim()){
       q('modalMsg').textContent='WSS Host 与 Path 不能为空';
       return;
     }
   }
-  const ex = readWssFields();
+
+  if(typeSel === 'wss_send'){
+    const rid = parseInt(q('f_wss_receiver')?.value || '') || 0;
+    if(!rid){
+      q('modalMsg').textContent='请选择接收机';
+      return;
+    }
+    if(String(rid) === String(window.__NODE_ID__)){
+      q('modalMsg').textContent='接收机不能选择自己';
+      return;
+    }
+  }
+
+  const ex = readWssFields(typeSel);
+  if(typeSel === 'wss_send'){
+    ex.wss_targets = remotes; // 仅用于 UI 展示/回填，后端会自动生成接收规则
+  }
 
   const endpoint = {
     listen,
     disabled,
     balance,
-    protocol: protocolSel || 'tcp+udp',
+    protocol: protocol,
     remotes,
     extra_config: ex,
   };
@@ -585,10 +653,6 @@ async function saveRule(){
   try{
     await savePool('保存成功');
     closeModal();
-    if(typeSel === 'wss_send'){
-      const code = encodePairingCode(buildPairingPayload());
-      openPairingModal(code);
-    }
   }catch(e){
     q('modalMsg').textContent = e.message;
   }
