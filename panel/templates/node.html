@@ -118,80 +118,57 @@
       <label class="label">隧道模式</label>
       <select class="select" id="f_type">
         <option value="tcp">TCP/UDP</option>
-        <option value="wss_send">WSS 隧道（自动配对）</option>
-        <option value="wss_recv">WSS 接收端（手动）</option>
+        <option value="wss_send">WSS 发送端（remote_transport=ws）</option>
+        <option value="wss_recv">WSS 接收端（listen_transport=ws）</option>
       </select>
 
       <div id="wssBox" style="display:none;">
-<div id="wssBox" style="display:none;">
-        <input type="hidden" id="f_wss_link_id" value="">
-
-        <div id="wssAutoRow" class="row" style="gap:12px;align-items:flex-end; display:none;">
+        <div class="row" style="gap:12px;align-items:center;">
           <div class="col">
-            <label class="label">接收机</label>
-            <select id="f_wss_receiver" class="select">
-              <option value="">请选择接收机</option>
-              {% for n in all_nodes %}
-                {% if n.id != node.id %}
-                  <option value="{{n.id}}">{{n.name}} · {{n.display_ip}}</option>
-                {% endif %}
-              {% endfor %}
+            <label class="label">配对码（粘贴后自动填充）</label>
+            <textarea class="textarea" id="f_pairing" rows="3" placeholder="在另一端生成配对码后粘贴"></textarea>
+          </div>
+          <div class="col right">
+            <button class="btn ghost" type="button" onclick="applyPairingCode()">解析配对码</button>
+          </div>
+        </div>
+        <div class="row" style="gap:12px;">
+          <div class="col">
+            <label class="label">WSS Host</label>
+            <input class="input" id="f_wss_host" placeholder="www.bing.com">
+          </div>
+          <div class="col">
+            <label class="label">WSS Path</label>
+            <input class="input" id="f_wss_path" placeholder="/ws">
+          </div>
+        </div>
+        <div class="row" style="gap:12px;align-items:center;">
+          <div class="col">
+            <div class="help">建议与服务端证书域名保持一致，TLS 不可用时可关闭。</div>
+          </div>
+          <div class="col right">
+            <button class="btn ghost" type="button" onclick="randomizeWss()">随机生成参数</button>
+          </div>
+        </div>
+        <div class="row" style="gap:12px;">
+          <div class="col">
+            <label class="label">SNI</label>
+            <input class="input" id="f_wss_sni" placeholder="www.bing.com">
+          </div>
+          <div class="col">
+            <label class="label">TLS</label>
+            <select class="select" id="f_wss_tls">
+              <option value="1">启用</option>
+              <option value="0">关闭</option>
             </select>
           </div>
-          <div style="width:160px;">
-            <label class="label">接收端口</label>
-            <input class="input" id="f_wss_receiver_port" type="number" value="443" min="1" max="65535"/>
-          </div>
-        </div>
-
-        <div id="pairingRow" class="row" style="gap:12px;align-items:center; display:none;">
           <div class="col">
-            <label class="label">配对码（手动接收端使用）</label>
-            <textarea class="textarea" id="f_pairing" rows="2" placeholder='{"host":"www.bing.com","path":"/ws","sni":"www.microsoft.com","tls":true,"insecure":true}'></textarea>
+            <label class="label">insecure</label>
+            <select class="select" id="f_wss_insecure">
+              <option value="0">否</option>
+              <option value="1">是</option>
+            </select>
           </div>
-          <div style="width:140px;">
-            <label class="label">&nbsp;</label>
-            <button class="btn ghost" type="button" onclick="applyPairingCode()">应用</button>
-          </div>
-        </div>
-
-        <div class="grid2">
-          <div>
-            <label class="label">WSS Host</label>
-            <input class="input" id="f_wss_host" placeholder="www.bing.com"/>
-          </div>
-          <div>
-            <label class="label">WSS Path</label>
-            <input class="input" id="f_wss_path" placeholder="/ws"/>
-          </div>
-        </div>
-
-        <div class="grid2">
-          <div>
-            <label class="label">TLS SNI</label>
-            <input class="input" id="f_wss_sni" placeholder="www.microsoft.com"/>
-          </div>
-          <div class="grid2">
-            <div>
-              <label class="label">TLS</label>
-              <select class="select" id="f_wss_tls">
-                <option value="1">启用</option>
-                <option value="0">关闭</option>
-              </select>
-            </div>
-            <div>
-              <label class="label">Insecure</label>
-              <select class="select" id="f_wss_insecure">
-                <option value="0">否</option>
-                <option value="1">是</option>
-              </select>
-            </div>
-          </div>
-        </div>
-
-        <div class="help muted" style="margin-top:8px;">
-          自动配对：选择接收机后，保存规则会自动在接收机生成对应接收规则，并保持同步（只读）。<br/>
-          手动接收：仅当你需要手工创建接收端规则时，粘贴配对码并点击“应用”。
         </div>
       </div>
 

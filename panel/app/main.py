@@ -9,7 +9,7 @@ import secrets
 from datetime import datetime
 from urllib.parse import urlparse
 from pathlib import Path
-from typing import Any, Dict, Optional, List, Tuple
+from typing import Any, Dict, Optional
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, Response, PlainTextResponse
@@ -409,10 +409,6 @@ async def node_detail(request: Request, node_id: int, user: str = Depends(requir
     install_cmd = f"curl -fsSL {base_url}/join/{node['api_key']} | bash"
     uninstall_cmd = f"curl -fsSL {base_url}/uninstall/{node['api_key']} | bash"
 
-    all_nodes = list_nodes()
-    for n in all_nodes:
-        n["display_ip"] = _extract_ip_for_display(n.get("base_url", ""))
-
     # 兼容旧字段（模板里可能还引用 node_port）
     agent_port = DEFAULT_AGENT_PORT
     return templates.TemplateResponse(
@@ -421,7 +417,6 @@ async def node_detail(request: Request, node_id: int, user: str = Depends(requir
             "request": request,
             "user": user,
             "node": node,
-            "all_nodes": all_nodes,
             "flash": _flash(request),
             "title": node["name"],
             "node_port": agent_port,
@@ -725,116 +720,29 @@ async def api_restore(
 
 
 @app.post("/api/nodes/{node_id}/pool")
-def api_pool_set(node_id: int, payload: Dict[str, Any] = Body(...)):
-    if not get_node(node_id):
-        raise HTTPException(status_code=404, detail="Node not found")
-    pool = payload.get("pool")
+async def api_pool_set(request: Request, node_id: int, payload: Dict[str, Any], user: str = Depends(require_login)):
+    node = get_node(node_id)
+    if not node:
+        return JSONResponse({"ok": False, "error": "node not found"}, status_code=404)
+    pool = payload.get("pool") if isinstance(payload, dict) else None
+    if pool is None and isinstance(payload, dict):
+        # some callers may post the pool dict directly
+        pool = payload
     if not isinstance(pool, dict):
-        raise HTTPException(status_code=400, detail="Invalid pool")
+        return JSONResponse({"ok": False, "error": "missing pool"}, status_code=400)
 
-    # 自动配对：发送机保存 WSS 隧道 => 同步生成接收机规则（只读）
-    recv_new: Dict[int, List[Dict[str, Any]]] = {}
-    recv_alive: Dict[int, set] = {}
+    # Store desired pool on panel. Agent will pull it on next report.
+    desired_ver, _ = set_desired_pool(node_id, pool)
+
+    # Best-effort immediate apply if panel can still reach agent
     try:
-        pool, recv_new, recv_alive = _apply_wss_auto_pair(node_id, pool)
-    except HTTPException:
-        raise
-    except Exception as e:
-        # 不阻断常规保存，但记录异常信息
-        print("[WSS_LINK] auto-pair failed:", repr(e))
+        data = await agent_post(node["base_url"], node["api_key"], "/api/v1/pool", {"pool": pool}, _node_verify_tls(node))
+        if data.get("ok", True):
+            await agent_post(node["base_url"], node["api_key"], "/api/v1/apply", {}, _node_verify_tls(node))
+            return {"ok": True, "pool": pool, "desired_version": desired_ver, "applied": True}
+    except Exception:
+        pass
 
-    desired_ver, patched_pool = set_desired_pool(node_id, pool)
-
-    # 需要同步的接收机：本次指定的 + 已经存在“由该发送机管理”的接收端
-    receiver_ids: set = set(recv_new.keys())
-    try:
-        for n in list_nodes():
-            rid = int(n["id"])
-            if rid == node_id:
-                continue
-            # 优先使用 desired pool，其次用最后上报的 pool
-            _, cur_desired = get_desired_pool(rid)
-            base_pool = cur_desired if isinstance(cur_desired, dict) else None
-            if base_pool is None:
-                rep = get_last_report(rid) or {}
-                base_pool = rep.get("pool") if isinstance(rep, dict) else None
-            if not isinstance(base_pool, dict):
-                continue
-            for ep in (base_pool.get("endpoints") or []):
-                ex = ep.get("extra_config") or {}
-                if ex.get("wss_managed") is True and ex.get("wss_from_node_id") == node_id:
-                    receiver_ids.add(rid)
-                    break
-    except Exception as e:
-        print("[WSS_LINK] receiver scan failed:", repr(e))
-
-    receiver_versions: Dict[int, int] = {}
-    receiver_pools: Dict[int, Dict[str, Any]] = {}
-
-    for rid in receiver_ids:
-        try:
-            _, cur_desired = get_desired_pool(rid)
-            base_pool = cur_desired if isinstance(cur_desired, dict) else None
-            if base_pool is None:
-                rep = get_last_report(rid) or {}
-                base_pool = rep.get("pool") if isinstance(rep, dict) else None
-            if base_pool is None:
-                base_pool = {"endpoints": []}
-            # 深拷贝（避免引用导致的意外改动）
-            base_pool = json.loads(json.dumps(base_pool))
-
-            kept = []
-            for ep in (base_pool.get("endpoints") or []):
-                ex = ep.get("extra_config") or {}
-                if ex.get("wss_managed") is True and ex.get("wss_from_node_id") == node_id:
-                    # 永远以本次计算结果为准：存在则替换，不存在则删除
-                    continue
-                kept.append(ep)
-
-            kept.extend(recv_new.get(rid, []))
-            base_pool["endpoints"] = kept
-
-            ver, patched = set_desired_pool(rid, base_pool)
-            receiver_versions[rid] = ver
-            receiver_pools[rid] = patched
-        except Exception as e:
-            print("[WSS_LINK] receiver update failed:", rid, repr(e))
-
-    apply_now = payload.get("apply_now", True)
-    if apply_now:
-        # 1) apply sender
-        node = get_node(node_id)
-        base_url = node.get("base_url", "")
-        api_key = node.get("api_key", "")
-        verify_tls = _node_verify_tls(node)
-        try:
-            agent_post(base_url, api_key, "/api/v1/pool", {"pool": pool}, verify_tls=verify_tls)
-            agent_post(base_url, api_key, "/api/v1/apply", {"desired_version": desired_ver}, verify_tls=verify_tls)
-        except Exception as e:
-            return {"ok": False, "error": str(e), "desired_version": desired_ver}
-
-        # 2) apply receivers (best effort)
-        for rid, rver in receiver_versions.items():
-            try:
-                rnode = get_node(rid)
-                rbase = rnode.get("base_url", "")
-                rkey = rnode.get("api_key", "")
-                rverify = _node_verify_tls(rnode)
-                agent_post(rbase, rkey, "/api/v1/pool", {"pool": receiver_pools.get(rid)}, verify_tls=rverify)
-                agent_post(rbase, rkey, "/api/v1/apply", {"desired_version": rver}, verify_tls=rverify)
-            except Exception as e:
-                print("[WSS_LINK] apply receiver failed:", rid, repr(e))
-
-        return {
-            "ok": True,
-            "pool": pool,
-            "desired_version": desired_ver,
-            "queued": False,
-            "note": "applied",
-            "wss_receivers_updated": sorted(list(receiver_versions.keys())),
-        }
-
-    # not applying now, just queued desired pools
     return {"ok": True, "pool": pool, "desired_version": desired_ver, "queued": True, "note": "waiting agent report"}
 
 
