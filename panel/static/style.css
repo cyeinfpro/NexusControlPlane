@@ -227,10 +227,14 @@ details.menu summary::-webkit-details-marker{display:none}
 .rule-actions{display:flex;gap:6px;justify-content:flex-end;margin-top:10px}
 
 /* Health badges */
-.health-wrap{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+.health-wrap{display:flex;flex-wrap:wrap;gap:8px;align-items:flex-start}
+.health-wrap.expanded{flex-direction:column;flex-wrap:nowrap;align-items:flex-start}
 .health-item{display:inline-flex;gap:6px;align-items:center;max-width:520px}
 .health-target{max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .health-reason{font-size:11px;color:var(--muted)}
+
+/* Inline expand area (+N -> multi-line) */
+.health-extra{flex-basis:100%;display:flex;flex-direction:column;gap:8px;margin-top:6px;padding-left:2px}
 
 /* Forms */
 .form{display:flex;flex-direction:column;gap:10px;margin-top:10px}
@@ -468,6 +472,7 @@ textarea,.textarea{min-height:90px;resize:vertical}
 
 /* Remote targets chips */
 .remote-wrap{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
+.remote-wrap.expanded{flex-direction:column;flex-wrap:nowrap;align-items:flex-start}
 .remote-chip{
   display:inline-flex;
   align-items:center;
@@ -482,6 +487,13 @@ textarea,.textarea{min-height:90px;resize:vertical}
   white-space:nowrap;
   font-size:12px;
 }
+
+/* Inline expand area (+N -> multi-line) */
+.remote-extra{flex-basis:100%;display:flex;flex-direction:column;gap:6px;margin-top:6px;padding-left:2px}
+.remote-line{display:flex;flex-wrap:wrap;gap:6px}
+
+/* Allow remote column to wrap when expanded */
+.rules-table th.remote,.rules-table td.remote{white-space:normal;min-width:260px}
 
 /* Table header glass + sticky */
 .table thead th{

@@ -116,8 +116,55 @@ function renderRemoteTargets(e, idx){
   const shown = rs.slice(0, MAX);
   const more = Math.max(0, rs.length - MAX);
   const chips = shown.map(r=>`<span class="remote-chip mono" title="${escapeHtml(r)}">${escapeHtml(r)}</span>`).join('');
-  const moreHtml = more>0 ? `<button class="pill ghost remote-more" type="button" data-idx="${idx}" title="点击查看全部目标">+${more}</button>` : '';
-  return `<div class="remote-wrap">${chips}${moreHtml}</div>`;
+  const moreHtml = more>0 ? `<button class="pill ghost remote-more" type="button" data-idx="${idx}" data-more="${more}" aria-expanded="false" title="展开更多目标">+${more}</button>` : '';
+  const extraHtml = more>0 ? `<div class="remote-extra" hidden>
+    ${rs.slice(MAX).map(r=>`<div class="remote-line"><span class="remote-chip mono" title="${escapeHtml(r)}">${escapeHtml(r)}</span></div>`).join('')}
+  </div>` : '';
+  return `<div class="remote-wrap">${chips}${moreHtml}${extraHtml}</div>`;
+}
+
+// 表格视图：直接展开成多行（不再使用 +N）
+function renderRemoteTargetsExpanded(e){
+  const rs = Array.isArray(e.remotes) ? e.remotes : (e.remote ? [e.remote] : []);
+  if(!rs.length) return '<span class="muted">—</span>';
+  const lines = rs.map(r=>`<div class="remote-line"><span class="remote-chip mono" title="${escapeHtml(r)}">${escapeHtml(r)}</span></div>`).join('');
+  return `<div class="remote-wrap expanded">${lines}</div>`;
+}
+
+// 表格视图：连通检测直接多行展示（不使用 +N）
+function renderHealthExpanded(healthList, statsError){
+  if(statsError){
+    return `<span class="muted">检测失败：${escapeHtml(statsError)}</span>`;
+  }
+  if(!Array.isArray(healthList) || healthList.length === 0){
+    return '<span class="muted">暂无检测数据</span>';
+  }
+  function friendlyError(err){
+    const s = String(err || '').trim();
+    if(!s) return '';
+    const t = s.toLowerCase();
+    if(t.includes('timed out') || t.includes('timeout')) return '超时';
+    if(t.includes('refused')) return '拒绝连接';
+    if(t.includes('no route')) return '无路由';
+    if(t.includes('name or service not known') || t.includes('temporary failure in name resolution')) return 'DNS失败';
+    if(t.includes('network is unreachable')) return '网络不可达';
+    if(t.includes('permission denied')) return '无权限';
+    return s.length > 28 ? (s.slice(0, 28) + '…') : s;
+  }
+  const lines = healthList.map((item)=>{
+    const isUnknown = item && item.ok == null;
+    const ok = !!item.ok;
+    const latencyMs = item && item.latency_ms != null ? item.latency_ms : item && item.latency != null ? item.latency : null;
+    const label = isUnknown ? (item.message || '不可检测') : (ok ? `${latencyMs != null ? latencyMs : '—'} ms` : '离线');
+    const reason = (!isUnknown && !ok) ? friendlyError(item.error || item.message) : '';
+    const title = !isUnknown && !ok ? `离线原因：${String(item.error || item.message || '').trim()}` : '';
+    return `<div class="health-item" title="${escapeHtml(title)}">
+      <span class="pill ${isUnknown ? 'warn' : (ok ? 'ok' : 'bad')}">${escapeHtml(label)}</span>
+      <span class="mono health-target">${escapeHtml(item.target)}</span>
+      ${reason ? `<span class="health-reason">(${escapeHtml(reason)})</span>` : ''}
+    </div>`;
+  }).join('');
+  return `<div class="health-wrap expanded">${lines}</div>`;
 }
 
 function showRemoteDetail(idx){
@@ -211,8 +258,23 @@ function renderHealth(healthList, statsError, idx){
     </div>`;
   }).join('');
 
-  const more = hiddenCount > 0 ? `<button class="pill ghost health-more" type="button" data-idx="${idx}" title="点击查看全部目标">+${hiddenCount}</button>` : '';
-  return `<div class="health-wrap">${chips}${more}</div>`;
+  const moreBtn = hiddenCount > 0 ? `<button class="pill ghost health-more" type="button" data-idx="${idx}" data-more="${hiddenCount}" aria-expanded="false" title="展开更多目标">+${hiddenCount}</button>` : '';
+  const extraHtml = hiddenCount > 0 ? `<div class="health-extra" hidden>
+    ${healthList.slice(MAX_SHOW).map((item)=>{
+      const isUnknown = item && item.ok == null;
+      const ok = !!item.ok;
+      const latencyMs = item && item.latency_ms != null ? item.latency_ms : item && item.latency != null ? item.latency : null;
+      const label = isUnknown ? (item.message || '不可检测') : (ok ? `${latencyMs != null ? latencyMs : '—'} ms` : '离线');
+      const reason = (!isUnknown && !ok) ? friendlyError(item.error || item.message) : '';
+      const title = !isUnknown && !ok ? `离线原因：${String(item.error || item.message || '').trim()}` : '';
+      return `<div class="health-item" title="${escapeHtml(title)}">
+        <span class="pill ${isUnknown ? 'warn' : (ok ? 'ok' : 'bad')}">${escapeHtml(label)}</span>
+        <span class="mono health-target">${escapeHtml(item.target)}</span>
+        ${reason ? `<span class="health-reason">(${escapeHtml(reason)})</span>` : ''}
+      </div>`;
+    }).join('')}
+  </div>` : '';
+  return `<div class="health-wrap">${chips}${moreBtn}${extraHtml}</div>`;
 }
 
 function renderHealthMobile(healthList, statsError, idx){
@@ -257,8 +319,26 @@ function renderHealthMobile(healthList, statsError, idx){
     </div>`;
   }).join('');
 
-  const more = hiddenCount > 0 ? `<button class="pill ghost health-more" type="button" data-idx="${idx}">+${hiddenCount}</button>` : '';
-  return `<div class="health-wrap mobile">${chips}${more}</div>`;
+  const moreBtn = hiddenCount > 0 ? `<button class="pill ghost health-more" type="button" data-idx="${idx}" data-more="${hiddenCount}" aria-expanded="false" title="展开更多目标">+${hiddenCount}</button>` : '';
+  const extraHtml = hiddenCount > 0 ? `<div class="health-extra" hidden>
+    ${healthList.slice(MAX_SHOW).map((item)=>{
+      const isUnknown = item && item.ok == null;
+      const ok = !!item.ok;
+      const latencyMs = item && item.latency_ms != null ? item.latency_ms : item && item.latency != null ? item.latency : null;
+      const label = isUnknown ? (item.message || '不可检测') : (ok ? `${latencyMs != null ? latencyMs : '—'} ms` : '离线');
+      const reason = (!isUnknown && !ok) ? friendlyError(item.error || item.message) : '';
+      const title = (!isUnknown && !ok) ? `离线原因：${String(item.error || item.message || '').trim()}` : '';
+
+      return `<div class="health-item mobile" title="${escapeHtml(title)}">
+        <span class="pill ${isUnknown ? 'warn' : (ok ? 'ok' : 'bad')}">${escapeHtml(label)}</span>
+        <div class="health-meta">
+          <div class="mono health-target" title="${escapeHtml(item.target)}">${escapeHtml(item.target)}</div>
+          ${reason ? `<div class="health-reason">${escapeHtml(reason)}</div>` : ''}
+        </div>
+      </div>`;
+    }).join('')}
+  </div>` : '';
+  return `<div class="health-wrap mobile">${chips}${moreBtn}${extraHtml}</div>`;
 }
 
 function showHealthDetail(idx){
@@ -379,7 +459,7 @@ ${endpointType(e)}`.toLowerCase();
       card.innerHTML = renderRuleCard(e, idx, rowNo, stats, statsError);
       mobileWrap.appendChild(card.firstElementChild);
     }else{
-      const healthHtml = renderHealth(stats.health, statsLookup.error, idx);
+      const healthHtml = renderHealthExpanded(stats.health, statsLookup.error);
       const rx = statsError ? null : (stats.rx_bytes || 0);
       const tx = statsError ? null : (stats.tx_bytes || 0);
       const total = (rx == null || tx == null) ? null : rx + tx;
@@ -394,7 +474,7 @@ ${endpointType(e)}`.toLowerCase();
           <div class="mono">${escapeHtml(e.listen)}</div>
           <div class="muted sm">${endpointType(e)}</div>
         </td>
-        <td class="remote">${renderRemoteTargets(e, idx)}</td>
+        <td class="remote">${renderRemoteTargetsExpanded(e)}</td>
         <td class="health">${healthHtml}</td>
         <td class="stat" title="当前已建立连接：${escapeHtml(est)}">${statsError ? '—' : escapeHtml(connActive)}</td>
         <td class="stat">${total == null ? '—' : formatBytes(total)}</td>
@@ -1255,15 +1335,39 @@ document.addEventListener('click', (e)=>{
   const rbtn = e.target.closest && e.target.closest('button.remote-more');
   if(rbtn){
     e.preventDefault();
-    const idx = Number(rbtn.dataset.idx);
-    if(!Number.isNaN(idx)) showRemoteDetail(idx);
+    const wrap = rbtn.closest('.remote-wrap');
+    const extra = wrap ? wrap.querySelector('.remote-extra') : null;
+    const more = rbtn.dataset.more || '';
+    if(extra){
+      const open = !!extra.hidden;
+      extra.hidden = !open;
+      rbtn.setAttribute('aria-expanded', open ? 'true' : 'false');
+      rbtn.textContent = open ? '−' : `+${more}`;
+      rbtn.title = open ? '收起' : '展开更多目标';
+      if(wrap) wrap.classList.toggle('expanded', open);
+    }else{
+      const idx = Number(rbtn.dataset.idx);
+      if(!Number.isNaN(idx)) showRemoteDetail(idx);
+    }
     return;
   }
   const hbtn = e.target.closest && e.target.closest('button.health-more');
   if(hbtn){
     e.preventDefault();
-    const idx = Number(hbtn.dataset.idx);
-    if(!Number.isNaN(idx)) showHealthDetail(idx);
+    const wrap = hbtn.closest('.health-wrap');
+    const extra = wrap ? wrap.querySelector('.health-extra') : null;
+    const more = hbtn.dataset.more || '';
+    if(extra){
+      const open = !!extra.hidden;
+      extra.hidden = !open;
+      hbtn.setAttribute('aria-expanded', open ? 'true' : 'false');
+      hbtn.textContent = open ? '−' : `+${more}`;
+      hbtn.title = open ? '收起' : '展开更多目标';
+      if(wrap) wrap.classList.toggle('expanded', open);
+    }else{
+      const idx = Number(hbtn.dataset.idx);
+      if(!Number.isNaN(idx)) showHealthDetail(idx);
+    }
     return;
   }
 });
