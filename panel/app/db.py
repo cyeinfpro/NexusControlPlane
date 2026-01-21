@@ -156,6 +156,15 @@ def get_node(node_id: int, db_path: str = DEFAULT_DB_PATH) -> Optional[Dict[str,
     return dict(row) if row else None
 
 
+def get_node_by_api_key(api_key: str, db_path: str = DEFAULT_DB_PATH) -> Optional[Dict[str, Any]]:
+    api_key = (api_key or "").strip()
+    if not api_key:
+        return None
+    with connect(db_path) as conn:
+        row = conn.execute("SELECT * FROM nodes WHERE api_key=?", (api_key,)).fetchone()
+    return dict(row) if row else None
+
+
 def add_node(
     name: str,
     base_url: str,

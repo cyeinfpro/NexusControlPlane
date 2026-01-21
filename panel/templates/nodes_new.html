@@ -2,14 +2,14 @@
 {% block content %}
 <div class="card" style="max-width:720px;margin:20px auto;">
   <h1 class="h1">接入节点</h1>
-  <p class="muted">填写节点名称与 IP，可自定义端口（默认 {{ default_port }}），系统自动生成密钥</p>
+  <p class="muted">填写节点名称与 IP（端口默认 {{ default_port }}，界面不再展示），系统自动生成密钥</p>
   <form method="post" action="/nodes/new" class="form">
     <label class="label">节点名称</label>
     <input class="input" name="name" placeholder="例如：北京-主机01">
 
     <label class="label">节点 IP 地址</label>
     <input class="input" name="ip_address" placeholder="10.0.0.2" required>
-    <div class="help">请输入主机或 IP。若填写了端口，需与下方端口保持一致。</div>
+    <div class="help">请输入主机或 IP。端口默认 {{ default_port }}（无需填写）。</div>
 
     <label class="label">协议</label>
     <select class="select" name="scheme">
@@ -18,9 +18,7 @@
     </select>
     <div class="help">用于生成 API 地址，HTTPS 场景请选 https。</div>
 
-    <label class="label">端口</label>
-    <input class="input" name="port" type="number" min="1" max="65535" value="{{ default_port }}" required>
-    <div class="help">默认 {{ default_port }}，需与 Agent 实际监听端口一致。</div>
+    <!-- 端口已隐藏：统一使用标准端口 {{ default_port }} -->
     <input type="hidden" name="api_key" value="{{ api_key }}">
 
     <div class="row" style="margin-top:14px;">

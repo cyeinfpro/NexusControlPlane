@@ -15,15 +15,19 @@
   <div class="card">
     <div class="row">
       <div class="col">
-        <div class="h2">{{ n.name }}</div>
-        <div class="muted">{{ n.base_url }}</div>
+        <div class="h2">{{ n.display_ip or n.name }}</div>
+        <div class="muted">上报：{{ n.last_seen_at or "-" }}</div>
       </div>
       <div class="col right">
         <a class="btn-secondary" href="/nodes/{{ n.id }}">打开</a>
       </div>
     </div>
-    <div class="meta" data-node-id="{{ n.id }}">
-      <span class="pill" id="node-{{ n.id }}-state">检测中...</span>
+    <div class="meta">
+      {% if n.online %}
+      <span class="pill ok">在线</span>
+      {% else %}
+      <span class="pill bad">离线</span>
+      {% endif %}
     </div>
   </div>
   {% else %}
@@ -35,31 +39,4 @@
 </div>
 {% endblock %}
 
-{% block scripts %}
-<script>
-async function pingNode(id){
-  try{
-    const res = await fetch(`/api/nodes/${id}/ping`);
-    const data = await res.json();
-    const el = document.getElementById(`node-${id}-state`);
-    if(data.ok){
-      const latency = (data.latency_ms != null) ? `在线 · ${data.latency_ms} ms` : '在线';
-      el.textContent = latency;
-      el.className = 'pill ok';
-    }else{
-      el.textContent = '离线';
-      el.className = 'pill bad';
-    }
-  }catch(e){
-    const el = document.getElementById(`node-${id}-state`);
-    el.textContent = '离线';
-    el.className = 'pill bad';
-  }
-}
-
-for(const el of document.querySelectorAll('[data-node-id]')){
-  const id = el.getAttribute('data-node-id');
-  pingNode(id);
-}
-</script>
-{% endblock %}
+{% block scripts %}{% endblock %}

@@ -1042,13 +1042,6 @@ def api_info(_: None = Depends(_api_key_required)) -> Dict[str, Any]:
         'time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
         'hostname': socket.gethostname(),
         'realm_active': any(_service_is_active(name) for name in REALM_SERVICE_NAMES),
-        'push_report': {
-            'enabled': bool(PANEL_URL and AGENT_ID > 0),
-            'panel_url': PANEL_URL or None,
-            'agent_id': AGENT_ID or None,
-            'interval_s': HEARTBEAT_INTERVAL,
-            'ack_version': _read_int(ACK_VER_FILE, 0),
-        },
     }
 
 

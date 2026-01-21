@@ -241,7 +241,8 @@ function renderRules(){
   const eps = (CURRENT_POOL && CURRENT_POOL.endpoints) ? CURRENT_POOL.endpoints : [];
   const statsLookup = buildStatsLookup();
   const statsLoading = q('statsLoading');
-  const isMobile = window.matchMedia && window.matchMedia('(max-width: 720px)').matches;
+  // 统一使用「卡片」展示（所有设备一致）
+  const isMobile = true;
   if(!eps.length){
     q('rulesLoading').style.display = '';
     q('rulesLoading').textContent = '暂无规则';
@@ -781,3 +782,35 @@ window.closeCommandModal = closeCommandModal;
 window.applyPairingCode = applyPairingCode;
 window.closePairingModal = closePairingModal;
 window.randomizeWss = randomizeWss;
+
+// -------------------- Small UX enhancements --------------------
+
+let AUTO_REFRESH_TIMER = null;
+function toggleAutoRefresh(){
+  const btn = q('autoRefreshBtn');
+  if(AUTO_REFRESH_TIMER){
+    clearInterval(AUTO_REFRESH_TIMER);
+    AUTO_REFRESH_TIMER = null;
+    if(btn) btn.textContent = '自动刷新：关';
+    return;
+  }
+  if(btn) btn.textContent = '自动刷新：开';
+  refreshStats();
+  AUTO_REFRESH_TIMER = setInterval(()=>{
+    refreshStats();
+  }, 3000);
+}
+
+async function copyText(text){
+  const str = String(text || '').trim();
+  if(!str) return;
+  try{
+    await navigator.clipboard.writeText(str);
+    toast('已复制');
+  }catch(e){
+    alert('复制失败，请手动复制');
+  }
+}
+
+window.toggleAutoRefresh = toggleAutoRefresh;
+window.copyText = copyText;

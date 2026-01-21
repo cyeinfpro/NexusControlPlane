@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, Response
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, Response, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.middleware.sessions import SessionMiddleware
@@ -20,6 +20,7 @@ from .db import (
     delete_node,
     ensure_db,
     get_node,
+    get_node_by_api_key,
     get_desired_pool,
     get_last_report,
     list_nodes,
@@ -113,6 +114,20 @@ def _extract_port_from_url(base_url: str, fallback_port: int) -> int:
     return parsed.port or fallback_port
 
 
+def _extract_ip_for_display(base_url: str) -> str:
+    """UI 只展示纯 IP/Host（不展示端口、不展示协议）。"""
+    raw = (base_url or "").strip()
+    if not raw:
+        return ""
+    if "://" not in raw:
+        raw = f"http://{raw}"
+    try:
+        parsed = urlparse(raw)
+        return parsed.hostname or (base_url or "").strip()
+    except Exception:
+        return (base_url or "").strip()
+
+
 def _node_verify_tls(node: Dict[str, Any]) -> bool:
     return bool(node.get("verify_tls", 0))
 
@@ -198,6 +213,9 @@ async def setup_action(
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request, user: str = Depends(require_login_page)):
     nodes = list_nodes()
+    for n in nodes:
+        n["display_ip"] = _extract_ip_for_display(n.get("base_url", ""))
+        n["online"] = _is_report_fresh(n)
     return templates.TemplateResponse(
         "index.html",
         {"request": request, "user": user, "nodes": nodes, "flash": _flash(request), "title": "控制台"},
@@ -225,7 +243,6 @@ async def node_new_action(
     request: Request,
     name: str = Form(""),
     ip_address: str = Form(...),
-    port: str = Form(""),
     scheme: str = Form("http"),
     api_key: str = Form(""),
     verify_tls: Optional[str] = Form(None),
@@ -235,7 +252,6 @@ async def node_new_action(
         return RedirectResponse(url="/login", status_code=303)
 
     ip_address = ip_address.strip()
-    port = port.strip()
     api_key = api_key.strip() or _generate_api_key()
     scheme = scheme.strip().lower() or "http"
     if scheme not in ("http", "https"):
@@ -246,26 +262,24 @@ async def node_new_action(
         return RedirectResponse(url="/nodes/new", status_code=303)
     if "://" not in ip_address:
         ip_address = f"{scheme}://{ip_address}"
+
+    # 端口在 UI 中隐藏：
+    # - 默认使用 Agent 标准端口 18700
+    # - 如用户在 IP 中自带 :port，则仍可解析并写入 base_url（兼容特殊环境）
     port_value = DEFAULT_AGENT_PORT
-    if port:
-        if not port.isdigit():
-            _set_flash(request, "端口必须是数字")
-            return RedirectResponse(url="/nodes/new", status_code=303)
-        port_value = int(port)
-    if not (1 <= port_value <= 65535):
-        _set_flash(request, "端口范围应为 1-65535")
-        return RedirectResponse(url="/nodes/new", status_code=303)
     host, parsed_port, has_port, scheme = _split_host_and_port(ip_address, port_value)
     if not host:
         _set_flash(request, "IP 地址不能为空")
         return RedirectResponse(url="/nodes/new", status_code=303)
-    if has_port and port and parsed_port != port_value:
-        _set_flash(request, "IP 地址已包含端口，请与端口输入保持一致")
-        return RedirectResponse(url="/nodes/new", status_code=303)
-    port_value = parsed_port if has_port and not port else port_value
-    base_url = f"{scheme}://{_format_host_for_url(host)}:{port_value}"
+    if has_port:
+        port_value = parsed_port
 
-    node_id = add_node(name or base_url, base_url, api_key, verify_tls=bool(verify_tls))
+    base_url = f"{scheme}://{_format_host_for_url(host)}"  # 不在 UI 展示端口
+
+    # name 为空则默认使用“纯 IP/Host”
+    display_name = (name or "").strip() or _extract_ip_for_display(base_url)
+
+    node_id = add_node(display_name, base_url, api_key, verify_tls=bool(verify_tls))
     request.session["show_install_cmd"] = True
     _set_flash(request, "已添加机器")
     return RedirectResponse(url=f"/nodes/{node_id}", status_code=303)
@@ -310,36 +324,15 @@ async def node_detail(request: Request, node_id: int, user: str = Depends(requir
         return RedirectResponse(url="/", status_code=303)
     show_install_cmd = bool(request.session.pop("show_install_cmd", False))
     base_url = str(request.base_url).rstrip("/")
-    repo_zip_url = f"{base_url}/static/realm-agent.zip"
-    agent_port = _extract_port_from_url(node["base_url"], DEFAULT_AGENT_PORT)
-    install_cmd = (
-        "sudo -E bash -c \""
-        "mkdir -p /etc/realm-agent && "
-        f"echo '{node['api_key']}' > /etc/realm-agent/api.key && "
-        f"curl -fsSL {base_url}/static/realm_agent.sh | "
-        f"REALM_AGENT_REPO_ZIP_URL={repo_zip_url} "
-        "REALM_AGENT_FORCE_UPDATE=1 "
-        f"REALM_AGENT_MODE=1 REALM_AGENT_PORT={agent_port} REALM_AGENT_ASSUME_YES=1 bash"
-        "\""
-    )
-    # Agent push-report mode (agent -> panel)
-    # - REALM_PANEL_URL: panel base url
-    # - REALM_AGENT_ID:  node id in panel DB
-    # - REALM_AGENT_HEARTBEAT_INTERVAL: default 3s
-    install_cmd = install_cmd.replace(
-        " REALM_AGENT_ASSUME_YES=1 bash\"",
-        f" REALM_AGENT_ASSUME_YES=1 REALM_PANEL_URL={base_url} REALM_AGENT_ID={node_id} REALM_AGENT_HEARTBEAT_INTERVAL=3 bash\"",
-    )
-    uninstall_cmd = (
-        "sudo -E bash -c \""
-        "systemctl disable --now realm-agent.service realm-agent-https.service realm.service realm "
-        ">/dev/null 2>&1 || true; "
-        "rm -f /etc/systemd/system/realm-agent.service /etc/systemd/system/realm-agent-https.service "
-        "/etc/systemd/system/realm.service; "
-        "systemctl daemon-reload; "
-        "rm -rf /opt/realm-agent /etc/realm-agent /etc/realm /opt/realm /usr/local/bin/realm /usr/bin/realm"
-        "\""
-    )
+    node["display_ip"] = _extract_ip_for_display(node.get("base_url", ""))
+
+    # ✅ 一键接入 / 卸载命令（短命令，避免超长）
+    # 说明：使用 node.api_key 作为 join token，脚本由面板返回并带参数执行。
+    install_cmd = f"curl -fsSL {base_url}/join/{node['api_key']} | bash"
+    uninstall_cmd = f"curl -fsSL {base_url}/uninstall/{node['api_key']} | bash"
+
+    # 兼容旧字段（模板里可能还引用 node_port）
+    agent_port = DEFAULT_AGENT_PORT
     return templates.TemplateResponse(
         "node.html",
         {
@@ -354,6 +347,99 @@ async def node_detail(request: Request, node_id: int, user: str = Depends(requir
             "show_install_cmd": show_install_cmd,
         },
     )
+
+
+# ------------------------ Short join / uninstall scripts (no login) ------------------------
+
+
+@app.get("/join/{token}", response_class=PlainTextResponse)
+async def join_script(request: Request, token: str):
+    """短命令接入脚本：curl .../join/<token> | bash
+
+    token = node.api_key（用于定位节点），脚本内部会写入 /etc/realm-agent/api.key，
+    并从面板 /static 拉取 realm_agent.sh 以及 realm-agent.zip。
+    """
+
+    node = get_node_by_api_key(token)
+    if not node:
+        return PlainTextResponse("echo '[ERR] invalid token'\n", status_code=404)
+
+    base_url = str(request.base_url).rstrip("/")
+    node_id = int(node.get("id"))
+    api_key = str(node.get("api_key"))
+    repo_zip_url = f"{base_url}/static/realm-agent.zip"
+
+    script = f"""#!/usr/bin/env bash
+set -euo pipefail
+
+PANEL_URL=\"{base_url}\"
+NODE_ID=\"{node_id}\"
+API_KEY=\"{api_key}\"
+
+if [[ \"$(id -u)\" -ne 0 ]]; then
+  if command -v sudo >/dev/null 2>&1; then
+    echo \"[提示] 需要 root，自动尝试 sudo...\" >&2
+    exec sudo -E bash -c \"curl -fsSL $PANEL_URL/join/{api_key} | bash\"
+  fi
+  echo \"[ERR ] 需要 root 权限运行（当前机器无 sudo）。请先 su - 后重试。\" >&2
+  exit 1
+fi
+
+mkdir -p /etc/realm-agent
+echo \"$API_KEY\" > /etc/realm-agent/api.key
+
+echo \"[提示] 正在安装/更新 Agent...\" >&2
+curl -fsSL $PANEL_URL/static/realm_agent.sh | \
+  REALM_AGENT_REPO_ZIP_URL=\"{repo_zip_url}\" \
+  REALM_AGENT_FORCE_UPDATE=1 \
+  REALM_AGENT_MODE=1 \
+  REALM_AGENT_PORT={DEFAULT_AGENT_PORT} \
+  REALM_AGENT_ASSUME_YES=1 \
+  REALM_PANEL_URL=\"$PANEL_URL\" \
+  REALM_AGENT_ID=\"$NODE_ID\" \
+  REALM_AGENT_HEARTBEAT_INTERVAL=3 \
+  bash
+"""
+    return PlainTextResponse(script, media_type="text/plain; charset=utf-8")
+
+
+@app.get("/uninstall/{token}", response_class=PlainTextResponse)
+async def uninstall_script(request: Request, token: str):
+    """短命令卸载脚本：curl .../uninstall/<token> | bash"""
+
+    node = get_node_by_api_key(token)
+    if not node:
+        return PlainTextResponse("echo '[ERR] invalid token'\n", status_code=404)
+
+    base_url = str(request.base_url).rstrip("/")
+    api_key = str(node.get("api_key"))
+    script = f"""#!/usr/bin/env bash
+set -euo pipefail
+
+PANEL_URL=\"{base_url}\"
+
+if [[ \"$(id -u)\" -ne 0 ]]; then
+  if command -v sudo >/dev/null 2>&1; then
+    echo \"[提示] 需要 root，自动尝试 sudo...\" >&2
+    exec sudo -E bash -c \"curl -fsSL $PANEL_URL/uninstall/{api_key} | bash\"
+  fi
+  echo \"[ERR ] 需要 root 权限运行（当前机器无 sudo）。请先 su - 后重试。\" >&2
+  exit 1
+fi
+
+echo \"[提示] 卸载 Agent / Realm...\" >&2
+systemctl disable --now realm-agent.service realm-agent-https.service realm.service realm \
+  >/dev/null 2>&1 || true
+rm -f /etc/systemd/system/realm-agent.service /etc/systemd/system/realm-agent-https.service \
+  /etc/systemd/system/realm.service || true
+systemctl daemon-reload || true
+
+rm -rf /opt/realm-agent /etc/realm-agent /etc/realm /opt/realm || true
+rm -f /usr/local/bin/realm /usr/bin/realm || true
+
+echo \"[OK] 已卸载\" >&2
+"""
+    return PlainTextResponse(script, media_type="text/plain; charset=utf-8")
 
 
 # ------------------------ Agent push-report API (no login) ------------------------
