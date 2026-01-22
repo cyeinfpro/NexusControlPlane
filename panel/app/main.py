@@ -32,6 +32,8 @@ from .db import (
     get_last_report,
     list_nodes,
     set_desired_pool,
+    set_desired_pool_exact,
+    set_desired_pool_version_exact,
     update_node_basic,
     update_node_report,
 )
@@ -633,6 +635,12 @@ async def api_agent_report(request: Request, payload: Dict[str, Any]):
         report = payload
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     ack_version = payload.get("ack_version")
+
+    # Parse agent ack version early (used for version realignment)
+    try:
+        agent_ack = int(ack_version) if ack_version is not None else 0
+    except Exception:
+        agent_ack = 0
     try:
         update_node_report(
             node_id=node_id,
@@ -644,21 +652,26 @@ async def api_agent_report(request: Request, payload: Dict[str, Any]):
         # 不要让写库失败影响 agent
         pass
 
-    # 若面板尚无 desired_pool，则尝试把 agent 当前 pool 作为初始 desired_pool
+    # 若面板尚无 desired_pool，则尝试把 agent 当前 pool 作为初始 desired_pool。
+    # ⚠️ 关键：当面板重装/恢复后，Agent 可能还保留旧的 ack_version（例如 33），
+    # 如果面板把 desired_pool_version 从 1 开始，后续新增规则会一直小于 ack_version，
+    # 导致面板永远不下发 commands，看起来像“不同步”。
+    # 这里将面板 desired_pool_version 对齐到 agent_ack（至少 1），避免版本回退。
     desired_ver, desired_pool = get_desired_pool(node_id)
     if desired_pool is None:
         rep_pool = None
         if isinstance(report, dict):
             rep_pool = report.get("pool")
         if isinstance(rep_pool, dict):
-            desired_ver, desired_pool = set_desired_pool(node_id, rep_pool)
+            init_ver = max(1, agent_ack)
+            desired_ver, desired_pool = set_desired_pool_exact(node_id, rep_pool, init_ver)
+    else:
+        # Desired exists but version is behind agent ack (panel DB reset or migrated)
+        if agent_ack > desired_ver:
+            desired_ver = set_desired_pool_version_exact(node_id, agent_ack)
 
     # 下发命令：规则池同步
     cmds: list[dict[str, Any]] = []
-    try:
-        agent_ack = int(ack_version) if ack_version is not None else 0
-    except Exception:
-        agent_ack = 0
     if isinstance(desired_pool, dict) and desired_ver > agent_ack:
         # ✅ 单条规则增量下发：仅当 agent 落后 1 个版本，且报告中存在当前 pool 时才尝试 patch
         base_pool = None

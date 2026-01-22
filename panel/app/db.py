@@ -117,6 +117,47 @@ def set_desired_pool(
         return new_ver, pool
 
 
+def set_desired_pool_exact(
+    node_id: int,
+    pool: Dict[str, Any],
+    version: int,
+    db_path: str = DEFAULT_DB_PATH,
+) -> Tuple[int, Dict[str, Any]]:
+    """Set desired pool with an explicit version (no auto increment).
+
+    Used to realign panel desired version to agent ack version after panel migration,
+    so that subsequent edits will produce versions greater than agent ack.
+    Returns (version, pool).
+    """
+    import json
+
+    ver = max(0, int(version or 0))
+    payload = json.dumps(pool, ensure_ascii=False)
+    with connect(db_path) as conn:
+        conn.execute(
+            "UPDATE nodes SET desired_pool_json=?, desired_pool_version=? WHERE id=?",
+            (payload, ver, int(node_id)),
+        )
+        conn.commit()
+    return ver, pool
+
+
+def set_desired_pool_version_exact(
+    node_id: int,
+    version: int,
+    db_path: str = DEFAULT_DB_PATH,
+) -> int:
+    """Set desired_pool_version without changing desired_pool_json."""
+    ver = max(0, int(version or 0))
+    with connect(db_path) as conn:
+        conn.execute(
+            "UPDATE nodes SET desired_pool_version=? WHERE id=?",
+            (ver, int(node_id)),
+        )
+        conn.commit()
+    return ver
+
+
 def get_desired_pool(node_id: int, db_path: str = DEFAULT_DB_PATH) -> Tuple[int, Optional[Dict[str, Any]]]:
     import json
 
