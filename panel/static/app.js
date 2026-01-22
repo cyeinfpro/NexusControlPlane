@@ -242,26 +242,27 @@ function setProgressEl(el, pct){
 // Dashboard node tile: render mini system info inside a node card
 function renderSysMini(cardEl, sys){
   if(!cardEl) return;
-  const sysCard = cardEl.querySelector('[data-sys-card]');
-  if(!sysCard) return;
-
-  const hint = sysCard.querySelector('[data-sys="hint"]');
+  // New compact dashboard tiles (index.html)
+  const hint = cardEl.querySelector('[data-sys="hint"]');
   const setText = (key, text) => {
-    const el = sysCard.querySelector(`[data-sys="${key}"]`);
+    const el = cardEl.querySelector(`[data-sys="${key}"]`);
     if(el) el.textContent = text;
   };
+  const setTitle = (key, title) => {
+    const el = cardEl.querySelector(`[data-sys="${key}"]`);
+    if(el) el.setAttribute('title', title || '');
+  };
   const setBar = (key, pct) => {
-    const el = sysCard.querySelector(`[data-sys-bar="${key}"]`);
+    const el = cardEl.querySelector(`[data-sys-bar="${key}"]`);
     setProgressEl(el, pct);
   };
 
   // Offline or missing data
   if(!sys || sys.error){
-    setText('cpuInfo', '暂无数据');
     setText('uptime', '—');
     setText('traffic', '—');
     setText('rate', '—');
-    setText('cpuPct', '0%');
+    setText('cpuPct', '—');
     setText('memText', '—');
     setText('diskText', '—');
     setBar('cpu', 0);
@@ -298,14 +299,19 @@ function renderSysMini(cardEl, sys){
   const txBps = sys?.net?.tx_bps || 0;
   const rxBps = sys?.net?.rx_bps || 0;
 
-  // CPU 型号信息太占空间：只展示核心数
-  setText('cpuInfo', `${cores}核`);
+  // Compact tile texts
   setText('uptime', formatDuration(sys?.uptime_sec || 0));
-  setText('traffic', `上传 ${formatBytes(tx)} | 下载 ${formatBytes(rx)}`);
-  setText('rate', `上传 ${formatBps(txBps)} | 下载 ${formatBps(rxBps)}`);
+  setText('traffic', `↑ ${formatBytes(tx)} · ↓ ${formatBytes(rx)}`);
+  setText('rate', `↑ ${formatBps(txBps)} · ↓ ${formatBps(rxBps)}`);
   setText('cpuPct', `${Number(cpuPct).toFixed(0)}%`);
-  setText('memText', `${formatBytes(memUsed)} / ${formatBytes(memTot)}  ${Number(memPct).toFixed(0)}%`);
-  setText('diskText', `${formatBytes(diskUsed)} / ${formatBytes(diskTot)}  ${Number(diskPct).toFixed(0)}%`);
+
+  // Keep the bar head short; put full numbers in tooltip
+  const memFull = `${formatBytes(memUsed)} / ${formatBytes(memTot)}  ${Number(memPct).toFixed(0)}%`;
+  const diskFull = `${formatBytes(diskUsed)} / ${formatBytes(diskTot)}  ${Number(diskPct).toFixed(0)}%`;
+  setText('memText', `${Number(memPct).toFixed(0)}%`);
+  setText('diskText', `${Number(diskPct).toFixed(0)}%`);
+  setTitle('memText', memFull);
+  setTitle('diskText', diskFull);
 
   setBar('cpu', cpuPct);
   setBar('mem', memPct);
@@ -1446,6 +1452,64 @@ function openAddNodeModal(){
   const ip = document.getElementById("addNodeIp");
   if(ip) setTimeout(()=>ip.focus(), 30);
 }
+
+
+// ---------------- Dashboard: Full Restore Modal ----------------
+function openRestoreFullModal(){
+  const m = document.getElementById('restoreFullModal');
+  if(!m) return;
+  m.style.display = 'flex';
+  const input = document.getElementById('restoreFullFile');
+  if(input) input.value = '';
+  const err = document.getElementById('restoreFullError');
+  if(err) err.textContent = '';
+  const btn = document.getElementById('restoreFullSubmit');
+  if(btn){ btn.disabled = false; btn.textContent = '开始恢复'; }
+}
+
+function closeRestoreFullModal(){
+  const m = document.getElementById('restoreFullModal');
+  if(!m) return;
+  m.style.display = 'none';
+}
+
+async function restoreFullNow(){
+  const fileInput = document.getElementById('restoreFullFile');
+  const err = document.getElementById('restoreFullError');
+  const btn = document.getElementById('restoreFullSubmit');
+  try{
+    if(err) err.textContent = '';
+    const f = fileInput && fileInput.files ? fileInput.files[0] : null;
+    if(!f){
+      if(err) err.textContent = '请选择 realm-backup-*.zip 全量备份包';
+      return;
+    }
+    if(btn){ btn.disabled = true; btn.textContent = '恢复中…'; }
+    const fd = new FormData();
+    fd.append('file', f);
+    const resp = await fetch('/api/restore/full', { method: 'POST', body: fd, credentials: 'include' });
+    const data = await resp.json().catch(()=>({ ok:false, error: '接口返回异常' }));
+    if(!resp.ok || !data.ok){
+      const msg = data.error || ('恢复失败（HTTP ' + resp.status + '）');
+      if(err) err.textContent = msg;
+      toast(msg, true);
+      return;
+    }
+    toast('全量恢复已完成');
+    closeRestoreFullModal();
+    setTimeout(()=>window.location.reload(), 600);
+  }catch(e){
+    const msg = (e && e.message) ? e.message : String(e || '恢复失败');
+    if(err) err.textContent = msg;
+    toast(msg, true);
+  }finally{
+    if(btn){ btn.disabled = false; btn.textContent = '开始恢复'; }
+  }
+}
+
+window.openRestoreFullModal = openRestoreFullModal;
+window.closeRestoreFullModal = closeRestoreFullModal;
+window.restoreFullNow = restoreFullNow;
 function closeAddNodeModal(){
   const m = document.getElementById("addNodeModal");
   if(!m) return;
@@ -1503,11 +1567,19 @@ document.addEventListener("click", (e)=>{
   if(e.target === m) closeAddNodeModal();
 });
 
+document.addEventListener("click", (e)=>{
+  const m = document.getElementById("restoreFullModal");
+  if(!m || m.style.display === "none") return;
+  if(e.target === m) closeRestoreFullModal();
+});
+
 // ESC 关闭
 document.addEventListener("keydown", (e)=>{
   if(e.key === "Escape"){
     const m = document.getElementById("addNodeModal");
     if(m && m.style.display !== "none") closeAddNodeModal();
+    const r = document.getElementById("restoreFullModal");
+    if(r && r.style.display !== "none") closeRestoreFullModal();
   }
 });
 

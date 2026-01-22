@@ -5,9 +5,13 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#060816">
   <title>{{ title or "Realm Pro Panel" }}</title>
-<link rel="stylesheet" href="/static/style.css?v=34.2">
+<link rel="stylesheet" href="/static/style.css?v=35.0">
 </head>
 <body>
+  <!-- Flowing background (fixed, no seams on scroll) -->
+  <div class="bg-flow" aria-hidden="true"></div>
+  <div class="bg-noise" aria-hidden="true"></div>
+
   <header class="topbar">
     <a class="brand" href="/" aria-label="Realm Pro">
       <div class="logo">RP</div>

@@ -6,75 +6,85 @@
   <div class="page-title">
     <h1 class="h1">控制台</h1>
     <div class="meta">
-      <span class="meta-item">集中管理节点接入、转发规则与 WSS 自动同步</span>
+      <span class="meta-item">集中管理节点接入、转发规则与 WSS 配置，状态实时同步。</span>
     </div>
   </div>
   <div class="right">
-    <a class="btn sm ghost" href="/api/backup/full">全量备份</a>
-    <button class="btn sm ghost" type="button" onclick="openRestoreNodesModal()">恢复节点列表</button>
-    <button class="btn sm ghost" type="button" onclick="openRestoreFullModal()">全量恢复</button>
+    <details class="menu">
+      <summary class="btn sm secondary" aria-label="备份与恢复">备份与恢复 ▾</summary>
+      <div class="menu-pop">
+        <a class="menu-item" href="/api/backup/full">全量备份</a>
+        <button class="menu-item" type="button" onclick="openRestoreFullModal()">全量恢复</button>
+      </div>
+    </details>
     <button class="btn sm" type="button" onclick="openAddNodeModal()">接入节点</button>
   </div>
 </div>
 
-<div class="grid" id="dashboardGrid">
+{% set total_count = nodes|length %}
+{% set online_count = nodes|selectattr('online')|list|length %}
+{% set offline_count = total_count - online_count %}
+<div class="summary-bar" style="margin: 0 0 8px 0;">
+  <div class="summary-pill">在线 <strong>{{ online_count }}</strong>/<strong>{{ total_count }}</strong></div>
+  <div class="summary-pill">离线 <strong>{{ offline_count }}</strong></div>
+</div>
+
+<div class="grid node-grid" id="dashboardGrid">
   {% for n in nodes %}
-  <div class="card compact node-card" data-node-id="{{ n.id }}" data-online="{{ '1' if n.online else '0' }}">
-    <div class="card-header">
-      <div style="min-width:0;">
-        <div class="row" style="justify-content:space-between;gap:10px;align-items:center;">
-          <div class="h2" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">{{ n.name or ("节点-" ~ n.id) }}</div>
-          {% if n.online %}
-          <span class="pill ok">在线</span>
-          {% else %}
-          <span class="pill bad">离线</span>
-          {% endif %}
-        </div>
-        <div class="meta" style="margin-top:6px;">
-          <span class="meta-item">IP：{{ n.display_ip or "-" }}</span>
-          <span class="meta-item">上报：{{ n.last_seen_at or "-" }}{% if n.agent_version %} · {{ n.agent_version }}{% endif %}</span>
-        </div>
+  <div class="card node-tile node-card" data-node-id="{{ n.id }}" data-online="{{ '1' if n.online else '0' }}">
+    <div class="node-top">
+      <div class="node-left" style="min-width:0;">
+        <div class="node-name" title="{{ n.name or ("节点-" ~ n.id) }}">{{ n.name or ("节点-" ~ n.id) }}</div>
+        <div class="node-host mono" title="{{ n.display_ip or "-" }}">{{ n.display_ip or "-" }}</div>
       </div>
-      <div class="right" style="flex:0 0 auto;">
-        <a class="btn xs secondary" href="/nodes/{{ n.id }}">打开</a>
+
+      <div class="node-right">
+        <div class="node-state {{ 'online' if n.online else 'offline' }}" title="{{ '在线' if n.online else '离线' }}">
+          <span class="node-dot {{ 'online' if n.online else 'offline' }}"></span>
+          <span>{{ '在线' if n.online else '离线' }}</span>
+        </div>
+        <a class="btn icon xs secondary" href="/nodes/{{ n.id }}" title="进入">↗</a>
       </div>
     </div>
 
-    <!-- Mini system info (auto refresh 3s) -->
-    <div class="sys-card mini" data-sys-card>
-      <div class="sys-grid">
-        <div class="sys-kv">
-          <div class="sys-row">
-            <div class="sys-k">在线时长</div>
-            <div class="sys-v" data-sys="uptime">—</div>
-          </div>
-          <div class="sys-row">
-            <div class="sys-k">流量使用</div>
-            <div class="sys-v" data-sys="traffic">—</div>
-          </div>
-          <div class="sys-row">
-            <div class="sys-k">实时速率</div>
-            <div class="sys-v" data-sys="rate">—</div>
-          </div>
-        </div>
-        <div class="sys-bars">
-          
-          <div class="sys-bar">
-            <div class="sys-bar-head"><span>CPU</span><span class="mono" data-sys="cpuPct">—</span></div>
-            <div class="progress"><div class="progress-fill" data-sys-bar="cpu"></div></div>
-          </div>
-          <div class="sys-bar">
-            <div class="sys-bar-head"><span>内存</span><span class="mono" data-sys="memText">—</span></div>
-            <div class="progress"><div class="progress-fill" data-sys-bar="mem"></div></div>
-          </div>
-          <div class="sys-bar">
-            <div class="sys-bar-head"><span>硬盘</span><span class="mono" data-sys="diskText">—</span></div>
-            <div class="progress"><div class="progress-fill" data-sys-bar="disk"></div></div>
-          </div>
-        </div>
+    <div class="node-kpis">
+      <div class="kpi">
+        <div class="k">已在线</div>
+        <div class="v mono" data-sys="uptime">—</div>
       </div>
-      <div class="muted" data-sys="hint" style="margin-top:8px;display:none;">系统信息暂无数据（等待 Agent 上报）</div>
+      <div class="kpi" title="{{ n.last_seen_at or '-' }}{% if n.agent_version %} · {{ n.agent_version }}{% endif %}">
+        <div class="k">最后心跳</div>
+        <div class="v mono">{{ n.last_seen_at or "-" }}</div>
+      </div>
     </div>
+
+    <div class="node-lines">
+      <div class="kvline">
+        <div class="k">累计流量</div>
+        <div class="v mono" data-sys="traffic">—</div>
+      </div>
+      <div class="kvline">
+        <div class="k">当前速率</div>
+        <div class="v mono" data-sys="rate">—</div>
+      </div>
+    </div>
+
+    <div class="node-bars">
+      <div class="mbar">
+        <div class="head"><span>CPU</span><span class="mono" data-sys="cpuPct">—</span></div>
+        <div class="mini-progress"><div class="mini-fill" data-sys-bar="cpu"></div></div>
+      </div>
+      <div class="mbar">
+        <div class="head"><span>内存</span><span class="mono" data-sys="memText">—</span></div>
+        <div class="mini-progress"><div class="mini-fill" data-sys-bar="mem"></div></div>
+      </div>
+      <div class="mbar">
+        <div class="head"><span>磁盘</span><span class="mono" data-sys="diskText">—</span></div>
+        <div class="mini-progress"><div class="mini-fill" data-sys-bar="disk"></div></div>
+      </div>
+    </div>
+
+    <div class="muted sm" data-sys="hint" style="margin-top:8px;display:none;">系统信息暂无数据（等待 Agent 上报）</div>
   </div>
   {% else %}
   <div class="card">
@@ -148,32 +158,7 @@
       <div id="restoreFullError" class="muted" style="margin-top:8px;color:#ffb3b3;white-space:pre-wrap;"></div>
       <div class="row" style="gap:10px; justify-content:flex-end; margin-top:14px;">
         <button class="btn xs ghost" type="button" onclick="closeRestoreFullModal()">取消</button>
-        <button class="btn xs" type="button" onclick="restoreFullNow()">开始恢复</button>
-      </div>
-    </div>
-  </div>
-</div>
-
-<!-- Restore Nodes Modal -->
-<div id="restoreNodesModal" class="modal" style="display:none;">
-  <div class="modal-inner" style="max-width:560px;">
-    <div class="row" style="align-items:center;">
-      <div class="col"><div class="h2">恢复节点列表</div></div>
-      <div class="col right"><button class="btn xs ghost" type="button" onclick="closeRestoreNodesModal()">关闭</button></div>
-    </div>
-
-    <p class="muted" style="margin-top:8px;">
-      上传 <span class="mono">realm-backup-*.zip</span>（全量备份包）或解压后的 <span class="mono">nodes.json</span>。
-      如果上传的是全量备份包，将自动连同 <span class="mono">rules/</span> 目录下的规则按节点批量恢复。
-    </p>
-
-    <div class="form" style="margin-top:10px;">
-      <label class="label">选择备份文件</label>
-      <input class="input" type="file" id="restoreNodesFile" accept=".zip,.json,application/zip,application/json">
-      <div id="restoreNodesError" class="muted" style="margin-top:8px;color:#ffb3b3;white-space:pre-wrap;"></div>
-      <div class="row" style="gap:10px; justify-content:flex-end; margin-top:14px;">
-        <button class="btn xs ghost" type="button" onclick="closeRestoreNodesModal()">取消</button>
-        <button class="btn xs" type="button" onclick="restoreNodesNow()">开始恢复</button>
+        <button class="btn xs" id="restoreFullSubmit" type="button" onclick="restoreFullNow()">开始恢复</button>
       </div>
     </div>
   </div>
@@ -182,5 +167,5 @@
 {% endblock %}
 
 {% block scripts %}
-<script src="/static/app.js?v=38.0"></script>
+<script src="/static/app.js?v=39.0"></script>
 {% endblock %}
