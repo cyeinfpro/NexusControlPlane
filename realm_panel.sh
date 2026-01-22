@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="v35"
+VERSION="v38"
 REPO_ZIP_URL_DEFAULT="https://github.com/cyeinfpro/Realm/archive/refs/heads/main.zip"
 
 info(){ echo -e "\033[33m[提示]\033[0m $*" >&2; }

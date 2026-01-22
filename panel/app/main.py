@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import time
@@ -280,6 +281,30 @@ def _extract_ip_for_display(base_url: str) -> str:
 def _node_verify_tls(node: Dict[str, Any]) -> bool:
     return bool(node.get("verify_tls", 0))
 
+
+
+async def _bg_apply_pool(node: Dict[str, Any], pool: Dict[str, Any]) -> None:
+    """Best-effort: push pool to agent and apply in background (do not block HTTP responses)."""
+    try:
+        data = await agent_post(
+            node["base_url"],
+            node["api_key"],
+            "/api/v1/pool",
+            {"pool": pool},
+            _node_verify_tls(node),
+        )
+        if isinstance(data, dict) and data.get("ok", True):
+            await agent_post(node["base_url"], node["api_key"], "/api/v1/apply", {}, _node_verify_tls(node))
+    except Exception:
+        return
+
+
+def _schedule_apply_pool(node: Dict[str, Any], pool: Dict[str, Any]) -> None:
+    """Schedule best-effort agent apply without blocking the request."""
+    try:
+        asyncio.create_task(_bg_apply_pool(node, pool))
+    except Exception:
+        pass
 
 def require_login(request: Request) -> str:
     user = request.session.get("user")
@@ -1193,21 +1218,10 @@ async def api_restore(
                     e["extra_remotes"] = [str(x).strip() for x in e.get("extra_remotes") if str(x).strip()]
     except Exception:
         pass
-    # Store on panel and attempt immediate apply if agent reachable.
+    # Store on panel; apply will be done asynchronously (avoid blocking / proxy timeouts).
     desired_ver, _ = set_desired_pool(node_id, pool)
-    try:
-        data = await agent_post(
-            node["base_url"],
-            node["api_key"],
-            "/api/v1/pool",
-            {"pool": pool},
-            _node_verify_tls(node),
-        )
-        if data.get("ok", True):
-            await agent_post(node["base_url"], node["api_key"], "/api/v1/apply", {}, _node_verify_tls(node))
-        return {"ok": True, "desired_version": desired_ver, "queued": True}
-    except Exception:
-        return {"ok": True, "desired_version": desired_ver, "queued": True}
+    _schedule_apply_pool(node, pool)
+    return {"ok": True, "desired_version": desired_ver, "queued": True}
 
 
 @app.post("/api/nodes/{node_id}/pool")
@@ -1307,18 +1321,11 @@ async def api_pool_set(request: Request, node_id: int, payload: Dict[str, Any], 
     except Exception:
         pass
 
-
     # Store desired pool on panel. Agent will pull it on next report.
     desired_ver, _ = set_desired_pool(node_id, pool)
 
-    # Best-effort immediate apply if panel can still reach agent
-    try:
-        data = await agent_post(node["base_url"], node["api_key"], "/api/v1/pool", {"pool": pool}, _node_verify_tls(node))
-        if data.get("ok", True):
-            await agent_post(node["base_url"], node["api_key"], "/api/v1/apply", {}, _node_verify_tls(node))
-            return {"ok": True, "pool": pool, "desired_version": desired_ver, "applied": True}
-    except Exception:
-        pass
+    # Apply in background: do not block HTTP response (prevents frontend seeing “Load failed” under proxy timeouts).
+    _schedule_apply_pool(node, pool)
 
     return {"ok": True, "pool": pool, "desired_version": desired_ver, "queued": True, "note": "waiting agent report"}
 
