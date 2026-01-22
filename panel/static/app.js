@@ -823,7 +823,7 @@ function readWssFields(){
     path: q('f_wss_path').value.trim(),
     sni: q('f_wss_sni').value.trim(),
     tls: q('f_wss_tls').value === '1',
-    insecure: q('f_wss_insecure').value === '1',
+    insecure: !!q('f_wss_insecure').checked,
   };
 }
 
@@ -841,7 +841,7 @@ function fillWssFields(e){
   setField('f_wss_path', path || '');
   setField('f_wss_sni', sni || '');
   q('f_wss_tls').value = (tls === false) ? '0' : '1';
-  q('f_wss_insecure').value = (insecure === true) ? '1' : '0';
+  q('f_wss_insecure').checked = (insecure !== false);
 }
 
 function showWssBox(){
@@ -889,7 +889,7 @@ function randomizeWss(){
   setField('f_wss_path', path);
   setField('f_wss_sni', pick);
   q('f_wss_tls').value = '1';
-  q('f_wss_insecure').value = '0';
+  q('f_wss_insecure').checked = true;
 }
 
 function parseWeights(text){

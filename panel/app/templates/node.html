@@ -214,7 +214,7 @@
 
         <div class="row" style="gap:12px;align-items:center;">
           <div class="col">
-            <div class="help">Host/Path/SNI 建议与证书域名一致；如需容错可将 insecure 设为“是”。</div>
+            <div class="help">Host/Path/SNI 建议与证书域名一致；如需提升兼容性，可勾选「跳过证书校验」。</div>
           </div>
           <div class="right" style="flex:0 0 auto;">
             <button class="btn xs ghost" type="button" onclick="randomizeWss()">随机生成参数</button>
@@ -234,11 +234,11 @@
             </select>
           </div>
           <div class="col" style="max-width:220px;">
-            <label class="label">insecure</label>
-            <select class="select" id="f_wss_insecure">
-              <option value="0">否</option>
-              <option value="1">是</option>
-            </select>
+            <label class="label" style="display:flex;align-items:center;gap:8px;">
+              <input type="checkbox" id="f_wss_insecure" checked style="width:auto;margin:0;">
+              跳过证书校验
+            </label>
+            <div class="help">开启后更稳定，但安全性降低。</div>
           </div>
         </div>
 
