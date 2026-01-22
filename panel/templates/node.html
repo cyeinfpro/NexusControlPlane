@@ -8,7 +8,7 @@
     <div class="card-header">
       <div style="min-width:0;">
         <div class="card-title">节点列表</div>
-        <div class="card-sub">点击节点即可切换到该节点的规则</div>
+        <div class="card-sub">切换查看该节点的转发规则</div>
       </div>
       <div class="right" style="flex:0 0 auto;">
         <button class="btn xs" type="button" onclick="openAddNodeModal()">+ 接入</button>
@@ -36,12 +36,16 @@
       <div class="card">
         <div class="card-header node-head" style="align-items:flex-start;">
           <div class="node-head-left" style="min-width:0;">
-            <div class="card-title">{{ node.name or node.display_ip }} <span class="muted sm">· {{ node.display_ip or '-' }}</span></div>
+            <div class="card-title">
+              <span class="node-title">{{ node.name or node.display_ip }}</span>
+              <span class="pill xs {% if node.online %}ok{% else %}ghost{% endif %}">{% if node.online %}在线{% else %}离线{% endif %}</span>
+              <span class="muted sm">· {{ node.display_ip or '-' }}</span>
+            </div>
             <div class="meta" style="margin-top:6px;">
               {% if node.agent_version %}<span class="meta-item">Agent：{{ node.agent_version }}</span>{% endif %}
-              <span class="meta-item">上报：{{ node.last_seen_at or "-" }}</span>
+              <span class="meta-item">心跳 <span id="nodeLastSeen" class="mono" data-last-seen="{{ node.last_seen_at or '' }}">{{ node.last_seen_at or "-" }}</span></span>
             </div>
-            <div class="card-sub" style="margin-top:8px;">支持 TCP/UDP/WSS；WSS 支持接收机自动同步（规则自动生成并锁定）</div>
+            <div class="card-sub" style="margin-top:8px;">支持 TCP/UDP/WSS · WSS 自动同步（生成规则锁定）</div>
           </div>
           <div class="right node-tools node-head-right" style="gap:10px; flex:0 0 auto; flex-wrap:wrap; justify-content:flex-end;">
             <div class="search-pill">
@@ -315,7 +319,7 @@
 {% endblock %}
 
 {% block scripts %}
-<script src="/static/app.js?v=38.0"></script>
+<script src="/static/app.js?v=40.0"></script>
 <script>
 window.__NODE_ID__ = {{ node.id }};
 window.__NODE_IP__ = {{ (node.display_ip or node.name)|tojson }};

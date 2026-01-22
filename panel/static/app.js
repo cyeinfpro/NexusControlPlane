@@ -1432,6 +1432,10 @@ async function refreshSys(){
 
 
 function initNodePage(){
+  // Compact "last seen" time in header (and anywhere with data-last-seen)
+  try{ refreshDashboardLastSeenShort(); }catch(_e){}
+  setInterval(()=>{ try{ refreshDashboardLastSeenShort(); }catch(_e){} }, 5000);
+
   document.querySelectorAll('.tab').forEach(t=>{
     t.addEventListener('click', ()=>{
       const name = t.getAttribute('data-tab');
