@@ -79,20 +79,18 @@ function wssMode(e){
   const remoteTransport = e.remote_transport || ex.remote_transport || '';
   const hasLisWs = String(listenTransport).includes('ws') || ex.listen_ws_host || ex.listen_ws_path || ex.listen_tls_servername;
   const hasRemWs = String(remoteTransport).includes('ws') || ex.remote_ws_host || ex.remote_ws_path || ex.remote_tls_sni;
-  if(hasLisWs) return 'wss_recv';
-  if(hasRemWs) return 'wss_send';
+  if(hasLisWs || hasRemWs) return 'wss';
   return 'tcp';
 }
 
 function endpointType(e){
   const ex = (e && e.extra_config) ? e.extra_config : {};
   if(ex && ex.sync_id){
-    if(ex.sync_role === 'receiver') return 'WSS接收(同步)';
-    if(ex.sync_role === 'sender') return 'WSS发送(同步)';
+    if(ex.sync_role === 'receiver') return 'WSS隧道(接收·同步)';
+    if(ex.sync_role === 'sender') return 'WSS隧道(发送·同步)';
   }
   const mode = wssMode(e);
-  if(mode === 'wss_recv') return 'WSS接收';
-  if(mode === 'wss_send') return 'WSS发送';
+  if(mode === 'wss') return 'WSS隧道';
   return 'TCP/UDP';
 }
 
@@ -829,38 +827,15 @@ function readWssFields(){
   };
 }
 
-// Convert WSS params into endpoint.extra_config for single-node/manual mode
-function buildWssExtra(mode, wss){
-  const ex = {};
-  if(mode === 'wss_send'){
-    ex.remote_transport = 'ws';
-    if(wss.host) ex.remote_ws_host = wss.host;
-    if(wss.path) ex.remote_ws_path = wss.path;
-    if(wss.sni) ex.remote_tls_sni = wss.sni;
-    ex.remote_tls_enabled = !!wss.tls;
-    ex.remote_tls_insecure = !!wss.insecure;
-  } else if(mode === 'wss_recv'){
-    ex.listen_transport = 'ws';
-    if(wss.host) ex.listen_ws_host = wss.host;
-    if(wss.path) ex.listen_ws_path = wss.path;
-    if(wss.sni) ex.listen_tls_servername = wss.sni;
-    ex.listen_tls_enabled = !!wss.tls;
-    ex.listen_tls_insecure = !!wss.insecure;
-  }
-  return ex;
-}
-
 function fillWssFields(e){
   const ex = e.extra_config || {};
-  const mode = wssMode(e);
-  q('f_type').value = mode;
-
-  const isSend = mode === 'wss_send';
-  const host = isSend ? ex.remote_ws_host : ex.listen_ws_host;
-  const path = isSend ? ex.remote_ws_path : ex.listen_ws_path;
-  const sni = isSend ? ex.remote_tls_sni : ex.listen_tls_servername;
-  const tls = isSend ? ex.remote_tls_enabled : ex.listen_tls_enabled;
-  const insecure = isSend ? ex.remote_tls_insecure : ex.listen_tls_insecure;
+  // For WSS 隧道：发送端主要用 remote_*；接收端用 listen_*。
+  // 这里做一次兜底，优先 remote_*，没有则读 listen_*。
+  const host = ex.remote_ws_host || ex.listen_ws_host || '';
+  const path = ex.remote_ws_path || ex.listen_ws_path || '';
+  const sni = ex.remote_tls_sni || ex.listen_tls_servername || '';
+  const tls = (ex.remote_tls_enabled !== undefined) ? ex.remote_tls_enabled : ex.listen_tls_enabled;
+  const insecure = (ex.remote_tls_insecure !== undefined) ? ex.remote_tls_insecure : ex.listen_tls_insecure;
 
   setField('f_wss_host', host || '');
   setField('f_wss_path', path || '');
@@ -871,85 +846,13 @@ function fillWssFields(e){
 
 function showWssBox(){
   const mode = q('f_type').value;
-  q('wssBox').style.display = (mode === 'tcp') ? 'none' : 'block';
+  q('wssBox').style.display = (mode === 'wss') ? 'block' : 'none';
 
+  // WSS 隧道统一走“选择接收机自动同步”
   const autoBox = document.getElementById('wssAutoSyncBox');
-  const manualDetails = document.getElementById('wssManualPairDetails');
-  const receiverPortCol = document.getElementById('wssReceiverPortCol');
-
-  const receiverSel = q('f_wss_receiver_node');
-  const receiverChosen = receiverSel ? receiverSel.value.trim() : '';
-
   if(autoBox){
-    autoBox.style.display = (mode === 'wss_send') ? 'flex' : 'none';
+    autoBox.style.display = (mode === 'wss') ? 'flex' : 'none';
   }
-  if(manualDetails){
-    // 发送端：选择了接收机则走自动同步（推荐），隐藏手动配对码；
-    // 未选择接收机则显示配对码（兼容旧模式）。
-    if(mode === 'wss_send'){
-      manualDetails.style.display = receiverChosen ? 'none' : 'block';
-    }else{
-      manualDetails.style.display = (mode === 'wss_recv') ? 'block' : 'none';
-    }
-  }
-  if(receiverPortCol){
-    receiverPortCol.style.display = (mode === 'wss_send' && receiverChosen) ? 'block' : 'none';
-  }
-}
-
-function encodePairingCode(data){
-  return btoa(unescape(encodeURIComponent(JSON.stringify(data))));
-}
-
-function decodePairingCode(code){
-  const text = decodeURIComponent(escape(atob(code.trim())));
-  return JSON.parse(text);
-}
-
-function buildPairingPayload(){
-  return {
-    host: q('f_wss_host').value.trim(),
-    path: q('f_wss_path').value.trim(),
-    sni: q('f_wss_sni').value.trim(),
-    tls: q('f_wss_tls').value === '1',
-    insecure: q('f_wss_insecure').value === '1',
-  };
-}
-
-function applyPairingPayload(payload){
-  if(!payload) return;
-  setField('f_wss_host', payload.host || '');
-  setField('f_wss_path', payload.path || '');
-  setField('f_wss_sni', payload.sni || '');
-  q('f_wss_tls').value = payload.tls === false ? '0' : '1';
-  q('f_wss_insecure').value = payload.insecure === true ? '1' : '0';
-  showWssBox();
-}
-
-function applyPairingCode(){
-  const code = q('f_pairing').value.trim();
-  if(!code){
-    q('modalMsg').textContent = '请先粘贴配对码';
-    return;
-  }
-  try{
-    const payload = decodePairingCode(code);
-    applyPairingPayload(payload);
-    q('modalMsg').textContent = '配对码已解析并填充';
-  }catch(e){
-    q('modalMsg').textContent = '配对码格式无效';
-  }
-}
-
-function openPairingModal(code){
-  const modal = q('pairingModal');
-  const text = q('pairingCodeText');
-  text.textContent = code;
-  modal.style.display = 'flex';
-}
-
-function closePairingModal(){
-  q('pairingModal').style.display = 'none';
 }
 
 function randomToken(len){
@@ -1009,7 +912,6 @@ function newRule(){
   setField('f_weights','');
   q('f_protocol').value = 'tcp+udp';
   q('f_type').value = 'tcp';
-  setField('f_pairing','');
   // reset autosync receiver fields
   if(q('f_wss_receiver_node')) setField('f_wss_receiver_node','');
   if(q('f_wss_receiver_port')) setField('f_wss_receiver_port','');
@@ -1044,7 +946,6 @@ function editRule(idx){
   if(q('f_wss_receiver_port')) setField('f_wss_receiver_port', ex.sync_role === 'sender' && ex.sync_receiver_port ? String(ex.sync_receiver_port) : '');
   populateReceiverSelect();
 
-  setField('f_pairing','');
   fillWssFields(e);
   showWssBox();
   openModal();
@@ -1167,9 +1068,13 @@ async function saveRule(){
   if(!listen){ toast('本地监听不能为空', true); return; }
   if(remotes.length === 0){ toast('目标地址不能为空', true); return; }
 
-  // Auto-sync WSS tunnel mode (select receiver node)
-  if(typeSel === 'wss_send' && q('f_wss_receiver_node') && q('f_wss_receiver_node').value){
-    const receiverNodeId = q('f_wss_receiver_node').value.trim();
+  // WSS 隧道：必须选择接收机，自动同步生成接收端规则
+  if(typeSel === 'wss'){
+    const receiverNodeId = q('f_wss_receiver_node') ? q('f_wss_receiver_node').value.trim() : '';
+    if(!receiverNodeId){
+      toast('WSS 隧道必须选择接收机节点', true);
+      return;
+    }
     const receiverPortTxt = q('f_wss_receiver_port') ? q('f_wss_receiver_port').value.trim() : '';
     const wss = readWssFields();
     if(!wss.host || !wss.path){
@@ -1202,28 +1107,7 @@ async function saveRule(){
         CURRENT_POOL = res.sender_pool;
         renderRules();
         closeModal();
-        // 人性化提示：接收端口留空时默认与发送端 Listen 一致，如冲突则自动挑选
-        try{
-          const chosenPort = res.receiver_port;
-          const listenPort = parseInt(String(listen).split(':').pop() || '0', 10);
-          const inputTxt = receiverPortTxt ? String(receiverPortTxt).trim() : '';
-          if(!inputTxt){
-            if(chosenPort && listenPort && chosenPort !== listenPort){
-              toast(`已保存并同步到接收机：接收端口自动选择为 ${chosenPort}（原 Listen ${listenPort} 已被占用）`);
-            }else{
-              toast('已保存，并自动同步到接收机');
-            }
-          }else{
-            const wanted = parseInt(inputTxt, 10);
-            if(chosenPort && wanted && chosenPort !== wanted){
-              toast(`已保存并同步到接收机：接收端口冲突，已自动调整为 ${chosenPort}`);
-            }else{
-              toast('已保存，并自动同步到接收机');
-            }
-          }
-        }catch(e){
-          toast('已保存，并自动同步到接收机');
-        }
+        toast('已保存，并自动同步到接收机');
       }else{
         toast((res && res.error) ? res.error : '保存失败', true);
       }
@@ -1235,33 +1119,8 @@ async function saveRule(){
     return;
   }
 
-  // Normal/manual mode (single node)
+  // 普通转发（单机）
   const endpoint = { listen, remotes, disabled, balance: balanceStr, protocol };
-
-  if(typeSel === 'wss_send' || typeSel === 'wss_recv'){
-    const wss = readWssFields();
-    if(!wss.host || !wss.path){
-      toast('WSS Host / Path 不能为空', true);
-      return;
-    }
-    const ex = {};
-    if(typeSel === 'wss_send'){
-      ex.remote_transport = 'ws';
-      ex.remote_ws_host = wss.host;
-      ex.remote_ws_path = wss.path;
-      ex.remote_tls_enabled = wss.tls;
-      ex.remote_tls_insecure = wss.insecure;
-      ex.remote_tls_sni = wss.sni;
-    }else{
-      ex.listen_transport = 'ws';
-      ex.listen_ws_host = wss.host;
-      ex.listen_ws_path = wss.path;
-      ex.listen_tls_enabled = wss.tls;
-      ex.listen_tls_insecure = wss.insecure;
-      ex.listen_tls_servername = wss.sni;
-    }
-    endpoint.extra_config = ex;
-  }
 
     try{
       setLoading(true);
@@ -1276,11 +1135,6 @@ async function saveRule(){
       renderRules();
       closeModal();
   
-      // For manual WSS send: show pairing code helper (optional)
-      if(typeSel === 'wss_send'){
-        const code = buildPairingPayload(endpoint);
-        openPairingModal(code);
-      }
     }catch(err){
       const msg = (err && err.message) ? err.message : String(err || '保存失败');
       toast(msg, true);
@@ -1537,8 +1391,6 @@ window.restoreFromText = restoreFromText;
 window.refreshStats = refreshStats;
 window.openCommandModal = openCommandModal;
 window.closeCommandModal = closeCommandModal;
-window.applyPairingCode = applyPairingCode;
-window.closePairingModal = closePairingModal;
 window.randomizeWss = randomizeWss;
 
 // -------------------- Small UX enhancements --------------------
