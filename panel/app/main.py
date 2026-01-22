@@ -7,6 +7,8 @@ import hmac
 import hashlib
 import secrets
 import uuid
+import io
+import zipfile
 from datetime import datetime
 from urllib.parse import urlparse
 from pathlib import Path
@@ -25,10 +27,12 @@ from .db import (
     ensure_db,
     get_node,
     get_node_by_api_key,
+    get_node_by_base_url,
     get_desired_pool,
     get_last_report,
     list_nodes,
     set_desired_pool,
+    update_node_basic,
     update_node_report,
 )
 from .agents import agent_get, agent_post, agent_ping
@@ -66,6 +70,38 @@ templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
 
 # DB init
 ensure_db()
+
+
+# ------------------------ Backup helpers ------------------------
+
+
+async def _get_pool_for_backup(node: Dict[str, Any]) -> Dict[str, Any]:
+    """Get pool data for backup.
+
+    Prefer panel-desired (push mode), then cached report, then pull from agent.
+    """
+    node_id = int(node.get("id") or 0)
+    desired_ver, desired_pool = get_desired_pool(node_id)
+    if isinstance(desired_pool, dict):
+        return {
+            "ok": True,
+            "pool": desired_pool,
+            "desired_version": desired_ver,
+            "source": "panel_desired",
+        }
+
+    rep = get_last_report(node_id)
+    if isinstance(rep, dict) and isinstance(rep.get("pool"), dict):
+        return {"ok": True, "pool": rep.get("pool"), "source": "report_cache"}
+
+    try:
+        data = await agent_get(node.get("base_url", ""), node.get("api_key", ""), "/api/v1/pool", _node_verify_tls(node))
+        # keep consistent shape
+        if isinstance(data, dict) and isinstance(data.get("pool"), dict):
+            return {"ok": True, "pool": data.get("pool"), "source": "agent_pull"}
+        return data if isinstance(data, dict) else {"ok": False, "error": "agent_return_invalid"}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc), "source": "agent_pull"}
 
 
 # ------------------------ Command signing (HMAC-SHA256) ------------------------
@@ -198,6 +234,23 @@ def _format_host_for_url(host: str) -> str:
     if ":" in host and not host.startswith("["):
         return f"[{host}]"
     return host
+
+
+def _safe_filename_part(name: str, default: str = "node", max_len: int = 60) -> str:
+    """Make a filesystem-friendly filename part (keeps Chinese/letters/numbers/_-)."""
+    raw = (name or "").strip()
+    if not raw:
+        return default
+    out = []
+    for ch in raw:
+        if ch.isalnum() or ch in ("-", "_") or ("\u4e00" <= ch <= "\u9fff"):
+            out.append(ch)
+        elif ch in (" ", "."):
+            out.append("-")
+        # else: drop
+    s = "".join(out).strip("-")
+    s = s or default
+    return s[:max_len]
 
 
 def _extract_port_from_url(base_url: str, fallback_port: int) -> int:
@@ -691,24 +744,403 @@ async def api_backup(request: Request, node_id: int, user: str = Depends(require
     node = get_node(node_id)
     if not node:
         return JSONResponse({"ok": False, "error": "节点不存在"}, status_code=404)
-    # Prefer panel-desired pool (push mode), then cached report, then pull from agent
-    desired_ver, desired_pool = get_desired_pool(node_id)
-    if isinstance(desired_pool, dict):
-        data = {"ok": True, "pool": desired_pool, "desired_version": desired_ver, "source": "panel_desired"}
-    else:
-        rep = get_last_report(node_id)
-        if isinstance(rep, dict) and isinstance(rep.get("pool"), dict):
-            data = {"ok": True, "pool": rep.get("pool"), "source": "report_cache"}
-        else:
-            try:
-                data = await agent_get(node["base_url"], node["api_key"], "/api/v1/pool", _node_verify_tls(node))
-            except Exception as exc:
-                return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
-    filename = f"realm-rules-node-{node_id}.json"
+    data = await _get_pool_for_backup(node)
+    # 规则文件名包含节点名，便于区分
+    safe = _safe_filename_part(node.get("name") or f"node-{node_id}")
+    filename = f"realm-rules-{safe}-id{node_id}.json"
     payload = json.dumps(data, ensure_ascii=False, indent=2)
     headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
     return Response(content=payload, media_type="application/json", headers=headers)
 
+
+@app.get("/api/backup/full")
+async def api_backup_full(request: Request, user: str = Depends(require_login)):
+    """Download a full backup zip: nodes list + per-node rules."""
+    nodes = list_nodes()
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+
+    # Build backup payloads (fetch missing pools concurrently)
+    async def build_one(n: Dict[str, Any]) -> tuple[str, Dict[str, Any]]:
+        node_id = int(n.get("id") or 0)
+        data = await _get_pool_for_backup(n)
+        data.setdefault("node", {"id": node_id, "name": n.get("name"), "base_url": n.get("base_url")})
+        safe = _safe_filename_part(n.get("name") or f"node-{node_id}")
+        path = f"rules/realm-rules-{safe}-id{node_id}.json"
+        return path, data
+
+    rules_entries: list[tuple[str, Dict[str, Any]]] = []
+    if nodes:
+        # Avoid unbounded parallelism
+        import asyncio
+
+        sem = asyncio.Semaphore(12)
+
+        async def guarded(n: Dict[str, Any]):
+            async with sem:
+                return await build_one(n)
+
+        rules_entries = list(await asyncio.gather(*[guarded(n) for n in nodes]))
+
+    nodes_payload = {
+        "kind": "realm_full_backup",
+        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "panel_public_url": _panel_public_base_url(request),
+        "nodes": [
+            {
+                "source_id": int(n.get("id") or 0),
+                "name": n.get("name"),
+                "base_url": n.get("base_url"),
+                "api_key": n.get("api_key"),
+                "verify_tls": bool(n.get("verify_tls", 0)),
+            }
+            for n in nodes
+        ],
+    }
+
+    meta_payload = {
+        "kind": "realm_backup_meta",
+        "created_at": nodes_payload["created_at"],
+        "nodes": len(nodes),
+        "files": 2 + len(rules_entries),
+    }
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as z:
+        z.writestr("backup_meta.json", json.dumps(meta_payload, ensure_ascii=False, indent=2))
+        z.writestr("nodes.json", json.dumps(nodes_payload, ensure_ascii=False, indent=2))
+        for path, data in rules_entries:
+            z.writestr(path, json.dumps(data, ensure_ascii=False, indent=2))
+        z.writestr(
+            "README.txt",
+            "Realm 全量备份说明\n\n"
+            "1) 恢复节点列表：登录面板 → 控制台 → 点击『恢复节点列表』，上传本压缩包（或解压后的 nodes.json）。\n"
+            "2) 恢复单节点规则：进入节点页面 → 更多 → 恢复规则，把 rules/ 目录下对应节点的规则文件上传/粘贴即可。\n",
+        )
+
+    filename = f"realm-backup-{ts}.zip"
+    headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+    return Response(content=buf.getvalue(), media_type="application/zip", headers=headers)
+
+
+@app.post("/api/restore/nodes")
+async def api_restore_nodes(
+    request: Request,
+    file: UploadFile = File(...),
+    user: str = Depends(require_login),
+):
+    """Restore nodes list from nodes.json or full backup zip."""
+    try:
+        raw = await file.read()
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": f"读取文件失败：{exc}"}, status_code=400)
+
+    payload = None
+    # Zip?
+    if raw[:2] == b"PK":
+        try:
+            z = zipfile.ZipFile(io.BytesIO(raw))
+            # find nodes.json
+            name = None
+            for n in z.namelist():
+                if n.lower().endswith("nodes.json"):
+                    name = n
+                    break
+            if not name:
+                return JSONResponse({"ok": False, "error": "压缩包中未找到 nodes.json"}, status_code=400)
+            payload = json.loads(z.read(name).decode("utf-8"))
+        except Exception as exc:
+            return JSONResponse({"ok": False, "error": f"压缩包解析失败：{exc}"}, status_code=400)
+    else:
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except Exception as exc:
+            return JSONResponse({"ok": False, "error": f"JSON 解析失败：{exc}"}, status_code=400)
+
+    # Accept: {nodes:[...]} or plain list
+    nodes_list = None
+    if isinstance(payload, dict) and isinstance(payload.get("nodes"), list):
+        nodes_list = payload.get("nodes")
+    elif isinstance(payload, list):
+        nodes_list = payload
+
+    if not isinstance(nodes_list, list):
+        return JSONResponse({"ok": False, "error": "备份内容缺少 nodes 列表"}, status_code=400)
+
+    added = 0
+    updated = 0
+    skipped = 0
+    mapping: Dict[str, int] = {}
+
+    for item in nodes_list:
+        if not isinstance(item, dict):
+            skipped += 1
+            continue
+        name = (item.get("name") or "").strip()
+        base_url = (item.get("base_url") or "").strip().rstrip('/')
+        api_key = (item.get("api_key") or "").strip()
+        verify_tls = bool(item.get("verify_tls", False))
+        source_id = item.get("source_id")
+        try:
+            source_id_i = int(source_id) if source_id is not None else None
+        except Exception:
+            source_id_i = None
+
+        if not base_url or not api_key:
+            skipped += 1
+            continue
+
+        existing = get_node_by_api_key(api_key) or get_node_by_base_url(base_url)
+        if existing:
+            update_node_basic(
+                existing["id"],
+                name or existing.get("name") or _extract_ip_for_display(base_url),
+                base_url,
+                api_key,
+                verify_tls=verify_tls,
+            )
+            updated += 1
+            if source_id_i is not None:
+                mapping[str(source_id_i)] = int(existing["id"])
+        else:
+            new_id = add_node(name or _extract_ip_for_display(base_url), base_url, api_key, verify_tls=verify_tls)
+            added += 1
+            if source_id_i is not None:
+                mapping[str(source_id_i)] = int(new_id)
+
+    return {
+        "ok": True,
+        "added": added,
+        "updated": updated,
+        "skipped": skipped,
+        "mapping": mapping,
+    }
+
+
+
+
+@app.post("/api/restore/full")
+async def api_restore_full(
+    request: Request,
+    file: UploadFile = File(...),
+    user: str = Depends(require_login),
+):
+    """Restore nodes list + per-node rules from full backup zip."""
+    try:
+        raw = await file.read()
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": f"读取文件失败：{exc}"}, status_code=400)
+
+    if not raw or raw[:2] != b"PK":
+        return JSONResponse({"ok": False, "error": "请上传 realm-backup-*.zip（全量备份包）"}, status_code=400)
+
+    try:
+        z = zipfile.ZipFile(io.BytesIO(raw))
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": f"压缩包解析失败：{exc}"}, status_code=400)
+
+    # ---- read nodes.json ----
+    nodes_payload = None
+    nodes_name = None
+    for n in z.namelist():
+        if n.lower().endswith('nodes.json'):
+            nodes_name = n
+            break
+    if not nodes_name:
+        return JSONResponse({"ok": False, "error": "压缩包中未找到 nodes.json"}, status_code=400)
+
+    try:
+        nodes_payload = json.loads(z.read(nodes_name).decode('utf-8'))
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": f"nodes.json 解析失败：{exc}"}, status_code=400)
+
+    # Accept: {nodes:[...]} or plain list
+    nodes_list = None
+    if isinstance(nodes_payload, dict) and isinstance(nodes_payload.get('nodes'), list):
+        nodes_list = nodes_payload.get('nodes')
+    elif isinstance(nodes_payload, list):
+        nodes_list = nodes_payload
+
+    if not isinstance(nodes_list, list):
+        return JSONResponse({"ok": False, "error": "备份内容缺少 nodes 列表"}, status_code=400)
+
+    # ---- restore nodes ----
+    added = 0
+    updated = 0
+    skipped = 0
+    mapping: Dict[str, int] = {}
+    srcid_to_baseurl: Dict[str, str] = {}
+    baseurl_to_nodeid: Dict[str, int] = {}
+
+    for item in nodes_list:
+        if not isinstance(item, dict):
+            skipped += 1
+            continue
+        name = (item.get('name') or '').strip()
+        base_url = (item.get('base_url') or '').strip().rstrip('/')
+        api_key = (item.get('api_key') or '').strip()
+        verify_tls = bool(item.get('verify_tls', False))
+        source_id = item.get('source_id')
+        try:
+            source_id_i = int(source_id) if source_id is not None else None
+        except Exception:
+            source_id_i = None
+
+        if base_url and source_id_i is not None:
+            srcid_to_baseurl[str(source_id_i)] = base_url
+
+        if not base_url or not api_key:
+            skipped += 1
+            continue
+
+        existing = get_node_by_api_key(api_key) or get_node_by_base_url(base_url)
+        if existing:
+            update_node_basic(
+                existing['id'],
+                name or existing.get('name') or _extract_ip_for_display(base_url),
+                base_url,
+                api_key,
+                verify_tls=verify_tls,
+            )
+            updated += 1
+            node_id = int(existing['id'])
+        else:
+            node_id = int(add_node(name or _extract_ip_for_display(base_url), base_url, api_key, verify_tls=verify_tls))
+            added += 1
+
+        baseurl_to_nodeid[base_url] = node_id
+        if source_id_i is not None:
+            mapping[str(source_id_i)] = node_id
+
+    # ---- restore rules (batch) ----
+    rule_paths = [
+        n for n in z.namelist()
+        if n.lower().startswith('rules/') and n.lower().endswith('.json')
+    ]
+
+    import re as _re
+    import asyncio
+
+    async def apply_pool_to_node(target_id: int, pool: Dict[str, Any]) -> Dict[str, Any]:
+        node = get_node(int(target_id))
+        if not node:
+            raise RuntimeError('节点不存在')
+        # store desired on panel
+        desired_ver, _ = set_desired_pool(int(target_id), pool)
+
+        # best-effort immediate apply
+        applied = False
+        try:
+            data = await agent_post(
+                node['base_url'],
+                node['api_key'],
+                '/api/v1/pool',
+                {'pool': pool},
+                _node_verify_tls(node),
+            )
+            if isinstance(data, dict) and data.get('ok', True):
+                await agent_post(node['base_url'], node['api_key'], '/api/v1/apply', {}, _node_verify_tls(node))
+                applied = True
+        except Exception:
+            applied = False
+
+        return {"node_id": int(target_id), "desired_version": desired_ver, "applied": applied}
+
+    sem = asyncio.Semaphore(6)
+
+    async def guarded_apply(target_id: int, pool: Dict[str, Any]) -> Dict[str, Any]:
+        async with sem:
+            return await apply_pool_to_node(target_id, pool)
+
+    total_rules = len(rule_paths)
+    restored_rules = 0
+    failed_rules = 0
+    unmatched_rules = 0
+    rule_failed: list[Dict[str, Any]] = []
+    rule_unmatched: list[Dict[str, Any]] = []
+
+    tasks = []
+    task_meta = []
+
+    for p in rule_paths:
+        try:
+            payload = json.loads(z.read(p).decode('utf-8'))
+        except Exception as exc:
+            failed_rules += 1
+            rule_failed.append({"path": p, "error": f"JSON 解析失败：{exc}"})
+            continue
+
+        pool = payload.get('pool') if isinstance(payload, dict) else None
+        if pool is None:
+            pool = payload
+        if not isinstance(pool, dict):
+            failed_rules += 1
+            rule_failed.append({"path": p, "error": "备份内容缺少 pool 数据"})
+            continue
+        if not isinstance(pool.get('endpoints'), list):
+            pool.setdefault('endpoints', [])
+
+        # resolve source_id / base_url
+        node_meta = payload.get('node') if isinstance(payload, dict) else None
+        source_id = None
+        base_url = None
+        if isinstance(node_meta, dict):
+            try:
+                if node_meta.get('id') is not None:
+                    source_id = int(node_meta.get('id'))
+            except Exception:
+                source_id = None
+            base_url = (node_meta.get('base_url') or '').strip().rstrip('/') or None
+
+        if source_id is None:
+            m = _re.search(r'id(\d+)\.json$', p)
+            if m:
+                try:
+                    source_id = int(m.group(1))
+                except Exception:
+                    source_id = None
+
+        if base_url is None and source_id is not None:
+            base_url = srcid_to_baseurl.get(str(source_id))
+
+        target_id = None
+        if source_id is not None:
+            target_id = mapping.get(str(source_id))
+        if target_id is None and base_url:
+            target_id = baseurl_to_nodeid.get(base_url)
+        if target_id is None and base_url:
+            ex = get_node_by_base_url(base_url)
+            if ex:
+                target_id = int(ex.get('id'))
+
+        if target_id is None:
+            unmatched_rules += 1
+            rule_unmatched.append({"path": p, "source_id": source_id, "base_url": base_url, "error": "未找到对应节点"})
+            continue
+
+        tasks.append(guarded_apply(int(target_id), pool))
+        task_meta.append({"path": p, "target_id": int(target_id), "source_id": source_id, "base_url": base_url})
+
+    if tasks:
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for meta, res in zip(task_meta, results):
+            if isinstance(res, Exception):
+                failed_rules += 1
+                rule_failed.append({"path": meta.get('path'), "target_id": meta.get('target_id'), "error": str(res)})
+            else:
+                restored_rules += 1
+
+    return {
+        "ok": True,
+        "nodes": {"added": added, "updated": updated, "skipped": skipped, "mapping": mapping},
+        "rules": {
+            "total": total_rules,
+            "restored": restored_rules,
+            "unmatched": unmatched_rules,
+            "failed": failed_rules,
+        },
+        "rule_unmatched": rule_unmatched[:50],
+        "rule_failed": rule_failed[:50],
+    }
 
 @app.post("/api/nodes/{node_id}/restore")
 async def api_restore(

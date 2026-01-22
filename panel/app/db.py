@@ -165,6 +165,38 @@ def get_node_by_api_key(api_key: str, db_path: str = DEFAULT_DB_PATH) -> Optiona
     return dict(row) if row else None
 
 
+def get_node_by_base_url(base_url: str, db_path: str = DEFAULT_DB_PATH) -> Optional[Dict[str, Any]]:
+    base_url = (base_url or "").strip().rstrip('/')
+    if not base_url:
+        return None
+    with connect(db_path) as conn:
+        row = conn.execute("SELECT * FROM nodes WHERE base_url=?", (base_url,)).fetchone()
+    return dict(row) if row else None
+
+
+def update_node_basic(
+    node_id: int,
+    name: str,
+    base_url: str,
+    api_key: str,
+    verify_tls: bool = False,
+    db_path: str = DEFAULT_DB_PATH,
+) -> None:
+    """Update basic node fields without touching reports/pools."""
+    with connect(db_path) as conn:
+        conn.execute(
+            "UPDATE nodes SET name=?, base_url=?, api_key=?, verify_tls=? WHERE id=?",
+            (
+                (name or "").strip(),
+                (base_url or "").strip().rstrip('/'),
+                (api_key or "").strip(),
+                1 if verify_tls else 0,
+                int(node_id),
+            ),
+        )
+        conn.commit()
+
+
 def add_node(
     name: str,
     base_url: str,
