@@ -59,6 +59,38 @@ prompt_secret(){
   echo "$out"
 }
 
+# --- Panel public URL (domain / reverse proxy) ---
+
+normalize_public_url(){
+  local v="${1:-}"
+  v="${v%%[[:space:]]*}"
+  v="${v%/}"
+  if [[ -z "$v" ]]; then
+    echo ""
+    return
+  fi
+  if [[ "$v" == http://* || "$v" == https://* ]]; then
+    echo "${v%/}"
+    return
+  fi
+  # 默认 https（常见反代/证书场景）；如需 http 请显式输入 http://
+  echo "https://${v}"
+}
+
+detect_ip(){
+  local ip=""
+  if command -v curl >/dev/null 2>&1; then
+    ip="$(curl -fsSL -4 https://api.ipify.org 2>/dev/null || true)"
+  fi
+  if [[ -z "$ip" ]]; then
+    ip="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
+  fi
+  if [[ -z "$ip" ]] && command -v ip >/dev/null 2>&1; then
+    ip="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") {print $(i+1); exit}}' || true)"
+  fi
+  echo "${ip:-127.0.0.1}"
+}
+
 TMPDIR=""
 EXTRACT_ROOT=""
 PANEL_DIR=""
@@ -139,6 +171,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=/opt/realm-panel/panel
+EnvironmentFile=-/etc/realm-panel/panel.env
 Environment=REALM_PANEL_DB=/etc/realm-panel/panel.db
 ExecStart=/opt/realm-panel/venv/bin/uvicorn app.main:app --host 0.0.0.0 --port ${port} --workers 1
 Restart=on-failure
@@ -182,6 +215,14 @@ install_panel(){
   done
   port="$(prompt "面板端口" "6080")"
 
+  local panel_domain public_url
+  panel_domain="$(prompt "面板域名/外网地址（可选：反向代理/HTTPS 场景；留空使用 IP+端口）" "")"
+  if [[ -n "$panel_domain" ]]; then
+    public_url="$(normalize_public_url "$panel_domain")"
+  else
+    public_url="http://$(detect_ip):${port}"
+  fi
+
   info "部署到 /opt/realm-panel ..."
   rm -rf /opt/realm-panel
   mkdir -p /opt/realm-panel
@@ -196,6 +237,10 @@ install_panel(){
 
   info "初始化面板配置..."
   mkdir -p /etc/realm-panel
+  cat > /etc/realm-panel/panel.env <<EOF
+REALM_PANEL_PUBLIC_URL=${public_url}
+REALM_PANEL_DB=/etc/realm-panel/panel.db
+EOF
   export PANEL_USER="$user"
   export PANEL_PASS="$pass"
   ( cd /opt/realm-panel/panel && /opt/realm-panel/venv/bin/python - <<'PY'
@@ -213,7 +258,7 @@ PY
   systemctl restart realm-panel.service
 
   ok "面板已启动"
-  echo "访问地址：http://<你的IP>:${port}"
+  echo "访问地址：${public_url}"
   echo "用户名：${user}"
   echo "密码：（你刚刚设置的）"
 }

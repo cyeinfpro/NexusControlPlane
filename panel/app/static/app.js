@@ -1460,7 +1460,7 @@ async function createNodeFromModal(){
     const verify_tls = !!document.getElementById("addNodeVerifyTls")?.checked;
 
     if(!ip_address){
-      if(err) err.textContent = "请填写 IP/域名";
+      if(err) err.textContent = "节点地址不能为空";
       if(btn){ btn.disabled = false; btn.textContent = "创建并进入"; }
       return;
     }
@@ -1473,7 +1473,7 @@ async function createNodeFromModal(){
 
     const data = await resp.json().catch(()=>({ok:false,error:"接口返回异常"}));
     if(!resp.ok || !data.ok){
-      if(err) err.textContent = data.error || ("创建失败（HTTP " + resp.status + "）。请检查 IP/域名与协议是否正确");
+      if(err) err.textContent = data.error || ("创建失败（HTTP " + resp.status + "）。请检查节点地址与协议");
       if(btn){ btn.disabled = false; btn.textContent = "创建并进入"; }
       return;
     }

@@ -41,7 +41,7 @@
               {% if node.agent_version %}<span class="meta-item">Agent：{{ node.agent_version }}</span>{% endif %}
               <span class="meta-item">上报：{{ node.last_seen_at or "-" }}</span>
             </div>
-            <div class="card-sub" style="margin-top:8px;">支持 TCP / UDP / WSS；WSS 隧道仅支持“选择接收机自动同步”，接收机规则会自动生成并锁定</div>
+            <div class="card-sub" style="margin-top:8px;">支持 TCP/UDP/WSS；WSS 支持接收机自动同步（规则自动生成并锁定）</div>
           </div>
           <div class="right node-tools node-head-right" style="gap:10px; flex:0 0 auto; flex-wrap:wrap; justify-content:flex-end;">
             <div class="search-pill">
@@ -65,9 +65,9 @@
                 <button class="menu-item" type="button" id="restoreRulesBtn" onclick="triggerRestore()">恢复规则 <span class="muted sm">粘贴</span></button>
                 <div class="menu-sep"></div>
                 <form method="post" action="/nodes/{{ node.id }}/delete" style="margin:0;">
-                  <button class="menu-item" type="submit" onclick="return confirm('确定移除该节点吗？
+                  <button class="menu-item" type="submit" onclick="return confirm('确认移除该节点？
 
-说明：此操作仅从面板移除节点，不会卸载该机器上的 Agent。')" style="color:var(--bad);">
+仅移除面板记录，不影响节点 Agent。')" style="color:var(--bad);">
                     移除节点 <span class="muted sm">危险</span>
                   </button>
                 </form>
@@ -117,7 +117,7 @@
       <div class="col right"><button class="btn xs ghost" type="button" onclick="closeAddNodeModal()">关闭</button></div>
     </div>
 
-    <p class="muted" style="margin-top:8px;">只需填写 <b>IP/域名</b>，端口默认使用 <span class="mono">18700</span>（Agent 默认端口）。如你改过端口，请在 IP/域名里自行带上 <span class="mono">:端口</span>。</p>
+    <p class="muted" style="margin-top:8px;">填写节点地址即可；默认端口 <span class="mono">18700</span>（如有自定义，请在地址中附带 <span class="mono">:port</span>）。</p>
 
     <div class="form" style="margin-top:10px;">
       <div class="row" style="gap:12px;">
@@ -215,12 +215,12 @@
             <select class="select" id="f_wss_receiver_node">
               <option value="">请选择接收机…</option>
             </select>
-            <div class="help">选择接收机后：保存会在接收机同步生成对应规则；删除也会同步删除。接收机中由同步生成的规则会被锁定不可编辑。</div>
+            <div class="help">保存/删除将同步至接收机；同步生成的规则为只读。</div>
           </div>
           <div class="col" style="max-width:240px;">
             <label class="label">接收机监听端口</label>
             <input class="input" id="f_wss_receiver_port" placeholder="留空 = 与发送机 Listen 一致">
-            <div class="help">留空会默认使用发送机 Listen 的端口；如冲突会自动挑选一个不冲突端口。</div>
+            <div class="help">留空=沿用发送机端口；如冲突自动避让。</div>
           </div>
         </div>
 
@@ -237,7 +237,7 @@
 
         <div class="row" style="gap:12px;align-items:center;">
           <div class="col">
-            <div class="help">Host/Path/SNI 建议与证书域名一致；如需提升兼容性，可勾选「跳过证书校验」。</div>
+            <div class="help">Host/Path/SNI 建议与证书域名一致；兼容模式可启用「跳过校验」。</div>
           </div>
           <div class="right" style="flex:0 0 auto;">
             <button class="btn xs ghost" type="button" onclick="randomizeWss()">随机生成参数</button>
@@ -261,7 +261,7 @@
               <input type="checkbox" id="f_wss_insecure" checked style="width:auto;margin:0;">
               跳过证书校验
             </label>
-            <div class="help">开启后更稳定，但安全性降低。</div>
+            <div class="help">兼容性更好，但安全性降低。</div>
           </div>
         </div>
 
@@ -305,7 +305,7 @@
       <div class="col"><div class="h2" id="commandTitle">命令</div></div>
       <div class="right"><button class="btn xs ghost" type="button" onclick="closeCommandModal()">关闭</button></div>
     </div>
-    <p class="muted" style="margin-top:8px;">复制命令到目标节点执行。</p>
+    <p class="muted" style="margin-top:8px;">在目标节点执行以下命令即可。</p>
     <pre class="code-block" id="commandText"></pre>
     <div class="row" style="justify-content:flex-end;">
       <button class="btn xs" data-copy-target="commandText">复制命令</button>

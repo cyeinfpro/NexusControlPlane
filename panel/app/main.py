@@ -39,6 +39,21 @@ STATIC_DIR = BASE_DIR / "static"
 
 DEFAULT_AGENT_PORT = 18700
 
+def _panel_public_base_url(request: Request) -> str:
+    """Return panel public base URL for generating scripts/links.
+
+    If REALM_PANEL_PUBLIC_URL is set, it takes precedence.
+    """
+    cfg = (os.getenv("REALM_PANEL_PUBLIC_URL") or os.getenv("REALM_PANEL_URL") or "").strip()
+    if cfg:
+        cfg = cfg.rstrip('/')
+        if '://' not in cfg:
+            # When user only provides domain/host, default to https (typical reverse-proxy setup).
+            cfg = 'https://' + cfg
+        return cfg
+    return str(request.base_url).rstrip('/')
+
+
 app = FastAPI(title="Realm Pro Panel", version="33")
 
 # Session
@@ -409,7 +424,7 @@ async def node_detail(request: Request, node_id: int, user: str = Depends(requir
         # 用更宽松的阈值显示在线状态（避免轻微抖动导致频繁显示离线）
         n["online"] = _is_report_fresh(n, max_age_sec=45)
     show_install_cmd = bool(request.session.pop("show_install_cmd", False))
-    base_url = str(request.base_url).rstrip("/")
+    base_url = _panel_public_base_url(request)
     node["display_ip"] = _extract_ip_for_display(node.get("base_url", ""))
 
     # ✅ 一键接入 / 卸载命令（短命令，避免超长）
@@ -453,7 +468,7 @@ async def join_script(request: Request, token: str):
 exit 1
 """, status_code=404)
 
-    base_url = str(request.base_url).rstrip("/")
+    base_url = _panel_public_base_url(request)
     node_id = int(node.get("id"))
     api_key = str(node.get("api_key"))
     repo_zip_url = f"{base_url}/static/realm-agent.zip"
@@ -502,7 +517,7 @@ async def uninstall_script(request: Request, token: str):
 exit 1
 """, status_code=404)
 
-    base_url = str(request.base_url).rstrip("/")
+    base_url = _panel_public_base_url(request)
     api_key = str(node.get("api_key"))
     script = f"""#!/usr/bin/env bash
 set -euo pipefail
@@ -946,7 +961,7 @@ async def api_nodes_create(request: Request, user: str = Depends(require_login))
     if scheme not in ("http", "https"):
         return JSONResponse({"ok": False, "error": "协议仅支持 http 或 https"}, status_code=400)
     if not ip_address:
-        return JSONResponse({"ok": False, "error": "IP/域名不能为空"}, status_code=400)
+        return JSONResponse({"ok": False, "error": "节点地址不能为空"}, status_code=400)
 
     # 端口在 UI 中隐藏：默认 18700；如用户自带 :port 则兼容解析（仍不展示）
     if "://" not in ip_address:
@@ -955,7 +970,7 @@ async def api_nodes_create(request: Request, user: str = Depends(require_login))
     port_value = DEFAULT_AGENT_PORT
     host, parsed_port, has_port, scheme = _split_host_and_port(ip_address, port_value)
     if not host:
-        return JSONResponse({"ok": False, "error": "IP/域名不能为空"}, status_code=400)
+        return JSONResponse({"ok": False, "error": "节点地址不能为空"}, status_code=400)
     if has_port:
         port_value = parsed_port
 

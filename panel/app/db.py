@@ -3,7 +3,7 @@ import sqlite3
 from contextlib import contextmanager
 from typing import Any, Dict, List, Optional, Tuple
 
-DEFAULT_DB_PATH = "/etc/realm-panel/panel.db"
+DEFAULT_DB_PATH = os.getenv("REALM_PANEL_DB", "/etc/realm-panel/panel.db")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS nodes (
