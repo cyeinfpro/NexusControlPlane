@@ -332,7 +332,7 @@ async function refreshDashboardMiniSys(){
     }
     try{
       // Dashboard: 优先读取 panel 的 push-report 缓存，避免直连 agent 卡住
-      const res = await fetchJSONTimeout(`/api/nodes/${nodeId}/sys?cached=1`, 1800);
+      const res = await fetchJSONTimeout(`/api/nodes/${nodeId}/sys?cached=1`, 3500);
       if(res && res.ok){
         renderSysMini(card, res.sys);
       } else {
@@ -382,7 +382,7 @@ function renderSysCard(sys){
 
   const setText = (id, text) => { const el = document.getElementById(id); if(el) el.textContent = text; };
 
-  setText('sysCpuInfo', `${cores}核心 ${cpuModel}`);
+  setText('sysCpuInfo', `${cores}核`);
   setText('sysUptime', formatDuration(sys?.uptime_sec || 0));
   setText('sysTraffic', `上传 ${formatBytes(tx)} | 下载 ${formatBytes(rx)}`);
   setText('sysRate', `上传 ${formatBps(txBps)} | 下载 ${formatBps(rxBps)}`);
@@ -423,7 +423,7 @@ function renderMiniSysOnCard(cardEl, sys){
   setBar('disk', sys.disk_percent);
 }
 
-function initDashboardMiniSys(){
+function initDashboardMiniSysV2(){
   const grid = document.getElementById('dashboardGrid');
   if(!grid) return;
   let inflight = false;
