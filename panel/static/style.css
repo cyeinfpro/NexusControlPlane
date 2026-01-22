@@ -534,6 +534,20 @@ textarea,.textarea{min-height:90px;resize:vertical}
   backdrop-filter: blur(10px);
 }
 
+/* Mini system card inside node tiles (Dashboard) */
+.card.compact .sys-card.mini{ margin: 10px 0 0 0; padding: 12px 12px; border-radius: 16px; }
+.sys-card.mini .sys-grid{ grid-template-columns: 1fr; gap: 12px; }
+.sys-card.mini .sys-row{ padding: 7px 9px; }
+.sys-card.mini .sys-k{ font-size: 11px; }
+.sys-card.mini .sys-v{ font-size: 12px; }
+.sys-card.mini .sys-bar{ padding: 7px 9px; }
+.sys-card.mini .sys-bar-head{ font-size: 11px; }
+.sys-card.mini .progress{ height: 9px; }
+
+@media (min-width: 1100px){
+  .sys-card.mini .sys-grid{ grid-template-columns: 1.15fr 1fr; }
+}
+
 .sys-grid{
   display: grid;
   grid-template-columns: 1.1fr 1fr;

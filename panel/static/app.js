@@ -235,6 +235,122 @@ function setProgress(elId, pct){
   el.style.width = v.toFixed(0) + '%';
 }
 
+function setProgressEl(el, pct){
+  if(!el) return;
+  const v = Math.max(0, Math.min(100, Number(pct) || 0));
+  el.style.width = v.toFixed(0) + '%';
+}
+
+// Dashboard node tile: render mini system info inside a node card
+function renderSysMini(cardEl, sys){
+  if(!cardEl) return;
+  const sysCard = cardEl.querySelector('[data-sys-card]');
+  if(!sysCard) return;
+
+  const hint = sysCard.querySelector('[data-sys="hint"]');
+  const setText = (key, text) => {
+    const el = sysCard.querySelector(`[data-sys="${key}"]`);
+    if(el) el.textContent = text;
+  };
+  const setBar = (key, pct) => {
+    const el = sysCard.querySelector(`[data-sys-bar="${key}"]`);
+    setProgressEl(el, pct);
+  };
+
+  // Offline or missing data
+  if(!sys || sys.error){
+    setText('cpuInfo', '暂无数据');
+    setText('uptime', '—');
+    setText('traffic', '—');
+    setText('rate', '—');
+    setText('cpuPct', '0%');
+    setText('memText', '—');
+    setText('diskText', '—');
+    setBar('cpu', 0);
+    setBar('mem', 0);
+    setBar('disk', 0);
+    if(hint) hint.style.display = '';
+    return;
+  }
+
+  if(hint) hint.style.display = 'none';
+
+  const cpuModel = sys?.cpu?.model || '-';
+  const cores = sys?.cpu?.cores || '-';
+  const cpuPct = sys?.cpu?.usage_pct ?? 0;
+
+  const memUsed = sys?.mem?.used || 0;
+  const memTot = sys?.mem?.total || 0;
+  const memPct = sys?.mem?.usage_pct ?? 0;
+
+  const diskUsed = sys?.disk?.used || 0;
+  const diskTot = sys?.disk?.total || 0;
+  const diskPct = sys?.disk?.usage_pct ?? 0;
+
+  const tx = sys?.net?.tx_bytes || 0;
+  const rx = sys?.net?.rx_bytes || 0;
+  const txBps = sys?.net?.tx_bps || 0;
+  const rxBps = sys?.net?.rx_bps || 0;
+
+  setText('cpuInfo', `${cores}核心 ${cpuModel}`);
+  setText('uptime', formatDuration(sys?.uptime_sec || 0));
+  setText('traffic', `上传 ${formatBytes(tx)} | 下载 ${formatBytes(rx)}`);
+  setText('rate', `上传 ${formatBps(txBps)} | 下载 ${formatBps(rxBps)}`);
+  setText('cpuPct', `${Number(cpuPct).toFixed(0)}%`);
+  setText('memText', `${formatBytes(memUsed)} / ${formatBytes(memTot)}  ${Number(memPct).toFixed(0)}%`);
+  setText('diskText', `${formatBytes(diskUsed)} / ${formatBytes(diskTot)}  ${Number(diskPct).toFixed(0)}%`);
+
+  setBar('cpu', cpuPct);
+  setBar('mem', memPct);
+  setBar('disk', diskPct);
+}
+
+async function fetchJSONTimeout(url, timeoutMs){
+  const ms = Number(timeoutMs) || 2000;
+  const ctrl = new AbortController();
+  const t = setTimeout(()=>ctrl.abort(), ms);
+  try{
+    const resp = await fetch(url, { credentials: 'include', signal: ctrl.signal });
+    const data = await resp.json();
+    return data;
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+async function refreshDashboardMiniSys(){
+  const cards = Array.from(document.querySelectorAll('.node-card[data-node-id]'));
+  if(cards.length === 0) return;
+  await Promise.all(cards.map(async (card)=>{
+    const nodeId = card.getAttribute('data-node-id');
+    const online = card.getAttribute('data-online') === '1';
+    if(!nodeId) return;
+    if(!online){
+      renderSysMini(card, { error: 'offline' });
+      return;
+    }
+    try{
+      const res = await fetchJSONTimeout(`/api/nodes/${nodeId}/sys`, 1800);
+      if(res && res.ok){
+        renderSysMini(card, res.sys);
+      } else {
+        renderSysMini(card, { error: (res && res.error) || 'no data' });
+      }
+    } catch(e){
+      renderSysMini(card, { error: 'timeout' });
+    }
+  }));
+}
+
+function initDashboardMiniSys(){
+  const grid = document.getElementById('dashboardGrid');
+  if(!grid) return;
+  // First paint
+  refreshDashboardMiniSys();
+  // Same refresh cadence as rules: 3s
+  setInterval(refreshDashboardMiniSys, 3000);
+}
+
 function renderSysCard(sys){
   const card = document.getElementById('sysCard');
   if(!card) return;
@@ -278,6 +394,122 @@ function renderSysCard(sys){
   setProgress('sysMemBar', memPct);
   setProgress('sysSwapBar', swapPct);
   setProgress('sysDiskBar', diskPct);
+}
+
+
+// ================= Dashboard: Node mini system info =================
+function renderMiniSysOnCard(cardEl, sys){
+  if(!cardEl) return;
+  const sysCard = cardEl.querySelector('[data-sys-card]');
+  if(!sysCard) return;
+
+  const hintEl = cardEl.querySelector('[data-sys="hint"]');
+  const setField = (key, text) => {
+    const el = cardEl.querySelector(`[data-sys="${key}"]`);
+    if(el) el.textContent = text;
+  };
+  const setBar = (key, pct) => {
+    const el = cardEl.querySelector(`[data-sys-bar="${key}"]`);
+    setProgressEl(el, pct);
+  };
+
+  if(!sys || sys.error || sys.ok === false){
+    // Keep a friendly placeholder in dashboard tiles.
+    setField('cpuInfo', '暂无数据');
+    setField('uptime', '—');
+    setField('traffic', '—');
+    setField('rate', '—');
+    setField('cpuPct', '0%');
+    setField('memText', '—');
+    setField('diskText', '—');
+    setBar('cpu', 0);
+    setBar('mem', 0);
+    setBar('disk', 0);
+    if(hintEl){ hintEl.style.display = ''; }
+    return;
+  }
+  if(hintEl){ hintEl.style.display = 'none'; }
+
+  const cpuModel = sys?.cpu?.model || '-';
+  const cores = sys?.cpu?.cores || '-';
+  const cpuPct = sys?.cpu?.usage_pct ?? 0;
+
+  const memUsed = sys?.mem?.used || 0;
+  const memTot = sys?.mem?.total || 0;
+  const memPct = sys?.mem?.usage_pct ?? 0;
+
+  const diskUsed = sys?.disk?.used || 0;
+  const diskTot = sys?.disk?.total || 0;
+  const diskPct = sys?.disk?.usage_pct ?? 0;
+
+  const tx = sys?.net?.tx_bytes || 0;
+  const rx = sys?.net?.rx_bytes || 0;
+  const txBps = sys?.net?.tx_bps || 0;
+  const rxBps = sys?.net?.rx_bps || 0;
+
+  setField('cpuInfo', `${cores}核心 ${cpuModel}`);
+  setField('uptime', formatDuration(sys?.uptime_sec || 0));
+  setField('traffic', `上传 ${formatBytes(tx)} | 下载 ${formatBytes(rx)}`);
+  setField('rate', `上传 ${formatBps(txBps)} | 下载 ${formatBps(rxBps)}`);
+  setField('cpuPct', `${Number(cpuPct).toFixed(0)}%`);
+  setField('memText', `${formatBytes(memUsed)} / ${formatBytes(memTot)}  ${Number(memPct).toFixed(0)}%`);
+  setField('diskText', `${formatBytes(diskUsed)} / ${formatBytes(diskTot)}  ${Number(diskPct).toFixed(0)}%`);
+
+  setBar('cpu', cpuPct);
+  setBar('mem', memPct);
+  setBar('disk', diskPct);
+}
+
+async function fetchJSONTimeout(url, timeoutMs){
+  const ms = Number(timeoutMs) || 2500;
+  const ctl = new AbortController();
+  const t = setTimeout(()=>{ try{ ctl.abort(); }catch(e){} }, ms);
+  try{
+    const res = await fetch(url, { signal: ctl.signal });
+    const data = await res.json().catch(()=> ({}));
+    return data;
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+function initDashboardMiniSys(){
+  const grid = document.getElementById('dashboardGrid');
+  if(!grid) return;
+  let inflight = false;
+
+  const tick = async () => {
+    if(inflight) return;
+    inflight = true;
+    try{
+      const cards = Array.from(document.querySelectorAll('.node-card[data-node-id]'));
+      for(const card of cards){
+        const nodeId = card.dataset.nodeId;
+        const online = card.dataset.online === '1';
+        const hintEl = card.querySelector('[data-sys="hint"]');
+        if(!online){
+          if(hintEl){ hintEl.textContent = '节点离线（系统信息暂停刷新）'; hintEl.style.display = ''; }
+          renderMiniSysOnCard(card, { ok:false, error:'offline' });
+          continue;
+        }
+        const data = await fetchJSONTimeout(`/api/nodes/${nodeId}/sys`, 2200);
+        // api returns {ok:true, sys:{...}} or {ok:false, error:'...'}
+        if(data && data.ok && data.sys){
+          renderMiniSysOnCard(card, data.sys);
+        }else{
+          if(hintEl){ hintEl.textContent = '系统信息暂无数据（等待 Agent 上报）'; }
+          renderMiniSysOnCard(card, { ok:false, error: data?.error || 'no_data' });
+        }
+      }
+    }catch(e){
+      // silent
+    }finally{
+      inflight = false;
+    }
+  };
+
+  tick();
+  setInterval(tick, 3000);
 }
 
 
@@ -1491,3 +1723,6 @@ document.addEventListener('click', (e)=>{
     closeAllMenus(null);
   }
 }, true);
+
+// Auto-init dashboard mini system info (safe no-op on non-dashboard pages)
+try{ initDashboardMiniSys(); }catch(_e){}

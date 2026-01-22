@@ -12,9 +12,9 @@
   </div>
 </div>
 
-<div class="grid">
+<div class="grid" id="dashboardGrid">
   {% for n in nodes %}
-  <div class="card compact">
+  <div class="card compact node-card" data-node-id="{{ n.id }}" data-online="{{ '1' if n.online else '0' }}">
     <div class="card-header">
       <div style="min-width:0;">
         <div class="row" style="justify-content:space-between;gap:10px;align-items:center;">
@@ -33,6 +33,45 @@
       <div class="right" style="flex:0 0 auto;">
         <a class="btn xs secondary" href="/nodes/{{ n.id }}">打开</a>
       </div>
+    </div>
+
+    <!-- Mini system info (auto refresh 3s) -->
+    <div class="sys-card mini" data-sys-card>
+      <div class="sys-grid">
+        <div class="sys-kv">
+          <div class="sys-row">
+            <div class="sys-k">CPU信息</div>
+            <div class="sys-v" data-sys="cpuInfo">加载中…</div>
+          </div>
+          <div class="sys-row">
+            <div class="sys-k">在线时长</div>
+            <div class="sys-v" data-sys="uptime">—</div>
+          </div>
+          <div class="sys-row">
+            <div class="sys-k">流量使用</div>
+            <div class="sys-v" data-sys="traffic">—</div>
+          </div>
+          <div class="sys-row">
+            <div class="sys-k">实时速率</div>
+            <div class="sys-v" data-sys="rate">—</div>
+          </div>
+        </div>
+        <div class="sys-bars">
+          <div class="sys-bar">
+            <div class="sys-bar-head"><span>CPU</span><span class="mono" data-sys="cpuPct">0%</span></div>
+            <div class="progress"><div class="progress-fill" data-sys-bar="cpu"></div></div>
+          </div>
+          <div class="sys-bar">
+            <div class="sys-bar-head"><span>内存</span><span class="mono" data-sys="memText">—</span></div>
+            <div class="progress"><div class="progress-fill" data-sys-bar="mem"></div></div>
+          </div>
+          <div class="sys-bar">
+            <div class="sys-bar-head"><span>硬盘</span><span class="mono" data-sys="diskText">—</span></div>
+            <div class="progress"><div class="progress-fill" data-sys-bar="disk"></div></div>
+          </div>
+        </div>
+      </div>
+      <div class="muted" data-sys="hint" style="margin-top:8px;display:none;">系统信息暂无数据（等待 Agent 上报）</div>
     </div>
   </div>
   {% else %}
@@ -88,5 +127,5 @@
 {% endblock %}
 
 {% block scripts %}
-<script src="/static/app.js?v=33.4"></script>
+<script src="/static/app.js?v=33.5"></script>
 {% endblock %}
