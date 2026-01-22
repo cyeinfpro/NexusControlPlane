@@ -1224,7 +1224,7 @@ async def api_stats(request: Request, node_id: int, user: str = Depends(require_
 
 
 @app.get("/api/nodes/{node_id}/sys")
-async def api_sys(request: Request, node_id: int, user: str = Depends(require_login)):
+async def api_sys(request: Request, node_id: int, cached: int = 0, user: str = Depends(require_login)):
     """节点系统信息：CPU/内存/硬盘/交换/在线时长/流量/实时速率。
 
     返回格式统一为：{ ok: true, sys: {...} }
@@ -1238,11 +1238,19 @@ async def api_sys(request: Request, node_id: int, user: str = Depends(require_lo
     source = None
 
     # 1) Push-report cache（更快、更稳定）
-    if _is_report_fresh(node):
+    # cached=1：即便不是“新鲜上报”，也优先返回最后一次上报的数据，避免前端长时间等待。
+    if cached:
         rep = get_last_report(node_id)
         if isinstance(rep, dict) and isinstance(rep.get("sys"), dict):
             sys_data = dict(rep["sys"])  # copy
+            sys_data["stale"] = not _is_report_fresh(node)
             source = "report"
+    else:
+        if _is_report_fresh(node):
+            rep = get_last_report(node_id)
+            if isinstance(rep, dict) and isinstance(rep.get("sys"), dict):
+                sys_data = dict(rep["sys"])  # copy
+                source = "report"
 
     # 2) Fallback：直连 Agent
     if sys_data is None:

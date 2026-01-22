@@ -292,7 +292,8 @@ function renderSysMini(cardEl, sys){
   const txBps = sys?.net?.tx_bps || 0;
   const rxBps = sys?.net?.rx_bps || 0;
 
-  setText('cpuInfo', `${cores}核心 ${cpuModel}`);
+  // CPU 型号信息太占空间：只展示核心数
+  setText('cpuInfo', `${cores}核`);
   setText('uptime', formatDuration(sys?.uptime_sec || 0));
   setText('traffic', `上传 ${formatBytes(tx)} | 下载 ${formatBytes(rx)}`);
   setText('rate', `上传 ${formatBps(txBps)} | 下载 ${formatBps(rxBps)}`);
@@ -330,7 +331,8 @@ async function refreshDashboardMiniSys(){
       return;
     }
     try{
-      const res = await fetchJSONTimeout(`/api/nodes/${nodeId}/sys`, 1800);
+      // Dashboard: 优先读取 panel 的 push-report 缓存，避免直连 agent 卡住
+      const res = await fetchJSONTimeout(`/api/nodes/${nodeId}/sys?cached=1`, 1800);
       if(res && res.ok){
         renderSysMini(card, res.sys);
       } else {
@@ -447,7 +449,8 @@ function renderMiniSysOnCard(cardEl, sys){
   const txBps = sys?.net?.tx_bps || 0;
   const rxBps = sys?.net?.rx_bps || 0;
 
-  setField('cpuInfo', `${cores}核心 ${cpuModel}`);
+  // CPU 型号信息太占空间：只展示核心数
+  setField('cpuInfo', `${cores}核`);
   setField('uptime', formatDuration(sys?.uptime_sec || 0));
   setField('traffic', `上传 ${formatBytes(tx)} | 下载 ${formatBytes(rx)}`);
   setField('rate', `上传 ${formatBps(txBps)} | 下载 ${formatBps(rxBps)}`);
@@ -492,7 +495,8 @@ function initDashboardMiniSys(){
           renderMiniSysOnCard(card, { ok:false, error:'offline' });
           continue;
         }
-        const data = await fetchJSONTimeout(`/api/nodes/${nodeId}/sys`, 2200);
+        // Dashboard: 优先读取 panel 的 push-report 缓存，避免直连 agent 卡住
+        const data = await fetchJSONTimeout(`/api/nodes/${nodeId}/sys?cached=1`, 2200);
         // api returns {ok:true, sys:{...}} or {ok:false, error:'...'}
         if(data && data.ok && data.sys){
           renderMiniSysOnCard(card, data.sys);
