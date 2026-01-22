@@ -875,12 +875,25 @@ function showWssBox(){
 
   const autoBox = document.getElementById('wssAutoSyncBox');
   const manualDetails = document.getElementById('wssManualPairDetails');
+  const receiverPortCol = document.getElementById('wssReceiverPortCol');
+
+  const receiverSel = q('f_wss_receiver_node');
+  const receiverChosen = receiverSel ? receiverSel.value.trim() : '';
 
   if(autoBox){
     autoBox.style.display = (mode === 'wss_send') ? 'flex' : 'none';
   }
   if(manualDetails){
-    manualDetails.style.display = (mode === 'wss_send' || mode === 'wss_recv') ? 'block' : 'none';
+    // 发送端：选择了接收机则走自动同步（推荐），隐藏手动配对码；
+    // 未选择接收机则显示配对码（兼容旧模式）。
+    if(mode === 'wss_send'){
+      manualDetails.style.display = receiverChosen ? 'none' : 'block';
+    }else{
+      manualDetails.style.display = (mode === 'wss_recv') ? 'block' : 'none';
+    }
+  }
+  if(receiverPortCol){
+    receiverPortCol.style.display = (mode === 'wss_send' && receiverChosen) ? 'block' : 'none';
   }
 }
 
@@ -1189,7 +1202,28 @@ async function saveRule(){
         CURRENT_POOL = res.sender_pool;
         renderRules();
         closeModal();
-        toast('已保存，并自动同步到接收机');
+        // 人性化提示：接收端口留空时默认与发送端 Listen 一致，如冲突则自动挑选
+        try{
+          const chosenPort = res.receiver_port;
+          const listenPort = parseInt(String(listen).split(':').pop() || '0', 10);
+          const inputTxt = receiverPortTxt ? String(receiverPortTxt).trim() : '';
+          if(!inputTxt){
+            if(chosenPort && listenPort && chosenPort !== listenPort){
+              toast(`已保存并同步到接收机：接收端口自动选择为 ${chosenPort}（原 Listen ${listenPort} 已被占用）`);
+            }else{
+              toast('已保存，并自动同步到接收机');
+            }
+          }else{
+            const wanted = parseInt(inputTxt, 10);
+            if(chosenPort && wanted && chosenPort !== wanted){
+              toast(`已保存并同步到接收机：接收端口冲突，已自动调整为 ${chosenPort}`);
+            }else{
+              toast('已保存，并自动同步到接收机');
+            }
+          }
+        }catch(e){
+          toast('已保存，并自动同步到接收机');
+        }
       }else{
         toast((res && res.error) ? res.error : '保存失败', true);
       }

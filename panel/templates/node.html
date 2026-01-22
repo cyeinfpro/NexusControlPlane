@@ -213,10 +213,10 @@
             </select>
             <div class="help">选择接收机后：保存会在接收机同步生成对应规则；删除也会同步删除。接收机中由同步生成的规则会被锁定不可编辑。</div>
           </div>
-          <div class="col" style="max-width:240px;">
+          <div class="col" id="wssReceiverPortCol" style="max-width:240px;">
             <label class="label">接收端口</label>
-            <input class="input" id="f_wss_receiver_port" placeholder="留空 = 自动选择">
-            <div class="help">接收端 Realm 监听端口（自动挑选不冲突端口）。</div>
+            <input class="input" id="f_wss_receiver_port" placeholder="留空 = 与发送机 Listen 一致">
+            <div class="help">留空默认与发送机 Listen 端口一致；如端口冲突将自动挑选可用端口。</div>
           </div>
         </div>
 
@@ -235,46 +235,46 @@
           </div>
         </details>
 
-        <div class="row" style="gap:12px;margin-top:10px;">
+        <div class="row" style="gap:12px;margin-top:10px;align-items:flex-end;">
           <div class="col">
-            <label class="label">WSS Host</label>
+            <label class="label">伪装域名 Host</label>
             <input class="input" id="f_wss_host" placeholder="www.bing.com">
           </div>
           <div class="col">
-            <label class="label">WSS Path</label>
+            <label class="label">路径 Path</label>
             <input class="input" id="f_wss_path" placeholder="/ws">
           </div>
-        </div>
-
-        <div class="row" style="gap:12px;align-items:center;">
-          <div class="col">
-            <div class="help">Host/Path/SNI 建议与证书域名一致；如需容错可将 insecure 设为“是”。</div>
-          </div>
           <div class="right" style="flex:0 0 auto;">
-            <button class="btn xs ghost" type="button" onclick="randomizeWss()">随机生成参数</button>
+            <button class="btn xs ghost" type="button" onclick="randomizeWss()">随机生成</button>
           </div>
         </div>
 
-        <div class="row" style="gap:12px;">
-          <div class="col">
-            <label class="label">SNI</label>
-            <input class="input" id="f_wss_sni" placeholder="www.bing.com">
+        <details id="wssAdvancedDetails" style="margin-top:10px;">
+          <summary class="help">高级参数（可不填，通常保持默认即可）</summary>
+          <div style="margin-top:10px;">
+            <div class="row" style="gap:12px;">
+              <div class="col">
+                <label class="label">SNI（可选）</label>
+                <input class="input" id="f_wss_sni" placeholder="www.bing.com">
+              </div>
+              <div class="col" style="max-width:220px;">
+                <label class="label">TLS</label>
+                <select class="select" id="f_wss_tls">
+                  <option value="1">启用</option>
+                  <option value="0">关闭</option>
+                </select>
+              </div>
+              <div class="col" style="max-width:220px;">
+                <label class="label">insecure</label>
+                <select class="select" id="f_wss_insecure">
+                  <option value="0">否</option>
+                  <option value="1">是</option>
+                </select>
+              </div>
+            </div>
+            <div class="help" style="margin-top:8px;">Host/Path/SNI 建议与证书域名一致；如遇证书不匹配或容错需求，可将 insecure 设为“是”。</div>
           </div>
-          <div class="col" style="max-width:220px;">
-            <label class="label">TLS</label>
-            <select class="select" id="f_wss_tls">
-              <option value="1">启用</option>
-              <option value="0">关闭</option>
-            </select>
-          </div>
-          <div class="col" style="max-width:220px;">
-            <label class="label">insecure</label>
-            <select class="select" id="f_wss_insecure">
-              <option value="0">否</option>
-              <option value="1">是</option>
-            </select>
-          </div>
-        </div>
+        </details>
 
       </div>
 
