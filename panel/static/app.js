@@ -490,7 +490,8 @@ function buildStatsLookup(){
   const rules = Array.isArray(CURRENT_STATS.rules) ? CURRENT_STATS.rules : [];
   rules.forEach((r)=>{
     if(typeof r.idx === 'number') lookup.byIdx[r.idx] = r;
-    if(r.listen) lookup.byListen[r.listen] = r;
+    const lis = (r && r.listen != null) ? String(r.listen).trim() : '';
+    if(lis) lookup.byListen[lis] = r;
   });
   return lookup;
 }
@@ -623,7 +624,8 @@ function showHealthDetail(idx){
   try{
     const statsLookup = buildStatsLookup();
     const eps = (CURRENT_POOL && CURRENT_POOL.endpoints) ? CURRENT_POOL.endpoints : [];
-    const stats = (statsLookup.byIdx[idx] || statsLookup.byListen[eps[idx]?.listen] || {});
+    const lis = (eps[idx] && eps[idx].listen != null) ? String(eps[idx].listen).trim() : '';
+    const stats = (statsLookup.byIdx[idx] || (lis ? statsLookup.byListen[lis] : null) || {});
     const list = Array.isArray(stats.health) ? stats.health : [];
     const lines = list.map((it)=>{
       const ok = it && it.ok === true;
@@ -727,7 +729,8 @@ ${endpointType(e)}`.toLowerCase();
     const e = it.e;
     const idx = it.idx;
     const rowNo = i + 1;
-    const stats = statsLookup.byIdx[idx] || statsLookup.byListen[e.listen] || {};
+    const lis = (e && e.listen != null) ? String(e.listen).trim() : '';
+    const stats = statsLookup.byIdx[idx] || (lis ? statsLookup.byListen[lis] : null) || {};
     const statsError = statsLookup.error;
 
     if(isMobile && mobileWrap){
@@ -1448,191 +1451,6 @@ function closeAddNodeModal(){
   if(!m) return;
   m.style.display = "none";
 }
-
-// ---------------- Dashboard: Restore Nodes Modal ----------------
-function openRestoreNodesModal(){
-  const m = document.getElementById('restoreNodesModal');
-  if(!m) return;
-  m.style.display = 'flex';
-  const err = document.getElementById('restoreNodesError');
-  if(err) err.textContent = '';
-  const f = document.getElementById('restoreNodesFile');
-  if(f) setTimeout(()=>f.focus(), 30);
-}
-
-function closeRestoreNodesModal(){
-  const m = document.getElementById('restoreNodesModal');
-  if(!m) return;
-  m.style.display = 'none';
-  const err = document.getElementById('restoreNodesError');
-  if(err) err.textContent = '';
-  const f = document.getElementById('restoreNodesFile');
-  if(f) f.value = '';
-}
-
-async function restoreNodesNow(){
-  const err = document.getElementById('restoreNodesError');
-  const input = document.getElementById('restoreNodesFile');
-  const file = input && input.files && input.files[0];
-  try{
-    if(err) err.textContent = '';
-    if(!file){
-      if(err) err.textContent = '请选择备份文件（zip 或 nodes.json）';
-      return;
-    }
-    const fd = new FormData();
-    fd.append('file', file);
-    toast('正在恢复节点列表…');
-    const isZip = String(file.name || '').toLowerCase().endsWith('.zip') || String(file.type || '').includes('zip');
-    const url = isZip ? '/api/restore/full' : '/api/restore/nodes';
-    const res = await fetch(url, {
-      method: 'POST',
-      body: fd,
-      credentials: 'same-origin',
-    });
-    const text = await res.text();
-    let data = {};
-    try{ data = text ? JSON.parse(text) : {}; }catch(_e){}
-    if(!res.ok || !data.ok){
-      const msg = (data && data.error) ? data.error : (text || `HTTP ${res.status}`);
-      if(err) err.textContent = msg;
-      toast(msg, true);
-      return;
-    }
-    const n = data.nodes || data;
-    const r = data.rules || {};
-    let msg = `节点恢复完成：新增 ${n.added||0}，更新 ${n.updated||0}，跳过 ${n.skipped||0}`;
-    if(r && (r.total!==undefined)) {
-      msg += `；规则 共 ${r.total||0}，成功 ${r.restored||0}，未匹配 ${r.unmatched||0}，失败 ${r.failed||0}`;
-    }
-    // If full zip restore has issues, keep modal open and show details
-    if(r && ((r.unmatched||0) > 0 || (r.failed||0) > 0)) {
-      let lines = [msg, '', '提示：未匹配/失败的规则不会丢失，你可进入对应节点 → 更多 → 恢复规则，单独导入 zip 内 rules/ 目录里的文件。'];
-      const um = data.rule_unmatched || [];
-      const ff = data.rule_failed || [];
-      if(um.length){
-        lines.push('', '未匹配（示例）：');
-        for(let i=0;i<Math.min(um.length, 6);i++){
-          const it = um[i] || {};
-          lines.push(`- ${it.path||''}  ${it.base_url||''}`.trim());
-        }
-      }
-      if(ff.length){
-        lines.push('', '失败（示例）：');
-        for(let i=0;i<Math.min(ff.length, 6);i++){
-          const it = ff[i] || {};
-          lines.push(`- ${it.path||''}  ${it.error||''}`.trim());
-        }
-      }
-      if(err) err.textContent = lines.join('\n');
-      toast('恢复完成（存在未匹配/失败项）', true);
-      return;
-    }
-    toast(msg);
-    closeRestoreNodesModal();
-    setTimeout(()=>{ window.location.reload(); }, 500);
-  }catch(e){
-    const msg = (e && e.message) ? e.message : String(e || '恢复失败');
-    if(err) err.textContent = msg;
-    toast('恢复失败：' + msg, true);
-  }
-}
-
-window.openRestoreNodesModal = openRestoreNodesModal;
-window.closeRestoreNodesModal = closeRestoreNodesModal;
-window.restoreNodesNow = restoreNodesNow;
-
-
-// ---------------- Dashboard: Restore Full Modal ----------------
-function openRestoreFullModal(){
-  const m = document.getElementById('restoreFullModal');
-  if(!m) return;
-  m.style.display = 'flex';
-  const err = document.getElementById('restoreFullError');
-  if(err) err.textContent = '';
-  const f = document.getElementById('restoreFullFile');
-  if(f) setTimeout(()=>f.focus(), 30);
-}
-
-function closeRestoreFullModal(){
-  const m = document.getElementById('restoreFullModal');
-  if(!m) return;
-  m.style.display = 'none';
-  const err = document.getElementById('restoreFullError');
-  if(err) err.textContent = '';
-  const f = document.getElementById('restoreFullFile');
-  if(f) f.value = '';
-}
-
-async function restoreFullNow(){
-  const err = document.getElementById('restoreFullError');
-  const input = document.getElementById('restoreFullFile');
-  const file = input && input.files && input.files[0];
-  try{
-    if(err) err.textContent = '';
-    if(!file){
-      if(err) err.textContent = '请选择全量备份包（zip）';
-      return;
-    }
-    const fd = new FormData();
-    fd.append('file', file);
-    toast('正在全量恢复（节点 + 规则）…');
-    const res = await fetch('/api/restore/full', {
-      method: 'POST',
-      body: fd,
-      credentials: 'same-origin',
-    });
-    const text = await res.text();
-    let data = {};
-    try{ data = text ? JSON.parse(text) : {}; }catch(_e){}
-    if(!res.ok || !data.ok){
-      const msg = (data && data.error) ? data.error : (text || `HTTP ${res.status}`);
-      if(err) err.textContent = msg;
-      toast(msg, true);
-      return;
-    }
-
-    const n = (data.nodes || {});
-    const r = (data.rules || {});
-    const msg = `全量恢复完成：节点 新增 ${n.added||0}，更新 ${n.updated||0}，跳过 ${n.skipped||0}；规则 共 ${r.total||0}，成功 ${r.restored||0}，未匹配 ${r.unmatched||0}，失败 ${r.failed||0}`;
-
-    // If there are any failures/unmatched, keep modal open to show details.
-    if((r.unmatched||0) > 0 || (r.failed||0) > 0){
-      let lines = [msg, '', '提示：未匹配/失败的规则不会丢失，你可进入对应节点 → 更多 → 恢复规则，单独导入 zip 内 rules/ 目录里的文件。'];
-      const um = data.rule_unmatched || [];
-      const ff = data.rule_failed || [];
-      if(um.length){
-        lines.push('', '未匹配（示例）：');
-        for(let i=0;i<Math.min(um.length, 6);i++){
-          const it = um[i] || {};
-          lines.push(`- ${it.path||''}  ${it.base_url||''}`.trim());
-        }
-      }
-      if(ff.length){
-        lines.push('', '失败（示例）：');
-        for(let i=0;i<Math.min(ff.length, 6);i++){
-          const it = ff[i] || {};
-          lines.push(`- ${it.path||''}  ${it.error||''}`.trim());
-        }
-      }
-      if(err) err.textContent = lines.join('\n');
-      toast('全量恢复完成（存在未匹配/失败项）', true);
-      return;
-    }
-
-    toast(msg);
-    closeRestoreFullModal();
-    setTimeout(()=>{ window.location.reload(); }, 600);
-  }catch(e){
-    const msg = (e && e.message) ? e.message : String(e || '恢复失败');
-    if(err) err.textContent = msg;
-    toast('恢复失败：' + msg, true);
-  }
-}
-
-window.openRestoreFullModal = openRestoreFullModal;
-window.closeRestoreFullModal = closeRestoreFullModal;
-window.restoreFullNow = restoreFullNow;
 async function createNodeFromModal(){
   const err = document.getElementById("addNodeError");
   const btn = document.getElementById("addNodeSubmit");
@@ -1685,29 +1503,11 @@ document.addEventListener("click", (e)=>{
   if(e.target === m) closeAddNodeModal();
 });
 
-// 点击遮罩关闭（恢复节点）
-document.addEventListener("click", (e)=>{
-  const m = document.getElementById('restoreNodesModal');
-  if(!m || m.style.display === 'none') return;
-  if(e.target === m) closeRestoreNodesModal();
-});
-
-// 点击遮罩关闭（全量恢复）
-document.addEventListener("click", (e)=>{
-  const m = document.getElementById('restoreFullModal');
-  if(!m || m.style.display === 'none') return;
-  if(e.target === m) closeRestoreFullModal();
-});
-
 // ESC 关闭
 document.addEventListener("keydown", (e)=>{
   if(e.key === "Escape"){
     const m = document.getElementById("addNodeModal");
     if(m && m.style.display !== "none") closeAddNodeModal();
-    const r = document.getElementById('restoreNodesModal');
-    if(r && r.style.display !== 'none') closeRestoreNodesModal();
-    const rf = document.getElementById('restoreFullModal');
-    if(rf && rf.style.display !== 'none') closeRestoreFullModal();
   }
 });
 

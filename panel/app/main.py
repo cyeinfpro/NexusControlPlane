@@ -1162,6 +1162,24 @@ async def api_restore(
         pool = payload
     if not isinstance(pool, dict):
         return JSONResponse({"ok": False, "error": "备份内容缺少 pool 数据"}, status_code=400)
+
+    # sanitize (trim spaces)
+    try:
+        eps = pool.get("endpoints")
+        if isinstance(eps, list):
+            for e in eps:
+                if not isinstance(e, dict):
+                    continue
+                if e.get("listen") is not None:
+                    e["listen"] = str(e.get("listen") or "").strip()
+                if e.get("remote") is not None:
+                    e["remote"] = str(e.get("remote") or "").strip()
+                if isinstance(e.get("remotes"), list):
+                    e["remotes"] = [str(x).strip() for x in e.get("remotes") if str(x).strip()]
+                if isinstance(e.get("extra_remotes"), list):
+                    e["extra_remotes"] = [str(x).strip() for x in e.get("extra_remotes") if str(x).strip()]
+    except Exception:
+        pass
     # Store on panel and attempt immediate apply if agent reachable.
     desired_ver, _ = set_desired_pool(node_id, pool)
     try:
@@ -1190,6 +1208,30 @@ async def api_pool_set(request: Request, node_id: int, payload: Dict[str, Any], 
         pool = payload
     if not isinstance(pool, dict):
         return JSONResponse({"ok": False, "error": "请求缺少 pool 字段"}, status_code=400)
+
+    # --- Sanitize pool fields (trim spaces) ---
+    # 说明：Agent 侧会对 listen 做 strip()，如果面板保存了带空格/不可见字符的 listen，
+    # 前端按 listen 精确匹配 stats 时会出现“暂无检测数据”。
+    try:
+        eps = pool.get("endpoints")
+        if isinstance(eps, list):
+            for e in eps:
+                if not isinstance(e, dict):
+                    continue
+                if e.get("listen") is not None:
+                    e["listen"] = str(e.get("listen") or "").strip()
+                if e.get("remote") is not None:
+                    e["remote"] = str(e.get("remote") or "").strip()
+                if isinstance(e.get("remotes"), list):
+                    e["remotes"] = [str(x).strip() for x in e.get("remotes") if str(x).strip()]
+                if isinstance(e.get("extra_remotes"), list):
+                    e["extra_remotes"] = [str(x).strip() for x in e.get("extra_remotes") if str(x).strip()]
+                # common optional string fields
+                for k in ("through", "interface", "listen_interface", "listen_transport", "remote_transport", "protocol", "balance"):
+                    if e.get(k) is not None and isinstance(e.get(k), str):
+                        e[k] = e[k].strip()
+    except Exception:
+        pass
 
 
     # Prevent editing/deleting synced receiver rules from UI

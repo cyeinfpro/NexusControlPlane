@@ -490,7 +490,8 @@ function buildStatsLookup(){
   const rules = Array.isArray(CURRENT_STATS.rules) ? CURRENT_STATS.rules : [];
   rules.forEach((r)=>{
     if(typeof r.idx === 'number') lookup.byIdx[r.idx] = r;
-    if(r.listen) lookup.byListen[r.listen] = r;
+    const lis = (r && r.listen != null) ? String(r.listen).trim() : '';
+    if(lis) lookup.byListen[lis] = r;
   });
   return lookup;
 }
@@ -623,7 +624,8 @@ function showHealthDetail(idx){
   try{
     const statsLookup = buildStatsLookup();
     const eps = (CURRENT_POOL && CURRENT_POOL.endpoints) ? CURRENT_POOL.endpoints : [];
-    const stats = (statsLookup.byIdx[idx] || statsLookup.byListen[eps[idx]?.listen] || {});
+    const lis = (eps[idx] && eps[idx].listen != null) ? String(eps[idx].listen).trim() : '';
+    const stats = (statsLookup.byIdx[idx] || (lis ? statsLookup.byListen[lis] : null) || {});
     const list = Array.isArray(stats.health) ? stats.health : [];
     const lines = list.map((it)=>{
       const ok = it && it.ok === true;
@@ -727,7 +729,8 @@ ${endpointType(e)}`.toLowerCase();
     const e = it.e;
     const idx = it.idx;
     const rowNo = i + 1;
-    const stats = statsLookup.byIdx[idx] || statsLookup.byListen[e.listen] || {};
+    const lis = (e && e.listen != null) ? String(e.listen).trim() : '';
+    const stats = statsLookup.byIdx[idx] || (lis ? statsLookup.byListen[lis] : null) || {};
     const statsError = statsLookup.error;
 
     if(isMobile && mobileWrap){
