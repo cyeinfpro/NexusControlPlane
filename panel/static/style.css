@@ -177,6 +177,20 @@ a{color:inherit}
   margin-top:10px;
 }
 
+
+/* Dashboard groups */
+.dash-group-head{grid-column:1/-1;display:flex;align-items:center;justify-content:space-between;gap:12px;padding:6px 2px 2px 2px;}
+.dash-group-left{display:flex;align-items:center;gap:10px;min-width:0;flex:1 1 auto;}
+.dash-group-name{font-size:12px;font-weight:850;letter-spacing:0.2px;color:rgba(226,232,240,0.92);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.dash-group-line{height:1px;flex:1 1 auto;border-radius:999px;background:rgba(148,163,184,0.18);}
+.dash-group-count{flex:0 0 auto;white-space:nowrap;}
+
+@media (max-width: 520px){
+  .dash-group-head{flex-wrap:wrap;gap:8px;}
+  .dash-group-left{width:100%;}
+  .dash-group-line{display:none;}
+}
+
 .node-tile{
   padding:10px;
   border-radius:14px;

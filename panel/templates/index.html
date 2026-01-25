@@ -30,66 +30,76 @@
 </div>
 
 <div class="grid node-grid" id="dashboardGrid">
-  {% for n in nodes %}
-  <div class="card node-tile node-card" data-node-id="{{ n.id }}" data-online="{{ '1' if n.online else '0' }}">
-    <div class="node-top">
-      <div class="node-left" style="min-width:0;">
-        <div class="node-name" title="{{ n.name or ("节点-" ~ n.id) }}">{{ n.name or ("节点-" ~ n.id) }}</div>
-        <div class="node-host mono" title="{{ n.display_ip or "-" }}">{{ n.display_ip or "-" }}</div>
-        <div class="node-group muted sm" title="{{ n.group_name or '默认分组' }}">{{ n.group_name or '默认分组' }}</div>
+  {% for g in (dashboard_groups or []) %}
+    <div class="dash-group-head"{% if loop.first %} style="margin-top:0;"{% endif %}>
+      <div class="dash-group-left">
+        <div class="dash-group-name" title="{{ g.name or '默认分组' }}">{{ g.name or '默认分组' }}</div>
+        <div class="dash-group-line" aria-hidden="true"></div>
       </div>
+      <div class="dash-group-count muted sm">在线 <strong>{{ g.online }}</strong>/<strong>{{ g.total }}</strong></div>
+    </div>
 
-      <div class="node-right">
-        <div class="node-state {{ 'online' if n.online else 'offline' }}" title="{{ '在线' if n.online else '离线' }}">
-          <span class="node-dot {{ 'online' if n.online else 'offline' }}"></span>
-          <span>{{ '在线' if n.online else '离线' }}</span>
+    {% for n in (g.nodes or []) %}
+    <div class="card node-tile node-card" data-node-id="{{ n.id }}" data-online="{{ '1' if n.online else '0' }}">
+      <div class="node-top">
+        <div class="node-left" style="min-width:0;">
+          <div class="node-name" title="{{ n.name or ("节点-" ~ n.id) }}">{{ n.name or ("节点-" ~ n.id) }}</div>
+          <div class="node-host mono" title="{{ n.display_ip or "-" }}">{{ n.display_ip or "-" }}</div>
+          <div class="node-group muted sm" title="{{ n.group_name or '默认分组' }}">{{ n.group_name or '默认分组' }}</div>
         </div>
-        <a class="btn icon xs ghost" href="/nodes/{{ n.id }}?edit=1" title="编辑">✎</a>
-        <a class="btn icon xs secondary" href="/nodes/{{ n.id }}" title="进入">↗</a>
-      </div>
-    </div>
 
-    <div class="node-kpis">
-      <div class="kpi">
-        <div class="k">已在线</div>
-        <div class="v mono" data-sys="uptime">—</div>
+        <div class="node-right">
+          <div class="node-state {{ 'online' if n.online else 'offline' }}" title="{{ '在线' if n.online else '离线' }}">
+            <span class="node-dot {{ 'online' if n.online else 'offline' }}"></span>
+            <span>{{ '在线' if n.online else '离线' }}</span>
+          </div>
+          <a class="btn icon xs ghost" href="/nodes/{{ n.id }}?edit=1" title="编辑">✎</a>
+          <a class="btn icon xs secondary" href="/nodes/{{ n.id }}" title="进入">↗</a>
+        </div>
       </div>
-      <div class="kpi" title="{{ n.last_seen_at or '-' }}{% if n.agent_version %} · {{ n.agent_version }}{% endif %}">
-        <div class="k">最后心跳</div>
-        <div class="v mono" data-last-seen="{{ n.last_seen_at or '' }}">{{ n.last_seen_at or "-" }}</div>
-      </div>
-    </div>
 
-    <div class="node-lines">
-      <div class="kvline">
-        <div class="k">累计流量</div>
-        <div class="v mono" data-sys="traffic">—</div>
+      <div class="node-kpis">
+        <div class="kpi">
+          <div class="k">已在线</div>
+          <div class="v mono" data-sys="uptime">—</div>
+        </div>
+        <div class="kpi" title="{{ n.last_seen_at or '-' }}{% if n.agent_version %} · {{ n.agent_version }}{% endif %}">
+          <div class="k">最后心跳</div>
+          <div class="v mono" data-last-seen="{{ n.last_seen_at or '' }}">{{ n.last_seen_at or "-" }}</div>
+        </div>
       </div>
-      <div class="kvline">
-        <div class="k">当前速率</div>
-        <div class="v mono" data-sys="rate">—</div>
-      </div>
-    </div>
 
-    <div class="node-bars">
-      <div class="mbar">
-        <div class="head"><span>CPU</span><span class="mono" data-sys="cpuPct">—</span></div>
-        <div class="mini-progress"><div class="mini-fill" data-sys-bar="cpu"></div></div>
+      <div class="node-lines">
+        <div class="kvline">
+          <div class="k">累计流量</div>
+          <div class="v mono" data-sys="traffic">—</div>
+        </div>
+        <div class="kvline">
+          <div class="k">当前速率</div>
+          <div class="v mono" data-sys="rate">—</div>
+        </div>
       </div>
-      <div class="mbar">
-        <div class="head"><span>内存</span><span class="mono" data-sys="memText">—</span></div>
-        <div class="mini-progress"><div class="mini-fill" data-sys-bar="mem"></div></div>
-      </div>
-      <div class="mbar">
-        <div class="head"><span>磁盘</span><span class="mono" data-sys="diskText">—</span></div>
-        <div class="mini-progress"><div class="mini-fill" data-sys-bar="disk"></div></div>
-      </div>
-    </div>
 
-    <div class="muted sm" data-sys="hint" style="margin-top:8px;display:none;">系统信息暂无数据（等待 Agent 上报）</div>
-  </div>
+      <div class="node-bars">
+        <div class="mbar">
+          <div class="head"><span>CPU</span><span class="mono" data-sys="cpuPct">—</span></div>
+          <div class="mini-progress"><div class="mini-fill" data-sys-bar="cpu"></div></div>
+        </div>
+        <div class="mbar">
+          <div class="head"><span>内存</span><span class="mono" data-sys="memText">—</span></div>
+          <div class="mini-progress"><div class="mini-fill" data-sys-bar="mem"></div></div>
+        </div>
+        <div class="mbar">
+          <div class="head"><span>磁盘</span><span class="mono" data-sys="diskText">—</span></div>
+          <div class="mini-progress"><div class="mini-fill" data-sys-bar="disk"></div></div>
+        </div>
+      </div>
+
+      <div class="muted sm" data-sys="hint" style="margin-top:8px;display:none;">系统信息暂无数据（等待 Agent 上报）</div>
+    </div>
+    {% endfor %}
   {% else %}
-  <div class="card">
+  <div class="card" style="grid-column:1/-1;">
     <div class="card-title">暂无节点</div>
     <div class="card-sub">请先在目标机安装 Agent，再回到此处接入。</div>
   </div>
@@ -173,5 +183,5 @@
 {% endblock %}
 
 {% block scripts %}
-<script src="/static/app.js?v=41.5"></script>
+<script src="/static/app.js?v=41.6"></script>
 {% endblock %}

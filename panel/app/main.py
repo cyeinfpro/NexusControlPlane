@@ -387,13 +387,70 @@ async def setup_action(
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request, user: str = Depends(require_login_page)):
     nodes = list_nodes()
+
+    def _gn(x: dict) -> str:
+        g = str(x.get("group_name") or "").strip()
+        return g or "默认分组"
+
     for n in nodes:
         n["display_ip"] = _extract_ip_for_display(n.get("base_url", ""))
         n["online"] = _is_report_fresh(n)
+        # 分组名为空时统一归入“默认分组”
+        n["group_name"] = _gn(n)
+
+    # 控制台卡片：按分组聚合展示
+    # - 组内排序：在线优先，其次按 id 倒序
+    nodes_sorted = sorted(
+        nodes,
+        key=lambda x: (
+            _gn(x),
+            0 if bool(x.get("online")) else 1,
+            -int(x.get("id") or 0),
+        ),
+    )
+
+    dashboard_groups = []
+    cur = None
+    buf = []
+    for n in nodes_sorted:
+        g = _gn(n)
+        if cur is None:
+            cur = g
+        if g != cur:
+            dashboard_groups.append(
+                {
+                    "name": cur,
+                    "nodes": buf,
+                    "online": sum(1 for i in buf if i.get("online")),
+                    "total": len(buf),
+                }
+            )
+            cur = g
+            buf = []
+        buf.append(n)
+
+    if cur is not None:
+        dashboard_groups.append(
+            {
+                "name": cur,
+                "nodes": buf,
+                "online": sum(1 for i in buf if i.get("online")),
+                "total": len(buf),
+            }
+        )
+
     return templates.TemplateResponse(
         "index.html",
-        {"request": request, "user": user, "nodes": nodes, "flash": _flash(request), "title": "控制台"},
+        {
+            "request": request,
+            "user": user,
+            "nodes": nodes,
+            "dashboard_groups": dashboard_groups,
+            "flash": _flash(request),
+            "title": "控制台",
+        },
     )
+
 
 
 @app.get("/nodes/new", response_class=HTMLResponse)
