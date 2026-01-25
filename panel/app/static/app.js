@@ -58,6 +58,18 @@ let CURRENT_SYS = null;
 let PENDING_COMMAND_TEXT = '';
 let NODES_LIST = [];
 
+// Remove ?edit=1 from current URL (used for "auto open edit modal" from dashboard)
+function stripEditQueryParam(){
+  try{
+    const u = new URL(window.location.href);
+    if(!u.searchParams.has('edit')) return;
+    u.searchParams.delete('edit');
+    const qs = u.searchParams.toString();
+    const next = u.pathname + (qs ? ('?' + qs) : '') + (u.hash || '');
+    history.replaceState({}, '', next);
+  }catch(_e){}
+}
+
 // Rules filter for quick search (listen / remote)
 let RULE_FILTER = '';
 function setRuleFilter(v){
@@ -226,6 +238,81 @@ function formatDuration(sec){
   return parts.join(' ');
 }
 
+// Compact duration for dashboard tiles: keep at most 2 units, use d/h/m/s (more professional & shorter)
+function formatDurationShort(sec){
+  const s = Math.max(0, Math.floor(Number(sec) || 0));
+  const d = Math.floor(s / 86400);
+  const h = Math.floor((s % 86400) / 3600);
+  const m2 = Math.floor((s % 3600) / 60);
+  const s2 = s % 60;
+  if(d > 0){
+    return h > 0 ? `${d}d ${h}h` : `${d}d`;
+  }
+  if(h > 0){
+    return m2 > 0 ? `${h}h ${m2}m` : `${h}h`;
+  }
+  if(m2 > 0){
+    // keep seconds only when very small to avoid flicker; otherwise show minutes only
+    if(m2 < 10 && s2 > 0) return `${m2}m ${s2}s`;
+    return `${m2}m`;
+  }
+  return `${s2}s`;
+}
+
+function parseDateTimeLocal(str){
+  const t = String(str || '').trim();
+  if(!t || t === '-') return null;
+  // Supports: YYYY-MM-DD HH:MM:SS / YYYY-MM-DDTHH:MM:SS / with optional ms
+  const m = t.match(/(\d{4})-(\d{1,2})-(\d{1,2})[T\s](\d{1,2}):(\d{1,2})(?::(\d{1,2}))?/);
+  if(!m) return null;
+  const y = Number(m[1]);
+  const mo = Number(m[2]) - 1;
+  const d = Number(m[3]);
+  const hh = Number(m[4]);
+  const mm = Number(m[5]);
+  const ss = Number(m[6] || 0);
+  const dt = new Date(y, mo, d, hh, mm, ss);
+  if(Number.isNaN(dt.getTime())) return null;
+  return dt;
+}
+
+// Compact "time ago" for dashboard tiles
+function formatAgoShort(dateStr){
+  const dt = parseDateTimeLocal(dateStr);
+  if(!dt) return (dateStr && String(dateStr).trim()) ? String(dateStr).trim() : '-';
+  const diff = Math.max(0, Math.floor((Date.now() - dt.getTime()) / 1000));
+  if(diff < 5) return '刚刚';
+  if(diff < 60) return `${diff}s`;
+  const m2 = Math.floor(diff / 60);
+  if(m2 < 60) return `${m2}m`;
+  const h = Math.floor(m2 / 60);
+  if(h < 24) return `${h}h`;
+  const d = Math.floor(h / 24);
+  if(d < 7) return `${d}d`;
+  // older: show MM-DD (keep full value in title)
+  const mm = String(dt.getMonth() + 1).padStart(2, '0');
+  const dd = String(dt.getDate()).padStart(2, '0');
+  return `${mm}-${dd}`;
+}
+
+function refreshDashboardLastSeenShort(){
+  const els = document.querySelectorAll('[data-last-seen]');
+  els.forEach((el)=>{
+    const raw = el.getAttribute('data-last-seen') || '';
+    const mode = (el.getAttribute('data-last-seen-mode') || '').trim();
+    // Keep full raw time on elements that explicitly request it
+    if(mode === 'full' || mode === 'raw'){
+      const v = raw && raw.trim() ? raw.trim() : '-';
+      if(v !== '-') el.setAttribute('title', v);
+      el.textContent = v;
+      return;
+    }
+    // Default: show compact time ago (keep full in title)
+    if(raw && raw.trim()) el.setAttribute('title', raw.trim());
+    el.textContent = formatAgoShort(raw);
+  });
+}
+
 function setProgress(elId, pct){
   const el = document.getElementById(elId);
   if(!el) return;
@@ -242,26 +329,27 @@ function setProgressEl(el, pct){
 // Dashboard node tile: render mini system info inside a node card
 function renderSysMini(cardEl, sys){
   if(!cardEl) return;
-  const sysCard = cardEl.querySelector('[data-sys-card]');
-  if(!sysCard) return;
-
-  const hint = sysCard.querySelector('[data-sys="hint"]');
+  // New compact dashboard tiles (index.html)
+  const hint = cardEl.querySelector('[data-sys="hint"]');
   const setText = (key, text) => {
-    const el = sysCard.querySelector(`[data-sys="${key}"]`);
+    const el = cardEl.querySelector(`[data-sys="${key}"]`);
     if(el) el.textContent = text;
   };
+  const setTitle = (key, title) => {
+    const el = cardEl.querySelector(`[data-sys="${key}"]`);
+    if(el) el.setAttribute('title', title || '');
+  };
   const setBar = (key, pct) => {
-    const el = sysCard.querySelector(`[data-sys-bar="${key}"]`);
+    const el = cardEl.querySelector(`[data-sys-bar="${key}"]`);
     setProgressEl(el, pct);
   };
 
   // Offline or missing data
   if(!sys || sys.error){
-    setText('cpuInfo', '暂无数据');
     setText('uptime', '—');
     setText('traffic', '—');
     setText('rate', '—');
-    setText('cpuPct', '0%');
+    setText('cpuPct', '—');
     setText('memText', '—');
     setText('diskText', '—');
     setBar('cpu', 0);
@@ -298,14 +386,22 @@ function renderSysMini(cardEl, sys){
   const txBps = sys?.net?.tx_bps || 0;
   const rxBps = sys?.net?.rx_bps || 0;
 
-  // CPU 型号信息太占空间：只展示核心数
-  setText('cpuInfo', `${cores}核`);
-  setText('uptime', formatDuration(sys?.uptime_sec || 0));
-  setText('traffic', `上传 ${formatBytes(tx)} | 下载 ${formatBytes(rx)}`);
-  setText('rate', `上传 ${formatBps(txBps)} | 下载 ${formatBps(rxBps)}`);
+  // Compact tile texts
+  const uptimeSec = sys?.uptime_sec || 0;
+  // Short in value, full in tooltip
+  setText('uptime', formatDurationShort(uptimeSec));
+  setTitle('uptime', formatDuration(uptimeSec));
+  setText('traffic', `↑ ${formatBytes(tx)} · ↓ ${formatBytes(rx)}`);
+  setText('rate', `↑ ${formatBps(txBps)} · ↓ ${formatBps(rxBps)}`);
   setText('cpuPct', `${Number(cpuPct).toFixed(0)}%`);
-  setText('memText', `${formatBytes(memUsed)} / ${formatBytes(memTot)}  ${Number(memPct).toFixed(0)}%`);
-  setText('diskText', `${formatBytes(diskUsed)} / ${formatBytes(diskTot)}  ${Number(diskPct).toFixed(0)}%`);
+
+  // Keep the bar head short; put full numbers in tooltip
+  const memFull = `${formatBytes(memUsed)} / ${formatBytes(memTot)}  ${Number(memPct).toFixed(0)}%`;
+  const diskFull = `${formatBytes(diskUsed)} / ${formatBytes(diskTot)}  ${Number(diskPct).toFixed(0)}%`;
+  setText('memText', `${Number(memPct).toFixed(0)}%`);
+  setText('diskText', `${Number(diskPct).toFixed(0)}%`);
+  setTitle('memText', memFull);
+  setTitle('diskText', diskFull);
 
   setBar('cpu', cpuPct);
   setBar('mem', memPct);
@@ -353,10 +449,14 @@ async function refreshDashboardMiniSys(){
 function initDashboardMiniSys(){
   const grid = document.getElementById('dashboardGrid');
   if(!grid) return;
+  // First paint for compact "last seen" time
+  try{ refreshDashboardLastSeenShort(); }catch(_e){}
   // First paint
   refreshDashboardMiniSys();
   // Same refresh cadence as rules: 3s
   setInterval(refreshDashboardMiniSys, 3000);
+  // Update "last seen" display every 5s (no network request)
+  setInterval(()=>{ try{ refreshDashboardLastSeenShort(); }catch(_e){} }, 5000);
 }
 
 function renderSysCard(sys){
@@ -1352,6 +1452,10 @@ async function refreshSys(){
 
 
 function initNodePage(){
+  // Compact "last seen" time in header (and anywhere with data-last-seen)
+  try{ refreshDashboardLastSeenShort(); }catch(_e){}
+  setInterval(()=>{ try{ refreshDashboardLastSeenShort(); }catch(_e){} }, 5000);
+
   document.querySelectorAll('.tab').forEach(t=>{
     t.addEventListener('click', ()=>{
       const name = t.getAttribute('data-tab');
@@ -1386,6 +1490,17 @@ function initNodePage(){
       if(!AUTO_REFRESH_TIMER) toggleAutoRefresh();
     }catch(e){}
   });
+
+  // Auto open edit-node modal when coming from dashboard
+  try{
+    if(window.__AUTO_OPEN_EDIT_NODE__){
+      setTimeout(()=>{
+        try{ openEditNodeModal(); }catch(_e){}
+        // Prevent re-opening on refresh / after save by cleaning the URL once.
+        try{ stripEditQueryParam(); }catch(_e){}
+      }, 80);
+    }
+  }catch(_e){}
 }
 
 window.initNodePage = initNodePage;
@@ -1442,10 +1557,266 @@ function openAddNodeModal(){
   const m = document.getElementById("addNodeModal");
   if(!m) return;
   m.style.display = "flex";
+  // prefill group
+  try{
+    const g = localStorage.getItem("realm_last_group") || "";
+    const gi = document.getElementById("addNodeGroup");
+    if(gi && g) gi.value = g;
+  }catch(_e){}
   // focus
   const ip = document.getElementById("addNodeIp");
   if(ip) setTimeout(()=>ip.focus(), 30);
 }
+
+
+
+
+// ---------------- Node: Edit Node Modal ----------------
+function openEditNodeModal(){
+  const m = document.getElementById('editNodeModal');
+  if(!m) return;
+  // fill current values
+  const name = window.__NODE_NAME__ || '';
+  const group = window.__NODE_GROUP__ || '默认分组';
+  const base = window.__NODE_BASE_URL__ || '';
+  const vt = !!window.__NODE_VERIFY_TLS__;
+
+  let scheme = 'http';
+  let host = '';
+  let port = '';
+  try{
+    const u = new URL(base.includes('://') ? base : ('http://' + base));
+    scheme = (u.protocol || 'http:').replace(':','') || 'http';
+    host = u.hostname || '';
+    port = u.port || '';
+  }catch(e){
+    host = String(base || '').replace(/^https?:\/\//,'').replace(/\/.*/,'');
+  }
+
+  const nameEl = document.getElementById('editNodeName');
+  const groupEl = document.getElementById('editNodeGroup');
+  const schemeEl = document.getElementById('editNodeScheme');
+  const ipEl = document.getElementById('editNodeIp');
+  const vtEl = document.getElementById('editNodeVerifyTls');
+  const err = document.getElementById('editNodeError');
+  const btn = document.getElementById('editNodeSubmit');
+
+  if(err) err.textContent = '';
+  if(btn){ btn.disabled = false; btn.textContent = '保存'; }
+
+  if(nameEl) nameEl.value = String(name || '').trim();
+  if(groupEl) groupEl.value = String(group || '').trim();
+  if(schemeEl) schemeEl.value = scheme;
+  if(vtEl) vtEl.checked = !!vt;
+
+  // Show host (append :port only when non-default and present)
+  let ipVal = host;
+  try{
+    const def = '18700';
+    if(port && port !== def) ipVal = host + ':' + port;
+  }catch(_e){}
+  if(ipEl) ipEl.value = ipVal;
+
+  m.style.display = 'flex';
+  if(nameEl) setTimeout(()=>nameEl.focus(), 30);
+}
+
+function closeEditNodeModal(){
+  const m = document.getElementById('editNodeModal');
+  if(!m) return;
+  m.style.display = 'none';
+}
+
+function applyEditedNodeToPage(data){
+  try{
+    if(!data || typeof data !== 'object') return;
+    const name = String(data.name || '').trim();
+    const displayIp = String(data.display_ip || '').trim();
+    const group = String(data.group_name || '').trim() || '默认分组';
+    const baseUrl = String(data.base_url || '').trim();
+    const verifyTls = !!data.verify_tls;
+
+    // update globals (for next time opening the modal)
+    if(name) window.__NODE_NAME__ = name;
+    if(baseUrl) window.__NODE_BASE_URL__ = baseUrl;
+    window.__NODE_GROUP__ = group;
+    window.__NODE_VERIFY_TLS__ = verifyTls ? 1 : 0;
+
+    // header title
+    const titleEl = document.querySelector('.node-title');
+    if(titleEl){
+      titleEl.textContent = name || displayIp || titleEl.textContent;
+    }
+    // header display ip
+    const ipEl = document.getElementById('nodeDisplayIp');
+    if(ipEl){
+      ipEl.textContent = `· ${displayIp || '-'}`;
+    }
+    // header group pill
+    const grpEl = document.getElementById('nodeGroupPill');
+    if(grpEl){
+      grpEl.textContent = group;
+    }
+
+    // sidebar active item
+    const active = document.querySelector('.node-item.active');
+    if(active){
+      const nm = active.querySelector('.node-name');
+      if(nm) nm.textContent = name || displayIp || nm.textContent;
+      const meta = active.querySelector('.node-meta');
+      if(meta) meta.textContent = displayIp || meta.textContent;
+      const gg = active.querySelector('.node-info .muted.sm');
+      if(gg) gg.textContent = group;
+    }
+  }catch(_e){}
+}
+
+async function saveEditNode(){
+  const err = document.getElementById('editNodeError');
+  const btn = document.getElementById('editNodeSubmit');
+  try{
+    if(err) err.textContent = '';
+    if(btn){ btn.disabled = true; btn.textContent = '保存中…'; }
+
+    const name = (document.getElementById('editNodeName')?.value || '').trim();
+    const group_name = (document.getElementById('editNodeGroup')?.value || '').trim();
+    const scheme = (document.getElementById('editNodeScheme')?.value || 'http').trim();
+    const ip_address = (document.getElementById('editNodeIp')?.value || '').trim();
+    const verify_tls = !!document.getElementById('editNodeVerifyTls')?.checked;
+
+    if(!ip_address){
+      if(err) err.textContent = '节点地址不能为空';
+      return;
+    }
+
+    const nodeId = window.__NODE_ID__;
+    const resp = await fetch(`/api/nodes/${nodeId}/update`, {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      credentials: 'same-origin',
+      body: JSON.stringify({ name, group_name, scheme, ip_address, verify_tls })
+    });
+    const data = await resp.json().catch(()=>({ok:false,error:'接口返回异常'}));
+    if(!resp.ok || !data.ok){
+      const msg = data.error || ('保存失败（HTTP ' + resp.status + '）');
+      if(err) err.textContent = msg;
+      toast(msg, true);
+      return;
+    }
+    toast('已保存');
+    // apply updates without reloading (avoid modal auto re-open)
+    let patch = data && data.node ? data.node : null;
+    if(!patch){
+      // Fallback when server returns only {ok:true}
+      let display_ip = '';
+      let base_url = '';
+      try{
+        const raw = ip_address.includes('://') ? ip_address : (scheme + '://' + ip_address);
+        const u = new URL(raw);
+        display_ip = u.hostname || '';
+        base_url = raw;
+      }catch(_e){}
+      patch = { name, group_name, display_ip, base_url, verify_tls };
+    }
+    try{ applyEditedNodeToPage(patch); }catch(_e){}
+    try{ stripEditQueryParam(); }catch(_e){}
+    closeEditNodeModal();
+  }catch(e){
+    const msg = (e && e.message) ? e.message : String(e || '保存失败');
+    if(err) err.textContent = msg;
+    toast(msg, true);
+  }finally{
+    if(btn){ btn.disabled = false; btn.textContent = '保存'; }
+  }
+}
+
+window.openEditNodeModal = openEditNodeModal;
+window.closeEditNodeModal = closeEditNodeModal;
+window.saveEditNode = saveEditNode;
+
+// click backdrop to close
+
+document.addEventListener('click', (e)=>{
+  const m = document.getElementById('editNodeModal');
+  if(!m || m.style.display === 'none') return;
+  if(e.target === m) closeEditNodeModal();
+});
+
+// ESC to close edit modal
+
+document.addEventListener('keydown', (e)=>{
+  const m = document.getElementById('editNodeModal');
+  if(!m || m.style.display === 'none') return;
+
+  if(e.key === 'Escape'){
+    closeEditNodeModal();
+    return;
+  }
+  // Press Enter to save (when focus is on an input/select), without page refresh.
+  if(e.key === 'Enter' && !e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey){
+    const t = (e.target && e.target.tagName) ? String(e.target.tagName).toLowerCase() : '';
+    if(t === 'input' || t === 'select'){
+      e.preventDefault();
+      try{ saveEditNode(); }catch(_e){}
+    }
+  }
+});
+// ---------------- Dashboard: Full Restore Modal ----------------
+function openRestoreFullModal(){
+  const m = document.getElementById('restoreFullModal');
+  if(!m) return;
+  m.style.display = 'flex';
+  const input = document.getElementById('restoreFullFile');
+  if(input) input.value = '';
+  const err = document.getElementById('restoreFullError');
+  if(err) err.textContent = '';
+  const btn = document.getElementById('restoreFullSubmit');
+  if(btn){ btn.disabled = false; btn.textContent = '开始恢复'; }
+}
+
+function closeRestoreFullModal(){
+  const m = document.getElementById('restoreFullModal');
+  if(!m) return;
+  m.style.display = 'none';
+}
+
+async function restoreFullNow(){
+  const fileInput = document.getElementById('restoreFullFile');
+  const err = document.getElementById('restoreFullError');
+  const btn = document.getElementById('restoreFullSubmit');
+  try{
+    if(err) err.textContent = '';
+    const f = fileInput && fileInput.files ? fileInput.files[0] : null;
+    if(!f){
+      if(err) err.textContent = '请选择 realm-backup-*.zip 全量备份包';
+      return;
+    }
+    if(btn){ btn.disabled = true; btn.textContent = '恢复中…'; }
+    const fd = new FormData();
+    fd.append('file', f);
+    const resp = await fetch('/api/restore/full', { method: 'POST', body: fd, credentials: 'include' });
+    const data = await resp.json().catch(()=>({ ok:false, error: '接口返回异常' }));
+    if(!resp.ok || !data.ok){
+      const msg = data.error || ('恢复失败（HTTP ' + resp.status + '）');
+      if(err) err.textContent = msg;
+      toast(msg, true);
+      return;
+    }
+    toast('全量恢复已完成');
+    closeRestoreFullModal();
+    setTimeout(()=>window.location.reload(), 600);
+  }catch(e){
+    const msg = (e && e.message) ? e.message : String(e || '恢复失败');
+    if(err) err.textContent = msg;
+    toast(msg, true);
+  }finally{
+    if(btn){ btn.disabled = false; btn.textContent = '开始恢复'; }
+  }
+}
+
+window.openRestoreFullModal = openRestoreFullModal;
+window.closeRestoreFullModal = closeRestoreFullModal;
+window.restoreFullNow = restoreFullNow;
 function closeAddNodeModal(){
   const m = document.getElementById("addNodeModal");
   if(!m) return;
@@ -1461,6 +1832,7 @@ async function createNodeFromModal(){
     const ip_address = (document.getElementById("addNodeIp")?.value || "").trim();
     const scheme = (document.getElementById("addNodeScheme")?.value || "http").trim();
     const verify_tls = !!document.getElementById("addNodeVerifyTls")?.checked;
+    const group_name = (document.getElementById("addNodeGroup")?.value || "").trim();
 
     if(!ip_address){
       if(err) err.textContent = "节点地址不能为空";
@@ -1471,7 +1843,7 @@ async function createNodeFromModal(){
     const resp = await fetch("/api/nodes/create", {
       method: "POST",
       headers: {"Content-Type":"application/json"},
-      body: JSON.stringify({name, ip_address, scheme, verify_tls})
+      body: JSON.stringify({name, ip_address, scheme, verify_tls, group_name})
     });
 
     const data = await resp.json().catch(()=>({ok:false,error:"接口返回异常"}));
@@ -1481,6 +1853,7 @@ async function createNodeFromModal(){
       return;
     }
 
+    try{ if(group_name) localStorage.setItem("realm_last_group", group_name); }catch(_e){}
     closeAddNodeModal();
     if(data.redirect_url){
       window.location.href = data.redirect_url;
@@ -1503,11 +1876,19 @@ document.addEventListener("click", (e)=>{
   if(e.target === m) closeAddNodeModal();
 });
 
+document.addEventListener("click", (e)=>{
+  const m = document.getElementById("restoreFullModal");
+  if(!m || m.style.display === "none") return;
+  if(e.target === m) closeRestoreFullModal();
+});
+
 // ESC 关闭
 document.addEventListener("keydown", (e)=>{
   if(e.key === "Escape"){
     const m = document.getElementById("addNodeModal");
     if(m && m.style.display !== "none") closeAddNodeModal();
+    const r = document.getElementById("restoreFullModal");
+    if(r && r.style.display !== "none") closeRestoreFullModal();
   }
 });
 

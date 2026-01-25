@@ -1587,7 +1587,23 @@ async def api_nodes_update(node_id: int, request: Request, user: str = Depends(r
         name = str(name_in or "").strip() or _extract_ip_for_display(base_url)
 
     update_node_basic(int(node_id), name, base_url, str(node.get("api_key") or ""), verify_tls=verify_tls, group_name=group_name)
-    return JSONResponse({"ok": True})
+
+    # Return updated fields for client-side UI refresh (avoid full page reload)
+    updated = get_node(int(node_id)) or {}
+    display_ip = _extract_ip_for_display(str(updated.get("base_url") or base_url))
+    return JSONResponse(
+        {
+            "ok": True,
+            "node": {
+                "id": int(node_id),
+                "name": str(updated.get("name") or name),
+                "base_url": str(updated.get("base_url") or base_url),
+                "group_name": str(updated.get("group_name") or group_name),
+                "display_ip": display_ip,
+                "verify_tls": bool(updated.get("verify_tls") or verify_tls),
+            },
+        }
+    )
 
 
 

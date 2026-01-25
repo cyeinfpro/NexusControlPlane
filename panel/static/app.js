@@ -58,6 +58,18 @@ let CURRENT_SYS = null;
 let PENDING_COMMAND_TEXT = '';
 let NODES_LIST = [];
 
+// Remove ?edit=1 from current URL (used for "auto open edit modal" from dashboard)
+function stripEditQueryParam(){
+  try{
+    const u = new URL(window.location.href);
+    if(!u.searchParams.has('edit')) return;
+    u.searchParams.delete('edit');
+    const qs = u.searchParams.toString();
+    const next = u.pathname + (qs ? ('?' + qs) : '') + (u.hash || '');
+    history.replaceState({}, '', next);
+  }catch(_e){}
+}
+
 // Rules filter for quick search (listen / remote)
 let RULE_FILTER = '';
 function setRuleFilter(v){
@@ -1482,7 +1494,11 @@ function initNodePage(){
   // Auto open edit-node modal when coming from dashboard
   try{
     if(window.__AUTO_OPEN_EDIT_NODE__){
-      setTimeout(()=>{ try{ openEditNodeModal(); }catch(_e){} }, 80);
+      setTimeout(()=>{
+        try{ openEditNodeModal(); }catch(_e){}
+        // Prevent re-opening on refresh / after save by cleaning the URL once.
+        try{ stripEditQueryParam(); }catch(_e){}
+      }, 80);
     }
   }catch(_e){}
 }
@@ -1611,6 +1627,50 @@ function closeEditNodeModal(){
   m.style.display = 'none';
 }
 
+function applyEditedNodeToPage(data){
+  try{
+    if(!data || typeof data !== 'object') return;
+    const name = String(data.name || '').trim();
+    const displayIp = String(data.display_ip || '').trim();
+    const group = String(data.group_name || '').trim() || '默认分组';
+    const baseUrl = String(data.base_url || '').trim();
+    const verifyTls = !!data.verify_tls;
+
+    // update globals (for next time opening the modal)
+    if(name) window.__NODE_NAME__ = name;
+    if(baseUrl) window.__NODE_BASE_URL__ = baseUrl;
+    window.__NODE_GROUP__ = group;
+    window.__NODE_VERIFY_TLS__ = verifyTls ? 1 : 0;
+
+    // header title
+    const titleEl = document.querySelector('.node-title');
+    if(titleEl){
+      titleEl.textContent = name || displayIp || titleEl.textContent;
+    }
+    // header display ip
+    const ipEl = document.getElementById('nodeDisplayIp');
+    if(ipEl){
+      ipEl.textContent = `· ${displayIp || '-'}`;
+    }
+    // header group pill
+    const grpEl = document.getElementById('nodeGroupPill');
+    if(grpEl){
+      grpEl.textContent = group;
+    }
+
+    // sidebar active item
+    const active = document.querySelector('.node-item.active');
+    if(active){
+      const nm = active.querySelector('.node-name');
+      if(nm) nm.textContent = name || displayIp || nm.textContent;
+      const meta = active.querySelector('.node-meta');
+      if(meta) meta.textContent = displayIp || meta.textContent;
+      const gg = active.querySelector('.node-info .muted.sm');
+      if(gg) gg.textContent = group;
+    }
+  }catch(_e){}
+}
+
 async function saveEditNode(){
   const err = document.getElementById('editNodeError');
   const btn = document.getElementById('editNodeSubmit');
@@ -1644,8 +1704,23 @@ async function saveEditNode(){
       return;
     }
     toast('已保存');
+    // apply updates without reloading (avoid modal auto re-open)
+    let patch = data && data.node ? data.node : null;
+    if(!patch){
+      // Fallback when server returns only {ok:true}
+      let display_ip = '';
+      let base_url = '';
+      try{
+        const raw = ip_address.includes('://') ? ip_address : (scheme + '://' + ip_address);
+        const u = new URL(raw);
+        display_ip = u.hostname || '';
+        base_url = raw;
+      }catch(_e){}
+      patch = { name, group_name, display_ip, base_url, verify_tls };
+    }
+    try{ applyEditedNodeToPage(patch); }catch(_e){}
+    try{ stripEditQueryParam(); }catch(_e){}
     closeEditNodeModal();
-    setTimeout(()=>window.location.reload(), 200);
   }catch(e){
     const msg = (e && e.message) ? e.message : String(e || '保存失败');
     if(err) err.textContent = msg;
@@ -1670,9 +1745,20 @@ document.addEventListener('click', (e)=>{
 // ESC to close edit modal
 
 document.addEventListener('keydown', (e)=>{
+  const m = document.getElementById('editNodeModal');
+  if(!m || m.style.display === 'none') return;
+
   if(e.key === 'Escape'){
-    const m = document.getElementById('editNodeModal');
-    if(m && m.style.display !== 'none') closeEditNodeModal();
+    closeEditNodeModal();
+    return;
+  }
+  // Press Enter to save (when focus is on an input/select), without page refresh.
+  if(e.key === 'Enter' && !e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey){
+    const t = (e.target && e.target.tagName) ? String(e.target.tagName).toLowerCase() : '';
+    if(t === 'input' || t === 'select'){
+      e.preventDefault();
+      try{ saveEditNode(); }catch(_e){}
+    }
   }
 });
 // ---------------- Dashboard: Full Restore Modal ----------------

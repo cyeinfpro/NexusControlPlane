@@ -8,10 +8,10 @@
     <div class="card-header">
       <div style="min-width:0;">
         <div class="card-title">节点列表</div>
-        <div class="card-sub">点击节点即可切换到该节点的规则</div>
+        <div class="card-sub">切换查看该节点的转发规则</div>
       </div>
       <div class="right" style="flex:0 0 auto;">
-        <button class="btn xs" type="button" onclick="openAddNodeModal()">+ 接入</button>
+        <button class="btn xs" type="button" onclick="openAddNodeModal()">接入节点</button>
       </div>
     </div>
     <div class="node-list">
@@ -21,6 +21,7 @@
         <div class="node-info">
           <div class="node-name">{{ n.name or n.display_ip or ('节点-' ~ n.id) }}</div>
           <div class="node-meta mono">{{ n.display_ip or '-' }}</div>
+          <div class="muted sm">{{ n.group_name or '默认分组' }}</div>
         </div>
       </a>
       {% endfor %}
@@ -36,12 +37,17 @@
       <div class="card">
         <div class="card-header node-head" style="align-items:flex-start;">
           <div class="node-head-left" style="min-width:0;">
-            <div class="card-title">{{ node.name or node.display_ip }} <span class="muted sm">· {{ node.display_ip or '-' }}</span></div>
+            <div class="card-title">
+              <span class="node-title">{{ node.name or node.display_ip }}</span>
+              <span class="pill xs {% if node.online %}ok{% else %}ghost{% endif %}">{% if node.online %}在线{% else %}离线{% endif %}</span>
+              <span id="nodeDisplayIp" class="muted sm">· {{ node.display_ip or '-' }}</span>
+            </div>
             <div class="meta" style="margin-top:6px;">
               {% if node.agent_version %}<span class="meta-item">Agent：{{ node.agent_version }}</span>{% endif %}
-              <span class="meta-item">上报：{{ node.last_seen_at or "-" }}</span>
+              <span class="meta-item">心跳 <span id="nodeLastSeen" class="mono" data-last-seen-mode="full" data-last-seen="{{ node.last_seen_at or '' }}" >{{ node.last_seen_at or "-" }}</span></span>
+              <span class="meta-item">分组 <span id="nodeGroupPill" class="pill xs ghost">{{ node.group_name or '默认分组' }}</span></span>
             </div>
-            <div class="card-sub" style="margin-top:8px;">支持 TCP / UDP / WSS；WSS 隧道仅支持“选择接收机自动同步”，接收机规则会自动生成并锁定</div>
+            <div class="card-sub" style="margin-top:8px;">支持 TCP/UDP/WSS · WSS 自动同步（生成规则锁定）</div>
           </div>
           <div class="right node-tools node-head-right" style="gap:10px; flex:0 0 auto; flex-wrap:wrap; justify-content:flex-end;">
             <div class="search-pill">
@@ -54,6 +60,8 @@
             <details class="menu">
               <summary class="btn sm ghost">更多 ▾</summary>
               <div class="menu-pop">
+                <button class="menu-item" type="button" onclick="openEditNodeModal()">编辑节点 <span class="muted sm">名称/地址/分组</span></button>
+                <div class="menu-sep"></div>
                 <button class="menu-item" type="button" onclick="openCommandModal('一键接入命令', window.__INSTALL_CMD__)">
                   接入命令 <span class="muted sm">复制</span>
                 </button>
@@ -65,9 +73,9 @@
                 <button class="menu-item" type="button" id="restoreRulesBtn" onclick="triggerRestore()">恢复规则 <span class="muted sm">粘贴</span></button>
                 <div class="menu-sep"></div>
                 <form method="post" action="/nodes/{{ node.id }}/delete" style="margin:0;">
-                  <button class="menu-item" type="submit" onclick="return confirm('确定移除该节点吗？
+                  <button class="menu-item" type="submit" onclick="return confirm('确认移除该节点？
 
-说明：此操作仅从面板移除节点，不会卸载该机器上的 Agent。')" style="color:var(--bad);">
+仅移除面板记录，不影响节点 Agent。')" style="color:var(--bad);">
                     移除节点 <span class="muted sm">危险</span>
                   </button>
                 </form>
@@ -117,8 +125,6 @@
       <div class="col right"><button class="btn xs ghost" type="button" onclick="closeAddNodeModal()">关闭</button></div>
     </div>
 
-    <p class="muted" style="margin-top:8px;">只需填写 <b>IP/域名</b>，端口默认使用 <span class="mono">18700</span>（Agent 默认端口）。如你改过端口，请在 IP/域名里自行带上 <span class="mono">:端口</span>。</p>
-
     <div class="form" style="margin-top:10px;">
       <div class="row" style="gap:12px;">
         <div class="col">
@@ -134,6 +140,10 @@
         </div>
       </div>
 
+      <label class="label">分组名称</label>
+      <input class="input" id="addNodeGroup" placeholder="例如：香港 / 美国 / 客户A" value="默认分组">
+      <div class="help">仅用于面板分类；不影响规则与转发。</div>
+
       <label class="label">IP/域名</label>
       <input class="input" id="addNodeIp" placeholder="例如：1.2.3.4 或 node.example.com">
 
@@ -148,6 +158,53 @@
       <div class="row" style="gap:10px; justify-content:flex-end; margin-top:14px;">
         <button class="btn xs ghost" type="button" onclick="closeAddNodeModal()">取消</button>
         <button class="btn xs" id="addNodeSubmit" type="button" onclick="createNodeFromModal()">创建并进入</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+
+<!-- Edit Node Modal -->
+<div id="editNodeModal" class="modal" style="display:none;">
+  <div class="modal-inner" style="max-width:560px;">
+    <div class="row" style="align-items:center;">
+      <div class="col"><div class="h2">编辑节点</div></div>
+      <div class="col right"><button class="btn xs ghost" type="button" onclick="closeEditNodeModal()">关闭</button></div>
+    </div>
+
+    <div class="form" style="margin-top:10px;">
+      <label class="label">节点名称</label>
+      <input class="input" id="editNodeName" placeholder="例如：香港-01 / US-Edge">
+
+      <div class="row" style="gap:12px; margin-top:10px;">
+        <div class="col" style="max-width:180px;">
+          <label class="label">协议</label>
+          <select class="select" id="editNodeScheme">
+            <option value="http">http</option>
+            <option value="https">https</option>
+          </select>
+        </div>
+        <div class="col">
+          <label class="label">分组名称</label>
+          <input class="input" id="editNodeGroup" placeholder="例如：香港 / 美国 / 客户A">
+        </div>
+      </div>
+
+      <label class="label" style="margin-top:10px;">IP/域名</label>
+      <input class="input" id="editNodeIp" placeholder="例如：1.2.3.4 或 node.example.com">
+      <div class="help">端口无需单独填写，默认 18700；如需自定义可在地址中写 host:port（保存后仍不在列表展示端口）。</div>
+
+      <div class="row" style="gap:12px;align-items:center;margin-top:6px;">
+        <div class="col">
+          <label class="help"><input type="checkbox" id="editNodeVerifyTls" style="transform:translateY(1px);"> 验证 TLS 证书（https 才需要）</label>
+        </div>
+      </div>
+
+      <div id="editNodeError" class="muted" style="margin-top:8px;color:#ffb3b3;"></div>
+
+      <div class="row" style="gap:10px; justify-content:flex-end; margin-top:14px;">
+        <button class="btn xs ghost" type="button" onclick="closeEditNodeModal()">取消</button>
+        <button class="btn xs" id="editNodeSubmit" type="button" onclick="saveEditNode()">保存</button>
       </div>
     </div>
   </div>
@@ -215,12 +272,12 @@
             <select class="select" id="f_wss_receiver_node">
               <option value="">请选择接收机…</option>
             </select>
-            <div class="help">选择接收机后：保存会在接收机同步生成对应规则；删除也会同步删除。接收机中由同步生成的规则会被锁定不可编辑。</div>
+            <div class="help">保存/删除将同步至接收机；同步生成的规则为只读。</div>
           </div>
           <div class="col" style="max-width:240px;">
             <label class="label">接收机监听端口</label>
             <input class="input" id="f_wss_receiver_port" placeholder="留空 = 与发送机 Listen 一致">
-            <div class="help">留空会默认使用发送机 Listen 的端口；如冲突会自动挑选一个不冲突端口。</div>
+            <div class="help">留空=沿用发送机端口；如冲突自动避让。</div>
           </div>
         </div>
 
@@ -237,7 +294,7 @@
 
         <div class="row" style="gap:12px;align-items:center;">
           <div class="col">
-            <div class="help">Host/Path/SNI 建议与证书域名一致；如需提升兼容性，可勾选「跳过证书校验」。</div>
+            <div class="help">Host/Path/SNI 建议与证书域名一致；兼容模式可启用「跳过校验」。</div>
           </div>
           <div class="right" style="flex:0 0 auto;">
             <button class="btn xs ghost" type="button" onclick="randomizeWss()">随机生成参数</button>
@@ -261,7 +318,7 @@
               <input type="checkbox" id="f_wss_insecure" checked style="width:auto;margin:0;">
               跳过证书校验
             </label>
-            <div class="help">开启后更稳定，但安全性降低。</div>
+            <div class="help">兼容性更好，但安全性降低。</div>
           </div>
         </div>
 
@@ -305,7 +362,7 @@
       <div class="col"><div class="h2" id="commandTitle">命令</div></div>
       <div class="right"><button class="btn xs ghost" type="button" onclick="closeCommandModal()">关闭</button></div>
     </div>
-    <p class="muted" style="margin-top:8px;">复制命令到目标节点执行。</p>
+    <p class="muted" style="margin-top:8px;">在目标节点执行以下命令即可。</p>
     <pre class="code-block" id="commandText"></pre>
     <div class="row" style="justify-content:flex-end;">
       <button class="btn xs" data-copy-target="commandText">复制命令</button>
@@ -315,12 +372,17 @@
 {% endblock %}
 
 {% block scripts %}
-<script src="/static/app.js?v=38.0"></script>
+<script src="/static/app.js?v=41.4"></script>
 <script>
 window.__NODE_ID__ = {{ node.id }};
 window.__NODE_IP__ = {{ (node.display_ip or node.name)|tojson }};
+window.__NODE_NAME__ = {{ (node.name or '')|tojson }};
+window.__NODE_BASE_URL__ = {{ (node.base_url or '')|tojson }};
+window.__NODE_VERIFY_TLS__ = {{ (1 if node.verify_tls else 0) }};
+window.__NODE_GROUP__ = {{ (node.group_name or '默认分组')|tojson }};
 window.__INSTALL_CMD__ = {{ install_cmd|tojson }};
 window.__UNINSTALL_CMD__ = {{ uninstall_cmd|tojson }};
+window.__AUTO_OPEN_EDIT_NODE__ = {{ (1 if show_edit_node else 0) }};
 window.addEventListener('DOMContentLoaded', () => {
   initNodePage();
 });
