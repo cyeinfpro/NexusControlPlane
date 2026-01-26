@@ -25,6 +25,10 @@ TCP_BACKLOG = int(os.getenv('REALM_INTRANET_TCP_BACKLOG', '256'))
 UDP_SESSION_TTL = float(os.getenv('REALM_INTRANET_UDP_TTL', '60.0'))
 MAX_FRAME = int(os.getenv('REALM_INTRANET_MAX_UDP_FRAME', '65535'))
 
+# Fallback to plaintext only when the server side has no TLS (e.g. openssl missing on A).
+# Keep it enabled by default to maximize connectivity; set REALM_INTRANET_ALLOW_PLAINTEXT=0 to force TLS-only.
+ALLOW_PLAINTEXT_FALLBACK = bool(int(os.getenv('REALM_INTRANET_ALLOW_PLAINTEXT', '1') or '1'))
+
 
 def _now() -> float:
     return time.time()
@@ -659,20 +663,41 @@ class _TunnelClient:
     def stop(self) -> None:
         self._stop.set()
 
-    def _dial_tls(self) -> Optional[ssl.SSLSocket]:
+    def _dial(self) -> Optional[Any]:
+        """Dial A side tunnel port.
+
+        Prefer TLS. If A cannot enable TLS (e.g. missing openssl and no cert provisioned),
+        the TLS handshake usually fails with WRONG_VERSION_NUMBER/UNKNOWN_PROTOCOL.
+        In that case, and only when verification is not required, we fall back to plaintext
+        to keep connectivity (still authenticated by token).
+        """
+        # 1) TLS first
         try:
             raw = socket.create_connection((self.peer_host, self.peer_port), timeout=6)
             ctx = _mk_client_ssl_context(self.server_cert_pem or None)
             ss = ctx.wrap_socket(raw, server_hostname=None)
             ss.settimeout(None)
             return ss
+        except ssl.SSLError as exc:
+            # Only fall back when TLS is not required and the error looks like server is not TLS.
+            msg = str(exc).upper()
+            if (not self.server_cert_pem) and ALLOW_PLAINTEXT_FALLBACK and (
+                'WRONG_VERSION_NUMBER' in msg or 'UNKNOWN_PROTOCOL' in msg or 'HTTP_REQUEST' in msg
+            ):
+                try:
+                    raw = socket.create_connection((self.peer_host, self.peer_port), timeout=6)
+                    raw.settimeout(None)
+                    return raw
+                except Exception:
+                    return None
+            return None
         except Exception:
             return None
 
     def _loop(self) -> None:
         backoff = 1.0
         while not self._stop.is_set():
-            ss = self._dial_tls()
+            ss = self._dial()
             if not ss:
                 time.sleep(min(10.0, backoff))
                 backoff = min(10.0, backoff * 1.6 + 0.2)
@@ -721,8 +746,8 @@ class _TunnelClient:
                     threading.Thread(target=self._handle_open, args=(msg,), daemon=True).start()
             _safe_close(ss)
 
-    def _open_data(self) -> Optional[ssl.SSLSocket]:
-        return self._dial_tls()
+    def _open_data(self) -> Optional[Any]:
+        return self._dial()
 
     def _handle_open(self, msg: Dict[str, Any]) -> None:
         conn_id = str(msg.get('conn_id') or '')
@@ -907,7 +932,8 @@ class IntranetManager:
         with self._lock:
             servers = []
             for p, s in self._servers.items():
-                servers.append({'port': p, 'sessions': list(getattr(s, '_sessions', {}).keys())})
+                tls_on = bool(getattr(s, '_ssl_ctx', None) is not None)
+                servers.append({'port': p, 'tls': tls_on, 'sessions': list(getattr(s, '_sessions', {}).keys())})
             return {
                 'servers': servers,
                 'tcp_rules': list(self._tcp_listeners.keys()),

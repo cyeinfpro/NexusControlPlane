@@ -2345,9 +2345,28 @@ async def api_intranet_tunnel_save(payload: Dict[str, Any], user: str = Depends(
     sync_id = str(payload.get("sync_id") or "").strip() or uuid.uuid4().hex
     token = str(payload.get("token") or "").strip() or uuid.uuid4().hex
 
-    sender_host = _node_host_for_realm(sender)
+    # A-side public host that B can reach. Default: sender base_url hostname. Allow override from UI.
+    def _norm_host(h: str) -> str:
+        h = (h or '').strip()
+        if not h:
+            return ''
+        # allow user to paste URL or host:port
+        try:
+            if '://' in h:
+                return urlparse(h).hostname or ''
+        except Exception:
+            pass
+        # strip port if provided
+        if h.startswith('[') and ']' in h:
+            return h.split(']')[0][1:]
+        if ':' in h:
+            return h.rsplit(':', 1)[0]
+        return h
+
+    override_host = _norm_host(str(payload.get('server_host') or ''))
+    sender_host = override_host or _node_host_for_realm(sender)
     if not sender_host:
-        return JSONResponse({"ok": False, "error": "公网入口 base_url 无法解析主机名，请检查节点地址"}, status_code=400)
+        return JSONResponse({"ok": False, "error": "公网入口地址为空。请检查节点 base_url 或在内网穿透中填写“公网入口地址(A)”。"}, status_code=400)
 
     # Best-effort: fetch A-side tunnel server cert and embed into B config for TLS verification.
     server_cert_pem = ""
@@ -2370,6 +2389,7 @@ async def api_intranet_tunnel_save(payload: Dict[str, Any], user: str = Depends(
             "intranet_role": "server",
             "intranet_peer_node_id": receiver_id,
             "intranet_peer_node_name": receiver.get("name"),
+            "intranet_public_host": sender_host,
             "intranet_server_port": server_port,
             "intranet_token": token,
             "intranet_original_remotes": remotes,

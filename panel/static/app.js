@@ -1194,8 +1194,10 @@ function fillIntranetFields(e){
   // sender side: choose intranet (LAN) node
   const peerId = ex.intranet_peer_node_id ? String(ex.intranet_peer_node_id) : '';
   const port = ex.intranet_server_port != null ? String(ex.intranet_server_port) : '18443';
+  const host = ex.intranet_public_host ? String(ex.intranet_public_host) : '';
   if(q('f_intranet_receiver_node')) setField('f_intranet_receiver_node', peerId);
   if(q('f_intranet_server_port')) setField('f_intranet_server_port', port);
+  if(q('f_intranet_server_host')) setField('f_intranet_server_host', host);
   populateIntranetReceiverSelect();
 }
 
@@ -1564,6 +1566,7 @@ async function saveRule(){
     }
     const portTxt = q('f_intranet_server_port') ? q('f_intranet_server_port').value.trim() : '';
     const server_port = portTxt ? parseInt(portTxt,10) : 18443;
+    const server_host = q('f_intranet_server_host') ? q('f_intranet_server_host').value.trim() : '';
     let syncId = '';
     if(CURRENT_EDIT_INDEX >= 0){
       const old = CURRENT_POOL.endpoints[CURRENT_EDIT_INDEX];
@@ -1579,6 +1582,7 @@ async function saveRule(){
       balance: balanceStr,
       protocol,
       server_port,
+      server_host: server_host || null,
       sync_id: syncId || undefined
     };
 
