@@ -1100,7 +1100,7 @@ def _wss_probe_entries(rule: Dict[str, Any]) -> List[Dict[str, str]]:
     return entries
 
 
-app = FastAPI(title='Realm Agent', version='32')
+app = FastAPI(title='Realm Agent', version='33')
 REALM_SERVICE_NAMES = [s for s in [CFG.realm_service, 'realm.service', 'realm'] if s]
 
 
