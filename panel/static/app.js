@@ -1400,6 +1400,7 @@ async function toggleRule(idx){
         CURRENT_POOL = res.sender_pool;
         renderRules();
         toast('已同步更新（公网入口/内网出口两端）');
+        showApplyHint(res);
       }else{
         toast(res && res.error ? res.error : '同步更新失败，请稍后重试', true);
       }
@@ -1464,6 +1465,7 @@ async function deleteRule(idx){
         CURRENT_POOL = res.sender_pool;
         renderRules();
         toast('已同步删除（公网入口/内网出口两端）');
+        showApplyHint(res);
       }else{
         toast(res && res.error ? res.error : '同步删除失败，请稍后重试', true);
       }
@@ -1594,6 +1596,7 @@ async function saveRule(){
         renderRules();
         closeModal();
         toast('已保存，并自动下发到内网节点');
+        showApplyHint(res);
       }else{
         toast((res && res.error) ? res.error : '保存失败，请检查节点是否在线', true);
       }
@@ -1680,6 +1683,31 @@ function toast(text, isError=false){
 
   // Last resort
   alert(msg);
+}
+
+// For NAT/LAN nodes, panel may not be able to directly call agent. In that case the desired_pool
+// will still be delivered on next agent push-report. This helper summarizes the direct-apply result.
+function showApplyHint(res){
+  try{
+    if(!res || !res.apply) return;
+    const s = res.apply.sender || {};
+    const r = res.apply.receiver || {};
+    const msgs = [];
+    if(s.reachable === false) msgs.push('公网入口节点直连下发失败：将等待节点上报自动同步');
+    if(r.reachable === false) msgs.push('内网节点直连下发失败：将等待节点上报自动同步');
+    // If reachable, surface the first warning from agent diagnosis.
+    const pickWarn = (x) => {
+      if(!x || !x.intranet) return '';
+      const diag = x.intranet;
+      const w = (diag && diag.warnings && diag.warnings.length) ? diag.warnings[0] : '';
+      return w;
+    };
+    const sw = pickWarn(s);
+    const rw = pickWarn(r);
+    if(sw) msgs.push('公网入口诊断：' + sw);
+    if(rw) msgs.push('内网节点诊断：' + rw);
+    if(msgs.length) toast(msgs.join(' | '));
+  }catch(e){}
 }
 
 async function restoreRules(file){

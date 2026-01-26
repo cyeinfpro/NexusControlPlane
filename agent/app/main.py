@@ -1100,7 +1100,7 @@ def _wss_probe_entries(rule: Dict[str, Any]) -> List[Dict[str, str]]:
     return entries
 
 
-app = FastAPI(title='Realm Agent', version='35')
+app = FastAPI(title='Realm Agent', version='36')
 REALM_SERVICE_NAMES = [s for s in [CFG.realm_service, 'realm.service', 'realm'] if s]
 
 
@@ -1171,6 +1171,8 @@ def _build_push_report() -> Dict[str, Any]:
         'pool': pool,
         'stats': stats,
         'sys': _build_sys_snapshot(),
+        # Intranet tunnel runtime status (helps debug LAN nodes when panel cannot reach agent port)
+        'intranet': (_INTRANET.diagnose() if _INTRANET else {}),
     }
     if _LAST_SYNC_ERROR:
         rep['sync_error'] = _LAST_SYNC_ERROR
@@ -1668,10 +1670,17 @@ def api_intranet_cert(_: None = Depends(_api_key_required)) -> Dict[str, Any]:
 def api_intranet_status(_: None = Depends(_api_key_required)) -> Dict[str, Any]:
     """内网穿透运行状态（调试用）。"""
     try:
-        st = _INTRANET.status()
+        diag = _INTRANET.diagnose()
     except Exception as exc:
-        st = {'error': str(exc)}
-    return {'ok': True, 'status': st}
+        diag = {'ok': False, 'status': {}, 'warnings': [], 'error': str(exc)}
+    # Keep backward compatible: status.servers/clients... stays at top-level "status".
+    return {
+        'ok': True,
+        'status': (diag.get('status') if isinstance(diag, dict) else {}),
+        'warnings': (diag.get('warnings') if isinstance(diag, dict) else []),
+        'diag_ok': bool(diag.get('ok')) if isinstance(diag, dict) else False,
+        'error': diag.get('error', '') if isinstance(diag, dict) else '',
+    }
 
 
 @app.post('/api/v1/pool')
