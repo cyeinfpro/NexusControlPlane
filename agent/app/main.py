@@ -1100,7 +1100,7 @@ def _wss_probe_entries(rule: Dict[str, Any]) -> List[Dict[str, str]]:
     return entries
 
 
-app = FastAPI(title='Realm Agent', version='34')
+app = FastAPI(title='Realm Agent', version='35')
 REALM_SERVICE_NAMES = [s for s in [CFG.realm_service, 'realm.service', 'realm'] if s]
 
 
@@ -1205,6 +1205,18 @@ def _apply_sync_pool_cmd(cmd: Dict[str, Any]) -> None:
             if do_apply:
                 _apply_pool_to_config()
                 _restart_realm()
+                # Keep intranet tunnel supervisor in sync for LAN/NAT nodes.
+                try:
+                    _INTRANET.apply_from_pool(_load_full_pool())
+                except Exception:
+                    pass
+                # Intranet tunnel rules are handled by agent (not realm). When pool is applied via
+                # push-report commands (sync_pool / pool_patch), panel may NOT be able to call /api/v1/apply
+                # directly (e.g., LAN nodes behind NAT). So we must also apply the intranet supervisor here.
+                try:
+                    _INTRANET.apply_from_pool(_load_full_pool())
+                except Exception:
+                    pass
 
             # ✅ 只有成功才 ack
             _write_int(ACK_VER_FILE, ver)
