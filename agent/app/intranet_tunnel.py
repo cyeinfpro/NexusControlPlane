@@ -1499,27 +1499,67 @@ class IntranetManager:
                 self._servers.pop(port, None)
 
         # rule listeners on server role
+        # NOTE: listeners are keyed by sync_id. When the server-side rule is edited (e.g. changing peer node),
+        # the sync_id usually stays the same but token/remotes/listen may change. We must update/restart
+        # existing listeners, otherwise the panel may show "handshake ok" while forwarding breaks.
         for sync_id, r in rules.items():
             if r.role != 'server':
                 continue
+
             srv = self._servers.get(r.tunnel_port)
             if not srv:
                 continue
+
+            # TCP
             if 'tcp' in r.protocol:
                 if sync_id not in self._tcp_listeners:
                     lis = _TCPListener(r, srv)
                     lis.start()
                     self._tcp_listeners[sync_id] = lis
+                else:
+                    # Update existing listener in-place; restart only when listen address or server changes.
+                    lis = self._tcp_listeners.get(sync_id)
+                    if lis:
+                        old_rule = getattr(lis, 'rule', None)
+                        old_listen = getattr(old_rule, 'listen', None)
+                        if getattr(lis, 'tunnel', None) is not srv or old_listen != r.listen:
+                            try:
+                                lis.stop()
+                            except Exception:
+                                pass
+                            lis2 = _TCPListener(r, srv)
+                            lis2.start()
+                            self._tcp_listeners[sync_id] = lis2
+                        else:
+                            lis.rule = r
+                            lis.tunnel = srv
             else:
                 if sync_id in self._tcp_listeners:
                     self._tcp_listeners[sync_id].stop()
                     self._tcp_listeners.pop(sync_id, None)
 
+            # UDP
             if 'udp' in r.protocol:
                 if sync_id not in self._udp_listeners:
                     ul = _UDPListener(r, srv)
                     ul.start()
                     self._udp_listeners[sync_id] = ul
+                else:
+                    ul = self._udp_listeners.get(sync_id)
+                    if ul:
+                        old_rule = getattr(ul, 'rule', None)
+                        old_listen = getattr(old_rule, 'listen', None)
+                        if getattr(ul, 'tunnel', None) is not srv or old_listen != r.listen:
+                            try:
+                                ul.stop()
+                            except Exception:
+                                pass
+                            ul2 = _UDPListener(r, srv)
+                            ul2.start()
+                            self._udp_listeners[sync_id] = ul2
+                        else:
+                            ul.rule = r
+                            ul.tunnel = srv
             else:
                 if sync_id in self._udp_listeners:
                     self._udp_listeners[sync_id].stop()

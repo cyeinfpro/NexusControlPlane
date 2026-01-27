@@ -53,7 +53,12 @@
     </div>
 
     {% for n in (g.nodes or []) %}
-    <div class="card node-tile node-card" data-node-id="{{ n.id }}" data-online="{{ '1' if n.online else '0' }}">
+    <div class="card node-tile node-card" data-node-id="{{ n.id }}" data-online="{{ '1' if n.online else '0' }}"
+      data-node-name="{{ n.name or '' }}"
+      data-node-base-url="{{ n.base_url or '' }}"
+      data-node-group="{{ n.group_name or '' }}"
+      data-node-verify-tls="{{ '1' if n.verify_tls else '0' }}"
+      data-node-is-private="{{ '1' if n.is_private else '0' }}">
       <div class="node-top">
         <div class="node-left" style="min-width:0;">
           <div class="node-name" title="{{ n.name or ("节点-" ~ n.id) }}">{{ n.name or ("节点-" ~ n.id) }}</div>
@@ -65,7 +70,7 @@
             <span class="node-dot {{ 'online' if n.online else 'offline' }}"></span>
             <span>{{ '在线' if n.online else '离线' }}</span>
           </div>
-          <a class="btn icon xs ghost" href="/nodes/{{ n.id }}?edit=1" title="编辑">✎</a>
+          <button class="btn icon xs ghost" type="button" title="编辑" onclick="openEditNodeModalFromCard(this)">✎</button>
           <a class="btn icon xs secondary" href="/nodes/{{ n.id }}" title="进入">↗</a>
         </div>
       </div>
@@ -152,11 +157,60 @@
         </div>
       </div>
 
-      <div id="addNodeError" class="muted" style="margin-top:8px;color:#ffb3b3;"></div>
+      <div id="addNodeError" class="muted" style="margin-top:8px;color:var(--bad);"></div>
 
       <div class="row" style="gap:10px; justify-content:flex-end; margin-top:14px;">
         <button class="btn xs ghost" type="button" onclick="closeAddNodeModal()">取消</button>
         <button class="btn xs" id="addNodeSubmit" type="button" onclick="createNodeFromModal()">创建并进入</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Edit Node Modal (dashboard) -->
+<div id="editNodeModal" class="modal" style="display:none;">
+  <div class="modal-inner" style="max-width:560px;">
+    <div class="row" style="align-items:center;">
+      <div class="col"><div class="h2">编辑节点</div></div>
+      <div class="col right"><button class="btn xs ghost" type="button" onclick="closeEditNodeModal()">关闭</button></div>
+    </div>
+
+    <div class="form" style="margin-top:10px;">
+      <label class="label">节点名称</label>
+      <input class="input" id="editNodeName" placeholder="例如：香港-01 / US-Edge">
+
+      <div class="row" style="gap:12px; margin-top:10px;">
+        <div class="col" style="max-width:180px;">
+          <label class="label">协议</label>
+          <select class="select" id="editNodeScheme">
+            <option value="http">http</option>
+            <option value="https">https</option>
+          </select>
+        </div>
+        <div class="col">
+          <label class="label">分组名称</label>
+          <input class="input" id="editNodeGroup" placeholder="例如：香港 / 美国 / 客户A">
+        </div>
+      </div>
+
+      <label class="label" style="margin-top:10px;">IP/域名</label>
+      <input class="input" id="editNodeIp" placeholder="例如：1.2.3.4 或 node.example.com">
+      <div class="help">端口无需单独填写，默认 18700；如需自定义可在地址中写 host:port。</div>
+
+      <div class="row" style="gap:12px;align-items:center;margin-top:6px;">
+        <div class="col">
+          <label class="help"><input type="checkbox" id="editNodeVerifyTls" style="transform:translateY(1px);"> 验证 TLS 证书（https 才需要）</label>
+        </div>
+        <div class="col">
+          <label class="help"><input type="checkbox" id="editNodeIsPrivate" style="transform:translateY(1px);"> 内网机器（用于内网穿透出口）</label>
+        </div>
+      </div>
+
+      <div id="editNodeError" class="muted" style="margin-top:8px;color:var(--bad);"></div>
+
+      <div class="row" style="gap:10px; justify-content:flex-end; margin-top:14px;">
+        <button class="btn xs ghost" type="button" onclick="closeEditNodeModal()">取消</button>
+        <button class="btn xs" id="editNodeSubmit" type="button" onclick="saveEditNode()">保存</button>
       </div>
     </div>
   </div>
@@ -236,7 +290,7 @@
     <div class="form" style="margin-top:10px;">
       <label class="label">选择全量备份包（zip）</label>
       <input class="input" type="file" id="restoreFullFile" accept=".zip,application/zip">
-      <div id="restoreFullError" class="muted" style="margin-top:8px;color:#ffb3b3;white-space:pre-wrap;"></div>
+      <div id="restoreFullError" class="muted" style="margin-top:8px;color:var(--bad);white-space:pre-wrap;"></div>
       <div class="row" style="gap:10px; justify-content:flex-end; margin-top:14px;">
         <button class="btn xs ghost" type="button" onclick="closeRestoreFullModal()">取消</button>
         <button class="btn xs" id="restoreFullSubmit" type="button" onclick="restoreFullNow()">开始恢复</button>
@@ -248,5 +302,5 @@
 {% endblock %}
 
 {% block scripts %}
-<script src="/static/app.js?v=48.0"></script>
+<script src="/static/app.js?v=49.0"></script>
 {% endblock %}

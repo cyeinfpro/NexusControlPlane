@@ -3,9 +3,10 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="theme-color" content="#060816">
-  <title>{{ title or "Realm Pro Panel" }}</title>
-<link rel="stylesheet" href="/static/style.css?v=43.0">
+  <meta name="theme-color" content="#0B0F14">
+  <title>{% if title %}{{ title }} · Nexus Network Control Plane{% else %}Nexus Network Control Plane{% endif %}</title>
+  <link rel="icon" type="image/svg+xml" href="/static/nexus.svg">
+  <link rel="stylesheet" href="/static/style.css?v=44.0">
 </head>
 <body>
   <!-- Flowing background (fixed, no seams on scroll) -->
@@ -13,11 +14,13 @@
   <div class="bg-noise" aria-hidden="true"></div>
 
   <header class="topbar">
-    <a class="brand" href="/" aria-label="Realm Pro">
-      <div class="logo">RP</div>
+    <a class="brand" href="/" aria-label="Nexus Network Control Plane">
+      <div class="logo" aria-hidden="true">
+        <img src="/static/nexus.svg" alt="" class="logo-img" />
+      </div>
       <div class="brand-text">
-        <div class="brand-name">Realm Pro</div>
-        <div class="brand-sub">Control Panel</div>
+        <div class="brand-name">Nexus</div>
+        <div class="brand-sub">Network Control Plane</div>
       </div>
     </a>
 
@@ -37,7 +40,7 @@
   </main>
 
   <footer class="footer">
-    <span>Realm Pro Suite v34</span>
+    <span>Nexus Control Plane · Human × AI Co-built System</span>
   </footer>
 
   <!-- Group order modal (shared) -->
@@ -56,7 +59,7 @@
         <input class="input" id="groupOrderValue" type="number" step="1" placeholder="例如：10">
         <div class="help">仅影响面板显示顺序，不影响规则与转发。</div>
 
-        <div id="groupOrderError" class="muted" style="margin-top:8px;color:#ffb3b3;"></div>
+      <div id="groupOrderError" class="muted" style="margin-top:8px;color:var(--bad);"></div>
         <div class="row" style="gap:10px; justify-content:flex-end; margin-top:14px;">
           <button class="btn xs ghost" type="button" onclick="closeGroupOrderModal()">取消</button>
           <button class="btn xs" id="groupOrderSubmit" type="button" onclick="saveGroupOrder()">保存</button>
