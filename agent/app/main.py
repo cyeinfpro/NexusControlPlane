@@ -130,8 +130,12 @@ def _reconcile_update_state() -> None:
     st = _load_update_state()
     if not st:
         return
+    # desired_version 可能是 "39-force-<id>" 这种形式（为了兼容旧版 Agent 的版本短路逻辑）。
+    # 这里做“前缀数字”解析，确保重启后能正确把 installing -> done。
+    desired = 0
     try:
-        desired = int(str(st.get('desired_version') or 0))
+        m = re.match(r"\s*([0-9]+)", str(st.get('desired_version') or ''))
+        desired = int(m.group(1)) if m else 0
     except Exception:
         desired = 0
     state = str(st.get('state') or '').strip().lower()
@@ -1122,7 +1126,7 @@ def _wss_probe_entries(rule: Dict[str, Any]) -> List[Dict[str, str]]:
     return entries
 
 
-app = FastAPI(title='Realm Agent', version='38')
+app = FastAPI(title='Realm Agent', version='39')
 REALM_SERVICE_NAMES = [s for s in [CFG.realm_service, 'realm.service', 'realm'] if s]
 
 

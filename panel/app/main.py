@@ -71,6 +71,11 @@ def _read_latest_agent_version() -> str:
     return ""
 
 
+# NOTE:
+#   不要把 latest agent version 缓存在 import-time 常量里。
+#   面板在“自更新/替换静态文件”后，如果不重启进程，常量会变旧，
+#   导致一键更新仍然下发旧版本号，进而触发不了 Agent 的自更新。
+#   因此，下面相关 API 都会在调用时动态读取 realm-agent.zip 里的版本号。
 LATEST_AGENT_VERSION = _read_latest_agent_version()
 
 
@@ -1045,25 +1050,32 @@ async def api_agent_report(request: Request, payload: Dict[str, Any]):
                     except Exception:
                         pass
             else:
-                # 自更新能力从 v32 开始（更老版本会忽略 update_agent 命令）
-                if _ver_int(cur_agent_ver) and _ver_int(cur_agent_ver) < 32:
-                    try:
-                        update_agent_status(
-                            node_id=node_id,
-                            state='failed',
-                            msg='Agent 版本过旧（<32），不支持一键自更新：请先在节点上手动运行 realm_agent.sh 更新一次',
-                        )
-                    except Exception:
-                        pass
-                    return {"ok": True, "server_time": now, "desired_version": desired_ver, "commands": cmds}
+                # ✅ 不对旧版本做“硬阻断”。
+                # 有些环境里节点上跑的 Agent 版本可能很旧/无法准确上报版本号。
+                # 这里仍然尝试下发 update_agent，让节点“尽最大可能”自更新。
 
                 panel_base = _panel_public_base_url(request)
                 sh_url, zip_url, github_only = _agent_asset_urls(panel_base)
                 zip_sha256 = '' if github_only else _file_sha256(STATIC_DIR / 'realm-agent.zip')
+
+                # ✅ 强制更新关键：
+                # 旧版 Agent 的 update_agent 实现里存在“版本号短路”逻辑：
+                #   - 当 current_version >= desired_version 时，直接标记 done 并返回
+                # 这会导致“面板点更新但实际不更新”（例如 target=38，节点也是 38）。
+                # 为了做到“无论当前版本如何，点更新就必须重装”，我们给 desired_version
+                # 加一个批次后缀，让旧版 Agent 的 int() 解析失败，从而不会短路。
+                # 新版 Agent 会解析前缀数字（见 agent/_reconcile_update_state），不影响展示。
+                desired_ver_for_cmd = desired_agent_ver
+                try:
+                    suf = (desired_update_id or '')[:8] or str(int(time.time()))
+                    if desired_ver_for_cmd:
+                        desired_ver_for_cmd = f"{desired_ver_for_cmd}-force-{suf}"
+                except Exception:
+                    pass
                 ucmd: Dict[str, Any] = {
                     'type': 'update_agent',
                     'update_id': desired_update_id,
-                    'desired_version': desired_agent_ver,
+                    'desired_version': desired_ver_for_cmd,
                     'panel_url': panel_base,
                     'sh_url': sh_url,
                     'zip_url': zip_url,
@@ -1091,10 +1103,11 @@ async def api_agent_report(request: Request, payload: Dict[str, Any]):
 @app.get('/api/agents/latest')
 async def api_agents_latest(_: Request, user: str = Depends(require_login)):
     """Return the latest agent version bundled with this panel."""
+    latest = _read_latest_agent_version()
     zip_sha256 = _file_sha256(STATIC_DIR / 'realm-agent.zip')
     return {
         'ok': True,
-        'latest_version': LATEST_AGENT_VERSION,
+        'latest_version': latest,
         'zip_sha256': zip_sha256,
     }
 
@@ -1102,7 +1115,7 @@ async def api_agents_latest(_: Request, user: str = Depends(require_login)):
 @app.post('/api/agents/update_all')
 async def api_agents_update_all(request: Request, user: str = Depends(require_login)):
     """Trigger an agent rollout to all nodes."""
-    target = (LATEST_AGENT_VERSION or '').strip()
+    target = (_read_latest_agent_version() or '').strip()
     if not target:
         return JSONResponse({'ok': False, 'error': '无法确定当前面板内置的 Agent 版本（realm-agent.zip 缺失或不可解析）'}, status_code=500)
 
