@@ -1536,19 +1536,28 @@ class IntranetManager:
                 self._udp_listeners.pop(sync_id, None)
 
         # clients on client role
-        desired_clients: Dict[str, _TunnelClient] = {}
+        desired_keys: set[str] = set()
         for r in rules.values():
             if r.role != 'client':
                 continue
             key = f"{r.peer_host}:{r.tunnel_port}:{r.token}"
+            desired_keys.add(key)
+
             c = self._clients.get(key)
             if not c:
-                c = _TunnelClient(peer_host=r.peer_host, peer_port=r.tunnel_port, token=r.token, node_id=self.node_id, server_cert_pem=r.server_cert_pem)
+                c = _TunnelClient(
+                    peer_host=r.peer_host,
+                    peer_port=r.tunnel_port,
+                    token=r.token,
+                    node_id=self.node_id,
+                    server_cert_pem=r.server_cert_pem,
+                )
                 c.start()
-            desired_clients[key] = c
+                # ✅ 关键修复：新建的 client 必须写入 self._clients，否则状态检测会一直显示“客户端未启动”
+                self._clients[key] = c
 
         for key in list(self._clients.keys()):
-            if key not in desired_clients:
+            if key not in desired_keys:
                 self._clients[key].stop()
                 self._clients.pop(key, None)
 
