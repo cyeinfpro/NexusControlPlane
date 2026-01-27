@@ -233,94 +233,10 @@
     </div>
 
     <div class="form">
-      <div class="row" style="gap:12px;">
-        <div class="col">
-          <label class="label" id="listenLabel">
-            <span id="listenLabelMain">监听</span> <span class="muted sm" id="listenLabelExample">（例如 0.0.0.0:443）</span>
-          </label>
-          <input class="input" id="f_listen" placeholder="0.0.0.0:443">
-          <div class="help" id="listenHelp"></div>
-        </div>
-        <div class="col" style="max-width:220px;">
-          <label class="label">状态</label>
-          <select class="select" id="f_disabled">
-            <option value="0">启用</option>
-            <option value="1">暂停</option>
-          </select>
-        </div>
-      </div>
-
-      <label class="label" id="remoteLabel">
-        <span id="remoteLabelMain">目标地址</span> <span class="muted sm" id="remoteLabelExtra">（Remote，每行一个 host:port）</span>
-      </label>
-      <textarea class="textarea" id="f_remotes" rows="5" placeholder="203.0.113.10:443\n198.51.100.8:443"></textarea>
-      <div class="help" id="remoteHelp"></div>
-
-      <div class="row" style="gap:12px;">
-        <div class="col" style="max-width:220px;">
-          <label class="label">策略</label>
-          <select class="select" id="f_balance">
-            <option value="roundrobin">轮询</option>
-            <option value="iphash">IP Hash</option>
-          </select>
-        </div>
-        <div class="col">
-          <label class="label">权重（与 Remote 行数一致，逗号分隔，可空）</label>
-          <input class="input" id="f_weights" placeholder="1,1,2">
-        </div>
-        <div class="col" style="max-width:220px;">
-          <label class="label">协议</label>
-          <select class="select" id="f_protocol">
-            <option value="tcp">TCP</option>
-            <option value="udp">UDP</option>
-            <option value="tcp+udp">TCP+UDP</option>
-          </select>
-        </div>
-      </div>
-
-      <label class="label">转发模式</label>
-      <div class="mode-switch" id="modeSwitch" role="tablist" aria-label="转发模式选择">
-        <button class="mode-card active" type="button" data-mode="tcp" role="tab" aria-selected="true">
-          <div class="mode-card-head">
-            <div class="mode-ico">⚡</div>
-            <div class="mode-card-txt">
-              <div class="mode-title">普通转发</div>
-              <div class="mode-sub">单机监听 → 目标</div>
-            </div>
-          </div>
-          <div class="mode-tags">
-            <span class="mode-tag">最常用</span>
-            <span class="mode-tag">单节点</span>
-          </div>
-        </button>
-
-        <button class="mode-card" type="button" data-mode="wss" role="tab" aria-selected="false">
-          <div class="mode-card-head">
-            <div class="mode-ico">🛡️</div>
-            <div class="mode-card-txt">
-              <div class="mode-title">WSS 隧道</div>
-              <div class="mode-sub">发送机 ↔ 接收机（自动同步）</div>
-            </div>
-          </div>
-          <div class="mode-tags">
-            <span class="mode-tag">伪装</span>
-            <span class="mode-tag">双端</span>
-          </div>
-        </button>
-
-        <button class="mode-card" type="button" data-mode="intranet" role="tab" aria-selected="false">
-          <div class="mode-card-head">
-            <div class="mode-ico">🏠</div>
-            <div class="mode-card-txt">
-              <div class="mode-title">内网穿透</div>
-              <div class="mode-sub">公网入口 ↔ 内网出口（自动同步）</div>
-            </div>
-          </div>
-          <div class="mode-tags">
-            <span class="mode-tag">暴露内网</span>
-            <span class="mode-tag">双端</span>
-          </div>
-        </button>
+      <!-- Split: 参数 / 介绍，避免一次塞太多信息 -->
+      <div class="rule-screen-tabs" role="tablist" aria-label="规则编辑页面切换">
+        <button class="rule-tab active" id="ruleTabParams" type="button" role="tab" aria-selected="true" onclick="setRuleScreen('params')">填写参数</button>
+        <button class="rule-tab" id="ruleTabIntro" type="button" role="tab" aria-selected="false" onclick="setRuleScreen('intro')">模式介绍</button>
       </div>
 
       <!-- 保留原 select（JS/接口依赖 #f_type），仅隐藏不展示 -->
@@ -330,9 +246,121 @@
         <option value="intranet">内网穿透</option>
       </select>
 
-      <div id="modeGuide" class="mode-guide" aria-live="polite"></div>
+      <!-- Intro screen: 只展示模式选择 + 说明（不展示参数表单） -->
+      <div id="ruleScreenIntro" class="rule-screen" style="display:none;">
+        <div class="rule-intro-head">
+          <div class="h3" style="margin:4px 0 0 0;">选择转发模式</div>
+          <div class="muted sm" style="margin-top:4px;">看完说明后点击「开始填写参数」进入配置；你也可以随时回到这里切换模式。</div>
+        </div>
 
-      <div id="wssBox" style="display:none;">
+        <div class="mode-switch" id="modeSwitch" role="tablist" aria-label="转发模式选择">
+          <button class="mode-card active" type="button" data-mode="tcp" role="tab" aria-selected="true">
+            <div class="mode-card-head">
+              <div class="mode-ico">⚡</div>
+              <div class="mode-card-txt">
+                <div class="mode-title">普通转发</div>
+                <div class="mode-sub">单机监听 → 目标</div>
+              </div>
+            </div>
+            <div class="mode-tags">
+              <span class="mode-tag">最常用</span>
+              <span class="mode-tag">单节点</span>
+            </div>
+          </button>
+
+          <button class="mode-card" type="button" data-mode="wss" role="tab" aria-selected="false">
+            <div class="mode-card-head">
+              <div class="mode-ico">🛡️</div>
+              <div class="mode-card-txt">
+                <div class="mode-title">WSS 隧道</div>
+                <div class="mode-sub">发送机 ↔ 接收机（自动同步）</div>
+              </div>
+            </div>
+            <div class="mode-tags">
+              <span class="mode-tag">伪装</span>
+              <span class="mode-tag">双端</span>
+            </div>
+          </button>
+
+          <button class="mode-card" type="button" data-mode="intranet" role="tab" aria-selected="false">
+            <div class="mode-card-head">
+              <div class="mode-ico">🏠</div>
+              <div class="mode-card-txt">
+                <div class="mode-title">内网穿透</div>
+                <div class="mode-sub">公网入口 ↔ 内网出口（自动同步）</div>
+              </div>
+            </div>
+            <div class="mode-tags">
+              <span class="mode-tag">暴露内网</span>
+              <span class="mode-tag">双端</span>
+            </div>
+          </button>
+        </div>
+
+        <div id="modeGuide" class="mode-guide" aria-live="polite"></div>
+
+        <div class="row" style="gap:10px; justify-content:flex-end; margin-top:12px;">
+          <button class="btn xs" type="button" onclick="setRuleScreen('params')">开始填写参数 →</button>
+        </div>
+      </div>
+
+      <!-- Params screen: 只展示参数表单（说明放到 intro） -->
+      <div id="ruleScreenParams" class="rule-screen">
+        <div class="mode-compact-bar">
+          <div class="mode-compact-left">
+            <span class="muted sm">当前模式</span>
+            <span class="pill xs ghost" id="currentModePill">普通转发</span>
+            <span class="muted sm" id="currentModeSub">单机监听 → 目标</span>
+          </div>
+          <button class="btn xs ghost" type="button" onclick="setRuleScreen('intro')">查看介绍/切换</button>
+        </div>
+
+        <div class="row" style="gap:12px;">
+          <div class="col">
+            <label class="label" id="listenLabel">
+              <span id="listenLabelMain">监听</span> <span class="muted sm" id="listenLabelExample">（例如 0.0.0.0:443）</span>
+            </label>
+            <input class="input" id="f_listen" placeholder="0.0.0.0:443">
+            <div class="help" id="listenHelp"></div>
+          </div>
+          <div class="col" style="max-width:220px;">
+            <label class="label">状态</label>
+            <select class="select" id="f_disabled">
+              <option value="0">启用</option>
+              <option value="1">暂停</option>
+            </select>
+          </div>
+        </div>
+
+        <label class="label" id="remoteLabel">
+          <span id="remoteLabelMain">目标地址</span> <span class="muted sm" id="remoteLabelExtra">（Remote，每行一个 host:port）</span>
+        </label>
+        <textarea class="textarea" id="f_remotes" rows="5" placeholder="203.0.113.10:443\n198.51.100.8:443"></textarea>
+        <div class="help" id="remoteHelp"></div>
+
+        <div class="row" style="gap:12px;">
+          <div class="col" style="max-width:220px;">
+            <label class="label">策略</label>
+            <select class="select" id="f_balance">
+              <option value="roundrobin">轮询</option>
+              <option value="iphash">IP Hash</option>
+            </select>
+          </div>
+          <div class="col">
+            <label class="label">权重（与 Remote 行数一致，逗号分隔，可空）</label>
+            <input class="input" id="f_weights" placeholder="1,1,2">
+          </div>
+          <div class="col" style="max-width:220px;">
+            <label class="label">协议</label>
+            <select class="select" id="f_protocol">
+              <option value="tcp">TCP</option>
+              <option value="udp">UDP</option>
+              <option value="tcp+udp">TCP+UDP</option>
+            </select>
+          </div>
+        </div>
+
+        <div id="wssBox" style="display:none;">
 
         <div id="wssAutoSyncBox" class="row" style="gap:12px;">
           <div class="col">
@@ -351,18 +379,18 @@
 
         <div class="row" style="gap:12px;margin-top:10px;">
           <div class="col">
-            <label class="label">WSS Host</label>
-            <input class="input" id="f_wss_host" placeholder="www.bing.com">
+            <label class="label">WSS Host <span class="muted sm">（留空自动生成）</span></label>
+            <input class="input" id="f_wss_host" placeholder="留空自动生成，例如 cdn.jsdelivr.net">
           </div>
           <div class="col">
-            <label class="label">WSS Path</label>
-            <input class="input" id="f_wss_path" placeholder="/ws">
+            <label class="label">WSS Path <span class="muted sm">（留空自动生成）</span></label>
+            <input class="input" id="f_wss_path" placeholder="留空自动生成，例如 /ws/xxxx">
           </div>
         </div>
 
         <div class="row" style="gap:12px;align-items:center;">
           <div class="col">
-            <div class="help">Host/Path/SNI 建议与证书域名一致；兼容模式可启用「跳过校验」。</div>
+            <div class="help">Host/Path/SNI 建议与证书域名一致；留空会在保存时自动随机生成；兼容模式可启用「跳过校验」。</div>
           </div>
           <div class="right" style="flex:0 0 auto;">
             <button class="btn xs ghost" type="button" onclick="randomizeWss()">随机生成参数</button>
@@ -371,8 +399,8 @@
 
         <div class="row" style="gap:12px;">
           <div class="col">
-            <label class="label">SNI</label>
-            <input class="input" id="f_wss_sni" placeholder="www.bing.com">
+            <label class="label">SNI <span class="muted sm">（留空=同 Host）</span></label>
+            <input class="input" id="f_wss_sni" placeholder="留空=同 Host，例如 cdn.jsdelivr.net">
           </div>
           <div class="col" style="max-width:220px;">
             <label class="label">TLS</label>
@@ -423,6 +451,7 @@
       </div>
 
       <div id="modalMsg" class="form-error" style="margin-top:10px;"></div>
+      </div>
     </div>
   </div>
 </div>
@@ -465,7 +494,7 @@
 {% endblock %}
 
 {% block scripts %}
-<script src="/static/app.js?v=45.0"></script>
+<script src="/static/app.js?v=46.0"></script>
 <script>
 window.__NODE_ID__ = {{ node.id }};
 window.__NODE_IP__ = {{ (node.display_ip or node.name)|tojson }};

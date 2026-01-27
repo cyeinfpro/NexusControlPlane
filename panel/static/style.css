@@ -724,6 +724,65 @@ textarea,.textarea{min-height:90px;resize:vertical}
   font-size: 12px;
 }
 
+/* =========================
+   Rule modal: split screens (Intro vs Params)
+   ========================= */
+
+.rule-screen-tabs{
+  display:flex;
+  gap:6px;
+  padding:6px;
+  border-radius:999px;
+  border:1px solid rgba(148,163,184,0.18);
+  background: rgba(2,6,23,0.14);
+  width:fit-content;
+  margin-top: 8px;
+}
+
+.rule-tab{
+  border:1px solid transparent;
+  background: transparent;
+  color: var(--muted);
+  padding:8px 12px;
+  border-radius:999px;
+  cursor:pointer;
+  font-size:12px;
+  font-weight:900;
+  line-height:1;
+}
+
+.rule-tab:hover{
+  background: rgba(148,163,184,0.08);
+}
+
+.rule-tab.active{
+  background: rgba(99,102,241,0.14);
+  border-color: rgba(99,102,241,0.24);
+  color: rgba(226,232,240,0.92);
+}
+
+.rule-screen{ margin-top: 12px; }
+.rule-intro-head{ margin-bottom: 8px; }
+
+.mode-compact-bar{
+  display:flex;
+  justify-content:space-between;
+  align-items:center;
+  gap:12px;
+  padding:10px 12px;
+  border-radius:16px;
+  border:1px solid rgba(148,163,184,0.18);
+  background: rgba(2,6,23,0.12);
+}
+
+.mode-compact-left{
+  display:flex;
+  gap:8px;
+  align-items:center;
+  flex-wrap:wrap;
+  min-width:0;
+}
+
 @media (max-width: 860px){
   .mode-switch{ grid-template-columns: 1fr; }
   .mode-ico{ width:32px; height:32px; }

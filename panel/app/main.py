@@ -2282,6 +2282,47 @@ async def api_groups_order(request: Request, user: str = Depends(require_login))
     return {"ok": True, "group_name": name, "sort_order": order}
 
 
+def _random_wss_params() -> tuple[str, str, str]:
+    """Generate a reasonable random WSS {host, path, sni}.
+
+    Used when UI leaves Host/Path/SNI empty (auto-fill). Keep it conservative:
+    - Host picked from common CDN/static domains
+    - Path includes a short random token
+    - SNI defaults to Host
+    """
+
+    hosts = [
+        "cdn.jsdelivr.net",
+        "assets.cloudflare.com",
+        "edge.microsoft.com",
+        "static.cloudflareinsights.com",
+        "ajax.googleapis.com",
+        "fonts.gstatic.com",
+        "images.unsplash.com",
+        "cdn.discordapp.com",
+    ]
+    path_templates = [
+        "/ws",
+        "/ws/{token}",
+        "/socket",
+        "/socket/{token}",
+        "/connect",
+        "/gateway",
+        "/api/ws",
+        "/v1/ws/{token}",
+        "/edge/{token}",
+    ]
+
+    host = secrets.choice(hosts)
+    token = secrets.token_hex(5)
+    tpl = secrets.choice(path_templates)
+    path = str(tpl or "/ws").replace("{token}", token)
+    if path and not path.startswith("/"):
+        path = "/" + path
+    sni = host
+    return host, path, sni
+
+
 @app.post("/api/wss_tunnel/save")
 async def api_wss_tunnel_save(payload: Dict[str, Any], user: str = Depends(require_login)):
     try:
@@ -2318,6 +2359,27 @@ async def api_wss_tunnel_save(payload: Dict[str, Any], user: str = Depends(requi
     wss_sni = str(wss.get("sni") or "").strip()
     wss_tls = bool(wss.get("tls", True))
     wss_insecure = bool(wss.get("insecure", False))
+
+    # UI may leave WSS Host/Path/SNI empty. Auto-fill with random params so
+    # users can quickly create a tunnel without understanding every field.
+    if (not wss_host) or (not wss_path) or (not wss_sni):
+        rh, rp, rs = _random_wss_params()
+        if not wss_host:
+            # if user only filled SNI, treat it as host
+            wss_host = wss_sni or rh
+        if not wss_path:
+            wss_path = rp
+        # Normalize
+        if wss_path and not wss_path.startswith("/"):
+            wss_path = "/" + wss_path
+        if not wss_sni:
+            wss_sni = wss_host or rs
+
+    # Always normalize: path must start with '/'
+    if wss_path and not wss_path.startswith("/"):
+        wss_path = "/" + wss_path
+    if not wss_sni:
+        wss_sni = wss_host
 
     if not listen:
         return JSONResponse({"ok": False, "error": "listen 不能为空"}, status_code=400)

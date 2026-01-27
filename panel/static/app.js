@@ -1172,6 +1172,32 @@ ${endpointType(e)}`.toLowerCase();
 function openModal(){ q('modal').style.display = 'flex'; }
 function closeModal(){ q('modal').style.display = 'none'; q('modalMsg').textContent=''; }
 
+// Rule editor: separate screens to reduce information density
+// - params: fill in fields
+// - intro : mode selection + explanations
+function setRuleScreen(screen){
+  const s = (String(screen||'').trim() === 'intro') ? 'intro' : 'params';
+  const intro = document.getElementById('ruleScreenIntro');
+  const params = document.getElementById('ruleScreenParams');
+  if(intro) intro.style.display = (s === 'intro') ? 'block' : 'none';
+  if(params) params.style.display = (s === 'params') ? 'block' : 'none';
+
+  const tabIntro = document.getElementById('ruleTabIntro');
+  const tabParams = document.getElementById('ruleTabParams');
+  if(tabIntro){
+    tabIntro.classList.toggle('active', s === 'intro');
+    tabIntro.setAttribute('aria-selected', (s === 'intro') ? 'true' : 'false');
+  }
+  if(tabParams){
+    tabParams.classList.toggle('active', s === 'params');
+    tabParams.setAttribute('aria-selected', (s === 'params') ? 'true' : 'false');
+  }
+
+  // Keep hints / pill / guide in sync
+  try{ syncTunnelModeUI(); }catch(_e){}
+}
+window.setRuleScreen = setRuleScreen;
+
 // Basic loading state helper (used by WSS auto-sync operations)
 // - Disable the modal save button to prevent double submit
 // - Show a short message in the modal
@@ -1289,6 +1315,16 @@ function syncTunnelModeUI(){
   const sel = q('f_type');
   if(!sel) return;
   const mode = String(sel.value || 'tcp').trim() || 'tcp';
+
+  // Compact mode pill (params screen)
+  const modePill = document.getElementById('currentModePill');
+  const modeSub = document.getElementById('currentModeSub');
+  if(modePill){
+    modePill.textContent = (mode === 'wss') ? 'WSS 隧道' : (mode === 'intranet') ? '内网穿透' : '普通转发';
+  }
+  if(modeSub){
+    modeSub.textContent = (mode === 'wss') ? '发送机 ↔ 接收机' : (mode === 'intranet') ? '公网入口 ↔ 内网出口' : '单机监听 → 目标';
+  }
 
   // Mode cards
   const wrap = document.getElementById('modeSwitch');
@@ -1465,35 +1501,93 @@ function randomToken(len){
   return Math.random().toString(36).slice(2, 2 + len);
 }
 
-function randomizeWss(){
-  const hosts = [
-    'cdn.jsdelivr.net',
-    'assets.cloudflare.com',
-    'edge.microsoft.com',
-    'static.cloudflareinsights.com',
-    'ajax.googleapis.com',
-    'fonts.gstatic.com',
-    'images.unsplash.com',
-    'cdn.discordapp.com',
-  ];
-  const pathTemplates = [
-    '/ws',
-    '/ws/{token}',
-    '/socket',
-    '/socket/{token}',
-    '/connect',
-    '/gateway',
-    '/api/ws',
-    '/v1/ws/{token}',
-    '/edge/{token}',
-  ];
-  const pick = hosts[Math.floor(Math.random() * hosts.length)];
+// WSS 参数：随机生成（用于一键填充/留空自动补全）
+const WSS_RANDOM_HOSTS = [
+  'cdn.jsdelivr.net',
+  'assets.cloudflare.com',
+  'edge.microsoft.com',
+  'static.cloudflareinsights.com',
+  'ajax.googleapis.com',
+  'fonts.gstatic.com',
+  'images.unsplash.com',
+  'cdn.discordapp.com',
+];
+
+const WSS_RANDOM_PATH_TPL = [
+  '/ws',
+  '/ws/{token}',
+  '/socket',
+  '/socket/{token}',
+  '/connect',
+  '/gateway',
+  '/api/ws',
+  '/v1/ws/{token}',
+  '/edge/{token}',
+];
+
+function genWssRandomParams(){
+  const host = WSS_RANDOM_HOSTS[Math.floor(Math.random() * WSS_RANDOM_HOSTS.length)];
   const token = randomToken(10);
-  const tpl = pathTemplates[Math.floor(Math.random() * pathTemplates.length)];
-  const path = tpl.replace('{token}', token);
-  setField('f_wss_host', pick);
-  setField('f_wss_path', path);
-  setField('f_wss_sni', pick);
+  const tpl = WSS_RANDOM_PATH_TPL[Math.floor(Math.random() * WSS_RANDOM_PATH_TPL.length)];
+  let path = String(tpl || '/ws').replace('{token}', token);
+  if(path && !path.startsWith('/')) path = '/' + path;
+  return { host, path, sni: host };
+}
+
+// If user leaves host/path/sni empty, auto-fill on save.
+// Return true if any field was auto-filled.
+function autoFillWssIfBlank(){
+  try{
+    const hostEl = q('f_wss_host');
+    const pathEl = q('f_wss_path');
+    const sniEl = q('f_wss_sni');
+    if(!hostEl || !pathEl || !sniEl) return false;
+
+    let host = hostEl.value.trim();
+    let path = pathEl.value.trim();
+    let sni = sniEl.value.trim();
+
+    // Normalize: path must start with /
+    if(path && !path.startsWith('/')){
+      path = '/' + path;
+      pathEl.value = path;
+    }
+
+    if(host && path && sni) return false;
+
+    const rnd = genWssRandomParams();
+    let changed = false;
+
+    if(!host){
+      // If user only filled SNI, use it as host for consistency
+      host = sni || rnd.host;
+      hostEl.value = host;
+      changed = true;
+    }
+
+    if(!path){
+      path = rnd.path;
+      pathEl.value = path;
+      changed = true;
+    }
+
+    if(!sni){
+      sni = host || rnd.sni;
+      sniEl.value = sni;
+      changed = true;
+    }
+
+    return changed;
+  }catch(_e){
+    return false;
+  }
+}
+
+function randomizeWss(){
+  const p = genWssRandomParams();
+  setField('f_wss_host', p.host);
+  setField('f_wss_path', p.path);
+  setField('f_wss_sni', p.sni);
   q('f_wss_tls').value = '1';
   q('f_wss_insecure').checked = true;
 }
@@ -1528,6 +1622,7 @@ function newRule(){
   fillWssFields({});
   fillIntranetFields({});
   showWssBox();
+  try{ setRuleScreen('intro'); }catch(_e){}
   openModal();
 }
 
@@ -1571,6 +1666,7 @@ function editRule(idx){
     fillIntranetFields({});
   }
   showWssBox();
+  try{ setRuleScreen('params'); }catch(_e){}
   openModal();
 }
 
@@ -1762,10 +1858,14 @@ async function saveRule(){
       return;
     }
     const receiverPortTxt = q('f_wss_receiver_port') ? q('f_wss_receiver_port').value.trim() : '';
+    const autoFilled = autoFillWssIfBlank();
     const wss = readWssFields();
     if(!wss.host || !wss.path){
       toast('WSS Host / Path 不能为空', true);
       return;
+    }
+    if(autoFilled){
+      toast('WSS Host/Path/SNI 留空已自动生成');
     }
     let syncId = '';
     if(CURRENT_EDIT_INDEX >= 0){
