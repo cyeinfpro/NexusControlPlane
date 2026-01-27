@@ -235,8 +235,11 @@
     <div class="form">
       <div class="row" style="gap:12px;">
         <div class="col">
-          <label class="label">监听（例如 0.0.0.0:443）</label>
+          <label class="label" id="listenLabel">
+            <span id="listenLabelMain">监听</span> <span class="muted sm" id="listenLabelExample">（例如 0.0.0.0:443）</span>
+          </label>
           <input class="input" id="f_listen" placeholder="0.0.0.0:443">
+          <div class="help" id="listenHelp"></div>
         </div>
         <div class="col" style="max-width:220px;">
           <label class="label">状态</label>
@@ -247,8 +250,11 @@
         </div>
       </div>
 
-      <label class="label">目标地址（Remote，每行一个 host:port）</label>
+      <label class="label" id="remoteLabel">
+        <span id="remoteLabelMain">目标地址</span> <span class="muted sm" id="remoteLabelExtra">（Remote，每行一个 host:port）</span>
+      </label>
       <textarea class="textarea" id="f_remotes" rows="5" placeholder="203.0.113.10:443\n198.51.100.8:443"></textarea>
+      <div class="help" id="remoteHelp"></div>
 
       <div class="row" style="gap:12px;">
         <div class="col" style="max-width:220px;">
@@ -272,12 +278,59 @@
         </div>
       </div>
 
-      <label class="label">隧道模式</label>
-      <select class="select" id="f_type">
+      <label class="label">转发模式</label>
+      <div class="mode-switch" id="modeSwitch" role="tablist" aria-label="转发模式选择">
+        <button class="mode-card active" type="button" data-mode="tcp" role="tab" aria-selected="true">
+          <div class="mode-card-head">
+            <div class="mode-ico">⚡</div>
+            <div class="mode-card-txt">
+              <div class="mode-title">普通转发</div>
+              <div class="mode-sub">单机监听 → 目标</div>
+            </div>
+          </div>
+          <div class="mode-tags">
+            <span class="mode-tag">最常用</span>
+            <span class="mode-tag">单节点</span>
+          </div>
+        </button>
+
+        <button class="mode-card" type="button" data-mode="wss" role="tab" aria-selected="false">
+          <div class="mode-card-head">
+            <div class="mode-ico">🛡️</div>
+            <div class="mode-card-txt">
+              <div class="mode-title">WSS 隧道</div>
+              <div class="mode-sub">发送机 ↔ 接收机（自动同步）</div>
+            </div>
+          </div>
+          <div class="mode-tags">
+            <span class="mode-tag">伪装</span>
+            <span class="mode-tag">双端</span>
+          </div>
+        </button>
+
+        <button class="mode-card" type="button" data-mode="intranet" role="tab" aria-selected="false">
+          <div class="mode-card-head">
+            <div class="mode-ico">🏠</div>
+            <div class="mode-card-txt">
+              <div class="mode-title">内网穿透</div>
+              <div class="mode-sub">公网入口 ↔ 内网出口（自动同步）</div>
+            </div>
+          </div>
+          <div class="mode-tags">
+            <span class="mode-tag">暴露内网</span>
+            <span class="mode-tag">双端</span>
+          </div>
+        </button>
+      </div>
+
+      <!-- 保留原 select（JS/接口依赖 #f_type），仅隐藏不展示 -->
+      <select class="select" id="f_type" style="display:none;">
         <option value="tcp">TCP/UDP</option>
         <option value="wss">WSS 隧道</option>
         <option value="intranet">内网穿透</option>
       </select>
+
+      <div id="modeGuide" class="mode-guide" aria-live="polite"></div>
 
       <div id="wssBox" style="display:none;">
 
@@ -412,7 +465,7 @@
 {% endblock %}
 
 {% block scripts %}
-<script src="/static/app.js?v=44.0"></script>
+<script src="/static/app.js?v=45.0"></script>
 <script>
 window.__NODE_ID__ = {{ node.id }};
 window.__NODE_IP__ = {{ (node.display_ip or node.name)|tojson }};

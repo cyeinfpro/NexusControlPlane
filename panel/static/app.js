@@ -21,6 +21,7 @@ async function loadNodesList(){
       NODES_LIST = data.nodes;
       populateReceiverSelect();
       populateIntranetReceiverSelect();
+      try{ syncTunnelModeUI(); }catch(_e){}
     }
   }catch(e){
     // ignore
@@ -1268,7 +1269,197 @@ function showWssBox(){
   if(autoBox){
     autoBox.style.display = (mode === 'wss') ? 'flex' : 'none';
   }
+
+  // Update mode cards / guide / dynamic hints (new UI)
+  try{ syncTunnelModeUI(); }catch(_e){}
 }
+
+
+
+// -------------------- Tunnel mode UX (3 modes) --------------------
+
+function setTunnelMode(mode){
+  const m = ['tcp','wss','intranet'].includes(String(mode||'').trim()) ? String(mode||'').trim() : 'tcp';
+  if(q('f_type')) q('f_type').value = m;
+  showWssBox();
+}
+
+// Sync mode cards + dynamic hints/guide in rule modal
+function syncTunnelModeUI(){
+  const sel = q('f_type');
+  if(!sel) return;
+  const mode = String(sel.value || 'tcp').trim() || 'tcp';
+
+  // Mode cards
+  const wrap = document.getElementById('modeSwitch');
+  if(wrap){
+    wrap.querySelectorAll('.mode-card').forEach((btn)=>{
+      const m = btn.getAttribute('data-mode');
+      const on = (m === mode);
+      btn.classList.toggle('active', on);
+      btn.setAttribute('aria-selected', on ? 'true' : 'false');
+    });
+  }
+
+  const listenHelp = document.getElementById('listenHelp');
+  const remoteHelp = document.getElementById('remoteHelp');
+  const remoteMain = document.getElementById('remoteLabelMain');
+  const remoteExtra = document.getElementById('remoteLabelExtra');
+  const listenMain = document.getElementById('listenLabelMain');
+  const listenExample = document.getElementById('listenLabelExample');
+
+  const remEl = q('f_remotes');
+  const lisEl = q('f_listen');
+
+  const setText = (el, t)=>{ if(el) el.textContent = t || ''; };
+  const setHtml = (el, h)=>{ if(el) el.innerHTML = h || ''; };
+
+  if(mode === 'wss'){
+    if(remoteMain) remoteMain.textContent = '最终目标';
+    if(remoteExtra) remoteExtra.textContent = '（由接收机转发，每行一个 host:port）';
+    if(listenMain) listenMain.textContent = '监听';
+    if(listenExample) listenExample.textContent = '（发送机对外端口，例如 0.0.0.0:443）';
+    if(remEl) remEl.placeholder = '例如：10.0.0.10:443\n10.0.0.11:443';
+    if(lisEl && !lisEl.placeholder) lisEl.placeholder = '0.0.0.0:443';
+    setText(listenHelp, '这里填“发送机”（当前节点）对外开放的端口；客户端会连接到这里。');
+
+    const optCount = q('f_wss_receiver_node') ? q('f_wss_receiver_node').querySelectorAll('option').length : 0;
+    const extraHint = optCount <= 1 ? '<div class="help">提示：接收机列表为空？先在左侧“节点列表”接入另一台节点，或检查节点是否在线。</div>' : '';
+    setHtml(remoteHelp, '这里填“最终目标”地址（接收机节点能够访问的地址）。多行会做负载均衡。' + extraHint);
+  } else if(mode === 'intranet'){
+    if(remoteMain) remoteMain.textContent = '内网目标';
+    if(remoteExtra) remoteExtra.textContent = '（内网出口节点可达，每行一个 host:port）';
+    if(listenExample) listenExample.textContent = '（公网入口对外端口，例如 0.0.0.0:443）';
+    if(remEl) remEl.placeholder = '例如：192.168.1.10:80\n10.0.0.5:443';
+    setText(listenHelp, '这里填“公网入口”（当前节点）对外开放的端口；外部用户会连接到这里。');
+
+    const optCount = q('f_intranet_receiver_node') ? q('f_intranet_receiver_node').querySelectorAll('option').length : 0;
+    const extraHint = optCount <= 1 ? '<div class="help">提示：下拉框为空？请先编辑内网节点，勾选“内网机器（用于内网穿透出口）”。</div>' : '';
+    setHtml(remoteHelp, '这里填“内网目标”地址（由内网出口节点转发到这些地址）。' + extraHint);
+  } else {
+    if(remoteMain) remoteMain.textContent = '目标地址';
+    if(remoteExtra) remoteExtra.textContent = '（Remote，每行一个 host:port）';
+    if(listenExample) listenExample.textContent = '（例如 0.0.0.0:443）';
+    if(remEl) remEl.placeholder = '203.0.113.10:443\n198.51.100.8:443';
+    setText(listenHelp, '这里填当前节点监听地址。常用：0.0.0.0:端口（监听所有网卡）。');
+    setText(remoteHelp, '每行一个目标地址；多行将启用负载均衡（轮询/IP Hash/权重）。');
+  }
+
+  renderModeGuide(mode);
+}
+
+function _findNodeNameById(id){
+  const rid = String(id || '').trim();
+  if(!rid) return '';
+  const list = Array.isArray(window.NODES_LIST) ? window.NODES_LIST : [];
+  for(const n of list){
+    if(String(n.id) === rid){
+      return n.name || n.display_ip || ('节点-' + n.id);
+    }
+  }
+  return '';
+}
+
+function renderModeGuide(mode){
+  const box = document.getElementById('modeGuide');
+  if(!box) return;
+
+  const nodeName = (window.__NODE_NAME__ && String(window.__NODE_NAME__).trim()) ? String(window.__NODE_NAME__).trim() : (window.__NODE_IP__ || '当前节点');
+
+  let title = '';
+  let desc = '';
+  let diagram = '';
+  let steps = [];
+  let ico = '⚡';
+
+  if(mode === 'wss'){
+    ico = '🛡️';
+    title = 'WSS 隧道（发送机 ↔ 接收机）';
+    desc = '适用于需要“伪装/隐藏传输”或跨网络环境转发。保存后会自动在接收机生成对应规则（只读锁定），后续暂停/删除会同步两端。';
+    diagram = `客户端 → 发送机 ${nodeName} 监听 Listen\n  ⇒ (WSS: Host/Path/TLS) ⇒ 接收机 监听端口\n    → 最终目标 Remotes`;
+    steps = [
+      '先选择 <b>接收机节点</b>（面板会自动同步配置到接收机）。',
+      '填写 WSS 参数：<b>Host/Path/SNI</b>（可点“随机生成参数”快速填充）。',
+      'Remote 填 <b>最终目标</b>（接收机能访问的地址）。多行可负载均衡。',
+      '如遇证书/兼容性问题，可勾选“跳过证书校验”（安全性会下降）。',
+    ];
+  } else if(mode === 'intranet'){
+    ico = '🏠';
+    title = '内网穿透（公网入口A ↔ 内网出口B）';
+    desc = '适用于把内网服务暴露到公网：公网入口节点 A 对外监听，内网出口节点 B 主动连回 A，并将流量转发到内网目标。';
+    diagram = `公网用户 → 公网入口 A（当前节点）监听 Listen\n  ⇒ (加密隧道: B 主动连回 A 的端口) ⇒ 内网出口 B\n    → 内网目标 Remotes`;
+    steps = [
+      '先在内网节点 B 的“编辑节点”里勾选 <b>内网机器</b>，这样它才会出现在下拉框。',
+      '在本节点（公网入口 A）选择对应的 <b>内网出口节点</b>。',
+      '在 A 放行“隧道服务端端口”（默认 18443），确保 B 能连上 A。',
+      'Remote 填 <b>内网目标</b>（B 内网可达地址，如 192.168.x.x:80）。',
+    ];
+  } else {
+    ico = '⚡';
+    title = '普通转发（单机）';
+    desc = '最常用：当前节点监听一个端口，并直接转发到一个或多个目标地址。';
+    diagram = `客户端 → 当前节点 ${nodeName} 监听 Listen → 目标 Remotes`;
+    steps = [
+      'Listen 填本机要开放的端口（例如 0.0.0.0:443）。',
+      'Remote 每行一个目标地址（host:port）。多行将启用负载均衡。',
+      '需要按来源 IP 固定落点时用“IP Hash”；否则建议轮询。',
+      '不需要 UDP 时，协议选 TCP 更省资源（可选）。',
+    ];
+  }
+
+  const stepsHtml = steps.map((s, i)=>`<div class=\"mode-step\"><span class=\"num\">${i+1}</span><div class=\"txt\">${s}</div></div>`).join('');
+  box.innerHTML = `
+    <div class=\"mode-guide-head\">
+      <div class=\"mode-ico\">${ico}</div>
+      <div style=\"min-width:0;\">
+        <div class=\"mode-guide-title\">${title}</div>
+        <div class=\"mode-guide-desc\">${desc}</div>
+      </div>
+    </div>
+    <div class=\"mode-diagram\">${escapeHtml(diagram)}</div>
+    <div class=\"mode-steps\">${stepsHtml}</div>
+    <div class=\"mode-preview\" id=\"modeGuidePreview\"></div>
+  `;
+
+  updateModePreview();
+}
+
+function _splitLines(raw){
+  return String(raw || '').split(/\n/).map(x=>x.trim()).filter(Boolean).map(x=>x.replace('\\r',''));
+}
+
+function updateModePreview(){
+  const el = document.getElementById('modeGuidePreview');
+  if(!el) return;
+
+  const mode = q('f_type') ? String(q('f_type').value || 'tcp').trim() : 'tcp';
+  const listen = q('f_listen') ? q('f_listen').value.trim() : '';
+  const remotes = _splitLines(q('f_remotes') ? q('f_remotes').value : '');
+  const n = remotes.length;
+  const nodeName = (window.__NODE_NAME__ && String(window.__NODE_NAME__).trim()) ? String(window.__NODE_NAME__).trim() : (window.__NODE_IP__ || '当前节点');
+
+  if(mode === 'wss'){
+    const rid = q('f_wss_receiver_node') ? q('f_wss_receiver_node').value.trim() : '';
+    const recvName = _findNodeNameById(rid) || (rid ? ('节点-' + rid) : '未选择');
+    const rport = q('f_wss_receiver_port') ? q('f_wss_receiver_port').value.trim() : '';
+    const portText = rport ? rport : '（与 Listen 一致）';
+    el.innerHTML = `预览：发送机 <b>${escapeHtml(nodeName)}</b> 监听 <span class=\"mono\">${escapeHtml(listen||'—')}</span> ⇒ WSS ⇒ 接收机 <b>${escapeHtml(recvName)}</b> 端口 <span class=\"mono\">${escapeHtml(portText)}</span> → 目标 <b>${n}</b> 个`;
+    return;
+  }
+
+  if(mode === 'intranet'){
+    const rid = q('f_intranet_receiver_node') ? q('f_intranet_receiver_node').value.trim() : '';
+    const recvName = _findNodeNameById(rid) || (rid ? ('节点-' + rid) : '未选择');
+    const sport = q('f_intranet_server_port') ? q('f_intranet_server_port').value.trim() : '';
+    const shost = q('f_intranet_server_host') ? q('f_intranet_server_host').value.trim() : '';
+    el.innerHTML = `预览：公网入口 <b>${escapeHtml(nodeName)}</b> 监听 <span class=\"mono\">${escapeHtml(listen||'—')}</span> ⇒ 隧道端口 <span class=\"mono\">${escapeHtml(sport||'18443')}</span>${shost ? (' · 公网地址 <span class=\"mono\">' + escapeHtml(shost) + '</span>') : ''} ⇒ 内网出口 <b>${escapeHtml(recvName)}</b> → 内网目标 <b>${n}</b> 个`;
+    return;
+  }
+
+  el.innerHTML = `预览：当前节点 <b>${escapeHtml(nodeName)}</b> 监听 <span class=\"mono\">${escapeHtml(listen||'—')}</span> → 目标 <b>${n}</b> 个`;
+}
+
+window.setTunnelMode = setTunnelMode;
 
 function randomToken(len){
   return Math.random().toString(36).slice(2, 2 + len);
@@ -1912,6 +2103,26 @@ function initNodePage(){
   }
   q('f_type').addEventListener('change', showWssBox);
   if(q('f_wss_receiver_node')) q('f_wss_receiver_node').addEventListener('change', showWssBox);
+
+  // Tunnel mode switcher cards (new UI)
+  document.querySelectorAll('#modeSwitch .mode-card').forEach(btn=>{
+    btn.addEventListener('click', ()=>{
+      const mode = btn.getAttribute('data-mode');
+      setTunnelMode(mode);
+    });
+  });
+
+  // Update mode preview as you type/select
+  ['f_listen','f_remotes','f_wss_receiver_node','f_wss_receiver_port','f_intranet_receiver_node','f_intranet_server_port','f_intranet_server_host'].forEach((id)=>{
+    const el = document.getElementById(id);
+    if(!el) return;
+    const fn = ()=>{ try{ updateModePreview(); }catch(_e){} };
+    el.addEventListener('input', fn);
+    el.addEventListener('change', fn);
+  });
+
+  // Initial render for mode guide/hints
+  try{ syncTunnelModeUI(); }catch(_e){}
 
   // ✅ Load nodes list for WSS auto-sync receiver selector
   // (otherwise the receiver dropdown stays empty and cannot be selected)
