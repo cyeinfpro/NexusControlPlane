@@ -872,6 +872,9 @@ class _TunnelClient:
                     echo_ts = int(m.get('echo_ts') or 0)
                     if echo_ts > 0:
                         self._set_state(rtt_ms=max(0, _now_ms() - echo_ts))
+                        # Also report RTT to server side for panel visibility.
+                        # Transport is plain TCP, so we keep it lightweight.
+                        _send_json_line(sock, {'t': 'pong', 'echo_ts': echo_ts})
                     self._set_state(last_pong_at=_now_ms())
                     continue
 
@@ -1147,6 +1150,8 @@ class IntranetManager:
             if not c:
                 c = _TunnelClient(peer_host=r.peer_host, peer_port=r.tunnel_port, token=r.token, node_id=self.node_id)
                 c.start()
+            # IMPORTANT: keep reference so status/health can observe it
+            self._clients[key] = c
             desired[key] = c
 
         for key in list(self._clients.keys()):
