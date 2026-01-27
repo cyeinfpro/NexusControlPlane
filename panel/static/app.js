@@ -2355,6 +2355,100 @@ async function restoreFromText(){
   }
 }
 
+
+
+function _parseDispositionFilename(disposition){
+  try{
+    const d = String(disposition||'');
+    // filename*=UTF-8''...
+    let m = d.match(/filename\*\s*=\s*UTF-8''([^;]+)/i);
+    if(m && m[1]){
+      return decodeURIComponent(m[1].trim().replace(/(^"|"$)/g,''));
+    }
+    m = d.match(/filename\s*=\s*"([^"]+)"/i);
+    if(m && m[1]) return m[1].trim();
+    m = d.match(/filename\s*=\s*([^;]+)/i);
+    if(m && m[1]) return m[1].trim().replace(/(^"|"$)/g,'');
+  }catch(_e){}
+  return '';
+}
+
+function _downloadBlob(blob, filename){
+  try{
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename || 'realm-backup.json';
+    a.style.display = 'none';
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(()=>{
+      try{ URL.revokeObjectURL(url); }catch(_e){}
+      try{ a.remove(); }catch(_e){}
+    }, 800);
+    return true;
+  }catch(_e){
+    return false;
+  }
+}
+
+async function clearAllRulesForNode(){
+  const nodeId = window.__NODE_ID__;
+  const nodeName = (window.__NODE_NAME__ && String(window.__NODE_NAME__).trim())
+    ? String(window.__NODE_NAME__).trim()
+    : (window.__NODE_IP__ || '当前节点');
+
+  if(!nodeId){
+    alert('缺少节点 ID');
+    return;
+  }
+
+  const ok1 = confirm(`危险操作：将清空「${nodeName}」上的全部规则（包含锁定同步规则）。
+
+系统将先自动下载一份规则备份，然后再执行清空。
+
+是否继续？`);
+  if(!ok1) return;
+
+  const input = prompt('请输入 “确认删除” 以继续：');
+  if(String(input || '').trim() !== '确认删除'){
+    toast('已取消', true);
+    return;
+  }
+
+  // 1) Backup download
+  toast('正在备份并下载…');
+  try{
+    const resp = await fetch(`/api/nodes/${nodeId}/backup`, { credentials: 'same-origin' });
+    if(!resp.ok){
+      const t = await resp.text();
+      throw new Error(t || `备份失败 HTTP ${resp.status}`);
+    }
+    const blob = await resp.blob();
+    const disp = resp.headers.get('Content-Disposition') || resp.headers.get('content-disposition') || '';
+    const fname = _parseDispositionFilename(disp) || `realm-rules-node-${nodeId}.json`;
+    const dlOk = _downloadBlob(blob, fname);
+    if(!dlOk) throw new Error('备份下载触发失败（浏览器拦截）');
+  }catch(e){
+    toast('备份失败：' + (e && e.message ? e.message : String(e)), true);
+    return;
+  }
+
+  // 2) Clear all rules (including locked)
+  toast('正在清空规则…');
+  try{
+    const res = await fetchJSON(`/api/nodes/${nodeId}/pool/clear_all`, { method:'POST', body: '{}' });
+    if(res && res.ok){
+      toast('已清空规则（已先下载备份）');
+      try{ await loadPool(); }catch(_e){}
+      return;
+    }
+    throw new Error(res && res.error ? res.error : '清空失败');
+  }catch(e){
+    toast('清空失败：' + (e && e.message ? e.message : String(e)), true);
+  }
+}
+
 async function refreshStats(){
   const id = window.__NODE_ID__;
   const loading = q('statsLoading');
@@ -2540,6 +2634,7 @@ window.closeModal = closeModal;
 window.toggleRule = toggleRule;
 window.deleteRule = deleteRule;
 window.triggerRestore = triggerRestore;
+window.clearAllRulesForNode = clearAllRulesForNode;
 window.openRestoreModal = openRestoreModal;
 window.closeRestoreModal = closeRestoreModal;
 window.restoreFromText = restoreFromText;
@@ -3549,12 +3644,95 @@ function closeAllMenus(except){
   }catch(_e){}
 }
 
+function _resetMenuPopover(detailsEl){
+  try{
+    const pop = detailsEl && detailsEl.querySelector ? detailsEl.querySelector('.menu-pop') : null;
+    if(!pop) return;
+    pop.style.position = '';
+    pop.style.left = '';
+    pop.style.right = '';
+    pop.style.top = '';
+    pop.style.bottom = '';
+    pop.style.maxHeight = '';
+    pop.style.overflowY = '';
+    pop.style.width = '';
+    pop.style.zIndex = '';
+  }catch(_e){}
+}
+
+function fitMenuPopover(detailsEl){
+  try{
+    const pop = detailsEl && detailsEl.querySelector ? detailsEl.querySelector('.menu-pop') : null;
+    const sum = detailsEl && detailsEl.querySelector ? detailsEl.querySelector('summary') : null;
+    if(!pop) return;
+
+    const vw = window.innerWidth || document.documentElement.clientWidth || 0;
+    const vh = window.innerHeight || document.documentElement.clientHeight || 0;
+
+    // Small screen: use bottom-sheet style to avoid any overflow/cropping
+    if(vw && vw <= 520){
+      pop.style.position = 'fixed';
+      pop.style.left = '12px';
+      pop.style.right = '12px';
+      pop.style.bottom = '12px';
+      pop.style.top = 'auto';
+      pop.style.width = 'auto';
+      pop.style.maxHeight = `calc(${vh || 100}vh - 24px)`;
+      pop.style.overflowY = 'auto';
+      pop.style.zIndex = '1000';
+      return;
+    }
+
+    // Default: absolute dropdown; if it would overflow the viewport, flip/shift.
+    pop.style.position = '';
+    pop.style.left = '';
+    pop.style.right = '';
+    pop.style.top = '';
+    pop.style.bottom = '';
+    pop.style.maxHeight = '';
+    pop.style.overflowY = '';
+    pop.style.width = '';
+    pop.style.zIndex = '';
+
+    // Wait for layout
+    requestAnimationFrame(()=>{
+      try{
+        const pr = pop.getBoundingClientRect();
+        const sr = sum ? sum.getBoundingClientRect() : detailsEl.getBoundingClientRect();
+        // Horizontal clamp
+        if(pr.right > vw - 8){
+          pop.style.right = '0';
+          pop.style.left = 'auto';
+        }
+        if(pr.left < 8){
+          pop.style.left = '0';
+          pop.style.right = 'auto';
+        }
+        // Vertical flip if bottom overflows and there's room above
+        const pr2 = pop.getBoundingClientRect();
+        if(pr2.bottom > vh - 8 && sr.top > pr2.height + 12){
+          pop.style.top = 'auto';
+          pop.style.bottom = 'calc(100% + 8px)';
+        }else{
+          pop.style.bottom = '';
+        }
+      }catch(_e){}
+    });
+  }catch(_e){}
+}
+
+
 // 当某个 menu 打开时，关掉其它 menu
 document.addEventListener('toggle', (e)=>{
   const t = e.target;
   if(!(t instanceof HTMLElement)) return;
-  if(t.matches && t.matches('details.menu') && t.open){
-    closeAllMenus(t);
+  if(t.matches && t.matches('details.menu')){
+    if(t.open){
+      closeAllMenus(t);
+      try{ fitMenuPopover(t); }catch(_e){}
+    }else{
+      try{ _resetMenuPopover(t); }catch(_e){}
+    }
   }
 }, true);
 

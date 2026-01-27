@@ -86,6 +86,10 @@
                 <a class="menu-item" href="/api/nodes/{{ node.id }}/backup">备份规则 <span class="muted sm">下载</span></a>
                 <button class="menu-item" type="button" id="restoreRulesBtn" onclick="triggerRestore()">恢复规则 <span class="muted sm">粘贴</span></button>
                 <div class="menu-sep"></div>
+                <button class="menu-item" type="button" onclick="clearAllRulesForNode()" style="color:var(--bad);">
+                  清空本节点全部规则 <span class="muted sm">含锁定</span>
+                </button>
+                <div class="menu-sep"></div>
                 <form method="post" action="/nodes/{{ node.id }}/delete" style="margin:0;">
                   <button class="menu-item" type="submit" onclick="return confirm('确认移除该节点？
 
@@ -510,7 +514,7 @@
 {% endblock %}
 
 {% block scripts %}
-<script src="/static/app.js?v=49.0"></script>
+<script src="/static/app.js?v=50.0"></script>
 <script>
 window.__NODE_ID__ = {{ node.id }};
 window.__NODE_IP__ = {{ (node.display_ip or node.name)|tojson }};
