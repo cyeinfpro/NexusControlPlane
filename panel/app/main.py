@@ -932,26 +932,39 @@ async def api_agent_report(request: Request, payload: Dict[str, Any]):
         pass
 
     # Persist agent version + update status (best-effort)
-    # ⚠️ 注意：面板触发新一轮更新（desired_agent_update_id 改变）时，
-    # agent 可能还在上报「旧 update_id=...」的 done 状态。
-    # 这会把面板刚设置的 queued 覆盖掉，导致新更新任务被误判为“已完成”。
-    # 解决：仅当 agent 上报的 update_id 为空，或与 desired_update_id 一致时，才更新 state/msg。
+    # ⚠️ 关键：面板触发新一轮更新（desired_agent_update_id 改变）时，
+    # Agent 可能还在上报「上一轮」的状态（甚至旧版本 Agent 的状态里没有 update_id）。
+    # 如果直接用 agent_update.state 覆盖 DB，就会把面板刚设置的 queued/sent 覆盖成 done，
+    # 从而出现“下发完就显示完成”。
+    # 解决：
+    #   - 若面板当前存在 desired_update_id：只接受 update_id == desired_update_id 的状态回报。
+    #   - 若面板未在滚动更新：允许无 update_id 的旧状态回报（仅用于展示历史状态）。
     try:
         desired_update_id_now = str(node.get('desired_agent_update_id') or '').strip()
         rep_update_id = str(agent_update.get('update_id') or '').strip() if isinstance(agent_update, dict) else ''
         st = str(agent_update.get('state') or '').strip() if isinstance(agent_update, dict) else ''
         msg = str(agent_update.get('error') or agent_update.get('msg') or '').strip() if isinstance(agent_update, dict) else ''
 
-        if (not desired_update_id_now) or (not rep_update_id) or (rep_update_id == desired_update_id_now):
+        if desired_update_id_now:
+            # 正在更新：必须强制对齐 update_id，否则视为“旧状态/噪声”不覆盖
+            if rep_update_id and rep_update_id == desired_update_id_now:
+                update_agent_status(
+                    node_id=node_id,
+                    agent_reported_version=agent_version or None,
+                    state=st or None,
+                    msg=msg or None,
+                )
+            else:
+                # 仅更新版本号，不覆盖面板当前批次的状态
+                update_agent_status(node_id=node_id, agent_reported_version=agent_version or None)
+        else:
+            # 未处于滚动更新中：允许旧版 agent（无 update_id）也能回报“上次更新状态”
             update_agent_status(
                 node_id=node_id,
                 agent_reported_version=agent_version or None,
                 state=st or None,
                 msg=msg or None,
             )
-        else:
-            # 仅更新版本号，不覆盖面板当前批次的状态
-            update_agent_status(node_id=node_id, agent_reported_version=agent_version or None)
     except Exception:
         pass
 
