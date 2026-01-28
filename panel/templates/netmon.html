@@ -6,100 +6,100 @@
   <div class="page-title">
     <h1 class="h1">网络波动监控</h1>
     <div class="meta">
-      <span class="meta-item">选择节点，对目标 IP 进行 ping / tcping，按时间绘制延迟波动曲线（多节点同图对比）。</span>
+      <span class="meta-item">后台持续采集 · 打开页面可直接查看历史曲线（时间-延迟坐标图）。每个目标一张图，多节点同图对比。</span>
     </div>
   </div>
-  <div class="right">
+  <div class="right" style="display:flex; gap:10px;">
+    <button class="btn sm" type="button" id="netmonNewBtn">新建监控</button>
     <a class="btn sm secondary" href="/">返回控制台</a>
   </div>
 </div>
 
-<div class="split-layout netmon-layout">
-  <!-- Left: config -->
-  <aside class="card node-sidebar netmon-sidebar">
-    <div class="card-header">
-      <div style="min-width:0;">
-        <div class="card-title">监控配置</div>
-        <div class="card-sub">目标每行一个 · 一条目标对应一张图</div>
-      </div>
-      <div class="right" style="flex:0 0 auto; display:flex; gap:8px;">
-        <button class="btn xs" type="button" id="netmonStartBtn">开始</button>
-        <button class="btn xs ghost" type="button" id="netmonStopBtn" disabled>停止</button>
-      </div>
+<div class="card netmon-toolbar">
+  <div class="row" style="gap:12px; flex-wrap:wrap; align-items:flex-end;">
+    <div class="col" style="max-width:180px;">
+      <label class="label">展示窗口</label>
+      <input class="input" id="netmonViewWindow" type="number" min="1" max="1440" value="10">
+      <div class="help">单位：分钟（仅影响图表展示，不影响后台采集）</div>
+    </div>
+    <div class="col" style="max-width:200px;">
+      <label class="label">自动刷新</label>
+      <select class="select" id="netmonAutoRefresh">
+        <option value="on">开启（2s）</option>
+        <option value="off">关闭</option>
+      </select>
+    </div>
+    <div class="col" style="max-width:200px;">
+      <button class="btn sm ghost" type="button" id="netmonRefreshBtn">立即刷新</button>
+    </div>
+    <div class="col" style="min-width:220px;">
+      <div class="muted sm" id="netmonStatus">加载中…</div>
+    </div>
+  </div>
+</div>
+
+<div id="netmonCharts" class="netmon-charts"></div>
+
+<div class="card netmon-empty" id="netmonEmpty" style="display:none;">
+  <div class="card-title">暂无监控</div>
+  <div class="card-sub">点击右上角「新建监控」，为某个目标配置监控节点与探测方式。</div>
+</div>
+
+<!-- Create/Edit Monitor Modal -->
+<div id="netmonMonitorModal" class="modal" style="display:none;">
+  <div class="modal-inner" style="max-width:720px;">
+    <div class="row" style="align-items:center;">
+      <div class="col"><div class="h2" id="netmonModalTitle">新建监控</div></div>
+      <div class="col right"><button class="btn xs ghost" type="button" onclick="closeNetMonMonitorModal()">关闭</button></div>
     </div>
 
-    <div class="node-list netmon-form">
+    <div class="form" style="margin-top:10px;">
       <label class="label">目标 IP / 域名</label>
-      <textarea class="textarea mono" id="netmonTargets" rows="6" placeholder="每行一个，例如：
-1.1.1.1
-8.8.8.8
-example.com
-（tcping 可写 example.com:443）"></textarea>
-      <div class="help">tcping 支持 “host:port”；若未写端口，将使用下方默认端口。</div>
+      <input class="input mono" id="netmonMTarget" placeholder="例如：1.1.1.1 或 example.com 或 example.com:443">
+      <div class="help">tcping 支持“host:port”；若未写端口，将使用默认端口。</div>
 
-      <div class="row" style="gap:10px;">
-        <div class="col" style="max-width:170px;">
+      <div class="row" style="gap:10px; margin-top:10px;">
+        <div class="col" style="max-width:190px;">
           <label class="label">探测方式</label>
-          <select class="select" id="netmonMode">
+          <select class="select" id="netmonMMode">
             <option value="ping">ping（ICMP）</option>
             <option value="tcping">tcping（TCP 握手）</option>
           </select>
         </div>
-        <div class="col" id="netmonTcpPortBox" style="max-width:160px;">
+        <div class="col" style="max-width:170px;" id="netmonMTcpPortBox">
           <label class="label">默认端口</label>
-          <input class="input" id="netmonTcpPort" type="number" min="1" max="65535" value="443">
-        </div>
-      </div>
-
-      <div class="row" style="gap:10px;">
-        <div class="col" style="max-width:160px;">
-          <label class="label">上报间隔</label>
-          <input class="input" id="netmonInterval" type="number" min="1" max="60" value="2">
-          <div class="help">单位：秒</div>
+          <input class="input" id="netmonMTcpPort" type="number" min="1" max="65535" value="443">
         </div>
         <div class="col" style="max-width:170px;">
-          <label class="label">展示窗口</label>
-          <input class="input" id="netmonWindow" type="number" min="1" max="120" value="10">
-          <div class="help">单位：分钟</div>
+          <label class="label">采集间隔</label>
+          <input class="input" id="netmonMInterval" type="number" min="1" max="3600" value="5">
+          <div class="help">单位：秒</div>
         </div>
       </div>
 
-      <div class="row" style="align-items:center; justify-content:space-between;">
-        <div class="label" style="margin:0;">选择节点</div>
+      <div class="row" style="align-items:center; justify-content:space-between; margin-top:12px;">
+        <div class="label" style="margin:0;">选择监控节点</div>
         <div class="row" style="gap:8px;">
-          <button class="btn xs ghost" type="button" id="netmonSelectAll">全选</button>
-          <button class="btn xs ghost" type="button" id="netmonSelectNone">全不选</button>
+          <button class="btn xs ghost" type="button" id="netmonMSelectAll">全选</button>
+          <button class="btn xs ghost" type="button" id="netmonMSelectNone">全不选</button>
         </div>
       </div>
 
-      <div id="netmonNodes" class="netmon-nodes"></div>
+      <div id="netmonMNodes" class="netmon-nodes"></div>
 
-      <div class="row" style="gap:10px; justify-content:flex-end;">
-        <button class="btn xs ghost" type="button" id="netmonClearBtn">清空图表</button>
+      <div id="netmonModalError" class="muted" style="margin-top:10px; color:var(--bad);"></div>
+      <div class="row" style="gap:10px; justify-content:flex-end; margin-top:14px;">
+        <button class="btn sm ghost" type="button" id="netmonModalCancel">取消</button>
+        <button class="btn sm" type="button" id="netmonModalSubmit">保存</button>
       </div>
-
-      <div class="muted sm" id="netmonStatus">未开始</div>
     </div>
-
-    <div class="sidebar-foot">
-      <div class="muted sm">提示：节点不可达/探测失败会显示为 “—”。</div>
-    </div>
-  </aside>
-
-  <!-- Right: charts -->
-  <main class="node-main">
-    <div id="netmonCharts" class="netmon-charts"></div>
-
-    <div class="card netmon-empty" id="netmonEmpty">
-      <div class="card-title">暂无监控数据</div>
-      <div class="card-sub">填写目标、选择节点后点击「开始」。</div>
-    </div>
-  </main>
+  </div>
 </div>
+
 {% endblock %}
 
 {% block scripts %}
-<script src="/static/app.js?v=50.0"></script>
+<script src="/static/app.js?v=51.0"></script>
 <script>
 window.__NETMON_NODE_GROUPS__ = {{ (node_groups or [])|tojson }};
 window.addEventListener('DOMContentLoaded', ()=>{

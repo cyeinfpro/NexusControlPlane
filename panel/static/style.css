@@ -1773,6 +1773,40 @@ body.modal-open{ overflow:hidden; }
 
 .netmon-node input{ transform: translateY(1px); }
 
+/* NetMon: node list online dot */
+.netmon-node .dot{
+  width:8px;
+  height:8px;
+  border-radius:999px;
+  display:inline-block;
+  flex:0 0 auto;
+  box-shadow:0 0 0 3px rgba(148,163,184,0.12) inset;
+}
+.netmon-node .dot.online{ background:#22c55e; }
+.netmon-node .dot.offline{ background:#64748b; }
+
+/* NetMon: toolbar & card actions */
+.netmon-toolbar{ padding: 12px; }
+.netmon-actions{
+  display:flex;
+  flex-direction:column;
+  align-items:flex-end;
+  gap:8px;
+}
+@media (min-width: 680px){
+  .netmon-actions{
+    flex-direction:row;
+    align-items:center;
+  }
+}
+.netmon-chart-card.netmon-disabled{
+  opacity: 0.65;
+  filter: saturate(0.9);
+}
+.netmon-chart-card.netmon-disabled .netmon-canvas{
+  background: rgba(2,6,23,0.28);
+}
+
 .netmon-node-name{
   font-weight:800;
   font-size:13px;

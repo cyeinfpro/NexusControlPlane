@@ -41,6 +41,16 @@ from .db import (
     update_node_report,
     set_agent_rollout_all,
     update_agent_status,
+
+    # NetMon
+    list_netmon_monitors,
+    get_netmon_monitor,
+    add_netmon_monitor,
+    update_netmon_monitor,
+    delete_netmon_monitor,
+    list_netmon_samples,
+    insert_netmon_samples,
+    prune_netmon_samples,
 )
 from .agents import agent_get, agent_post, agent_ping
 
@@ -149,7 +159,7 @@ def _panel_public_base_url(request: Request) -> str:
     return str(request.base_url).rstrip('/')
 
 
-app = FastAPI(title="Realm Pro Panel", version="33")
+app = FastAPI(title="Realm Pro Panel", version="34")
 
 # Session
 secret = ensure_secret_key()
@@ -161,6 +171,253 @@ templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
 
 # DB init
 ensure_db()
+
+
+# ------------------------ NetMon background collector ------------------------
+
+_NETMON_BG_ENABLED = (os.getenv("REALM_NETMON_BG_ENABLED") or "1").strip() not in ("0", "false", "False")
+try:
+    _NETMON_RETENTION_DAYS = int((os.getenv("REALM_NETMON_RETENTION_DAYS") or "7").strip() or 7)
+except Exception:
+    _NETMON_RETENTION_DAYS = 7
+if _NETMON_RETENTION_DAYS < 1:
+    _NETMON_RETENTION_DAYS = 1
+if _NETMON_RETENTION_DAYS > 90:
+    _NETMON_RETENTION_DAYS = 90
+
+try:
+    _NETMON_HTTP_TIMEOUT = float((os.getenv("REALM_NETMON_HTTP_TIMEOUT") or "3.5").strip() or 3.5)
+except Exception:
+    _NETMON_HTTP_TIMEOUT = 3.5
+if _NETMON_HTTP_TIMEOUT < 1.5:
+    _NETMON_HTTP_TIMEOUT = 1.5
+if _NETMON_HTTP_TIMEOUT > 20:
+    _NETMON_HTTP_TIMEOUT = 20.0
+
+try:
+    _NETMON_MAX_CONCURRENCY = int((os.getenv("REALM_NETMON_CONCURRENCY") or "40").strip() or 40)
+except Exception:
+    _NETMON_MAX_CONCURRENCY = 40
+if _NETMON_MAX_CONCURRENCY < 4:
+    _NETMON_MAX_CONCURRENCY = 4
+if _NETMON_MAX_CONCURRENCY > 200:
+    _NETMON_MAX_CONCURRENCY = 200
+
+_NETMON_SEM = asyncio.Semaphore(_NETMON_MAX_CONCURRENCY)
+_NETMON_BG_LAST_RUN: Dict[int, float] = {}
+
+
+async def _netmon_call_agent(node: Dict[str, Any], body: Dict[str, Any], timeout: float) -> Dict[str, Any]:
+    """Call agent /api/v1/netprobe with a global concurrency limit."""
+    async with _NETMON_SEM:
+        return await agent_post(
+            node.get("base_url", ""),
+            node.get("api_key", ""),
+            "/api/v1/netprobe",
+            body,
+            _node_verify_tls(node),
+            timeout=timeout,
+        )
+
+
+async def _netmon_collect_one(mon: Dict[str, Any], nodes_map: Dict[int, Dict[str, Any]]) -> None:
+    """Collect one monitor tick and persist samples."""
+    try:
+        mid = int(mon.get("id") or 0)
+    except Exception:
+        mid = 0
+    if mid <= 0:
+        return
+
+    target = str(mon.get("target") or "").strip()
+    if not target:
+        return
+
+    mode = str(mon.get("mode") or "ping").strip().lower()
+    if mode not in ("ping", "tcping"):
+        mode = "ping"
+
+    try:
+        tcp_port = int(mon.get("tcp_port") or 443)
+    except Exception:
+        tcp_port = 443
+    if tcp_port < 1 or tcp_port > 65535:
+        tcp_port = 443
+
+    # select nodes for this monitor
+    node_ids = mon.get("node_ids") if isinstance(mon.get("node_ids"), list) else None
+    if node_ids is None:
+        # fallback parse json field for compatibility
+        try:
+            raw = json.loads(str(mon.get("node_ids_json") or "[]"))
+        except Exception:
+            raw = []
+        node_ids = raw if isinstance(raw, list) else []
+
+    cleaned: List[int] = []
+    for x in node_ids:
+        try:
+            nid = int(x)
+        except Exception:
+            continue
+        if nid > 0 and nid not in cleaned:
+            cleaned.append(nid)
+
+    nodes: List[Dict[str, Any]] = []
+    for nid in cleaned[:60]:
+        n = nodes_map.get(int(nid))
+        if n:
+            nodes.append(n)
+
+    if not nodes:
+        # no nodes selected / missing
+        try:
+            update_netmon_monitor(mid, last_run_ts_ms=int(time.time() * 1000), last_run_msg="no_nodes")
+        except Exception:
+            pass
+        return
+
+    ts_ms = int(time.time() * 1000)
+
+    # One target per monitor, but agent API supports batch.
+    body = {"mode": mode, "targets": [target], "tcp_port": tcp_port, "timeout": 1.5}
+
+    async def _one(n: Dict[str, Any]):
+        nid = int(n.get("id") or 0)
+        try:
+            data = await _netmon_call_agent(n, body, timeout=_NETMON_HTTP_TIMEOUT)
+            return nid, data
+        except Exception as exc:
+            return nid, {"ok": False, "error": str(exc)}
+
+    results = await asyncio.gather(*[_one(n) for n in nodes])
+
+    # Persist samples
+    rows: List[tuple] = []
+    ok_any = False
+    last_msg = ""
+
+    for nid, data in results:
+        ok = False
+        latency = None
+        err = None
+        if isinstance(data, dict) and data.get("ok") is True:
+            res_map = data.get("results") if isinstance(data.get("results"), dict) else {}
+            item = res_map.get(target) if isinstance(res_map, dict) else None
+            if isinstance(item, dict) and item.get("ok"):
+                ok = True
+                try:
+                    v = float(item.get("latency_ms")) if item.get("latency_ms") is not None else None
+                except Exception:
+                    v = None
+                latency = v
+                ok_any = True
+            else:
+                ok = False
+                err = str(item.get("error") or "probe_failed") if isinstance(item, dict) else "probe_failed"
+        else:
+            err = str((data or {}).get("error") or "agent_failed") if isinstance(data, dict) else "agent_failed"
+
+        if err and not last_msg:
+            last_msg = err
+
+        rows.append((mid, int(nid), int(ts_ms), 1 if ok else 0, latency, (err or None)))
+
+    try:
+        insert_netmon_samples(rows)
+    except Exception:
+        # ignore DB errors to keep background running
+        pass
+
+    try:
+        update_netmon_monitor(
+            mid,
+            last_run_ts_ms=int(ts_ms),
+            last_run_msg=("ok" if ok_any else (last_msg or "failed")),
+        )
+    except Exception:
+        pass
+
+
+async def _netmon_bg_loop() -> None:
+    """Background loop that continuously collects NetMon monitors."""
+    last_refresh = 0.0
+    last_cleanup = 0.0
+    monitors_cache: List[Dict[str, Any]] = []
+    nodes_map: Dict[int, Dict[str, Any]] = {}
+
+    while True:
+        try:
+            now = time.time()
+
+            # Refresh config cache periodically
+            if (now - last_refresh) >= 3.0:
+                try:
+                    monitors_cache = list_netmon_monitors()
+                except Exception:
+                    monitors_cache = []
+                try:
+                    nodes_map = {int(n.get("id") or 0): n for n in list_nodes() if int(n.get("id") or 0) > 0}
+                except Exception:
+                    nodes_map = {}
+                last_refresh = now
+
+            # Schedule due monitors
+            tasks: List[asyncio.Task] = []
+            for mon in monitors_cache:
+                try:
+                    mid = int(mon.get("id") or 0)
+                except Exception:
+                    continue
+                if mid <= 0:
+                    continue
+                if not bool(mon.get("enabled") or 0):
+                    continue
+                try:
+                    interval = int(mon.get("interval_sec") or 5)
+                except Exception:
+                    interval = 5
+                if interval < 1:
+                    interval = 1
+                if interval > 3600:
+                    interval = 3600
+
+                last = float(_NETMON_BG_LAST_RUN.get(mid, 0.0) or 0.0)
+                if (now - last) >= float(interval):
+                    _NETMON_BG_LAST_RUN[mid] = now
+                    tasks.append(asyncio.create_task(_netmon_collect_one(mon, nodes_map)))
+
+            if tasks:
+                # Let exceptions be handled inside _netmon_collect_one
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+            # Cleanup old samples
+            if (now - last_cleanup) >= 60.0:
+                try:
+                    cutoff_ms = int((now - (_NETMON_RETENTION_DAYS * 86400)) * 1000)
+                    prune_netmon_samples(cutoff_ms)
+                except Exception:
+                    pass
+                last_cleanup = now
+
+        except Exception:
+            # Never crash the loop
+            pass
+
+        await asyncio.sleep(1.0)
+
+
+@app.on_event("startup")
+async def _start_netmon_bg() -> None:
+    if not _NETMON_BG_ENABLED:
+        return
+    if getattr(app.state, "netmon_bg_started", False):
+        return
+    app.state.netmon_bg_started = True
+    try:
+        asyncio.create_task(_netmon_bg_loop())
+    except Exception:
+        pass
 
 
 # ------------------------ Backup helpers ------------------------
@@ -2438,6 +2695,327 @@ async def api_nodes_list(user: str = Depends(require_login)):
         })
     return {"ok": True, "nodes": out}
 
+
+
+
+@app.get("/api/netmon/snapshot")
+async def api_netmon_snapshot(request: Request, user: str = Depends(require_login)):
+    """Return NetMon monitors + samples (history window).
+
+    Query:
+      - window_min: minutes, default 10
+      - window_sec: seconds, alternative to window_min
+    """
+    qp = request.query_params
+    raw_min = qp.get("window_min")
+    raw_sec = qp.get("window_sec")
+
+    window_sec = None
+    if raw_sec is not None and str(raw_sec).strip() != "":
+        try:
+            window_sec = int(raw_sec)
+        except Exception:
+            window_sec = None
+    if window_sec is None:
+        try:
+            window_min = int(raw_min) if raw_min is not None else 10
+        except Exception:
+            window_min = 10
+        if window_min < 1:
+            window_min = 1
+        if window_min > 24 * 60:
+            window_min = 24 * 60
+        window_sec = window_min * 60
+
+    if window_sec < 10:
+        window_sec = 10
+    if window_sec > 24 * 3600:
+        window_sec = 24 * 3600
+
+    now_ms = int(time.time() * 1000)
+    cutoff_ms = now_ms - int(window_sec * 1000)
+
+    monitors = list_netmon_monitors()
+    monitor_ids = [int(m.get("id") or 0) for m in monitors if int(m.get("id") or 0) > 0]
+
+    # Node metadata (for legend)
+    nodes = list_nodes()
+    nodes_meta: Dict[str, Any] = {}
+    for n in nodes:
+        nid = int(n.get("id") or 0)
+        if nid <= 0:
+            continue
+        nodes_meta[str(nid)] = {
+            "id": nid,
+            "name": n.get("name") or _extract_ip_for_display(n.get("base_url", "")),
+            "group_name": str(n.get("group_name") or "").strip() or "默认分组",
+            "display_ip": _extract_ip_for_display(n.get("base_url", "")),
+            "online": _is_report_fresh(n, max_age_sec=90),
+        }
+
+    # Samples
+    samples = list_netmon_samples(monitor_ids, cutoff_ms) if monitor_ids else []
+
+    series: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
+    for m in monitors:
+        mid = int(m.get("id") or 0)
+        if mid <= 0:
+            continue
+        mid_s = str(mid)
+        series[mid_s] = {}
+        # pre-create node arrays for configured nodes
+        for nid in (m.get("node_ids") or []):
+            try:
+                nid_i = int(nid)
+            except Exception:
+                continue
+            series[mid_s][str(nid_i)] = []
+
+    for r in samples:
+        try:
+            mid = int(r.get("monitor_id") or 0)
+            nid = int(r.get("node_id") or 0)
+            ts = int(r.get("ts_ms") or 0)
+        except Exception:
+            continue
+        if mid <= 0 or nid <= 0 or ts <= 0:
+            continue
+        mid_s = str(mid)
+        nid_s = str(nid)
+        if mid_s not in series:
+            series[mid_s] = {}
+        if nid_s not in series[mid_s]:
+            series[mid_s][nid_s] = []
+        ok = bool(r.get("ok") or 0)
+        v = None
+        if ok and r.get("latency_ms") is not None:
+            try:
+                v = float(r.get("latency_ms"))
+            except Exception:
+                v = None
+        series[mid_s][nid_s].append({"t": ts, "v": v})
+
+    monitors_out: List[Dict[str, Any]] = []
+    for m in monitors:
+        try:
+            mid = int(m.get("id") or 0)
+        except Exception:
+            continue
+        if mid <= 0:
+            continue
+        monitors_out.append(
+            {
+                "id": mid,
+                "target": str(m.get("target") or ""),
+                "mode": str(m.get("mode") or "ping"),
+                "tcp_port": int(m.get("tcp_port") or 443),
+                "interval_sec": int(m.get("interval_sec") or 5),
+                "enabled": bool(m.get("enabled") or 0),
+                "node_ids": [int(x) for x in (m.get("node_ids") or []) if isinstance(x, int) or str(x).isdigit()],
+                "last_run_ts_ms": int(m.get("last_run_ts_ms") or 0),
+                "last_run_msg": str(m.get("last_run_msg") or ""),
+            }
+        )
+
+    return {
+        "ok": True,
+        "ts": now_ms,
+        "cutoff_ms": cutoff_ms,
+        "window_sec": int(window_sec),
+        "monitors": monitors_out,
+        "nodes": nodes_meta,
+        "series": series,
+    }
+
+
+@app.get("/api/netmon/monitors")
+async def api_netmon_monitors_list(user: str = Depends(require_login)):
+    monitors = list_netmon_monitors()
+    out: List[Dict[str, Any]] = []
+    for m in monitors:
+        try:
+            mid = int(m.get("id") or 0)
+        except Exception:
+            continue
+        if mid <= 0:
+            continue
+        out.append(
+            {
+                "id": mid,
+                "target": str(m.get("target") or ""),
+                "mode": str(m.get("mode") or "ping"),
+                "tcp_port": int(m.get("tcp_port") or 443),
+                "interval_sec": int(m.get("interval_sec") or 5),
+                "enabled": bool(m.get("enabled") or 0),
+                "node_ids": [int(x) for x in (m.get("node_ids") or []) if isinstance(x, int) or str(x).isdigit()],
+                "last_run_ts_ms": int(m.get("last_run_ts_ms") or 0),
+                "last_run_msg": str(m.get("last_run_msg") or ""),
+            }
+        )
+    return {"ok": True, "monitors": out}
+
+
+@app.post("/api/netmon/monitors")
+async def api_netmon_monitors_create(request: Request, user: str = Depends(require_login)):
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+
+    target = str(payload.get("target") or "").strip()
+    mode = str(payload.get("mode") or "ping").strip().lower()
+    tcp_port = payload.get("tcp_port", 443)
+    interval_sec = payload.get("interval_sec", payload.get("interval", 5))
+    node_ids = payload.get("node_ids") or payload.get("nodes") or []
+    enabled = bool(payload.get("enabled", True))
+
+    if not target:
+        return JSONResponse({"ok": False, "error": "target 不能为空"}, status_code=400)
+    if len(target) > 128:
+        return JSONResponse({"ok": False, "error": "target 太长"}, status_code=400)
+    if mode not in ("ping", "tcping"):
+        mode = "ping"
+
+    try:
+        tcp_port_i = int(tcp_port)
+    except Exception:
+        tcp_port_i = 443
+    if tcp_port_i < 1 or tcp_port_i > 65535:
+        tcp_port_i = 443
+
+    try:
+        interval_i = int(interval_sec)
+    except Exception:
+        interval_i = 5
+    if interval_i < 1:
+        interval_i = 1
+    if interval_i > 3600:
+        interval_i = 3600
+
+    if not isinstance(node_ids, list):
+        node_ids = []
+
+    cleaned: List[int] = []
+    for x in node_ids:
+        try:
+            nid = int(x)
+        except Exception:
+            continue
+        if nid > 0 and nid not in cleaned:
+            cleaned.append(nid)
+    cleaned = cleaned[:60]
+    if not cleaned:
+        return JSONResponse({"ok": False, "error": "请选择至少一个节点"}, status_code=400)
+
+    mid = add_netmon_monitor(target, mode, tcp_port_i, interval_i, cleaned, enabled=enabled)
+    mon = get_netmon_monitor(mid) or {}
+    return {
+        "ok": True,
+        "monitor": {
+            "id": mid,
+            "target": str(mon.get("target") or target),
+            "mode": str(mon.get("mode") or mode),
+            "tcp_port": int(mon.get("tcp_port") or tcp_port_i),
+            "interval_sec": int(mon.get("interval_sec") or interval_i),
+            "enabled": bool(mon.get("enabled") or enabled),
+            "node_ids": [int(x) for x in (mon.get("node_ids") or cleaned) if int(x) > 0],
+        },
+    }
+
+
+@app.post("/api/netmon/monitors/{monitor_id}")
+async def api_netmon_monitors_update(monitor_id: int, request: Request, user: str = Depends(require_login)):
+    mon = get_netmon_monitor(int(monitor_id))
+    if not mon:
+        return JSONResponse({"ok": False, "error": "monitor 不存在"}, status_code=404)
+
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+
+    fields: Dict[str, Any] = {}
+    if "target" in payload:
+        target = str(payload.get("target") or "").strip()
+        if not target:
+            return JSONResponse({"ok": False, "error": "target 不能为空"}, status_code=400)
+        if len(target) > 128:
+            return JSONResponse({"ok": False, "error": "target 太长"}, status_code=400)
+        fields["target"] = target
+
+    if "mode" in payload:
+        mode = str(payload.get("mode") or "ping").strip().lower()
+        if mode not in ("ping", "tcping"):
+            mode = "ping"
+        fields["mode"] = mode
+
+    if "tcp_port" in payload:
+        try:
+            tp = int(payload.get("tcp_port"))
+        except Exception:
+            tp = 443
+        if tp < 1 or tp > 65535:
+            tp = 443
+        fields["tcp_port"] = tp
+
+    if "interval_sec" in payload or "interval" in payload:
+        raw = payload.get("interval_sec", payload.get("interval"))
+        try:
+            itv = int(raw)
+        except Exception:
+            itv = 5
+        if itv < 1:
+            itv = 1
+        if itv > 3600:
+            itv = 3600
+        fields["interval_sec"] = itv
+
+    if "node_ids" in payload or "nodes" in payload:
+        node_ids = payload.get("node_ids") or payload.get("nodes") or []
+        if not isinstance(node_ids, list):
+            node_ids = []
+        cleaned: List[int] = []
+        for x in node_ids:
+            try:
+                nid = int(x)
+            except Exception:
+                continue
+            if nid > 0 and nid not in cleaned:
+                cleaned.append(nid)
+        cleaned = cleaned[:60]
+        if not cleaned:
+            return JSONResponse({"ok": False, "error": "请选择至少一个节点"}, status_code=400)
+        fields["node_ids"] = cleaned
+
+    if "enabled" in payload:
+        fields["enabled"] = bool(payload.get("enabled"))
+
+    update_netmon_monitor(int(monitor_id), **fields)
+
+    mon2 = get_netmon_monitor(int(monitor_id)) or {}
+    return {
+        "ok": True,
+        "monitor": {
+            "id": int(monitor_id),
+            "target": str(mon2.get("target") or ""),
+            "mode": str(mon2.get("mode") or "ping"),
+            "tcp_port": int(mon2.get("tcp_port") or 443),
+            "interval_sec": int(mon2.get("interval_sec") or 5),
+            "enabled": bool(mon2.get("enabled") or 0),
+            "node_ids": [int(x) for x in (mon2.get("node_ids") or []) if int(x) > 0],
+            "last_run_ts_ms": int(mon2.get("last_run_ts_ms") or 0),
+            "last_run_msg": str(mon2.get("last_run_msg") or ""),
+        },
+    }
+
+
+@app.post("/api/netmon/monitors/{monitor_id}/delete")
+async def api_netmon_monitors_delete(monitor_id: int, user: str = Depends(require_login)):
+    mon = get_netmon_monitor(int(monitor_id))
+    if not mon:
+        return JSONResponse({"ok": False, "error": "monitor 不存在"}, status_code=404)
+    delete_netmon_monitor(int(monitor_id))
+    return {"ok": True}
 
 @app.post("/api/netmon/probe")
 async def api_netmon_probe(request: Request, user: str = Depends(require_login)):

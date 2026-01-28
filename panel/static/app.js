@@ -3668,13 +3668,148 @@ try{ initDashboardViewControls(); }catch(_e){}
 let NETMON_STATE = null;
 
 function initNetMonPage(){
-  const groups = window.__NETMON_NODE_GROUPS__ || [];
-  const nodesBox = document.getElementById('netmonNodes');
-  if(!nodesBox) return; // not on this page
+  const chartsBox = document.getElementById('netmonCharts');
+  if(!chartsBox) return; // not on this page
 
-  // Build node checkbox list
+  const groups = window.__NETMON_NODE_GROUPS__ || [];
+
+  // Build node checkbox list for modal
   const nodesMeta = {};
-  nodesBox.innerHTML = '';
+  _netmonBuildNodes(groups, document.getElementById('netmonMNodes'), nodesMeta);
+
+  NETMON_STATE = {
+    inflight: false,
+    timer: null,
+    lastTs: Date.now(),
+    windowMin: 10,
+    autoRefresh: true,
+    nodesMeta: nodesMeta,       // from template (fallback). will be replaced by snapshot.nodes
+    monitors: [],
+    monitorsMap: {},
+    series: {},
+    charts: {},
+    editingId: null,
+  };
+
+  // Restore view config
+  try{
+    const saved = JSON.parse(localStorage.getItem('netmon_view') || '{}');
+    if(saved && typeof saved === 'object'){
+      if(saved.windowMin) NETMON_STATE.windowMin = Math.max(1, Number(saved.windowMin) || 10);
+      if(saved.autoRefresh === false) NETMON_STATE.autoRefresh = false;
+    }
+  }catch(_e){}
+
+  // Init toolbar UI
+  const winEl = document.getElementById('netmonViewWindow');
+  if(winEl) winEl.value = String(Math.max(1, Math.min(1440, NETMON_STATE.windowMin)));
+  const autoEl = document.getElementById('netmonAutoRefresh');
+  if(autoEl) autoEl.value = NETMON_STATE.autoRefresh ? 'on' : 'off';
+
+  if(winEl){
+    winEl.addEventListener('change', ()=>{
+      const v = Math.max(1, Math.min(1440, Number(winEl.value) || 10));
+      NETMON_STATE.windowMin = v;
+      _netmonSaveView();
+      netmonRefresh(true);
+    });
+  }
+
+  if(autoEl){
+    autoEl.addEventListener('change', ()=>{
+      NETMON_STATE.autoRefresh = (autoEl.value !== 'off');
+      _netmonSaveView();
+      _netmonSyncAutoTimer();
+    });
+  }
+
+  const refreshBtn = document.getElementById('netmonRefreshBtn');
+  if(refreshBtn) refreshBtn.addEventListener('click', ()=>netmonRefresh(true));
+
+  const newBtn = document.getElementById('netmonNewBtn');
+  if(newBtn) newBtn.addEventListener('click', ()=>openNetMonMonitorModal(null));
+
+  // Modal UX
+  const cancelBtn = document.getElementById('netmonModalCancel');
+  if(cancelBtn) cancelBtn.addEventListener('click', closeNetMonMonitorModal);
+
+  const submitBtn = document.getElementById('netmonModalSubmit');
+  if(submitBtn) submitBtn.addEventListener('click', netmonSubmitMonitorModal);
+
+  const selAllBtn = document.getElementById('netmonMSelectAll');
+  const selNoneBtn = document.getElementById('netmonMSelectNone');
+  if(selAllBtn) selAllBtn.addEventListener('click', ()=>_netmonModalSelectAll(true));
+  if(selNoneBtn) selNoneBtn.addEventListener('click', ()=>_netmonModalSelectAll(false));
+
+  const modeSel = document.getElementById('netmonMMode');
+  if(modeSel) modeSel.addEventListener('change', _netmonSyncModalModeUI);
+  _netmonSyncModalModeUI();
+
+  // Chart card actions (event delegation)
+  chartsBox.addEventListener('click', async (e)=>{
+    const editBtn = e.target.closest && e.target.closest('button.netmon-edit');
+    if(editBtn){
+      e.preventDefault();
+      const mid = editBtn.getAttribute('data-mid');
+      if(mid) openNetMonMonitorModal(mid);
+      return;
+    }
+    const toggleBtn = e.target.closest && e.target.closest('button.netmon-toggle');
+    if(toggleBtn){
+      e.preventDefault();
+      const mid = toggleBtn.getAttribute('data-mid');
+      if(mid) await netmonToggleMonitor(mid);
+      return;
+    }
+    const delBtn = e.target.closest && e.target.closest('button.netmon-delete');
+    if(delBtn){
+      e.preventDefault();
+      const mid = delBtn.getAttribute('data-mid');
+      if(mid) await netmonDeleteMonitor(mid);
+      return;
+    }
+  });
+
+  // Resize redraw (debounced)
+  let _resizeTimer = null;
+  window.addEventListener('resize', ()=>{
+    if(!_resizeTimer){
+      _resizeTimer = setTimeout(()=>{
+        _resizeTimer = null;
+        try{ netmonRenderAll(true); }catch(_e){}
+      }, 120);
+    }
+  });
+
+  // First refresh and start polling
+  netmonRefresh(true);
+  _netmonSyncAutoTimer();
+}
+
+function _netmonSaveView(){
+  try{
+    localStorage.setItem('netmon_view', JSON.stringify({
+      windowMin: NETMON_STATE ? NETMON_STATE.windowMin : 10,
+      autoRefresh: NETMON_STATE ? NETMON_STATE.autoRefresh : true,
+    }));
+  }catch(_e){}
+}
+
+function _netmonSyncAutoTimer(){
+  const st = NETMON_STATE;
+  if(!st) return;
+  if(st.timer){
+    clearInterval(st.timer);
+    st.timer = null;
+  }
+  if(st.autoRefresh){
+    st.timer = setInterval(()=>netmonRefresh(false), 2000);
+  }
+}
+
+function _netmonBuildNodes(groups, boxEl, nodesMeta){
+  if(!boxEl) return;
+  boxEl.innerHTML = '';
   const frag = document.createDocumentFragment();
 
   (Array.isArray(groups) ? groups : []).forEach((g)=>{
@@ -3719,334 +3854,376 @@ function initNetMonPage(){
     frag.appendChild(wrap);
   });
 
-  nodesBox.appendChild(frag);
-
-  // Restore last config
-  try{
-    const saved = JSON.parse(localStorage.getItem('netmon_cfg') || '{}');
-    if(saved && typeof saved === 'object'){
-      if(saved.targets && typeof saved.targets === 'string'){
-        const ta = document.getElementById('netmonTargets');
-        if(ta) ta.value = saved.targets;
-      }
-      if(saved.mode){
-        const sel = document.getElementById('netmonMode');
-        if(sel) sel.value = String(saved.mode);
-      }
-      if(saved.tcp_port){
-        const ipt = document.getElementById('netmonTcpPort');
-        if(ipt) ipt.value = String(saved.tcp_port);
-      }
-      if(saved.interval){
-        const ipt = document.getElementById('netmonInterval');
-        if(ipt) ipt.value = String(saved.interval);
-      }
-      if(saved.window){
-        const ipt = document.getElementById('netmonWindow');
-        if(ipt) ipt.value = String(saved.window);
-      }
-      if(Array.isArray(saved.node_ids) && saved.node_ids.length){
-        // Uncheck all first
-        document.querySelectorAll('#netmonNodes input[type=checkbox][data-node-id]').forEach(cb=>{ cb.checked = false; });
-        saved.node_ids.forEach((id)=>{
-          const cb = document.querySelector(`#netmonNodes input[type=checkbox][data-node-id="${CSS.escape(String(id))}"]`);
-          if(cb) cb.checked = true;
-        });
-      }
-    }
-  }catch(_e){}
-
-  // Mode UI
-  const modeSel = document.getElementById('netmonMode');
-  const portBox = document.getElementById('netmonTcpPortBox');
-  function syncModeUI(){
-    const mode = modeSel ? modeSel.value : 'ping';
-    if(portBox) portBox.style.display = (mode === 'tcping') ? '' : 'none';
-  }
-  if(modeSel) modeSel.addEventListener('change', syncModeUI);
-  syncModeUI();
-
-  // Buttons
-  const startBtn = document.getElementById('netmonStartBtn');
-  const stopBtn = document.getElementById('netmonStopBtn');
-  const clearBtn = document.getElementById('netmonClearBtn');
-  const allBtn = document.getElementById('netmonSelectAll');
-  const noneBtn = document.getElementById('netmonSelectNone');
-
-  if(allBtn) allBtn.addEventListener('click', ()=>netmonSelectAll(true));
-  if(noneBtn) noneBtn.addEventListener('click', ()=>netmonSelectAll(false));
-  if(startBtn) startBtn.addEventListener('click', ()=>netmonStart(nodesMeta));
-  if(stopBtn) stopBtn.addEventListener('click', netmonStop);
-  if(clearBtn) clearBtn.addEventListener('click', netmonClear);
-
-  // Resize redraw (debounced)
-  let _resizeTimer = null;
-  window.addEventListener('resize', ()=>{
-    if(!_resizeTimer){
-      _resizeTimer = setTimeout(()=>{
-        _resizeTimer = null;
-        try{ netmonRenderAll(true); }catch(_e){}
-      }, 120);
-    }
-  });
+  boxEl.appendChild(frag);
 }
 
-function netmonSelectAll(on){
-  document.querySelectorAll('#netmonNodes input[type=checkbox][data-node-id]').forEach((cb)=>{
+function _netmonModalSelectAll(on){
+  document.querySelectorAll('#netmonMNodes input[type=checkbox][data-node-id]').forEach((cb)=>{
     cb.checked = !!on;
   });
 }
 
-function _netmonParseTargets(raw){
-  const out = [];
-  const seen = new Set();
-  String(raw || '').split(/\n+/).forEach((line)=>{
-    const s = String(line || '').trim();
-    if(!s) return;
-    if(s.length > 128) return;
-    if(seen.has(s)) return;
-    seen.add(s);
-    out.push(s);
-  });
-  return out;
+function _netmonSyncModalModeUI(){
+  const mode = (document.getElementById('netmonMMode')?.value || 'ping').toLowerCase();
+  const box = document.getElementById('netmonMTcpPortBox');
+  if(box) box.style.display = (mode === 'tcping') ? '' : 'none';
 }
 
-function _netmonReadConfig(){
-  const targets = _netmonParseTargets(q('netmonTargets') ? q('netmonTargets').value : '');
-  const mode = (q('netmonMode') ? q('netmonMode').value : 'ping') || 'ping';
-  const tcpPort = Number(q('netmonTcpPort') ? q('netmonTcpPort').value : 443) || 443;
-  const interval = Math.max(1, Number(q('netmonInterval') ? q('netmonInterval').value : 2) || 2);
-  const windowMin = Math.max(1, Number(q('netmonWindow') ? q('netmonWindow').value : 10) || 10);
+function openNetMonMonitorModal(monitorIdOrNull){
+  const st = NETMON_STATE;
+  if(!st) return;
 
-  const nodeIds = [];
-  document.querySelectorAll('#netmonNodes input[type=checkbox][data-node-id]').forEach((cb)=>{
+  const modal = document.getElementById('netmonMonitorModal');
+  if(!modal) return;
+
+  const titleEl = document.getElementById('netmonModalTitle');
+  const errEl = document.getElementById('netmonModalError');
+  if(errEl) errEl.textContent = '';
+
+  let mon = null;
+  if(monitorIdOrNull){
+    const mid = String(monitorIdOrNull);
+    mon = st.monitorsMap ? st.monitorsMap[mid] : null;
+    st.editingId = mid;
+    if(titleEl) titleEl.textContent = '编辑监控';
+  }else{
+    st.editingId = null;
+    if(titleEl) titleEl.textContent = '新建监控';
+  }
+
+  const targetEl = document.getElementById('netmonMTarget');
+  const modeEl = document.getElementById('netmonMMode');
+  const portEl = document.getElementById('netmonMTcpPort');
+  const intervalEl = document.getElementById('netmonMInterval');
+
+  // Defaults for new monitor (restore from last create)
+  let defaults = {mode:'ping', tcp_port:443, interval_sec:5, node_ids:[]};
+  try{
+    const saved = JSON.parse(localStorage.getItem('netmon_last_create') || '{}');
+    if(saved && typeof saved === 'object'){
+      if(saved.mode) defaults.mode = String(saved.mode);
+      if(saved.tcp_port) defaults.tcp_port = Number(saved.tcp_port) || 443;
+      if(saved.interval_sec) defaults.interval_sec = Number(saved.interval_sec) || 5;
+      if(Array.isArray(saved.node_ids)) defaults.node_ids = saved.node_ids;
+    }
+  }catch(_e){}
+
+  if(targetEl) targetEl.value = mon ? (mon.target || '') : '';
+  if(modeEl) modeEl.value = mon ? String(mon.mode || 'ping') : String(defaults.mode || 'ping');
+  if(portEl) portEl.value = String(mon ? (mon.tcp_port || 443) : (defaults.tcp_port || 443));
+  if(intervalEl) intervalEl.value = String(mon ? (mon.interval_sec || 5) : (defaults.interval_sec || 5));
+
+  _netmonSyncModalModeUI();
+
+  // Node selection
+  const want = new Set((mon ? (mon.node_ids || []) : (defaults.node_ids || [])).map(x=>String(x)));
+  const hasWant = want.size > 0;
+  document.querySelectorAll('#netmonMNodes input[type=checkbox][data-node-id]').forEach((cb)=>{
+    if(!hasWant){
+      cb.checked = true;
+      return;
+    }
+    const id = cb.getAttribute('data-node-id');
+    cb.checked = id ? want.has(String(id)) : false;
+  });
+
+  modal.style.display = 'flex';
+  if(targetEl) setTimeout(()=>targetEl.focus(), 30);
+}
+
+function closeNetMonMonitorModal(){
+  const modal = document.getElementById('netmonMonitorModal');
+  if(!modal) return;
+  modal.style.display = 'none';
+  if(NETMON_STATE) NETMON_STATE.editingId = null;
+}
+
+window.closeNetMonMonitorModal = closeNetMonMonitorModal;
+
+function _netmonReadModal(){
+  const target = String(document.getElementById('netmonMTarget')?.value || '').trim();
+  const mode = String(document.getElementById('netmonMMode')?.value || 'ping').trim().toLowerCase() || 'ping';
+  const tcp_port = Number(document.getElementById('netmonMTcpPort')?.value || 443) || 443;
+  const interval_sec = Number(document.getElementById('netmonMInterval')?.value || 5) || 5;
+
+  const node_ids = [];
+  document.querySelectorAll('#netmonMNodes input[type=checkbox][data-node-id]').forEach((cb)=>{
     if(cb.checked){
       const id = cb.getAttribute('data-node-id');
-      if(id && !nodeIds.includes(id)) nodeIds.push(id);
+      if(id && !node_ids.includes(id)) node_ids.push(id);
     }
   });
 
-  return {
-    targets,
-    mode,
-    tcpPort,
-    interval,
-    windowMin,
-    nodeIds,
-  };
+  return { target, mode, tcp_port, interval_sec, node_ids };
 }
 
-function _netmonSaveConfig(cfg){
+async function netmonSubmitMonitorModal(){
+  const st = NETMON_STATE;
+  if(!st) return;
+  const errEl = document.getElementById('netmonModalError');
+  const btn = document.getElementById('netmonModalSubmit');
+
+  const cfg = _netmonReadModal();
+  if(!cfg.target){
+    if(errEl) errEl.textContent = '请输入目标（IP / 域名）';
+    return;
+  }
+  if(cfg.target.length > 128){
+    if(errEl) errEl.textContent = '目标太长（>128）';
+    return;
+  }
+  if(cfg.mode !== 'ping' && cfg.mode !== 'tcping'){
+    cfg.mode = 'ping';
+  }
+  if(cfg.tcp_port < 1 || cfg.tcp_port > 65535) cfg.tcp_port = 443;
+  if(cfg.interval_sec < 1) cfg.interval_sec = 1;
+  if(cfg.interval_sec > 3600) cfg.interval_sec = 3600;
+  if(!cfg.node_ids.length){
+    if(errEl) errEl.textContent = '请选择至少一个节点';
+    return;
+  }
+
+  // persist last-create defaults
   try{
-    localStorage.setItem('netmon_cfg', JSON.stringify({
-      targets: (q('netmonTargets') ? q('netmonTargets').value : ''),
+    localStorage.setItem('netmon_last_create', JSON.stringify({
       mode: cfg.mode,
-      tcp_port: cfg.tcpPort,
-      interval: cfg.interval,
-      window: cfg.windowMin,
-      node_ids: cfg.nodeIds,
+      tcp_port: cfg.tcp_port,
+      interval_sec: cfg.interval_sec,
+      node_ids: cfg.node_ids,
     }));
   }catch(_e){}
-}
 
-function netmonStart(nodesMeta){
-  if(NETMON_STATE && NETMON_STATE.running){
-    toast('监控已在运行中');
-    return;
-  }
-
-  const cfg = _netmonReadConfig();
-  if(!cfg.targets.length){ toast('请填写至少一个目标（每行一个）', true); return; }
-  if(!cfg.nodeIds.length){ toast('请选择至少一个节点', true); return; }
-
-  _netmonSaveConfig(cfg);
-
-  const chartsBox = q('netmonCharts');
-  const emptyCard = q('netmonEmpty');
-  if(chartsBox) chartsBox.innerHTML = '';
-  if(emptyCard) emptyCard.style.display = 'none';
-
-  NETMON_STATE = {
-    running: true,
-    inflight: false,
-    timer: null,
-    errorCount: 0,
-    lastTs: Date.now(),
-    cfg,
-    nodesMeta: nodesMeta || {},
-    // series[target][nodeId] = [{t, v}]
-    series: {},
-    charts: {},
-  };
-
-  // Build charts
-  cfg.targets.forEach((target)=>{
-    NETMON_STATE.series[target] = {};
-    cfg.nodeIds.forEach((nid)=>{ NETMON_STATE.series[target][nid] = []; });
-    const card = _netmonCreateChartCard(target);
-    if(chartsBox) chartsBox.appendChild(card);
-    NETMON_STATE.charts[target] = new NetMonChart(card, target);
-  });
-
-  // Render empty axes immediately
-  netmonRenderAll(true);
-
-  // UI state
-  const startBtn = q('netmonStartBtn');
-  const stopBtn = q('netmonStopBtn');
-  if(startBtn) startBtn.disabled = true;
-  if(stopBtn) stopBtn.disabled = false;
-
-  // First tick immediately
-  netmonTick();
-
-  // Polling
-  NETMON_STATE.timer = setInterval(netmonTick, cfg.interval * 1000);
-
-  const status = q('netmonStatus');
-  if(status) status.textContent = `运行中：${cfg.mode}${cfg.mode==='tcping' ? ('/' + cfg.tcpPort) : ''} · ${cfg.interval}s 上报 · 窗口 ${cfg.windowMin}min`;
-}
-
-function netmonStop(){
-  if(!NETMON_STATE){
-    toast('监控未运行');
-    return;
-  }
-  try{ if(NETMON_STATE.timer) clearInterval(NETMON_STATE.timer); }catch(_e){}
-  NETMON_STATE.running = false;
-  NETMON_STATE.timer = null;
-
-  const startBtn = q('netmonStartBtn');
-  const stopBtn = q('netmonStopBtn');
-  if(startBtn) startBtn.disabled = false;
-  if(stopBtn) stopBtn.disabled = true;
-
-  const status = q('netmonStatus');
-  if(status) status.textContent = '已停止';
-}
-
-function netmonClear(){
-  if(!NETMON_STATE){
-    // clear UI anyway
-    const chartsBox = q('netmonCharts');
-    if(chartsBox) chartsBox.innerHTML = '';
-    const emptyCard = q('netmonEmpty');
-    if(emptyCard) emptyCard.style.display = '';
-    return;
-  }
-  // Clear series but keep running
   try{
-    Object.keys(NETMON_STATE.series || {}).forEach((target)=>{
-      const per = NETMON_STATE.series[target] || {};
-      Object.keys(per).forEach((nid)=>{ per[nid] = []; });
-    });
-  }catch(_e){}
-  netmonRenderAll(true);
-  toast('已清空图表');
+    if(errEl) errEl.textContent = '';
+    if(btn){ btn.disabled = true; btn.textContent = '保存中…'; }
+
+    if(st.editingId){
+      const mid = st.editingId;
+      await fetchJSON(`/api/netmon/monitors/${encodeURIComponent(mid)}`, {
+        method: 'POST',
+        body: JSON.stringify({
+          target: cfg.target,
+          mode: cfg.mode,
+          tcp_port: cfg.tcp_port,
+          interval_sec: cfg.interval_sec,
+          node_ids: cfg.node_ids,
+        }),
+      });
+      toast('已更新监控');
+    }else{
+      await fetchJSON('/api/netmon/monitors', {
+        method: 'POST',
+        body: JSON.stringify({
+          target: cfg.target,
+          mode: cfg.mode,
+          tcp_port: cfg.tcp_port,
+          interval_sec: cfg.interval_sec,
+          node_ids: cfg.node_ids,
+          enabled: true,
+        }),
+      });
+      toast('已创建监控');
+    }
+
+    closeNetMonMonitorModal();
+    await netmonRefresh(true);
+  }catch(e){
+    const msg = (e && e.message) ? e.message : String(e);
+    if(errEl) errEl.textContent = msg;
+  }finally{
+    if(btn){ btn.disabled = false; btn.textContent = '保存'; }
+  }
 }
 
-async function netmonTick(){
+async function netmonToggleMonitor(monitorId){
   const st = NETMON_STATE;
-  if(!st || !st.running) return;
+  if(!st) return;
+  const mid = String(monitorId);
+  const mon = st.monitorsMap ? st.monitorsMap[mid] : null;
+  if(!mon) return;
+
+  try{
+    await fetchJSON(`/api/netmon/monitors/${encodeURIComponent(mid)}`, {
+      method: 'POST',
+      body: JSON.stringify({ enabled: !mon.enabled }),
+    });
+    toast(mon.enabled ? '已停用' : '已启用');
+    await netmonRefresh(true);
+  }catch(e){
+    toast((e && e.message) ? e.message : String(e), true);
+  }
+}
+
+async function netmonDeleteMonitor(monitorId){
+  const st = NETMON_STATE;
+  if(!st) return;
+  const mid = String(monitorId);
+  const mon = st.monitorsMap ? st.monitorsMap[mid] : null;
+  const name = mon ? (mon.target || ('#' + mid)) : ('#' + mid);
+  if(!confirm(`确认删除监控：${name} ？\n（将同时删除历史采集数据）`)) return;
+
+  try{
+    await fetchJSON(`/api/netmon/monitors/${encodeURIComponent(mid)}/delete`, { method:'POST', body: '{}' });
+    toast('已删除');
+    await netmonRefresh(true);
+  }catch(e){
+    toast((e && e.message) ? e.message : String(e), true);
+  }
+}
+
+async function netmonRefresh(force){
+  const st = NETMON_STATE;
+  if(!st) return;
   if(st.inflight) return;
   st.inflight = true;
 
-  const cfg = st.cfg;
-  const statusEl = q('netmonStatus');
-
+  const statusEl = document.getElementById('netmonStatus');
   try{
-    const res = await fetchJSON('/api/netmon/probe', {
-      method: 'POST',
-      body: JSON.stringify({
-        node_ids: cfg.nodeIds,
-        targets: cfg.targets,
-        mode: cfg.mode,
-        tcp_port: cfg.tcpPort,
-        timeout: 1.5,
-      }),
-    });
-
+    const winMin = Math.max(1, Math.min(1440, Number(st.windowMin) || 10));
+    const res = await fetchJSON(`/api/netmon/snapshot?window_min=${encodeURIComponent(winMin)}`);
     st.lastTs = (res && res.ts) ? Number(res.ts) : Date.now();
 
-    const now = st.lastTs;
-    const windowMs = cfg.windowMin * 60 * 1000;
-    const cutoff = now - windowMs;
+    // Update node meta from server (better names/online state)
+    if(res && res.nodes && typeof res.nodes === 'object'){
+      st.nodesMeta = res.nodes;
+    }
 
-    const matrix = (res && res.matrix && typeof res.matrix === 'object') ? res.matrix : {};
-
-    cfg.targets.forEach((target)=>{
-      const perTarget = matrix[target] && typeof matrix[target] === 'object' ? matrix[target] : {};
-      cfg.nodeIds.forEach((nid)=>{
-        const item = perTarget[nid];
-        let v = null;
-        if(item && typeof item === 'object' && item.ok){
-          const num = Number(item.latency_ms);
-          if(!Number.isNaN(num) && num >= 0) v = num;
-        }
-        if(!st.series[target]) st.series[target] = {};
-        if(!st.series[target][nid]) st.series[target][nid] = [];
-        st.series[target][nid].push({ t: now, v });
-        // trim
-        const arr = st.series[target][nid];
-        while(arr.length && arr[0].t < cutoff){ arr.shift(); }
-        // hard cap
-        if(arr.length > 1200){ arr.splice(0, arr.length - 1200); }
-      });
+    const monitors = (res && Array.isArray(res.monitors)) ? res.monitors : [];
+    st.monitors = monitors;
+    st.monitorsMap = {};
+    monitors.forEach((m)=>{
+      if(!m || m.id == null) return;
+      st.monitorsMap[String(m.id)] = m;
     });
 
-    st.errorCount = 0;
-    if(statusEl){
-      const tsTxt = _netmonFormatClock(now);
-      statusEl.textContent = `运行中 · 最近一次：${tsTxt}`;
-    }
+    st.series = (res && res.series && typeof res.series === 'object') ? res.series : {};
 
-    netmonRenderAll();
-  }catch(err){
-    st.errorCount = (st.errorCount || 0) + 1;
-    const msg = (err && err.message) ? err.message : String(err);
-    if(statusEl) statusEl.textContent = `探测失败：${msg}`;
-    // Avoid spamming toast
-    if(st.errorCount === 1 || st.errorCount % 6 === 0){
-      toast(`探测失败：${msg}`, true);
+    _netmonEnsureCards();
+    netmonRenderAll(force);
+
+    const empty = document.getElementById('netmonEmpty');
+    if(empty) empty.style.display = monitors.length ? 'none' : '';
+
+    if(statusEl){
+      const tsTxt = _netmonFormatClock(st.lastTs);
+      statusEl.textContent = `已加载 ${monitors.length} 条监控 · 最近更新：${tsTxt}`;
     }
+  }catch(e){
+    const msg = (e && e.message) ? e.message : String(e);
+    if(statusEl) statusEl.textContent = `加载失败：${msg}`;
+    if(force) toast(`加载失败：${msg}`, true);
   }finally{
     st.inflight = false;
   }
 }
 
+function _netmonEnsureCards(){
+  const st = NETMON_STATE;
+  if(!st) return;
+  const chartsBox = document.getElementById('netmonCharts');
+  if(!chartsBox) return;
+
+  const keep = new Set();
+  const monitors = Array.isArray(st.monitors) ? st.monitors.slice() : [];
+  // Default sort: enabled first, then newest first
+  monitors.sort((a,b)=>{
+    const ae = a && a.enabled ? 1 : 0;
+    const be = b && b.enabled ? 1 : 0;
+    if(ae !== be) return be - ae;
+    return (Number(b.id)||0) - (Number(a.id)||0);
+  });
+
+  monitors.forEach((m)=>{
+    if(!m || m.id == null) return;
+    const mid = String(m.id);
+    keep.add(mid);
+    if(!st.charts[mid]){
+      const card = _netmonCreateMonitorCard(m);
+      chartsBox.appendChild(card);
+      st.charts[mid] = new NetMonChart(card, mid);
+    }else{
+      // update info + keep order by append
+      const ch = st.charts[mid];
+      if(ch && ch.card){
+        _netmonUpdateMonitorCard(ch.card, m);
+        chartsBox.appendChild(ch.card);
+      }
+    }
+  });
+
+  // Remove deleted monitors
+  Object.keys(st.charts || {}).forEach((mid)=>{
+    if(!keep.has(mid)){
+      const ch = st.charts[mid];
+      if(ch && ch.card && ch.card.parentNode) ch.card.parentNode.removeChild(ch.card);
+      delete st.charts[mid];
+    }
+  });
+}
+
 function netmonRenderAll(force){
   const st = NETMON_STATE;
   if(!st || !st.charts) return;
-  Object.keys(st.charts).forEach((target)=>{
-    const ch = st.charts[target];
+  Object.keys(st.charts).forEach((mid)=>{
+    const ch = st.charts[mid];
     if(ch) ch.render(force);
   });
 }
 
-function _netmonCreateChartCard(target){
+function _netmonCreateMonitorCard(m){
   const card = document.createElement('div');
   card.className = 'card netmon-chart-card';
-  card.setAttribute('data-target', target);
-
-  const mode = NETMON_STATE && NETMON_STATE.cfg ? NETMON_STATE.cfg.mode : 'ping';
+  card.setAttribute('data-mid', String(m.id));
 
   card.innerHTML = `
     <div class="card-header" style="padding:12px 12px 8px;">
       <div style="min-width:0;">
-        <div class="card-title mono">${escapeHtml(target)}</div>
-        <div class="card-sub">${escapeHtml(mode)} 延迟波动（ms）</div>
+        <div class="card-title mono netmon-title"></div>
+        <div class="card-sub netmon-sub"></div>
         <div class="netmon-legend"></div>
       </div>
-      <div class="right" style="flex:0 0 auto;">
-        <span class="pill xs ghost">x=时间</span>
-        <span class="pill xs ghost" style="margin-left:6px;">y=延迟(ms)</span>
+      <div class="right netmon-actions" style="flex:0 0 auto;">
+        <button class="btn xs ghost netmon-edit" type="button" data-mid="${escapeHtml(String(m.id))}">编辑</button>
+        <button class="btn xs ghost netmon-toggle" type="button" data-mid="${escapeHtml(String(m.id))}">停用</button>
+        <button class="btn xs danger netmon-delete" type="button" data-mid="${escapeHtml(String(m.id))}">删除</button>
       </div>
     </div>
     <div class="netmon-canvas-wrap">
       <canvas class="netmon-canvas" height="220"></canvas>
     </div>
   `;
+
+  _netmonUpdateMonitorCard(card, m);
   return card;
+}
+
+function _netmonUpdateMonitorCard(card, m){
+  if(!card || !m) return;
+  const title = card.querySelector('.netmon-title');
+  if(title) title.textContent = String(m.target || ('#' + m.id));
+
+  const sub = card.querySelector('.netmon-sub');
+  const enabled = !!m.enabled;
+  const mode = String(m.mode || 'ping');
+  const interval = Number(m.interval_sec || 5) || 5;
+  const nodeCount = Array.isArray(m.node_ids) ? m.node_ids.length : 0;
+
+  let lastTxt = '';
+  if(m.last_run_ts_ms){
+    lastTxt = ` · 最近采集 ${_netmonFormatClock(Number(m.last_run_ts_ms))}`;
+  }else{
+    lastTxt = ' · 尚未采集';
+  }
+
+  if(sub){
+    const extra = (!enabled) ? '（已停用）' : '';
+    sub.textContent = `${mode}${mode==='tcping' ? ('/' + (m.tcp_port || 443)) : ''} · ${interval}s · 节点 ${nodeCount}${lastTxt} ${extra}`;
+  }
+
+  const toggleBtn = card.querySelector('button.netmon-toggle');
+  if(toggleBtn) toggleBtn.textContent = enabled ? '停用' : '启用';
+
+  card.classList.toggle('netmon-disabled', !enabled);
 }
 
 function _netmonColorForNode(nodeId){
@@ -4079,9 +4256,9 @@ function _netmonFormatClock(ts){
 }
 
 class NetMonChart{
-  constructor(card, target){
+  constructor(card, monitorId){
     this.card = card;
-    this.target = target;
+    this.monitorId = String(monitorId || '');
     this.canvas = card.querySelector('canvas');
     this.ctx = this.canvas ? this.canvas.getContext('2d') : null;
     this.legendEl = card.querySelector('.netmon-legend');
@@ -4090,6 +4267,9 @@ class NetMonChart{
   render(force){
     const st = NETMON_STATE;
     if(!st || !this.canvas || !this.ctx) return;
+
+    const mon = st.monitorsMap ? st.monitorsMap[this.monitorId] : null;
+    if(!mon) return;
 
     const w = Math.max(200, this.canvas.clientWidth || 0);
     const h = Math.max(140, this.canvas.clientHeight || 0);
@@ -4113,13 +4293,12 @@ class NetMonChart{
     const plotW = Math.max(10, w - padL - padR);
     const plotH = Math.max(10, h - padT - padB);
 
-    const cfg = st.cfg;
     const now = st.lastTs || Date.now();
-    const windowMs = cfg.windowMin * 60 * 1000;
+    const windowMs = (st.windowMin || 10) * 60 * 1000;
     const xMin = now - windowMs;
     const xMax = now;
 
-    const per = (st.series && st.series[this.target]) ? st.series[this.target] : {};
+    const per = (st.series && st.series[this.monitorId]) ? st.series[this.monitorId] : {};
 
     let maxV = 0;
     Object.keys(per).forEach((nid)=>{
@@ -4213,24 +4392,25 @@ class NetMonChart{
       if(started) this.ctx.stroke();
     });
 
-    this._renderLegend();
+    this._renderLegend(mon, per);
   }
 
-  _renderLegend(){
+  _renderLegend(mon, per){
     const st = NETMON_STATE;
     if(!st || !this.legendEl) return;
 
-    const cfg = st.cfg;
-    const per = (st.series && st.series[this.target]) ? st.series[this.target] : {};
+    const nodeIds = Array.isArray(mon.node_ids) ? mon.node_ids : [];
 
     const parts = [];
-    (cfg.nodeIds || []).forEach((nid)=>{
-      const meta = (st.nodesMeta && st.nodesMeta[nid]) ? st.nodesMeta[nid] : {name: ('节点-' + nid)};
-      const color = _netmonColorForNode(nid);
+    nodeIds.forEach((nid)=>{
+      const nidStr = String(nid);
+      const meta = (st.nodesMeta && st.nodesMeta[nidStr]) ? st.nodesMeta[nidStr] : null;
+      const showName = meta ? (meta.name || ('节点-' + nidStr)) : ('节点-' + nidStr);
+      const color = _netmonColorForNode(nidStr);
 
-      // find latest non-null
+      // latest non-null
       let last = null;
-      const arr = per[nid] || [];
+      const arr = per && per[nidStr] ? per[nidStr] : [];
       for(let i=arr.length-1;i>=0;i--){
         const p = arr[i];
         if(p && p.v != null){ last = p.v; break; }
@@ -4240,7 +4420,7 @@ class NetMonChart{
       parts.push(`
         <div class="netmon-legend-item">
           <span class="netmon-dot" style="background:${escapeHtml(color)}"></span>
-          <span class="mono">${escapeHtml(meta.name || ('节点-' + nid))}</span>
+          <span class="mono">${escapeHtml(showName)}</span>
           <span class="muted mono">${escapeHtml(valTxt)}</span>
         </div>
       `);

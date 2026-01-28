@@ -39,6 +39,34 @@ CREATE TABLE IF NOT EXISTS group_orders (
   sort_order INTEGER NOT NULL DEFAULT 0,
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+CREATE TABLE IF NOT EXISTS netmon_monitors (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  target TEXT NOT NULL,
+  mode TEXT NOT NULL DEFAULT 'ping',
+  tcp_port INTEGER NOT NULL DEFAULT 443,
+  interval_sec INTEGER NOT NULL DEFAULT 5,
+  node_ids_json TEXT NOT NULL DEFAULT '[]',
+  enabled INTEGER NOT NULL DEFAULT 1,
+  last_run_ts_ms INTEGER NOT NULL DEFAULT 0,
+  last_run_msg TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS netmon_samples (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  monitor_id INTEGER NOT NULL,
+  node_id INTEGER NOT NULL,
+  ts_ms INTEGER NOT NULL,
+  ok INTEGER NOT NULL DEFAULT 0,
+  latency_ms REAL,
+  error TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_netmon_samples_monitor_ts ON netmon_samples(monitor_id, ts_ms);
+CREATE INDEX IF NOT EXISTS idx_netmon_samples_monitor_node_ts ON netmon_samples(monitor_id, node_id, ts_ms);
 """
 
 
@@ -51,6 +79,20 @@ def ensure_parent_dir(path: str) -> None:
 def init_db(db_path: str = DEFAULT_DB_PATH) -> None:
     ensure_parent_dir(db_path)
     with sqlite3.connect(db_path) as conn:
+        # Improve concurrent read/write (background collectors, UI requests).
+        # Best effort: ignore if the underlying SQLite build/filesystem doesn't support it.
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+        except Exception:
+            pass
+        try:
+            conn.execute("PRAGMA synchronous=NORMAL")
+        except Exception:
+            pass
+        try:
+            conn.execute("PRAGMA busy_timeout=5000")
+        except Exception:
+            pass
         conn.executescript(SCHEMA)
         conn.commit()
 
@@ -89,6 +131,33 @@ def ensure_db(db_path: str = DEFAULT_DB_PATH) -> None:
             conn.execute("ALTER TABLE nodes ADD COLUMN agent_update_msg TEXT NOT NULL DEFAULT ''")
         if "agent_update_at" not in columns:
             conn.execute("ALTER TABLE nodes ADD COLUMN agent_update_at TEXT")
+
+
+        # NetMon tables migrations (older DBs may miss columns)
+        try:
+            mcols = {row[1] for row in conn.execute("PRAGMA table_info(netmon_monitors)").fetchall()}
+            if mcols:
+                if "tcp_port" not in mcols:
+                    conn.execute("ALTER TABLE netmon_monitors ADD COLUMN tcp_port INTEGER NOT NULL DEFAULT 443")
+                if "interval_sec" not in mcols:
+                    conn.execute("ALTER TABLE netmon_monitors ADD COLUMN interval_sec INTEGER NOT NULL DEFAULT 5")
+                if "node_ids_json" not in mcols:
+                    conn.execute("ALTER TABLE netmon_monitors ADD COLUMN node_ids_json TEXT NOT NULL DEFAULT '[]'")
+                if "enabled" not in mcols:
+                    conn.execute("ALTER TABLE netmon_monitors ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1")
+                if "last_run_ts_ms" not in mcols:
+                    conn.execute("ALTER TABLE netmon_monitors ADD COLUMN last_run_ts_ms INTEGER NOT NULL DEFAULT 0")
+                if "last_run_msg" not in mcols:
+                    conn.execute("ALTER TABLE netmon_monitors ADD COLUMN last_run_msg TEXT NOT NULL DEFAULT ''")
+        except Exception:
+            pass
+
+        # NetMon indexes (best effort)
+        try:
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_netmon_samples_monitor_ts ON netmon_samples(monitor_id, ts_ms)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_netmon_samples_monitor_node_ts ON netmon_samples(monitor_id, node_id, ts_ms)")
+        except Exception:
+            pass
         conn.commit()
 
 
@@ -286,6 +355,23 @@ def connect(db_path: str = DEFAULT_DB_PATH):
     ensure_parent_dir(db_path)
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
+    # Best-effort PRAGMAs for better concurrency / less "database is locked" in background sampling.
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+    except Exception:
+        pass
+    try:
+        conn.execute("PRAGMA synchronous=NORMAL")
+    except Exception:
+        pass
+    try:
+        conn.execute("PRAGMA busy_timeout=5000")
+    except Exception:
+        pass
+    try:
+        conn.execute("PRAGMA foreign_keys=ON")
+    except Exception:
+        pass
     try:
         yield conn
     finally:
@@ -401,3 +487,269 @@ def delete_node(node_id: int, db_path: str = DEFAULT_DB_PATH) -> None:
     with connect(db_path) as conn:
         conn.execute("DELETE FROM nodes WHERE id=?", (node_id,))
         conn.commit()
+
+
+# =========================
+# NetMon: monitor definitions + samples
+# =========================
+
+def _netmon_json_loads(raw: str) -> Any:
+    import json
+    try:
+        return json.loads(raw) if raw else None
+    except Exception:
+        return None
+
+
+def _netmon_json_dumps(obj: Any) -> str:
+    import json
+    try:
+        return json.dumps(obj, ensure_ascii=False)
+    except Exception:
+        return "[]"
+
+
+def list_netmon_monitors(db_path: str = DEFAULT_DB_PATH) -> List[Dict[str, Any]]:
+    """Return all NetMon monitors (newest first).
+
+    Fields:
+      - node_ids: parsed list[int]
+    """
+    with connect(db_path) as conn:
+        rows = conn.execute("SELECT * FROM netmon_monitors ORDER BY id DESC").fetchall()
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        d = dict(r)
+        node_ids = _netmon_json_loads(str(d.get("node_ids_json") or "[]"))
+        if not isinstance(node_ids, list):
+            node_ids = []
+        cleaned: List[int] = []
+        for x in node_ids:
+            try:
+                nid = int(x)
+            except Exception:
+                continue
+            if nid > 0 and nid not in cleaned:
+                cleaned.append(nid)
+        d["node_ids"] = cleaned
+        out.append(d)
+    return out
+
+
+def get_netmon_monitor(monitor_id: int, db_path: str = DEFAULT_DB_PATH) -> Optional[Dict[str, Any]]:
+    with connect(db_path) as conn:
+        row = conn.execute("SELECT * FROM netmon_monitors WHERE id=?", (int(monitor_id),)).fetchone()
+    if not row:
+        return None
+    d = dict(row)
+    node_ids = _netmon_json_loads(str(d.get("node_ids_json") or "[]"))
+    if not isinstance(node_ids, list):
+        node_ids = []
+    cleaned: List[int] = []
+    for x in node_ids:
+        try:
+            nid = int(x)
+        except Exception:
+            continue
+        if nid > 0 and nid not in cleaned:
+            cleaned.append(nid)
+    d["node_ids"] = cleaned
+    return d
+
+
+def add_netmon_monitor(
+    target: str,
+    mode: str,
+    tcp_port: int,
+    interval_sec: int,
+    node_ids: List[int],
+    enabled: bool = True,
+    db_path: str = DEFAULT_DB_PATH,
+) -> int:
+    import json
+
+    t = (target or "").strip()
+    m = (mode or "ping").strip().lower() or "ping"
+    if m not in ("ping", "tcping"):
+        m = "ping"
+    try:
+        tp = int(tcp_port)
+    except Exception:
+        tp = 443
+    if tp < 1 or tp > 65535:
+        tp = 443
+    try:
+        itv = int(interval_sec)
+    except Exception:
+        itv = 5
+    if itv < 1:
+        itv = 1
+    if itv > 3600:
+        itv = 3600
+
+    cleaned: List[int] = []
+    for x in node_ids or []:
+        try:
+            nid = int(x)
+        except Exception:
+            continue
+        if nid > 0 and nid not in cleaned:
+            cleaned.append(nid)
+
+    node_ids_json = json.dumps(cleaned, ensure_ascii=False)
+
+    with connect(db_path) as conn:
+        cur = conn.execute(
+            "INSERT INTO netmon_monitors(target, mode, tcp_port, interval_sec, node_ids_json, enabled, updated_at) VALUES(?,?,?,?,?,?,datetime('now'))",
+            (t, m, tp, itv, node_ids_json, 1 if enabled else 0),
+        )
+        conn.commit()
+        return int(cur.lastrowid)
+
+
+def update_netmon_monitor(
+    monitor_id: int,
+    target: Optional[str] = None,
+    mode: Optional[str] = None,
+    tcp_port: Optional[int] = None,
+    interval_sec: Optional[int] = None,
+    node_ids: Optional[List[int]] = None,
+    enabled: Optional[bool] = None,
+    last_run_ts_ms: Optional[int] = None,
+    last_run_msg: Optional[str] = None,
+    db_path: str = DEFAULT_DB_PATH,
+) -> None:
+    import json
+
+    fields: List[str] = []
+    vals: List[Any] = []
+
+    if target is not None:
+        fields.append("target=?")
+        vals.append((target or "").strip())
+    if mode is not None:
+        m = (mode or "ping").strip().lower() or "ping"
+        if m not in ("ping", "tcping"):
+            m = "ping"
+        fields.append("mode=?")
+        vals.append(m)
+    if tcp_port is not None:
+        try:
+            tp = int(tcp_port)
+        except Exception:
+            tp = 443
+        if tp < 1 or tp > 65535:
+            tp = 443
+        fields.append("tcp_port=?")
+        vals.append(tp)
+    if interval_sec is not None:
+        try:
+            itv = int(interval_sec)
+        except Exception:
+            itv = 5
+        if itv < 1:
+            itv = 1
+        if itv > 3600:
+            itv = 3600
+        fields.append("interval_sec=?")
+        vals.append(itv)
+    if node_ids is not None:
+        cleaned: List[int] = []
+        for x in node_ids or []:
+            try:
+                nid = int(x)
+            except Exception:
+                continue
+            if nid > 0 and nid not in cleaned:
+                cleaned.append(nid)
+        fields.append("node_ids_json=?")
+        vals.append(json.dumps(cleaned, ensure_ascii=False))
+    if enabled is not None:
+        fields.append("enabled=?")
+        vals.append(1 if enabled else 0)
+    if last_run_ts_ms is not None:
+        try:
+            ts = int(last_run_ts_ms)
+        except Exception:
+            ts = 0
+        fields.append("last_run_ts_ms=?")
+        vals.append(ts)
+    if last_run_msg is not None:
+        fields.append("last_run_msg=?")
+        vals.append(str(last_run_msg or ""))
+
+    if not fields:
+        return
+
+    fields.append("updated_at=datetime('now')")
+    with connect(db_path) as conn:
+        conn.execute(
+            f"UPDATE netmon_monitors SET {', '.join(fields)} WHERE id=?",
+            tuple(vals + [int(monitor_id)]),
+        )
+        conn.commit()
+
+
+def delete_netmon_monitor(monitor_id: int, db_path: str = DEFAULT_DB_PATH) -> None:
+    mid = int(monitor_id)
+    with connect(db_path) as conn:
+        conn.execute("DELETE FROM netmon_samples WHERE monitor_id=?", (mid,))
+        conn.execute("DELETE FROM netmon_monitors WHERE id=?", (mid,))
+        conn.commit()
+
+
+def insert_netmon_samples(
+    rows: List[Tuple[int, int, int, int, Optional[float], Optional[str]]],
+    db_path: str = DEFAULT_DB_PATH,
+) -> int:
+    """Insert samples. Returns inserted row count."""
+    if not rows:
+        return 0
+    with connect(db_path) as conn:
+        conn.executemany(
+            "INSERT INTO netmon_samples(monitor_id, node_id, ts_ms, ok, latency_ms, error) VALUES(?,?,?,?,?,?)",
+            rows,
+        )
+        conn.commit()
+    return len(rows)
+
+
+def list_netmon_samples(
+    monitor_ids: List[int],
+    since_ts_ms: int,
+    db_path: str = DEFAULT_DB_PATH,
+) -> List[Dict[str, Any]]:
+    mids = []
+    for x in monitor_ids or []:
+        try:
+            mid = int(x)
+        except Exception:
+            continue
+        if mid > 0 and mid not in mids:
+            mids.append(mid)
+    if not mids:
+        return []
+    try:
+        since = int(since_ts_ms)
+    except Exception:
+        since = 0
+
+    # Build dynamic IN clause safely
+    placeholders = ",".join(["?"] * len(mids))
+    sql = f"SELECT monitor_id, node_id, ts_ms, ok, latency_ms, error FROM netmon_samples WHERE monitor_id IN ({placeholders}) AND ts_ms>=? ORDER BY ts_ms ASC"
+    with connect(db_path) as conn:
+        rows = conn.execute(sql, tuple(mids + [since])).fetchall()
+    return [dict(r) for r in rows]
+
+
+def prune_netmon_samples(before_ts_ms: int, db_path: str = DEFAULT_DB_PATH) -> int:
+    try:
+        cutoff = int(before_ts_ms)
+    except Exception:
+        cutoff = 0
+    if cutoff <= 0:
+        return 0
+    with connect(db_path) as conn:
+        cur = conn.execute("DELETE FROM netmon_samples WHERE ts_ms < ?", (cutoff,))
+        conn.commit()
+        return int(cur.rowcount or 0)
