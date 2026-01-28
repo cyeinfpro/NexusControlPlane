@@ -1855,29 +1855,107 @@ async def api_pool_set(request: Request, node_id: int, payload: Dict[str, Any], 
     return {"ok": True, "pool": pool, "desired_version": desired_ver, "queued": True, "note": "waiting agent report"}
 
 
-@app.post("/api/nodes/{node_id}/pool/clear_all")
-async def api_pool_clear_all(request: Request, node_id: int, user: str = Depends(require_login)):
-    """危险操作：清空该节点所有规则（包含同步锁定规则）。
+@app.post("/api/nodes/{node_id}/purge")
+async def api_node_purge(
+    request: Request,
+    node_id: int,
+    payload: Dict[str, Any],
+    user: str = Depends(require_login),
+):
+    """Dangerous: clear all endpoints on a node (including locked/synced rules).
 
-    设计：
-      - 先在前端触发 /backup 下载备份；
-      - 再调用该接口清空 endpoints。
+    Workflow is enforced both on UI and server side:
+      - UI asks for 2-step confirmation and requires typing "确认删除".
+      - Server also verifies confirm_text == "确认删除".
 
-    说明：此接口绕过 /api/nodes/{node_id}/pool 的锁定规则保护，
-    仅用于“清空全部规则”场景。
+    Best-effort: also cleans up paired synced rules on peer nodes (WSS sync / Intranet tunnel).
     """
+
+    confirm_text = str((payload or {}).get("confirm_text") or "").strip()
+    if confirm_text != "确认删除":
+        return JSONResponse({"ok": False, "error": "确认文本不匹配（需要完整输入：确认删除）"}, status_code=400)
+
     node = get_node(node_id)
     if not node:
         return JSONResponse({"ok": False, "error": "节点不存在"}, status_code=404)
 
-    pool = await _load_pool_for_node(node)
-    # 保留 pool 其他配置，只清空 endpoints
-    pool["endpoints"] = []
+    # Load current pool snapshot (desired > report > agent)
+    cur_pool = await _load_pool_for_node(node)
 
-    desired_ver, _ = set_desired_pool(node_id, pool)
-    _schedule_apply_pool(node, pool)
-    return {"ok": True, "desired_version": desired_ver, "queued": True}
+    # Collect sync pairs so we can remove peer rules too (avoid leaving orphaned locked rules)
+    peer_tasks: list[tuple[int, str]] = []  # (peer_node_id, sync_id)
+    seen_pairs: set[tuple[int, str]] = set()
 
+    for ep in (cur_pool.get("endpoints") or []):
+        if not isinstance(ep, dict):
+            continue
+        ex = ep.get("extra_config") or {}
+        if not isinstance(ex, dict):
+            continue
+        sid = str(ex.get("sync_id") or "").strip()
+        if not sid:
+            continue
+
+        peer_id = 0
+
+        # WSS node-to-node sync
+        role = str(ex.get("sync_role") or "").strip()
+        if role == "sender":
+            try:
+                peer_id = int(ex.get("sync_peer_node_id") or 0)
+            except Exception:
+                peer_id = 0
+        elif role == "receiver":
+            try:
+                peer_id = int(ex.get("sync_from_node_id") or 0)
+            except Exception:
+                peer_id = 0
+
+        # Intranet tunnel sync (server/client)
+        if peer_id <= 0:
+            irole = str(ex.get("intranet_role") or "").strip()
+            if irole in ("server", "client"):
+                try:
+                    peer_id = int(ex.get("intranet_peer_node_id") or 0)
+                except Exception:
+                    peer_id = 0
+
+        if peer_id > 0 and peer_id != int(node_id):
+            key = (peer_id, sid)
+            if key not in seen_pairs:
+                seen_pairs.add(key)
+                peer_tasks.append((peer_id, sid))
+
+    # Remove peers first (best effort). We do not block purge if peers fail.
+    peers_cleared: list[int] = []
+    for peer_id, sid in peer_tasks:
+        peer = get_node(int(peer_id))
+        if not peer:
+            continue
+        try:
+            peer_pool = await _load_pool_for_node(peer)
+            _remove_endpoints_by_sync_id(peer_pool, sid)
+            set_desired_pool(int(peer_id), peer_pool)
+            _schedule_apply_pool(peer, peer_pool)
+            peers_cleared.append(int(peer_id))
+        except Exception:
+            continue
+
+    # Clear local endpoints (keep other pool keys as-is)
+    new_pool = dict(cur_pool)
+    new_pool["endpoints"] = []
+
+    desired_ver, _ = set_desired_pool(node_id, new_pool)
+    _schedule_apply_pool(node, new_pool)
+
+    return {
+        "ok": True,
+        "node_id": int(node_id),
+        "cleared": True,
+        "peer_nodes_touched": sorted(set(peers_cleared)),
+        "desired_version": desired_ver,
+        "queued": True,
+    }
 
 
 
@@ -2415,35 +2493,39 @@ async def api_wss_tunnel_save(payload: Dict[str, Any], user: str = Depends(requi
 
     sync_id = str(payload.get("sync_id") or "").strip() or uuid.uuid4().hex
 
-    # If editing an existing sync rule and changing receiver node,
-    # we must remove the stale receiver rule from the OLD B node.
+    # If editing an existing synced rule and switching receiver node,
+    # proactively remove the old receiver-side rule to avoid leaving stale rules behind.
+    # (Bugfix: previously the old receiver kept the synced rule forever.)
     sender_pool = await _load_pool_for_node(sender)
-    old_receiver_id: Optional[int] = None
-    old_receiver_port_from_sender: Optional[int] = None
+    old_receiver_id: int = 0
     try:
-        for ep0 in (sender_pool.get("endpoints") or []):
-            if not isinstance(ep0, dict):
+        for ep in sender_pool.get("endpoints") or []:
+            if not isinstance(ep, dict):
                 continue
-            ex0 = ep0.get("extra_config") or {}
+            ex0 = ep.get("extra_config") or {}
             if not isinstance(ex0, dict):
                 continue
             if str(ex0.get("sync_id") or "") != str(sync_id):
                 continue
-            if str(ex0.get("sync_role") or "") == "sender":
-                try:
-                    oi = int(ex0.get("sync_peer_node_id") or 0)
-                    old_receiver_id = oi if oi > 0 else None
-                except Exception:
-                    old_receiver_id = None
-                try:
-                    op = int(ex0.get("sync_receiver_port") or 0)
-                    old_receiver_port_from_sender = op if 0 < op <= 65535 else None
-                except Exception:
-                    old_receiver_port_from_sender = None
-                break
+            if str(ex0.get("sync_role") or "") != "sender":
+                continue
+            old_receiver_id = int(ex0.get("sync_peer_node_id") or 0)
+            break
     except Exception:
-        old_receiver_id = None
-        old_receiver_port_from_sender = None
+        old_receiver_id = 0
+
+    old_receiver: Optional[Dict[str, Any]] = None
+    old_receiver_pool: Optional[Dict[str, Any]] = None
+    if old_receiver_id > 0 and old_receiver_id != receiver_id:
+        old_receiver = get_node(old_receiver_id)
+        if old_receiver:
+            try:
+                old_receiver_pool = await _load_pool_for_node(old_receiver)
+                _remove_endpoints_by_sync_id(old_receiver_pool, sync_id)
+                set_desired_pool(old_receiver_id, old_receiver_pool)
+            except Exception:
+                old_receiver = None
+                old_receiver_pool = None
 
     # Receiver port policy:
     #   - If receiver_port is explicitly provided (UI input / toggle), treat it as FIXED.
@@ -2468,8 +2550,6 @@ async def api_wss_tunnel_save(payload: Dict[str, Any], user: str = Depends(requi
 
     if receiver_port is None:
         receiver_port = existing_receiver_port
-    if receiver_port is None and old_receiver_port_from_sender:
-        receiver_port = old_receiver_port_from_sender
     if receiver_port is None:
         receiver_port = sender_listen_port
 
@@ -2542,8 +2622,6 @@ async def api_wss_tunnel_save(payload: Dict[str, Any], user: str = Depends(requi
         },
     }
 
-    # sender_pool already loaded above for peer-change cleanup
-
     # upsert by sync_id (preserve original ordering to avoid UI/stat mismatch)
     _upsert_endpoint_by_sync_id(sender_pool, sync_id, sender_ep)
     _upsert_endpoint_by_sync_id(receiver_pool, sync_id, receiver_ep)
@@ -2564,15 +2642,9 @@ async def api_wss_tunnel_save(payload: Dict[str, Any], user: str = Depends(requi
     await _apply(sender, sender_pool)
     await _apply(receiver, receiver_pool)
 
-    # Cleanup stale rule on old receiver (if receiver node changed)
-    old_receiver_desired_version: Optional[int] = None
-    if old_receiver_id and int(old_receiver_id) != int(receiver_id):
-        old_node = get_node(int(old_receiver_id))
-        if old_node:
-            old_pool = await _load_pool_for_node(old_node)
-            _remove_endpoints_by_sync_id(old_pool, sync_id)
-            old_receiver_desired_version, _ = set_desired_pool(int(old_receiver_id), old_pool)
-            await _apply(old_node, old_pool)
+    # Best-effort: apply cleanup on the old receiver node (if receiver changed)
+    if old_receiver and isinstance(old_receiver_pool, dict):
+        await _apply(old_receiver, old_receiver_pool)
 
     return {
         "ok": True,
@@ -2582,8 +2654,6 @@ async def api_wss_tunnel_save(payload: Dict[str, Any], user: str = Depends(requi
         "receiver_pool": receiver_pool,
         "sender_desired_version": s_ver,
         "receiver_desired_version": r_ver,
-        "old_receiver_node_id": old_receiver_id,
-        "old_receiver_desired_version": old_receiver_desired_version,
     }
 
 
@@ -2608,7 +2678,7 @@ async def api_wss_tunnel_delete(payload: Dict[str, Any], user: str = Depends(req
     if not sender or not receiver:
         return JSONResponse({"ok": False, "error": "节点不存在"}, status_code=404)
 
-    # sender_pool already loaded above for peer-change cleanup
+    sender_pool = await _load_pool_for_node(sender)
     receiver_pool = await _load_pool_for_node(receiver)
 
     _remove_endpoints_by_sync_id(sender_pool, sync_id)
@@ -2685,28 +2755,38 @@ async def api_intranet_tunnel_save(payload: Dict[str, Any], user: str = Depends(
     sync_id = str(payload.get("sync_id") or "").strip() or uuid.uuid4().hex
     token = str(payload.get("token") or "").strip() or uuid.uuid4().hex
 
-    # If editing an existing intranet rule and changing receiver node,
-    # remove the stale client rule from the OLD B node.
+    # If editing an existing intranet tunnel and switching the peer node,
+    # proactively remove the old peer-side rule to avoid leaving stale synced rules behind.
     sender_pool = await _load_pool_for_node(sender)
-    old_client_node_id: Optional[int] = None
+    old_receiver_id: int = 0
     try:
-        for ep0 in (sender_pool.get("endpoints") or []):
-            if not isinstance(ep0, dict):
+        for ep in sender_pool.get("endpoints") or []:
+            if not isinstance(ep, dict):
                 continue
-            ex0 = ep0.get("extra_config") or {}
+            ex0 = ep.get("extra_config") or {}
             if not isinstance(ex0, dict):
                 continue
             if str(ex0.get("sync_id") or "") != str(sync_id):
                 continue
-            if str(ex0.get("intranet_role") or "") == "server":
-                try:
-                    oi = int(ex0.get("intranet_peer_node_id") or 0)
-                    old_client_node_id = oi if oi > 0 else None
-                except Exception:
-                    old_client_node_id = None
-                break
+            if str(ex0.get("intranet_role") or "") != "server":
+                continue
+            old_receiver_id = int(ex0.get("intranet_peer_node_id") or 0)
+            break
     except Exception:
-        old_client_node_id = None
+        old_receiver_id = 0
+
+    old_receiver: Optional[Dict[str, Any]] = None
+    old_receiver_pool: Optional[Dict[str, Any]] = None
+    if old_receiver_id > 0 and old_receiver_id != receiver_id:
+        old_receiver = get_node(old_receiver_id)
+        if old_receiver:
+            try:
+                old_receiver_pool = await _load_pool_for_node(old_receiver)
+                _remove_endpoints_by_sync_id(old_receiver_pool, sync_id)
+                set_desired_pool(old_receiver_id, old_receiver_pool)
+            except Exception:
+                old_receiver = None
+                old_receiver_pool = None
 
     # A-side public host that B can reach. Default: sender base_url hostname. Allow override from UI.
     def _norm_host(h: str) -> str:
@@ -2785,7 +2865,6 @@ async def api_intranet_tunnel_save(payload: Dict[str, Any], user: str = Depends(
         },
     }
 
-    # sender_pool already loaded above for peer-change cleanup
     receiver_pool = await _load_pool_for_node(receiver)
 
     # upsert by sync_id (preserve original ordering to avoid UI/stat mismatch)
@@ -2806,15 +2885,9 @@ async def api_intranet_tunnel_save(payload: Dict[str, Any], user: str = Depends(
     await _apply(sender, sender_pool)
     await _apply(receiver, receiver_pool)
 
-    # Cleanup stale rule on old client node (if receiver node changed)
-    old_client_desired_version: Optional[int] = None
-    if old_client_node_id and int(old_client_node_id) != int(receiver_id):
-        old_node = get_node(int(old_client_node_id))
-        if old_node:
-            old_pool = await _load_pool_for_node(old_node)
-            _remove_endpoints_by_sync_id(old_pool, sync_id)
-            old_client_desired_version, _ = set_desired_pool(int(old_client_node_id), old_pool)
-            await _apply(old_node, old_pool)
+    # Best-effort: apply cleanup on the old peer node (if peer changed)
+    if old_receiver and isinstance(old_receiver_pool, dict):
+        await _apply(old_receiver, old_receiver_pool)
 
     return {
         "ok": True,
@@ -2823,8 +2896,6 @@ async def api_intranet_tunnel_save(payload: Dict[str, Any], user: str = Depends(
         "receiver_pool": receiver_pool,
         "sender_desired_version": s_ver,
         "receiver_desired_version": r_ver,
-        "old_client_node_id": old_client_node_id,
-        "old_client_desired_version": old_client_desired_version,
     }
 
 
@@ -2849,7 +2920,7 @@ async def api_intranet_tunnel_delete(payload: Dict[str, Any], user: str = Depend
     if not sender or not receiver:
         return JSONResponse({"ok": False, "error": "节点不存在"}, status_code=404)
 
-    # sender_pool already loaded above for peer-change cleanup
+    sender_pool = await _load_pool_for_node(sender)
     receiver_pool = await _load_pool_for_node(receiver)
 
     _remove_endpoints_by_sync_id(sender_pool, sync_id)

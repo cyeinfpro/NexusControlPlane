@@ -50,12 +50,6 @@ body{
   overflow-x:hidden;
 }
 
-@media (max-width: 520px){
-  body{
-    overflow-x:auto;
-  }
-}
-
 /* =========================
    Flowing background (fixed, seamless)
    ========================= */
@@ -163,6 +157,9 @@ a{color:inherit}
 @media (max-width: 640px){
   .page-head{flex-direction:column;align-items:stretch;}
   .page-head .right{justify-content:flex-start;}
+  /* Mobile: make dropdown menu full-width to prevent it from popping outside viewport */
+  .page-head .right details.menu{flex:1 1 100%; width:100%;}
+  .page-head .right details.menu summary{width:100%; text-align:center;}
 }
 
 /* Typography */
@@ -479,11 +476,7 @@ details.menu summary::-webkit-details-marker{display:none}
 .menu-pop{
   position:absolute;right:0;top:calc(100% + 8px);
   min-width:190px;
-  max-width: min(92vw, 360px);
-  max-height: min(70vh, 520px);
-  overflow-y:auto;
-  overflow-x:hidden;
-
+  max-width:min(360px, calc(100vw - 24px));
   background:rgba(17,24,39,0.94);
   border:1px solid var(--line);
   border-radius:14px;
@@ -494,11 +487,8 @@ details.menu summary::-webkit-details-marker{display:none}
 }
 .menu-item{
   width:100%;
-  display:flex;align-items:flex-start;justify-content:space-between;
+  display:flex;align-items:center;justify-content:space-between;
   gap:10px;
-  flex-wrap:wrap;
-  white-space:normal;
-  overflow-wrap:anywhere;
   padding:9px 10px;
   border-radius:12px;
   border:1px solid transparent;
@@ -507,23 +497,10 @@ details.menu summary::-webkit-details-marker{display:none}
   cursor:pointer;
   text-decoration:none;
   font-size:12px;
+  overflow-wrap:anywhere;
 }
 .menu-item:hover{background:rgba(148,163,184,0.12);border-color:rgba(148,163,184,0.24)}
 .menu-sep{height:1px;background:rgba(148,163,184,0.16);margin:6px 4px}
-@media (max-width: 520px){
-  /* Mobile: dropdown menus become bottom sheets to avoid being cropped */
-  .menu-pop{
-    position:fixed;
-    left:12px; right:12px;
-    bottom:12px; top:auto;
-    min-width:0;
-    max-width:none;
-    max-height: calc(100vh - 24px);
-    overflow:auto;
-    z-index:1000;
-  }
-}
-
 
 /* Tables */
 .table-wrap{overflow-x:auto}
@@ -1240,7 +1217,10 @@ textarea,.textarea{min-height:90px;resize:vertical}
   .node-tools{gap:8px}
   .node-tools .search-pill{min-height:34px}
   .node-tools{width:100%;}
-  .node-tools .btn, .node-tools details.menu{flex:1 1 48%;}
+  .node-tools .btn{flex:1 1 48%;}
+  /* Make the dropdown menu occupy full row on very small screens.
+     Otherwise, the popover may overflow the viewport when the button sits in the left column. */
+  .node-tools details.menu{flex:1 1 100%;}
   .node-tools details.menu summary{width:100%; text-align:center;}
   .node-item{min-width: 160px; padding: 9px; border-radius: 12px;}
   .node-group-divider{height:40px;}
@@ -1710,13 +1690,4 @@ body.modal-open{ overflow:hidden; }
   .au-hero-grid{ grid-template-columns: 1fr; }
   .au-hero-right{ align-items:stretch; }
   .au-search{ flex:1; max-width:none; }
-}
-
-/* Mobile overflow guards */
-@media (max-width: 520px){
-  body{ overflow-x:auto; }
-  .container{ padding-left:12px; padding-right:12px; }
-  .table-wrap{ -webkit-overflow-scrolling: touch; }
-  .card, .card-header, .node-head, .node-tools{ min-width:0; }
-  input, textarea, select{ max-width:100%; }
 }
