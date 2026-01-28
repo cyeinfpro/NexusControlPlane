@@ -3662,3 +3662,593 @@ document.addEventListener('click', (e)=>{
 try{ initDashboardMiniSys(); }catch(_e){}
 // Auto-init dashboard filters/search/group collapse
 try{ initDashboardViewControls(); }catch(_e){}
+
+// ========================= Network fluctuation monitor (NetMon) =========================
+
+let NETMON_STATE = null;
+
+function initNetMonPage(){
+  const groups = window.__NETMON_NODE_GROUPS__ || [];
+  const nodesBox = document.getElementById('netmonNodes');
+  if(!nodesBox) return; // not on this page
+
+  // Build node checkbox list
+  const nodesMeta = {};
+  nodesBox.innerHTML = '';
+  const frag = document.createDocumentFragment();
+
+  (Array.isArray(groups) ? groups : []).forEach((g)=>{
+    const gName = (g && g.name) ? String(g.name) : '默认分组';
+    const gNodes = (g && Array.isArray(g.nodes)) ? g.nodes : [];
+    const online = Number(g && g.online) || 0;
+    const total = Number(g && g.total) || gNodes.length;
+
+    const wrap = document.createElement('div');
+    wrap.className = 'netmon-group';
+
+    const head = document.createElement('div');
+    head.className = 'netmon-group-head';
+    head.innerHTML = `
+      <div class="netmon-group-name">${escapeHtml(gName)} <span class="muted sm">在线 <strong>${online}</strong>/<strong>${total}</strong></span></div>
+    `;
+    wrap.appendChild(head);
+
+    const items = document.createElement('div');
+    items.className = 'netmon-group-items';
+
+    gNodes.forEach((n)=>{
+      if(!n || n.id == null) return;
+      const nid = String(n.id);
+      const name = n.name ? String(n.name) : ('节点-' + nid);
+      const host = n.display_ip ? String(n.display_ip) : '';
+      const isOnline = !!n.online;
+      nodesMeta[nid] = { id: nid, name, host, group: gName, online: isOnline };
+
+      const label = document.createElement('label');
+      label.className = 'netmon-node';
+      label.innerHTML = `
+        <input type="checkbox" data-node-id="${escapeHtml(nid)}" checked>
+        <span class="dot ${isOnline ? 'online' : 'offline'}"></span>
+        <span class="netmon-node-name">${escapeHtml(name)}</span>
+        ${host ? `<span class="muted mono sm">${escapeHtml(host)}</span>` : ''}
+      `;
+      items.appendChild(label);
+    });
+
+    wrap.appendChild(items);
+    frag.appendChild(wrap);
+  });
+
+  nodesBox.appendChild(frag);
+
+  // Restore last config
+  try{
+    const saved = JSON.parse(localStorage.getItem('netmon_cfg') || '{}');
+    if(saved && typeof saved === 'object'){
+      if(saved.targets && typeof saved.targets === 'string'){
+        const ta = document.getElementById('netmonTargets');
+        if(ta) ta.value = saved.targets;
+      }
+      if(saved.mode){
+        const sel = document.getElementById('netmonMode');
+        if(sel) sel.value = String(saved.mode);
+      }
+      if(saved.tcp_port){
+        const ipt = document.getElementById('netmonTcpPort');
+        if(ipt) ipt.value = String(saved.tcp_port);
+      }
+      if(saved.interval){
+        const ipt = document.getElementById('netmonInterval');
+        if(ipt) ipt.value = String(saved.interval);
+      }
+      if(saved.window){
+        const ipt = document.getElementById('netmonWindow');
+        if(ipt) ipt.value = String(saved.window);
+      }
+      if(Array.isArray(saved.node_ids) && saved.node_ids.length){
+        // Uncheck all first
+        document.querySelectorAll('#netmonNodes input[type=checkbox][data-node-id]').forEach(cb=>{ cb.checked = false; });
+        saved.node_ids.forEach((id)=>{
+          const cb = document.querySelector(`#netmonNodes input[type=checkbox][data-node-id="${CSS.escape(String(id))}"]`);
+          if(cb) cb.checked = true;
+        });
+      }
+    }
+  }catch(_e){}
+
+  // Mode UI
+  const modeSel = document.getElementById('netmonMode');
+  const portBox = document.getElementById('netmonTcpPortBox');
+  function syncModeUI(){
+    const mode = modeSel ? modeSel.value : 'ping';
+    if(portBox) portBox.style.display = (mode === 'tcping') ? '' : 'none';
+  }
+  if(modeSel) modeSel.addEventListener('change', syncModeUI);
+  syncModeUI();
+
+  // Buttons
+  const startBtn = document.getElementById('netmonStartBtn');
+  const stopBtn = document.getElementById('netmonStopBtn');
+  const clearBtn = document.getElementById('netmonClearBtn');
+  const allBtn = document.getElementById('netmonSelectAll');
+  const noneBtn = document.getElementById('netmonSelectNone');
+
+  if(allBtn) allBtn.addEventListener('click', ()=>netmonSelectAll(true));
+  if(noneBtn) noneBtn.addEventListener('click', ()=>netmonSelectAll(false));
+  if(startBtn) startBtn.addEventListener('click', ()=>netmonStart(nodesMeta));
+  if(stopBtn) stopBtn.addEventListener('click', netmonStop);
+  if(clearBtn) clearBtn.addEventListener('click', netmonClear);
+
+  // Resize redraw (debounced)
+  let _resizeTimer = null;
+  window.addEventListener('resize', ()=>{
+    if(!_resizeTimer){
+      _resizeTimer = setTimeout(()=>{
+        _resizeTimer = null;
+        try{ netmonRenderAll(true); }catch(_e){}
+      }, 120);
+    }
+  });
+}
+
+function netmonSelectAll(on){
+  document.querySelectorAll('#netmonNodes input[type=checkbox][data-node-id]').forEach((cb)=>{
+    cb.checked = !!on;
+  });
+}
+
+function _netmonParseTargets(raw){
+  const out = [];
+  const seen = new Set();
+  String(raw || '').split(/\n+/).forEach((line)=>{
+    const s = String(line || '').trim();
+    if(!s) return;
+    if(s.length > 128) return;
+    if(seen.has(s)) return;
+    seen.add(s);
+    out.push(s);
+  });
+  return out;
+}
+
+function _netmonReadConfig(){
+  const targets = _netmonParseTargets(q('netmonTargets') ? q('netmonTargets').value : '');
+  const mode = (q('netmonMode') ? q('netmonMode').value : 'ping') || 'ping';
+  const tcpPort = Number(q('netmonTcpPort') ? q('netmonTcpPort').value : 443) || 443;
+  const interval = Math.max(1, Number(q('netmonInterval') ? q('netmonInterval').value : 2) || 2);
+  const windowMin = Math.max(1, Number(q('netmonWindow') ? q('netmonWindow').value : 10) || 10);
+
+  const nodeIds = [];
+  document.querySelectorAll('#netmonNodes input[type=checkbox][data-node-id]').forEach((cb)=>{
+    if(cb.checked){
+      const id = cb.getAttribute('data-node-id');
+      if(id && !nodeIds.includes(id)) nodeIds.push(id);
+    }
+  });
+
+  return {
+    targets,
+    mode,
+    tcpPort,
+    interval,
+    windowMin,
+    nodeIds,
+  };
+}
+
+function _netmonSaveConfig(cfg){
+  try{
+    localStorage.setItem('netmon_cfg', JSON.stringify({
+      targets: (q('netmonTargets') ? q('netmonTargets').value : ''),
+      mode: cfg.mode,
+      tcp_port: cfg.tcpPort,
+      interval: cfg.interval,
+      window: cfg.windowMin,
+      node_ids: cfg.nodeIds,
+    }));
+  }catch(_e){}
+}
+
+function netmonStart(nodesMeta){
+  if(NETMON_STATE && NETMON_STATE.running){
+    toast('监控已在运行中');
+    return;
+  }
+
+  const cfg = _netmonReadConfig();
+  if(!cfg.targets.length){ toast('请填写至少一个目标（每行一个）', true); return; }
+  if(!cfg.nodeIds.length){ toast('请选择至少一个节点', true); return; }
+
+  _netmonSaveConfig(cfg);
+
+  const chartsBox = q('netmonCharts');
+  const emptyCard = q('netmonEmpty');
+  if(chartsBox) chartsBox.innerHTML = '';
+  if(emptyCard) emptyCard.style.display = 'none';
+
+  NETMON_STATE = {
+    running: true,
+    inflight: false,
+    timer: null,
+    errorCount: 0,
+    lastTs: Date.now(),
+    cfg,
+    nodesMeta: nodesMeta || {},
+    // series[target][nodeId] = [{t, v}]
+    series: {},
+    charts: {},
+  };
+
+  // Build charts
+  cfg.targets.forEach((target)=>{
+    NETMON_STATE.series[target] = {};
+    cfg.nodeIds.forEach((nid)=>{ NETMON_STATE.series[target][nid] = []; });
+    const card = _netmonCreateChartCard(target);
+    if(chartsBox) chartsBox.appendChild(card);
+    NETMON_STATE.charts[target] = new NetMonChart(card, target);
+  });
+
+  // Render empty axes immediately
+  netmonRenderAll(true);
+
+  // UI state
+  const startBtn = q('netmonStartBtn');
+  const stopBtn = q('netmonStopBtn');
+  if(startBtn) startBtn.disabled = true;
+  if(stopBtn) stopBtn.disabled = false;
+
+  // First tick immediately
+  netmonTick();
+
+  // Polling
+  NETMON_STATE.timer = setInterval(netmonTick, cfg.interval * 1000);
+
+  const status = q('netmonStatus');
+  if(status) status.textContent = `运行中：${cfg.mode}${cfg.mode==='tcping' ? ('/' + cfg.tcpPort) : ''} · ${cfg.interval}s 上报 · 窗口 ${cfg.windowMin}min`;
+}
+
+function netmonStop(){
+  if(!NETMON_STATE){
+    toast('监控未运行');
+    return;
+  }
+  try{ if(NETMON_STATE.timer) clearInterval(NETMON_STATE.timer); }catch(_e){}
+  NETMON_STATE.running = false;
+  NETMON_STATE.timer = null;
+
+  const startBtn = q('netmonStartBtn');
+  const stopBtn = q('netmonStopBtn');
+  if(startBtn) startBtn.disabled = false;
+  if(stopBtn) stopBtn.disabled = true;
+
+  const status = q('netmonStatus');
+  if(status) status.textContent = '已停止';
+}
+
+function netmonClear(){
+  if(!NETMON_STATE){
+    // clear UI anyway
+    const chartsBox = q('netmonCharts');
+    if(chartsBox) chartsBox.innerHTML = '';
+    const emptyCard = q('netmonEmpty');
+    if(emptyCard) emptyCard.style.display = '';
+    return;
+  }
+  // Clear series but keep running
+  try{
+    Object.keys(NETMON_STATE.series || {}).forEach((target)=>{
+      const per = NETMON_STATE.series[target] || {};
+      Object.keys(per).forEach((nid)=>{ per[nid] = []; });
+    });
+  }catch(_e){}
+  netmonRenderAll(true);
+  toast('已清空图表');
+}
+
+async function netmonTick(){
+  const st = NETMON_STATE;
+  if(!st || !st.running) return;
+  if(st.inflight) return;
+  st.inflight = true;
+
+  const cfg = st.cfg;
+  const statusEl = q('netmonStatus');
+
+  try{
+    const res = await fetchJSON('/api/netmon/probe', {
+      method: 'POST',
+      body: JSON.stringify({
+        node_ids: cfg.nodeIds,
+        targets: cfg.targets,
+        mode: cfg.mode,
+        tcp_port: cfg.tcpPort,
+        timeout: 1.5,
+      }),
+    });
+
+    st.lastTs = (res && res.ts) ? Number(res.ts) : Date.now();
+
+    const now = st.lastTs;
+    const windowMs = cfg.windowMin * 60 * 1000;
+    const cutoff = now - windowMs;
+
+    const matrix = (res && res.matrix && typeof res.matrix === 'object') ? res.matrix : {};
+
+    cfg.targets.forEach((target)=>{
+      const perTarget = matrix[target] && typeof matrix[target] === 'object' ? matrix[target] : {};
+      cfg.nodeIds.forEach((nid)=>{
+        const item = perTarget[nid];
+        let v = null;
+        if(item && typeof item === 'object' && item.ok){
+          const num = Number(item.latency_ms);
+          if(!Number.isNaN(num) && num >= 0) v = num;
+        }
+        if(!st.series[target]) st.series[target] = {};
+        if(!st.series[target][nid]) st.series[target][nid] = [];
+        st.series[target][nid].push({ t: now, v });
+        // trim
+        const arr = st.series[target][nid];
+        while(arr.length && arr[0].t < cutoff){ arr.shift(); }
+        // hard cap
+        if(arr.length > 1200){ arr.splice(0, arr.length - 1200); }
+      });
+    });
+
+    st.errorCount = 0;
+    if(statusEl){
+      const tsTxt = _netmonFormatClock(now);
+      statusEl.textContent = `运行中 · 最近一次：${tsTxt}`;
+    }
+
+    netmonRenderAll();
+  }catch(err){
+    st.errorCount = (st.errorCount || 0) + 1;
+    const msg = (err && err.message) ? err.message : String(err);
+    if(statusEl) statusEl.textContent = `探测失败：${msg}`;
+    // Avoid spamming toast
+    if(st.errorCount === 1 || st.errorCount % 6 === 0){
+      toast(`探测失败：${msg}`, true);
+    }
+  }finally{
+    st.inflight = false;
+  }
+}
+
+function netmonRenderAll(force){
+  const st = NETMON_STATE;
+  if(!st || !st.charts) return;
+  Object.keys(st.charts).forEach((target)=>{
+    const ch = st.charts[target];
+    if(ch) ch.render(force);
+  });
+}
+
+function _netmonCreateChartCard(target){
+  const card = document.createElement('div');
+  card.className = 'card netmon-chart-card';
+  card.setAttribute('data-target', target);
+
+  const mode = NETMON_STATE && NETMON_STATE.cfg ? NETMON_STATE.cfg.mode : 'ping';
+
+  card.innerHTML = `
+    <div class="card-header" style="padding:12px 12px 8px;">
+      <div style="min-width:0;">
+        <div class="card-title mono">${escapeHtml(target)}</div>
+        <div class="card-sub">${escapeHtml(mode)} 延迟波动（ms）</div>
+        <div class="netmon-legend"></div>
+      </div>
+      <div class="right" style="flex:0 0 auto;">
+        <span class="pill xs ghost">x=时间</span>
+        <span class="pill xs ghost" style="margin-left:6px;">y=延迟(ms)</span>
+      </div>
+    </div>
+    <div class="netmon-canvas-wrap">
+      <canvas class="netmon-canvas" height="220"></canvas>
+    </div>
+  `;
+  return card;
+}
+
+function _netmonColorForNode(nodeId){
+  const s = String(nodeId || '0');
+  let h = 0;
+  for(let i=0;i<s.length;i++) h = (h*31 + s.charCodeAt(i)) % 360;
+  const hue = (h + 210) % 360;
+  return `hsl(${hue}, 70%, 60%)`;
+}
+
+function _netmonNiceMax(v){
+  const x = Math.max(1, Number(v) || 1);
+  // 1,2,5 * 10^n
+  const pow = Math.pow(10, Math.floor(Math.log10(x)));
+  const n = x / pow;
+  let m = 1;
+  if(n <= 1) m = 1;
+  else if(n <= 2) m = 2;
+  else if(n <= 5) m = 5;
+  else m = 10;
+  return m * pow;
+}
+
+function _netmonFormatClock(ts){
+  const d = new Date(Number(ts) || Date.now());
+  const hh = String(d.getHours()).padStart(2,'0');
+  const mm = String(d.getMinutes()).padStart(2,'0');
+  const ss = String(d.getSeconds()).padStart(2,'0');
+  return `${hh}:${mm}:${ss}`;
+}
+
+class NetMonChart{
+  constructor(card, target){
+    this.card = card;
+    this.target = target;
+    this.canvas = card.querySelector('canvas');
+    this.ctx = this.canvas ? this.canvas.getContext('2d') : null;
+    this.legendEl = card.querySelector('.netmon-legend');
+  }
+
+  render(force){
+    const st = NETMON_STATE;
+    if(!st || !this.canvas || !this.ctx) return;
+
+    const w = Math.max(200, this.canvas.clientWidth || 0);
+    const h = Math.max(140, this.canvas.clientHeight || 0);
+    const dpr = window.devicePixelRatio || 1;
+
+    const needResize = force || (this.canvas.width !== Math.floor(w * dpr)) || (this.canvas.height !== Math.floor(h * dpr));
+    if(needResize){
+      this.canvas.width = Math.floor(w * dpr);
+      this.canvas.height = Math.floor(h * dpr);
+    }
+
+    // draw in CSS pixels
+    this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    this.ctx.clearRect(0, 0, w, h);
+
+    const padL = 54;
+    const padR = 12;
+    const padT = 14;
+    const padB = 30;
+
+    const plotW = Math.max(10, w - padL - padR);
+    const plotH = Math.max(10, h - padT - padB);
+
+    const cfg = st.cfg;
+    const now = st.lastTs || Date.now();
+    const windowMs = cfg.windowMin * 60 * 1000;
+    const xMin = now - windowMs;
+    const xMax = now;
+
+    const per = (st.series && st.series[this.target]) ? st.series[this.target] : {};
+
+    let maxV = 0;
+    Object.keys(per).forEach((nid)=>{
+      const arr = per[nid] || [];
+      for(const p of arr){
+        if(!p) continue;
+        if(p.t < xMin) continue;
+        if(p.v == null) continue;
+        const v = Number(p.v);
+        if(!Number.isNaN(v)) maxV = Math.max(maxV, v);
+      }
+    });
+
+    let yMax = maxV > 0 ? _netmonNiceMax(maxV * 1.25) : 10;
+    if(yMax < 10) yMax = 10;
+
+    // grid
+    this.ctx.strokeStyle = 'rgba(255,255,255,0.08)';
+    this.ctx.lineWidth = 1;
+    for(let i=0;i<=4;i++){
+      const y = padT + (plotH * i / 4);
+      this.ctx.beginPath();
+      this.ctx.moveTo(padL, y);
+      this.ctx.lineTo(padL + plotW, y);
+      this.ctx.stroke();
+    }
+
+    // axes
+    this.ctx.strokeStyle = 'rgba(255,255,255,0.18)';
+    this.ctx.beginPath();
+    this.ctx.moveTo(padL, padT);
+    this.ctx.lineTo(padL, padT + plotH);
+    this.ctx.lineTo(padL + plotW, padT + plotH);
+    this.ctx.stroke();
+
+    // labels
+    const fontMono = '12px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace';
+    this.ctx.font = fontMono;
+    this.ctx.fillStyle = 'rgba(255,255,255,0.55)';
+
+    for(let i=0;i<=4;i++){
+      const val = yMax * (1 - i/4);
+      const y = padT + (plotH * i / 4);
+      const label = `${Math.round(val)}`;
+      this.ctx.textAlign = 'right';
+      this.ctx.textBaseline = 'middle';
+      this.ctx.fillText(label, padL - 8, y);
+    }
+
+    for(let i=0;i<=4;i++){
+      const ts = xMin + (windowMs * i / 4);
+      const x = padL + (plotW * i / 4);
+      const label = _netmonFormatClock(ts);
+      this.ctx.textAlign = 'center';
+      this.ctx.textBaseline = 'top';
+      this.ctx.fillText(label, x, padT + plotH + 8);
+    }
+
+    // lines
+    const xSpan = Math.max(1, xMax - xMin);
+    Object.keys(per).forEach((nid)=>{
+      const arr = per[nid] || [];
+      const color = _netmonColorForNode(nid);
+      this.ctx.strokeStyle = color;
+      this.ctx.lineWidth = 2;
+      this.ctx.beginPath();
+      let started = false;
+      for(const p of arr){
+        if(!p) continue;
+        const t = Number(p.t);
+        if(t < xMin) continue;
+        if(t > xMax) continue;
+        if(p.v == null){
+          started = false;
+          continue;
+        }
+        const v = Number(p.v);
+        if(Number.isNaN(v)){
+          started = false;
+          continue;
+        }
+        const x = padL + ((t - xMin) / xSpan) * plotW;
+        const y = padT + plotH - (Math.max(0, Math.min(yMax, v)) / yMax) * plotH;
+        if(!started){
+          this.ctx.moveTo(x, y);
+          started = true;
+        }else{
+          this.ctx.lineTo(x, y);
+        }
+      }
+      if(started) this.ctx.stroke();
+    });
+
+    this._renderLegend();
+  }
+
+  _renderLegend(){
+    const st = NETMON_STATE;
+    if(!st || !this.legendEl) return;
+
+    const cfg = st.cfg;
+    const per = (st.series && st.series[this.target]) ? st.series[this.target] : {};
+
+    const parts = [];
+    (cfg.nodeIds || []).forEach((nid)=>{
+      const meta = (st.nodesMeta && st.nodesMeta[nid]) ? st.nodesMeta[nid] : {name: ('节点-' + nid)};
+      const color = _netmonColorForNode(nid);
+
+      // find latest non-null
+      let last = null;
+      const arr = per[nid] || [];
+      for(let i=arr.length-1;i>=0;i--){
+        const p = arr[i];
+        if(p && p.v != null){ last = p.v; break; }
+      }
+      const valTxt = (last != null && !Number.isNaN(Number(last))) ? `${Number(last).toFixed(1)} ms` : '—';
+
+      parts.push(`
+        <div class="netmon-legend-item">
+          <span class="netmon-dot" style="background:${escapeHtml(color)}"></span>
+          <span class="mono">${escapeHtml(meta.name || ('节点-' + nid))}</span>
+          <span class="muted mono">${escapeHtml(valTxt)}</span>
+        </div>
+      `);
+    });
+
+    this.legendEl.innerHTML = `<div class="netmon-legend-wrap">${parts.join('')}</div>`;
+  }
+}
+
+// Expose for template inline init
+window.initNetMonPage = initNetMonPage;

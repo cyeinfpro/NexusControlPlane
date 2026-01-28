@@ -557,6 +557,85 @@ async def index(request: Request, user: str = Depends(require_login_page)):
 
 
 
+@app.get("/netmon", response_class=HTMLResponse)
+async def netmon_page(request: Request, user: str = Depends(require_login_page)):
+    """Network fluctuation monitoring page."""
+    nodes = list_nodes()
+
+    group_orders = get_group_orders()
+
+    def _gk(name: str) -> tuple[int, str]:
+        n = (name or '').strip() or '默认分组'
+        try:
+            order = int(group_orders.get(n, 1000))
+        except Exception:
+            order = 1000
+        return (order, n)
+
+    def _gn(x: Dict[str, Any]) -> str:
+        g = str(x.get("group_name") or "").strip()
+        return g or "默认分组"
+
+    for n in nodes:
+        n["display_ip"] = _extract_ip_for_display(n.get("base_url", ""))
+        # 用更宽松的阈值显示在线状态（避免轻微抖动导致频繁显示离线）
+        n["online"] = _is_report_fresh(n, max_age_sec=90)
+        n["group_name"] = _gn(n)
+
+    nodes_sorted = sorted(
+        nodes,
+        key=lambda x: (
+            _gk(_gn(x)),
+            0 if bool(x.get("online")) else 1,
+            -int(x.get("id") or 0),
+        ),
+    )
+
+    node_groups: List[Dict[str, Any]] = []
+    cur = None
+    buf: List[Dict[str, Any]] = []
+    for n in nodes_sorted:
+        g = _gn(n)
+        if cur is None:
+            cur = g
+        if g != cur:
+            node_groups.append(
+                {
+                    "name": cur,
+                    "sort_order": _gk(cur)[0],
+                    "nodes": buf,
+                    "online": sum(1 for i in buf if i.get("online")),
+                    "total": len(buf),
+                }
+            )
+            cur = g
+            buf = []
+        buf.append(n)
+
+    if cur is not None:
+        node_groups.append(
+            {
+                "name": cur,
+                "sort_order": _gk(cur)[0],
+                "nodes": buf,
+                "online": sum(1 for i in buf if i.get("online")),
+                "total": len(buf),
+            }
+        )
+
+    return templates.TemplateResponse(
+        "netmon.html",
+        {
+            "request": request,
+            "user": user,
+            "node_groups": node_groups,
+            "flash": _flash(request),
+            "title": "网络波动监控",
+        },
+    )
+
+
+
 @app.get("/nodes/new", response_class=HTMLResponse)
 async def node_new_page(request: Request, user: str = Depends(require_login_page)):
     api_key = _generate_api_key()
@@ -2358,6 +2437,159 @@ async def api_nodes_list(user: str = Depends(require_login)):
             "is_private": bool(n.get("is_private") or 0),
         })
     return {"ok": True, "nodes": out}
+
+
+@app.post("/api/netmon/probe")
+async def api_netmon_probe(request: Request, user: str = Depends(require_login)):
+    """Probe one or more targets from one or more nodes.
+
+    Frontend will poll this endpoint periodically to build time-series charts.
+    """
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+
+    node_ids = payload.get('node_ids') or payload.get('nodes') or []
+    targets = payload.get('targets') or []
+    mode = str(payload.get('mode') or 'ping').strip().lower()
+    tcp_port = payload.get('tcp_port')
+    timeout = payload.get('timeout')
+
+    # sanitize
+    if not isinstance(node_ids, list):
+        node_ids = []
+    if not isinstance(targets, list):
+        targets = []
+
+    cleaned_node_ids = []
+    for x in node_ids:
+        try:
+            nid = int(x)
+        except Exception:
+            continue
+        if nid > 0 and nid not in cleaned_node_ids:
+            cleaned_node_ids.append(nid)
+    node_ids = cleaned_node_ids[:30]
+
+    cleaned_targets = []
+    for t in targets:
+        s = str(t or '').strip()
+        if not s:
+            continue
+        if len(s) > 128:
+            continue
+        if s not in cleaned_targets:
+            cleaned_targets.append(s)
+    targets = cleaned_targets[:20]
+
+    if mode not in ('ping', 'tcping'):
+        mode = 'ping'
+
+    try:
+        tcp_port_i = int(tcp_port) if tcp_port is not None else 443
+    except Exception:
+        tcp_port_i = 443
+    if tcp_port_i < 1 or tcp_port_i > 65535:
+        tcp_port_i = 443
+
+    try:
+        timeout_f = float(timeout) if timeout is not None else 1.5
+    except Exception:
+        timeout_f = 1.5
+    if timeout_f < 0.2:
+        timeout_f = 0.2
+    if timeout_f > 10:
+        timeout_f = 10.0
+
+    if not node_ids:
+        return JSONResponse({"ok": False, "error": "请选择至少一个节点"}, status_code=400)
+    if not targets:
+        return JSONResponse({"ok": False, "error": "请填写至少一个目标"}, status_code=400)
+
+    # load node records
+    nodes = []
+    for nid in node_ids:
+        n = get_node(nid)
+        if n:
+            nodes.append(n)
+    if not nodes:
+        return JSONResponse({"ok": False, "error": "节点不存在"}, status_code=404)
+
+    # call agents concurrently
+    body = {
+        "mode": mode,
+        "targets": targets,
+        "tcp_port": tcp_port_i,
+        "timeout": timeout_f,
+    }
+
+    async def _call_one(n: Dict[str, Any]):
+        nid = int(n.get('id') or 0)
+        try:
+            # keep the HTTP timeout small for UI polling
+            http_timeout = max(2.5, timeout_f + 1.0)
+            data = await agent_post(
+                n.get('base_url', ''),
+                n.get('api_key', ''),
+                '/api/v1/netprobe',
+                body,
+                _node_verify_tls(n),
+                timeout=http_timeout,
+            )
+            return nid, data
+        except Exception as exc:
+            return nid, {"ok": False, "error": str(exc)}
+
+    tasks = [_call_one(n) for n in nodes]
+    results = await asyncio.gather(*tasks)
+
+    matrix: Dict[str, Dict[str, Any]] = {t: {} for t in targets}
+    node_errors: Dict[str, str] = {}
+
+    for nid, data in results:
+        nid_s = str(nid)
+        if not isinstance(data, dict) or data.get('ok') is not True:
+            err = str((data or {}).get('error') or 'agent_failed')
+            node_errors[nid_s] = err
+            for t in targets:
+                matrix[t][nid_s] = {"ok": False, "latency_ms": None, "error": err}
+            continue
+
+        res_map = data.get('results') if isinstance(data.get('results'), dict) else {}
+        for t in targets:
+            item = res_map.get(t)
+            if not isinstance(item, dict):
+                matrix[t][nid_s] = {"ok": False, "latency_ms": None, "error": "no_data"}
+                continue
+            out_item: Dict[str, Any] = {"ok": bool(item.get('ok'))}
+            if item.get('latency_ms') is not None:
+                out_item['latency_ms'] = item.get('latency_ms')
+            else:
+                out_item['latency_ms'] = None
+            if item.get('error'):
+                out_item['error'] = str(item.get('error'))
+            matrix[t][nid_s] = out_item
+
+    nodes_meta = []
+    for n in nodes:
+        nodes_meta.append({
+            "id": int(n.get('id') or 0),
+            "name": n.get('name') or _extract_ip_for_display(n.get('base_url', '')),
+            "group_name": str(n.get('group_name') or '').strip() or '默认分组',
+        })
+
+    return {
+        "ok": True,
+        "ts": int(time.time() * 1000),
+        "mode": mode,
+        "tcp_port": tcp_port_i,
+        "timeout": timeout_f,
+        "targets": targets,
+        "nodes": nodes_meta,
+        "matrix": matrix,
+        "errors": node_errors,
+    }
 
 
 @app.post("/api/groups/order")

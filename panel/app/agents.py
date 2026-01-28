@@ -12,10 +12,10 @@ DEFAULT_AGENT_PORT = 18700
 TCPING_TIMEOUT = 3.0
 
 
-async def agent_get(base_url: str, api_key: str, path: str, verify_tls: bool) -> Dict[str, Any]:
+async def agent_get(base_url: str, api_key: str, path: str, verify_tls: bool, timeout: Optional[float] = None) -> Dict[str, Any]:
     headers = {"X-API-Key": api_key}
     url = f"{base_url.rstrip('/')}{path}"
-    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT, verify=verify_tls) as client:
+    async with httpx.AsyncClient(timeout=(timeout or DEFAULT_TIMEOUT), verify=verify_tls) as client:
         r = await client.get(url, headers=headers)
         if r.status_code >= 400:
             raise RuntimeError(_format_agent_error(r))
@@ -28,10 +28,11 @@ async def agent_post(
     path: str,
     data: Any,
     verify_tls: bool,
+    timeout: Optional[float] = None,
 ) -> Dict[str, Any]:
     headers = {"X-API-Key": api_key}
     url = f"{base_url.rstrip('/')}{path}"
-    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT, verify=verify_tls) as client:
+    async with httpx.AsyncClient(timeout=(timeout or DEFAULT_TIMEOUT), verify=verify_tls) as client:
         r = await client.post(url, headers=headers, json=data)
         if r.status_code >= 400:
             raise RuntimeError(_format_agent_error(r))

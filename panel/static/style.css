@@ -185,6 +185,18 @@ a{color:inherit}
 
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px;margin-top:12px}
 
+/*
+  Prevent horizontal overflow in CSS grid layouts.
+
+  Grid items default to `min-width:auto` (min-content sizing). If any child
+  contains long unbreakable text (e.g. a long domain / IP / UA), the item's
+  min-content size can exceed the grid track width and force the whole grid
+  wider than the viewport.
+
+  By setting `min-width:0` we allow the item to shrink within the track.
+*/
+.grid > *{min-width:0;}
+
 /* =========================
    Dashboard: compact node tile grid
    ========================= */
@@ -310,6 +322,9 @@ a{color:inherit}
 
 .node-tile{
   position:relative;
+  min-width:0;
+  max-width:100%;
+  overflow:hidden;
   padding:9px;
   border-radius:14px;
   transition: transform .12s ease, border-color .12s ease, background .12s ease;
@@ -406,6 +421,8 @@ a{color:inherit}
 
   /* Mobile node tile: denser */
   .node-tile{padding:8px;border-radius:14px;}
+  .node-top{flex-wrap:wrap;}
+  .node-right{width:100%; justify-content:flex-end;}
   .node-right{gap:6px;}
   .node-state{padding:5px 7px;}
 
@@ -1690,4 +1707,119 @@ body.modal-open{ overflow:hidden; }
   .au-hero-grid{ grid-template-columns: 1fr; }
   .au-hero-right{ align-items:stretch; }
   .au-search{ flex:1; max-width:none; }
+}
+
+/* =========================
+   NetMon page (network fluctuation monitor)
+   ========================= */
+.node-list.netmon-form{
+  padding: 10px 12px 12px;
+  display:flex;
+  flex-direction:column;
+  gap:10px;
+  max-height: calc(100vh - 208px);
+  overflow:auto;
+}
+
+@media (max-width: 980px){
+  .node-list.netmon-form{
+    flex-direction:column;
+    gap:10px;
+    overflow:visible;
+    scroll-snap-type:none;
+    -webkit-overflow-scrolling:auto;
+  }
+}
+
+.netmon-nodes{
+  display:flex;
+  flex-direction:column;
+  gap:10px;
+}
+
+.netmon-group{
+  border: 1px solid rgba(148,163,184,0.14);
+  border-radius: 12px;
+  padding: 10px;
+  background: rgba(15,23,42,0.18);
+}
+
+.netmon-group-head{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:10px;
+  margin-bottom:8px;
+}
+
+.netmon-group-name{
+  font-weight:900;
+  font-size:13px;
+}
+
+.netmon-group-items{
+  display:flex;
+  flex-direction:column;
+  gap:8px;
+}
+
+.netmon-node{
+  display:flex;
+  align-items:center;
+  gap:8px;
+  cursor:pointer;
+  user-select:none;
+}
+
+.netmon-node input{ transform: translateY(1px); }
+
+.netmon-node-name{
+  font-weight:800;
+  font-size:13px;
+  max-width: 160px;
+  white-space:nowrap;
+  overflow:hidden;
+  text-overflow:ellipsis;
+}
+
+.netmon-charts{
+  display:flex;
+  flex-direction:column;
+  gap:10px;
+}
+
+.netmon-chart-card .netmon-canvas-wrap{
+  padding: 0 12px 12px;
+}
+
+.netmon-canvas{
+  width: 100%;
+  height: 220px;
+  display:block;
+  border-radius: 12px;
+  background: rgba(2,6,23,0.38);
+  border: 1px solid rgba(148,163,184,0.12);
+}
+
+.netmon-legend{ margin-top: 10px; }
+
+.netmon-legend-wrap{
+  display:flex;
+  flex-wrap:wrap;
+  gap:10px;
+}
+
+.netmon-legend-item{
+  display:flex;
+  align-items:center;
+  gap:6px;
+  font-size:12px;
+  color: rgba(226,232,240,0.92);
+}
+
+.netmon-dot{
+  width: 10px;
+  height: 10px;
+  border-radius: 999px;
+  box-shadow: 0 0 0 2px rgba(11,15,20,0.65);
 }

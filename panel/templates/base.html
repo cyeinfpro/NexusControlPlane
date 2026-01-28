@@ -6,7 +6,7 @@
   <meta name="theme-color" content="#0B0F14">
   <title>{% if title %}{{ title }} · Nexus Network Control Plane{% else %}Nexus Network Control Plane{% endif %}</title>
   <link rel="icon" type="image/svg+xml" href="/static/nexus.svg">
-  <link rel="stylesheet" href="/static/style.css?v=44.0">
+  <link rel="stylesheet" href="/static/style.css?v=46.0">
 </head>
 <body>
   <!-- Flowing background (fixed, no seams on scroll) -->
@@ -27,6 +27,7 @@
     <nav class="nav">
       {% if user %}
         <a href="/" class="nav-link">控制台</a>
+        <a href="/netmon" class="nav-link">网络波动</a>
         <a href="/logout" class="nav-link">退出</a>
       {% endif %}
     </nav>

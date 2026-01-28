@@ -1126,7 +1126,7 @@ def _wss_probe_entries(rule: Dict[str, Any]) -> List[Dict[str, str]]:
     return entries
 
 
-app = FastAPI(title='Realm Agent', version='40')
+app = FastAPI(title='Realm Agent', version='41')
 REALM_SERVICE_NAMES = [s for s in [CFG.realm_service, 'realm.service', 'realm'] if s]
 
 
@@ -1764,6 +1764,219 @@ def api_apply(_: None = Depends(_api_key_required)) -> Dict[str, Any]:
     except Exception as exc:
         return {'ok': False, 'error': str(exc)}
     return {'ok': True}
+
+
+# ------------------------ NetProbe (ping/tcping) ------------------------
+
+_NETPROBE_PING_RE = re.compile(r'time[=<]?\s*([0-9.]+)\s*ms', re.IGNORECASE)
+
+
+def _parse_tcp_target(target: str, default_port: int) -> tuple[str, int]:
+    """Parse tcping target.
+
+    Supported:
+    - host
+    - host:port
+    - [ipv6]:port
+
+    If no port is provided, use default_port.
+    """
+    s = str(target or '').strip()
+    if not s:
+        return '', default_port
+
+    # [ipv6]:port
+    if s.startswith('[') and ']' in s:
+        host = s[1:s.index(']')]
+        rest = s[s.index(']') + 1:]
+        if rest.startswith(':') and rest[1:].isdigit():
+            try:
+                p = int(rest[1:])
+                if 1 <= p <= 65535:
+                    return host, p
+            except Exception:
+                pass
+        return host, default_port
+
+    # host:port (avoid误判ipv6: allow only one ':')
+    if s.count(':') == 1:
+        host, p = s.rsplit(':', 1)
+        if p.isdigit():
+            try:
+                pi = int(p)
+                if 1 <= pi <= 65535:
+                    return host.strip(), pi
+            except Exception:
+                pass
+
+    return s, default_port
+
+
+def _icmp_ping_once(target: str, timeout_sec: float) -> Dict[str, Any]:
+    """Run one ICMP ping and return latency (ms)."""
+    t = str(target or '').strip()
+    if not t:
+        return {'ok': False, 'error': 'empty_target'}
+
+    ping_bin = shutil.which('ping') or ''
+    if not ping_bin:
+        ping_bin = shutil.which('ping6') or ''
+    if not ping_bin:
+        return {'ok': False, 'error': 'ping_not_found'}
+
+    try:
+        to = float(timeout_sec)
+    except Exception:
+        to = 1.5
+    if to < 0.2:
+        to = 0.2
+    if to > 10:
+        to = 10.0
+
+    wait_s = max(1, int(to + 0.999))
+
+    # -n: numeric, -c 1: single packet, -W: per-packet timeout seconds
+    cmd = [ping_bin, '-n', '-c', '1', '-W', str(wait_s), t]
+
+    # Best effort: some ping supports -6 for IPv6
+    if ':' in t and ping_bin.endswith('ping'):
+        cmd = [ping_bin, '-6', '-n', '-c', '1', '-W', str(wait_s), t]
+
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=wait_s + 1.0)
+    except subprocess.TimeoutExpired:
+        return {'ok': False, 'error': 'timeout'}
+    except Exception as exc:
+        return {'ok': False, 'error': str(exc)}
+
+    out = (r.stdout or '') + "\n" + (r.stderr or '')
+    if r.returncode == 0:
+        m = _NETPROBE_PING_RE.search(out)
+        if m:
+            try:
+                latency = float(m.group(1))
+                return {'ok': True, 'latency_ms': latency}
+            except Exception:
+                return {'ok': True, 'latency_ms': None}
+        if re.search(r'time<\s*1\s*ms', out, re.IGNORECASE):
+            return {'ok': True, 'latency_ms': 1.0}
+        return {'ok': True, 'latency_ms': None}
+
+    err = out.strip().splitlines()[-1] if out.strip() else 'timeout'
+    if len(err) > 200:
+        err = err[:200] + '…'
+    return {'ok': False, 'error': err}
+
+
+def _tcp_ping_once(host: str, port: int, timeout_sec: float) -> Dict[str, Any]:
+    """TCP connect latency (ms)."""
+    h = str(host or '').strip()
+    try:
+        p = int(port)
+    except Exception:
+        p = 0
+    if not h or p < 1 or p > 65535:
+        return {'ok': False, 'error': 'invalid_target'}
+
+    try:
+        to = float(timeout_sec)
+    except Exception:
+        to = 1.5
+    if to < 0.2:
+        to = 0.2
+    if to > 10:
+        to = 10.0
+
+    start = time.perf_counter()
+    try:
+        sock = socket.create_connection((h, p), timeout=to)
+        try:
+            sock.close()
+        except Exception:
+            pass
+        latency_ms = (time.perf_counter() - start) * 1000.0
+        return {'ok': True, 'latency_ms': round(latency_ms, 3)}
+    except Exception as exc:
+        msg = str(exc)
+        if len(msg) > 200:
+            msg = msg[:200] + '…'
+        return {'ok': False, 'error': msg}
+
+
+@app.post('/api/v1/netprobe')
+def api_netprobe(payload: Dict[str, Any], _: None = Depends(_api_key_required)) -> Dict[str, Any]:
+    """Batch network probe from this node."""
+    mode = str(payload.get('mode') or 'ping').strip().lower()
+    targets = payload.get('targets') or []
+    tcp_port = payload.get('tcp_port')
+    timeout = payload.get('timeout')
+
+    if mode not in ('ping', 'tcping'):
+        mode = 'ping'
+
+    if not isinstance(targets, list):
+        targets = []
+
+    cleaned: List[str] = []
+    seen: set[str] = set()
+    for t in targets:
+        s = str(t or '').strip()
+        if not s:
+            continue
+        if len(s) > 128:
+            continue
+        if s in seen:
+            continue
+        seen.add(s)
+        cleaned.append(s)
+    targets = cleaned[:50]
+
+    try:
+        default_port = int(tcp_port) if tcp_port is not None else 443
+    except Exception:
+        default_port = 443
+    if default_port < 1 or default_port > 65535:
+        default_port = 443
+
+    try:
+        timeout_f = float(timeout) if timeout is not None else 1.5
+    except Exception:
+        timeout_f = 1.5
+    if timeout_f < 0.2:
+        timeout_f = 0.2
+    if timeout_f > 10:
+        timeout_f = 10.0
+
+    if not targets:
+        return {'ok': False, 'error': 'targets_empty'}
+
+    results: Dict[str, Any] = {}
+
+    max_workers = max(4, min(32, len(targets)))
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        fut_map = {}
+        for t in targets:
+            if mode == 'tcping':
+                host, port = _parse_tcp_target(t, default_port)
+                fut = ex.submit(_tcp_ping_once, host, port, timeout_f)
+            else:
+                fut = ex.submit(_icmp_ping_once, t, timeout_f)
+            fut_map[fut] = t
+
+        for fut in as_completed(fut_map):
+            t = fut_map[fut]
+            try:
+                out = fut.result(timeout=timeout_f + 1.0)
+                if isinstance(out, dict):
+                    results[t] = out
+                else:
+                    results[t] = {'ok': False, 'error': 'probe_error'}
+            except Exception as exc:
+                results[t] = {'ok': False, 'error': str(exc)}
+
+    return {'ok': True, 'mode': mode, 'tcp_port': default_port, 'timeout': timeout_f, 'results': results}
+
+
 
 
 def _build_stats_snapshot() -> Dict[str, Any]:
