@@ -46,6 +46,8 @@ CREATE TABLE IF NOT EXISTS netmon_monitors (
   mode TEXT NOT NULL DEFAULT 'ping',
   tcp_port INTEGER NOT NULL DEFAULT 443,
   interval_sec INTEGER NOT NULL DEFAULT 5,
+  warn_ms INTEGER NOT NULL DEFAULT 0,
+  crit_ms INTEGER NOT NULL DEFAULT 0,
   node_ids_json TEXT NOT NULL DEFAULT '[]',
   enabled INTEGER NOT NULL DEFAULT 1,
   last_run_ts_ms INTEGER NOT NULL DEFAULT 0,
@@ -141,6 +143,10 @@ def ensure_db(db_path: str = DEFAULT_DB_PATH) -> None:
                     conn.execute("ALTER TABLE netmon_monitors ADD COLUMN tcp_port INTEGER NOT NULL DEFAULT 443")
                 if "interval_sec" not in mcols:
                     conn.execute("ALTER TABLE netmon_monitors ADD COLUMN interval_sec INTEGER NOT NULL DEFAULT 5")
+                if "warn_ms" not in mcols:
+                    conn.execute("ALTER TABLE netmon_monitors ADD COLUMN warn_ms INTEGER NOT NULL DEFAULT 0")
+                if "crit_ms" not in mcols:
+                    conn.execute("ALTER TABLE netmon_monitors ADD COLUMN crit_ms INTEGER NOT NULL DEFAULT 0")
                 if "node_ids_json" not in mcols:
                     conn.execute("ALTER TABLE netmon_monitors ADD COLUMN node_ids_json TEXT NOT NULL DEFAULT '[]'")
                 if "enabled" not in mcols:
@@ -563,6 +569,8 @@ def add_netmon_monitor(
     tcp_port: int,
     interval_sec: int,
     node_ids: List[int],
+    warn_ms: int = 0,
+    crit_ms: int = 0,
     enabled: bool = True,
     db_path: str = DEFAULT_DB_PATH,
 ) -> int:
@@ -587,6 +595,28 @@ def add_netmon_monitor(
     if itv > 3600:
         itv = 3600
 
+    try:
+        wm = int(warn_ms)
+    except Exception:
+        wm = 0
+    if wm < 0:
+        wm = 0
+    if wm > 600000:
+        wm = 600000
+
+    try:
+        cm = int(crit_ms)
+    except Exception:
+        cm = 0
+    if cm < 0:
+        cm = 0
+    if cm > 600000:
+        cm = 600000
+
+    # Ensure warn <= crit when both set
+    if wm > 0 and cm > 0 and wm > cm:
+        wm, cm = cm, wm
+
     cleaned: List[int] = []
     for x in node_ids or []:
         try:
@@ -600,8 +630,8 @@ def add_netmon_monitor(
 
     with connect(db_path) as conn:
         cur = conn.execute(
-            "INSERT INTO netmon_monitors(target, mode, tcp_port, interval_sec, node_ids_json, enabled, updated_at) VALUES(?,?,?,?,?,?,datetime('now'))",
-            (t, m, tp, itv, node_ids_json, 1 if enabled else 0),
+            "INSERT INTO netmon_monitors(target, mode, tcp_port, interval_sec, warn_ms, crit_ms, node_ids_json, enabled, updated_at) VALUES(?,?,?,?,?,?,?,?,datetime('now'))",
+            (t, m, tp, itv, wm, cm, node_ids_json, 1 if enabled else 0),
         )
         conn.commit()
         return int(cur.lastrowid)
@@ -614,6 +644,8 @@ def update_netmon_monitor(
     tcp_port: Optional[int] = None,
     interval_sec: Optional[int] = None,
     node_ids: Optional[List[int]] = None,
+    warn_ms: Optional[int] = None,
+    crit_ms: Optional[int] = None,
     enabled: Optional[bool] = None,
     last_run_ts_ms: Optional[int] = None,
     last_run_msg: Optional[str] = None,
@@ -653,6 +685,43 @@ def update_netmon_monitor(
             itv = 3600
         fields.append("interval_sec=?")
         vals.append(itv)
+    wm_set = None
+    cm_set = None
+
+    if warn_ms is not None:
+        try:
+            wm = int(warn_ms)
+        except Exception:
+            wm = 0
+        if wm < 0:
+            wm = 0
+        if wm > 600000:
+            wm = 600000
+        wm_set = wm
+
+    if crit_ms is not None:
+        try:
+            cm = int(crit_ms)
+        except Exception:
+            cm = 0
+        if cm < 0:
+            cm = 0
+        if cm > 600000:
+            cm = 600000
+        cm_set = cm
+
+    # Ensure warn <= crit when both are provided and both enabled
+    if wm_set is not None and cm_set is not None and wm_set > 0 and cm_set > 0 and wm_set > cm_set:
+        wm_set, cm_set = cm_set, wm_set
+
+    if wm_set is not None:
+        fields.append("warn_ms=?")
+        vals.append(wm_set)
+
+    if cm_set is not None:
+        fields.append("crit_ms=?")
+        vals.append(cm_set)
+
     if node_ids is not None:
         cleaned: List[int] = []
         for x in node_ids or []:

@@ -3913,15 +3913,19 @@ function openNetMonMonitorModal(monitorIdOrNull){
   const modeEl = document.getElementById('netmonMMode');
   const portEl = document.getElementById('netmonMTcpPort');
   const intervalEl = document.getElementById('netmonMInterval');
+  const warnEl = document.getElementById('netmonMWarn');
+  const critEl = document.getElementById('netmonMCrit');
 
   // Defaults for new monitor (restore from last create)
-  let defaults = {mode:'ping', tcp_port:443, interval_sec:5, node_ids:[]};
+  let defaults = {mode:'ping', tcp_port:443, interval_sec:5, warn_ms:0, crit_ms:0, node_ids:[]};
   try{
     const saved = JSON.parse(localStorage.getItem('netmon_last_create') || '{}');
     if(saved && typeof saved === 'object'){
       if(saved.mode) defaults.mode = String(saved.mode);
       if(saved.tcp_port) defaults.tcp_port = Number(saved.tcp_port) || 443;
       if(saved.interval_sec) defaults.interval_sec = Number(saved.interval_sec) || 5;
+      if(saved.warn_ms != null) defaults.warn_ms = Number(saved.warn_ms) || 0;
+      if(saved.crit_ms != null) defaults.crit_ms = Number(saved.crit_ms) || 0;
       if(Array.isArray(saved.node_ids)) defaults.node_ids = saved.node_ids;
     }
   }catch(_e){}
@@ -3930,6 +3934,8 @@ function openNetMonMonitorModal(monitorIdOrNull){
   if(modeEl) modeEl.value = mon ? String(mon.mode || 'ping') : String(defaults.mode || 'ping');
   if(portEl) portEl.value = String(mon ? (mon.tcp_port || 443) : (defaults.tcp_port || 443));
   if(intervalEl) intervalEl.value = String(mon ? (mon.interval_sec || 5) : (defaults.interval_sec || 5));
+  if(warnEl) warnEl.value = String(mon ? (mon.warn_ms || 0) : (defaults.warn_ms || 0));
+  if(critEl) critEl.value = String(mon ? (mon.crit_ms || 0) : (defaults.crit_ms || 0));
 
   _netmonSyncModalModeUI();
 
@@ -3965,6 +3971,9 @@ function _netmonReadModal(){
   const interval_sec = Number(document.getElementById('netmonMInterval')?.value || 5) || 5;
 
   const node_ids = [];
+  const warn_ms = Number(document.getElementById('netmonMWarn')?.value || 0) || 0;
+  const crit_ms = Number(document.getElementById('netmonMCrit')?.value || 0) || 0;
+
   document.querySelectorAll('#netmonMNodes input[type=checkbox][data-node-id]').forEach((cb)=>{
     if(cb.checked){
       const id = cb.getAttribute('data-node-id');
@@ -3972,7 +3981,7 @@ function _netmonReadModal(){
     }
   });
 
-  return { target, mode, tcp_port, interval_sec, node_ids };
+  return { target, mode, tcp_port, interval_sec, warn_ms, crit_ms, node_ids };
 }
 
 async function netmonSubmitMonitorModal(){
@@ -3996,6 +4005,15 @@ async function netmonSubmitMonitorModal(){
   if(cfg.tcp_port < 1 || cfg.tcp_port > 65535) cfg.tcp_port = 443;
   if(cfg.interval_sec < 1) cfg.interval_sec = 1;
   if(cfg.interval_sec > 3600) cfg.interval_sec = 3600;
+  if(cfg.warn_ms == null || !Number.isFinite(Number(cfg.warn_ms))) cfg.warn_ms = 0;
+  if(cfg.crit_ms == null || !Number.isFinite(Number(cfg.crit_ms))) cfg.crit_ms = 0;
+  cfg.warn_ms = Math.max(0, Math.min(600000, Math.floor(Number(cfg.warn_ms))));
+  cfg.crit_ms = Math.max(0, Math.min(600000, Math.floor(Number(cfg.crit_ms))));
+  if(cfg.warn_ms > 0 && cfg.crit_ms > 0 && cfg.warn_ms > cfg.crit_ms){
+    // keep warn <= crit
+    const tmp = cfg.warn_ms; cfg.warn_ms = cfg.crit_ms; cfg.crit_ms = tmp;
+  }
+
   if(!cfg.node_ids.length){
     if(errEl) errEl.textContent = '请选择至少一个节点';
     return;
@@ -4007,6 +4025,8 @@ async function netmonSubmitMonitorModal(){
       mode: cfg.mode,
       tcp_port: cfg.tcp_port,
       interval_sec: cfg.interval_sec,
+      warn_ms: cfg.warn_ms,
+      crit_ms: cfg.crit_ms,
       node_ids: cfg.node_ids,
     }));
   }catch(_e){}
@@ -4024,6 +4044,8 @@ async function netmonSubmitMonitorModal(){
           mode: cfg.mode,
           tcp_port: cfg.tcp_port,
           interval_sec: cfg.interval_sec,
+          warn_ms: cfg.warn_ms,
+          crit_ms: cfg.crit_ms,
           node_ids: cfg.node_ids,
         }),
       });
@@ -4036,6 +4058,8 @@ async function netmonSubmitMonitorModal(){
           mode: cfg.mode,
           tcp_port: cfg.tcp_port,
           interval_sec: cfg.interval_sec,
+          warn_ms: cfg.warn_ms,
+          crit_ms: cfg.crit_ms,
           node_ids: cfg.node_ids,
           enabled: true,
         }),
@@ -4214,6 +4238,7 @@ function _netmonCreateMonitorCard(m){
     </div>
     <div class="netmon-canvas-wrap">
       <canvas class="netmon-canvas" height="220"></canvas>
+      <canvas class="netmon-nav-canvas" height="44"></canvas>
       <button class="btn xs primary netmon-realtime-btn" type="button" style="display:none;" title="回到实时窗口">回到实时</button>
       <div class="netmon-tooltip" style="display:none;"></div>
     </div>
@@ -4243,7 +4268,15 @@ function _netmonUpdateMonitorCard(card, m){
 
   if(sub){
     const extra = (!enabled) ? '（已停用）' : '';
-    sub.textContent = `${mode}${mode==='tcping' ? ('/' + (m.tcp_port || 443)) : ''} · ${interval}s · 节点 ${nodeCount}${lastTxt} ${extra}`;
+    const warn = Number(m.warn_ms || 0) || 0;
+    const crit = Number(m.crit_ms || 0) || 0;
+    let thrTxt = '';
+    if(warn > 0 || crit > 0){
+      const w = warn > 0 ? ('W' + warn) : 'W-';
+      const c = crit > 0 ? ('C' + crit) : 'C-';
+      thrTxt = ` · 阈值 ${w}/${c}ms`;
+    }
+    sub.textContent = `${mode}${mode==='tcping' ? ('/' + (m.tcp_port || 443)) : ''} · ${interval}s · 节点 ${nodeCount}${thrTxt}${lastTxt} ${extra}`;
   }
 
   const toggleBtn = card.querySelector('button.netmon-toggle');
@@ -4374,8 +4407,10 @@ class NetMonChart{
   constructor(card, monitorId){
     this.card = card;
     this.monitorId = String(monitorId || '');
-    this.canvas = card.querySelector('canvas');
+    this.canvas = card.querySelector('canvas.netmon-canvas');
     this.ctx = this.canvas ? this.canvas.getContext('2d') : null;
+    this.navCanvas = card.querySelector('canvas.netmon-nav-canvas');
+    this.navCtx = this.navCanvas ? this.navCanvas.getContext('2d') : null;
     this.legendEl = card.querySelector('.netmon-legend');
     this.statsEl = card.querySelector('.netmon-stats');
     this.tooltipEl = card.querySelector('.netmon-tooltip');
@@ -4393,6 +4428,9 @@ class NetMonChart{
     this.layout = null;
     this.hover = null;
     this.drag = { active:false, pointerId:null, startX:0, startY:0, startRange:null, moved:false, mode:'pan', prevView:null };
+
+    this.navLayout = null;
+    this.navDrag = { active:false, pointerId:null, mode:'move', startX:0, startRange:null, moved:false };
     this._raf = null;
 
     // cached UI fragments
@@ -4463,6 +4501,15 @@ class NetMonChart{
       this.canvas.addEventListener('pointercancel', (e)=>this._onPointerUp(e));
       this.canvas.addEventListener('mouseleave', ()=>this._onMouseLeave());
       this.canvas.addEventListener('dblclick', (e)=>{ e.preventDefault(); this.resetView(); });
+    }
+
+    if(this.navCanvas){
+      this.navCanvas.addEventListener('pointerdown', (e)=>this._onNavPointerDown(e));
+      this.navCanvas.addEventListener('pointermove', (e)=>this._onNavPointerMove(e));
+      this.navCanvas.addEventListener('pointerup', (e)=>this._onNavPointerUp(e));
+      this.navCanvas.addEventListener('pointercancel', (e)=>this._onNavPointerUp(e));
+      this.navCanvas.addEventListener('mouseleave', ()=>this._onNavMouseLeave());
+      this.navCanvas.addEventListener('dblclick', (e)=>{ e.preventDefault(); this.resetView(); });
     }
   }
 
@@ -5134,6 +5181,306 @@ class NetMonChart{
     this.tooltipEl.style.display = 'none';
   }
 
+  _getNavPos(e){
+    if(!this.navCanvas) return null;
+    const rect = this.navCanvas.getBoundingClientRect();
+    const x = (e.clientX || 0) - rect.left;
+    const y = (e.clientY || 0) - rect.top;
+    return {x, y, rect};
+  }
+
+  _inNavPlot(x, y){
+    if(!this.navLayout) return false;
+    return x >= this.navLayout.padL && x <= (this.navLayout.padL + this.navLayout.plotW)
+      && y >= this.navLayout.padT && y <= (this.navLayout.padT + this.navLayout.plotH);
+  }
+
+  _navXToT(x){
+    if(!this.navLayout) return null;
+    const nl = this.navLayout;
+    const span = Math.max(1, Number(nl.loadedMax) - Number(nl.loadedMin));
+    const r = _netmonClamp((Number(x) - nl.padL) / nl.plotW, 0, 1);
+    return Number(nl.loadedMin) + r * span;
+  }
+
+  _onNavPointerDown(e){
+    if(!this.navCanvas) return;
+    if(!this.navLayout) return;
+    if(e.pointerType === 'mouse' && e.button !== 0) return;
+
+    const pos = this._getNavPos(e);
+    if(!pos) return;
+    if(!this._inNavPlot(pos.x, pos.y)) return;
+
+    try{ this.navCanvas.setPointerCapture(e.pointerId); }catch(_e){}
+
+    // Freeze view into history mode while dragging navigator
+    const cur = this._currentRange();
+    this.viewMode = 'fixed';
+    this.fixed.xMin = cur.xMin;
+    this.fixed.xMax = cur.xMax;
+
+    const nl = this.navLayout;
+    const loadedSpan = Math.max(1, Number(nl.loadedMax) - Number(nl.loadedMin));
+    const span = Math.max(10000, Number(cur.xMax) - Number(cur.xMin));
+
+    let selX0 = nl.padL + ((Number(cur.xMin) - Number(nl.loadedMin)) / loadedSpan) * nl.plotW;
+    let selX1 = nl.padL + ((Number(cur.xMax) - Number(nl.loadedMin)) / loadedSpan) * nl.plotW;
+    const x = _netmonClamp(pos.x, nl.padL, nl.padL + nl.plotW);
+
+    const EDGE = 8;
+    const inSel = x >= selX0 && x <= selX1;
+    let mode = 'move';
+    if(inSel && Math.abs(x - selX0) <= EDGE) mode = 'left';
+    else if(inSel && Math.abs(x - selX1) <= EDGE) mode = 'right';
+    else if(inSel) mode = 'move';
+    else mode = 'jump';
+
+    // Jump: center window around pointer time first
+    if(mode === 'jump'){
+      const t = this._navXToT(x);
+      if(t != null){
+        let newMin = Number(t) - span / 2;
+        let newMax = newMin + span;
+        const clamped = this._clampRange(newMin, newMax, Number(nl.loadedMin), Number(nl.loadedMax));
+        this.fixed.xMin = clamped.xMin;
+        this.fixed.xMax = clamped.xMax;
+        selX0 = nl.padL + ((Number(this.fixed.xMin) - Number(nl.loadedMin)) / loadedSpan) * nl.plotW;
+        selX1 = nl.padL + ((Number(this.fixed.xMax) - Number(nl.loadedMin)) / loadedSpan) * nl.plotW;
+        mode = 'move';
+      }
+    }
+
+    this.navDrag.active = true;
+    this.navDrag.pointerId = e.pointerId;
+    this.navDrag.mode = mode;
+    this.navDrag.startX = x;
+    this.navDrag.startRange = {xMin:Number(this.fixed.xMin), xMax:Number(this.fixed.xMax)};
+    this.navDrag.moved = false;
+
+    this.hover = null;
+    this._hideTooltip();
+
+    if(this.navCanvas) this.navCanvas.classList.add('is-dragging');
+    this._syncHistoryUI();
+    this._scheduleRender(false);
+  }
+
+  _onNavPointerMove(e){
+    if(!this.navDrag || !this.navDrag.active) return;
+    if(this.navDrag.pointerId !== e.pointerId) return;
+    if(!this.navLayout) return;
+
+    const pos = this._getNavPos(e);
+    if(!pos) return;
+
+    const nl = this.navLayout;
+    const x = _netmonClamp(pos.x, nl.padL, nl.padL + nl.plotW);
+
+    const dx = x - Number(this.navDrag.startX || 0);
+    if(Math.abs(dx) > 1) this.navDrag.moved = true;
+
+    const loadedSpan = Math.max(1, Number(nl.loadedMax) - Number(nl.loadedMin));
+    const dt = (dx / nl.plotW) * loadedSpan;
+
+    const start = this.navDrag.startRange;
+    if(!start) return;
+
+    let newMin = Number(start.xMin);
+    let newMax = Number(start.xMax);
+
+    if(this.navDrag.mode === 'move'){
+      newMin = Number(start.xMin) + dt;
+      newMax = Number(start.xMax) + dt;
+    }else if(this.navDrag.mode === 'left'){
+      newMin = Number(start.xMin) + dt;
+      newMax = Number(start.xMax);
+    }else if(this.navDrag.mode === 'right'){
+      newMin = Number(start.xMin);
+      newMax = Number(start.xMax) + dt;
+    }
+
+    const MIN_SPAN = 10000; // 10s
+    if(newMax - newMin < MIN_SPAN){
+      if(this.navDrag.mode === 'left') newMin = newMax - MIN_SPAN;
+      else newMax = newMin + MIN_SPAN;
+    }
+
+    const clamped = this._clampRange(newMin, newMax, Number(nl.loadedMin), Number(nl.loadedMax));
+    this.viewMode = 'fixed';
+    this.fixed.xMin = clamped.xMin;
+    this.fixed.xMax = clamped.xMax;
+    this._syncHistoryUI();
+
+    this.hover = null;
+    this._hideTooltip();
+    this._scheduleRender(false);
+  }
+
+  _onNavPointerUp(e){
+    if(!this.navDrag || !this.navDrag.active) return;
+    if(this.navDrag.pointerId !== e.pointerId) return;
+
+    this.navDrag.active = false;
+    this.navDrag.pointerId = null;
+    this.navDrag.startRange = null;
+    this.navDrag.mode = 'move';
+
+    if(this.navCanvas) this.navCanvas.classList.remove('is-dragging');
+    this._scheduleRender(true);
+  }
+
+  _onNavMouseLeave(){
+    if(this.navDrag && this.navDrag.active) return;
+    // nothing for now
+  }
+
+  _renderNavigator(mon, per, curRange){
+    if(!this.navCanvas || !this.navCtx) return;
+    const st = NETMON_STATE;
+    if(!st) return;
+
+    const loaded = this._loadedRange(st);
+    const loadedMin = Number(loaded.minMs);
+    const loadedMax = Number(loaded.maxMs);
+    const loadedSpan = Math.max(1, loadedMax - loadedMin);
+
+    const w = Math.max(200, this.navCanvas.clientWidth || 0);
+    const h = Math.max(28, this.navCanvas.clientHeight || 0);
+    const dpr = window.devicePixelRatio || 1;
+    const needResize = (this.navCanvas.width !== Math.floor(w * dpr)) || (this.navCanvas.height !== Math.floor(h * dpr));
+    if(needResize){
+      this.navCanvas.width = Math.floor(w * dpr);
+      this.navCanvas.height = Math.floor(h * dpr);
+    }
+
+    this.navCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    this.navCtx.clearRect(0, 0, w, h);
+
+    const padL = 10;
+    const padR = 10;
+    const padT = 6;
+    const padB = 6;
+    const plotW = Math.max(10, w - padL - padR);
+    const plotH = Math.max(10, h - padT - padB);
+
+    // Build bucketed overview (max latency across visible nodes)
+    const BUCKETS = Math.max(80, Math.min(420, Math.floor(plotW)));
+    const buckets = new Array(BUCKETS);
+    for(let i=0;i<BUCKETS;i++) buckets[i] = 0;
+
+    const nodeIds = Array.isArray(mon && mon.node_ids) ? mon.node_ids.map(x=>String(x)) : [];
+    for(const nid of nodeIds){
+      if(this.hiddenNodes && this.hiddenNodes.has(String(nid))) continue;
+      const arr = (per && per[String(nid)]) ? per[String(nid)] : [];
+      if(!arr.length) continue;
+      const step = Math.max(1, Math.ceil(arr.length / 5000));
+      for(let i=0;i<arr.length;i+=step){
+        const p = arr[i];
+        if(!p || p.v == null) continue;
+        const t = Number(p.t);
+        if(!Number.isFinite(t)) continue;
+        if(t < loadedMin) continue;
+        if(t > loadedMax) break;
+        const v = Number(p.v);
+        if(!Number.isFinite(v) || v < 0) continue;
+        const r = (t - loadedMin) / loadedSpan;
+        const idx = Math.max(0, Math.min(BUCKETS-1, Math.floor(r * BUCKETS)));
+        if(v > buckets[idx]) buckets[idx] = v;
+      }
+    }
+
+    let maxV = 0;
+    for(const v of buckets){ if(v > maxV) maxV = v; }
+
+    // include thresholds so overview line doesn't look "flat" under a low yMax
+    const warnThr = Number(mon.warn_ms || 0) || 0;
+    const critThr = Number(mon.crit_ms || 0) || 0;
+    if(warnThr > 0) maxV = Math.max(maxV, warnThr);
+    if(critThr > 0) maxV = Math.max(maxV, critThr);
+
+    let yMax = maxV > 0 ? _netmonNiceMax(maxV * 1.15) : 10;
+    if(yMax < 10) yMax = 10;
+
+    // background
+    this.navCtx.fillStyle = 'rgba(2,6,23,0.24)';
+    this.navCtx.fillRect(0, 0, w, h);
+
+    // area
+    this.navCtx.save();
+    this.navCtx.beginPath();
+    for(let i=0;i<BUCKETS;i++){
+      const x = padL + (i / (BUCKETS-1)) * plotW;
+      const v = buckets[i];
+      const y = padT + plotH - (Math.max(0, Math.min(yMax, v)) / yMax) * plotH;
+      if(i === 0) this.navCtx.moveTo(x, y);
+      else this.navCtx.lineTo(x, y);
+    }
+    this.navCtx.lineTo(padL + plotW, padT + plotH);
+    this.navCtx.lineTo(padL, padT + plotH);
+    this.navCtx.closePath();
+    this.navCtx.fillStyle = 'rgba(226,232,240,0.10)';
+    this.navCtx.fill();
+    this.navCtx.strokeStyle = 'rgba(226,232,240,0.18)';
+    this.navCtx.lineWidth = 1;
+    this.navCtx.stroke();
+    this.navCtx.restore();
+
+    // thresholds in navigator (subtle)
+    const yFor = (val)=> padT + plotH - (Math.max(0, Math.min(yMax, val)) / yMax) * plotH;
+    this.navCtx.save();
+    this.navCtx.lineWidth = 1;
+    try{ this.navCtx.setLineDash([4,4]); }catch(_e){}
+    if(warnThr > 0){
+      const y = yFor(warnThr);
+      this.navCtx.strokeStyle = 'rgba(245,158,11,0.35)';
+      this.navCtx.beginPath();
+      this.navCtx.moveTo(padL, y);
+      this.navCtx.lineTo(padL + plotW, y);
+      this.navCtx.stroke();
+    }
+    if(critThr > 0){
+      const y = yFor(critThr);
+      this.navCtx.strokeStyle = 'rgba(248,113,113,0.35)';
+      this.navCtx.beginPath();
+      this.navCtx.moveTo(padL, y);
+      this.navCtx.lineTo(padL + plotW, y);
+      this.navCtx.stroke();
+    }
+    try{ this.navCtx.setLineDash([]); }catch(_e){}
+    this.navCtx.restore();
+
+    const curMin = Number(curRange && curRange.xMin != null ? curRange.xMin : loadedMax - Math.min(loadedSpan, 10*60*1000));
+    const curMax = Number(curRange && curRange.xMax != null ? curRange.xMax : loadedMax);
+
+    const selX0 = padL + ((curMin - loadedMin) / loadedSpan) * plotW;
+    const selX1 = padL + ((curMax - loadedMin) / loadedSpan) * plotW;
+
+    const a = Math.min(selX0, selX1);
+    const b = Math.max(selX0, selX1);
+
+    // shade outside selection
+    this.navCtx.fillStyle = 'rgba(0,0,0,0.34)';
+    this.navCtx.fillRect(padL, padT, Math.max(0, a - padL), plotH);
+    this.navCtx.fillRect(Math.min(b, padL + plotW), padT, Math.max(0, (padL + plotW) - b), plotH);
+
+    // selection border + handles
+    this.navCtx.save();
+    this.navCtx.strokeStyle = 'rgba(226,232,240,0.55)';
+    this.navCtx.lineWidth = (this.navDrag && this.navDrag.active) ? 1.6 : 1;
+    this.navCtx.strokeRect(a + 0.5, padT + 0.5, Math.max(1, b - a), plotH - 1);
+
+    // handles
+    this.navCtx.fillStyle = 'rgba(226,232,240,0.65)';
+    const hw = 2;
+    this.navCtx.fillRect(a - hw, padT + 3, hw, plotH - 6);
+    this.navCtx.fillRect(b, padT + 3, hw, plotH - 6);
+    this.navCtx.restore();
+
+    // save layout for interactions
+    this.navLayout = {w, h, padL, padR, padT, padB, plotW, plotH, loadedMin, loadedMax};
+  }
+
   render(force){
     const st = NETMON_STATE;
     if(!st || !this.canvas || !this.ctx) return;
@@ -5207,11 +5554,38 @@ class NetMonChart{
       }
     }
 
+    // thresholds (optional)
+    let warnThr = Number(mon.warn_ms || 0) || 0;
+    let critThr = Number(mon.crit_ms || 0) || 0;
+    if(warnThr > 0 && critThr > 0 && warnThr > critThr){
+      const tmp = warnThr; warnThr = critThr; critThr = tmp;
+    }
+    if(warnThr > 0) maxV = Math.max(maxV, warnThr);
+    if(critThr > 0) maxV = Math.max(maxV, critThr);
+
     let yMax = maxV > 0 ? _netmonNiceMax(maxV * 1.25) : 10;
     if(yMax < 10) yMax = 10;
 
     // keep for hit-test & tooltip
-    this.layout = {w, h, padL, padR, padT, padB, plotW, plotH, xMin, xMax, yMax};
+    this.layout = {w, h, padL, padR, padT, padB, plotW, plotH, xMin, xMax, yMax, warnThr, critThr};
+
+    // threshold background (subtle)
+    if(warnThr > 0 || critThr > 0){
+      const yFor = (val)=> padT + plotH - (Math.max(0, Math.min(yMax, val)) / yMax) * plotH;
+      this.ctx.save();
+      if(critThr > 0){
+        const yC = yFor(critThr);
+        this.ctx.fillStyle = 'rgba(248,113,113,0.06)';
+        this.ctx.fillRect(padL, padT, plotW, Math.max(0, yC - padT));
+      }
+      if(warnThr > 0){
+        const yW = yFor(warnThr);
+        const yTop = (critThr > 0) ? yFor(critThr) : padT;
+        this.ctx.fillStyle = 'rgba(245,158,11,0.06)';
+        this.ctx.fillRect(padL, yTop, plotW, Math.max(0, yW - yTop));
+      }
+      this.ctx.restore();
+    }
 
     // grid
     this.ctx.strokeStyle = 'rgba(255,255,255,0.08)';
@@ -5254,6 +5628,38 @@ class NetMonChart{
       this.ctx.textAlign = 'center';
       this.ctx.textBaseline = 'top';
       this.ctx.fillText(label, x, padT + plotH + 8);
+    }
+
+
+    // threshold lines
+    if(warnThr > 0 || critThr > 0){
+      const yFor = (val)=> padT + plotH - (Math.max(0, Math.min(yMax, val)) / yMax) * plotH;
+      this.ctx.save();
+      this.ctx.lineWidth = 1;
+      try{ this.ctx.setLineDash([6,4]); }catch(_e){}
+
+      const drawLine = (val, stroke, label)=>{
+        const y = yFor(val);
+        this.ctx.strokeStyle = stroke;
+        this.ctx.beginPath();
+        this.ctx.moveTo(padL, y);
+        this.ctx.lineTo(padL + plotW, y);
+        this.ctx.stroke();
+
+        // label on the right
+        this.ctx.fillStyle = stroke;
+        this.ctx.font = '11px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace';
+        this.ctx.textAlign = 'right';
+        this.ctx.textBaseline = 'bottom';
+        const yTxt = _netmonClamp(y - 2, padT + 12, padT + plotH - 2);
+        this.ctx.fillText(label, padL + plotW - 4, yTxt);
+      };
+
+      if(warnThr > 0) drawLine(warnThr, 'rgba(245,158,11,0.65)', `W ${Math.round(warnThr)}ms`);
+      if(critThr > 0) drawLine(critThr, 'rgba(248,113,113,0.65)', `C ${Math.round(critThr)}ms`);
+
+      try{ this.ctx.setLineDash([]); }catch(_e){}
+      this.ctx.restore();
     }
 
     // lines
@@ -5360,6 +5766,8 @@ class NetMonChart{
         }
       }
     }
+
+    try{ this._renderNavigator(mon, per, range); }catch(_e){}
 
     this._renderStats(mon, per, xMin, xMax);
     this._renderLegend(mon, per, xMin, xMax);
@@ -5470,12 +5878,50 @@ class NetMonChart{
     };
 
     const pills = [];
+
+    // thresholds status (use P95 when available)
+    const thrW0 = Number(mon.warn_ms || 0) || 0;
+    const thrC0 = Number(mon.crit_ms || 0) || 0;
+    let thrW = thrW0;
+    let thrC = thrC0;
+    if(thrW > 0 && thrC > 0 && thrW > thrC){
+      const tmp = thrW; thrW = thrC; thrC = tmp;
+    }
+
+    const ref = (p95 != null && Number.isFinite(Number(p95))) ? Number(p95)
+      : ((lastMax != null && Number.isFinite(Number(lastMax))) ? Number(lastMax) : null);
+
+    let level = 'none';
+    if(thrW > 0 || thrC > 0){
+      if(ref != null){
+        if(thrC > 0 && ref >= thrC) level = 'crit';
+        else if(thrW > 0 && ref >= thrW) level = 'warn';
+        else level = 'ok';
+      }else{
+        level = 'ok';
+      }
+
+      const thrTxt = `W${thrW > 0 ? Math.round(thrW) : '-'} / C${thrC > 0 ? Math.round(thrC) : '-'}ms`;
+      const stTxt = (level === 'crit') ? 'CRIT' : (level === 'warn') ? 'WARN' : 'OK';
+      pills.push(pill('状态', stTxt, level, '基于当前窗口 P95（优先）或最新值与阈值对比'));
+      pills.push(pill('阈值', thrTxt, '', '该监控的告警/严重阈值（0 表示关闭）'));
+    }
+
+    // Card accent
+    if(this.card){
+      this.card.classList.remove('netmon-level-ok','netmon-level-warn','netmon-level-crit');
+      if(level === 'crit') this.card.classList.add('netmon-level-crit');
+      else if(level === 'warn') this.card.classList.add('netmon-level-warn');
+      else if(level === 'ok') this.card.classList.add('netmon-level-ok');
+    }
+
     pills.push(pill('在线', `${online}/${visibleNodes.length}`, '', '当前可见节点在线数 / 可见节点数'));
     pills.push(pill('当前', (lastMax != null) ? `${Number(lastMax).toFixed(1)}ms` : '—', '', '可见节点在当前窗口内的“最新延迟”的最大值'));
     pills.push(pill('均值', (avg != null) ? `${Number(avg).toFixed(1)}ms` : '—', '', '窗口内全部成功采样点的均值'));
     pills.push(pill('P95', (p95 != null) ? `${Number(p95).toFixed(1)}ms` : '—', '', '窗口内全部成功采样点的 95 分位'));
     pills.push(pill('抖动', (jitter != null) ? `${Number(jitter).toFixed(1)}ms` : '—', '', 'P95 - P50（越大说明波动越明显）'));
     pills.push(pill('失败', (loss != null) ? `${(loss*100).toFixed(1)}%` : '—', (loss != null && loss > 0.02) ? 'warn' : '', '失败采样占比（v 为空/探测失败）'));
+
 
     this.statsEl.innerHTML = `<div class="netmon-stats-wrap">${pills.join('')}</div>`;
   }

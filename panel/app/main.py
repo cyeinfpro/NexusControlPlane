@@ -2822,6 +2822,8 @@ async def api_netmon_snapshot(request: Request, user: str = Depends(require_logi
                 "mode": str(m.get("mode") or "ping"),
                 "tcp_port": int(m.get("tcp_port") or 443),
                 "interval_sec": int(m.get("interval_sec") or 5),
+                "warn_ms": int(m.get("warn_ms") or 0),
+                "crit_ms": int(m.get("crit_ms") or 0),
                 "enabled": bool(m.get("enabled") or 0),
                 "node_ids": [int(x) for x in (m.get("node_ids") or []) if isinstance(x, int) or str(x).isdigit()],
                 "last_run_ts_ms": int(m.get("last_run_ts_ms") or 0),
@@ -2858,6 +2860,8 @@ async def api_netmon_monitors_list(user: str = Depends(require_login)):
                 "mode": str(m.get("mode") or "ping"),
                 "tcp_port": int(m.get("tcp_port") or 443),
                 "interval_sec": int(m.get("interval_sec") or 5),
+                "warn_ms": int(m.get("warn_ms") or 0),
+                "crit_ms": int(m.get("crit_ms") or 0),
                 "enabled": bool(m.get("enabled") or 0),
                 "node_ids": [int(x) for x in (m.get("node_ids") or []) if isinstance(x, int) or str(x).isdigit()],
                 "last_run_ts_ms": int(m.get("last_run_ts_ms") or 0),
@@ -2878,6 +2882,8 @@ async def api_netmon_monitors_create(request: Request, user: str = Depends(requi
     mode = str(payload.get("mode") or "ping").strip().lower()
     tcp_port = payload.get("tcp_port", 443)
     interval_sec = payload.get("interval_sec", payload.get("interval", 5))
+    warn_ms = payload.get("warn_ms", payload.get("warn", 0))
+    crit_ms = payload.get("crit_ms", payload.get("crit", 0))
     node_ids = payload.get("node_ids") or payload.get("nodes") or []
     enabled = bool(payload.get("enabled", True))
 
@@ -2904,6 +2910,28 @@ async def api_netmon_monitors_create(request: Request, user: str = Depends(requi
     if interval_i > 3600:
         interval_i = 3600
 
+
+    try:
+        warn_i = int(warn_ms)
+    except Exception:
+        warn_i = 0
+    if warn_i < 0:
+        warn_i = 0
+    if warn_i > 600000:
+        warn_i = 600000
+
+    try:
+        crit_i = int(crit_ms)
+    except Exception:
+        crit_i = 0
+    if crit_i < 0:
+        crit_i = 0
+    if crit_i > 600000:
+        crit_i = 600000
+
+    if warn_i > 0 and crit_i > 0 and warn_i > crit_i:
+        warn_i, crit_i = crit_i, warn_i
+
     if not isinstance(node_ids, list):
         node_ids = []
 
@@ -2919,7 +2947,7 @@ async def api_netmon_monitors_create(request: Request, user: str = Depends(requi
     if not cleaned:
         return JSONResponse({"ok": False, "error": "请选择至少一个节点"}, status_code=400)
 
-    mid = add_netmon_monitor(target, mode, tcp_port_i, interval_i, cleaned, enabled=enabled)
+    mid = add_netmon_monitor(target, mode, tcp_port_i, interval_i, cleaned, warn_ms=warn_i, crit_ms=crit_i, enabled=enabled)
     mon = get_netmon_monitor(mid) or {}
     return {
         "ok": True,
@@ -2929,6 +2957,8 @@ async def api_netmon_monitors_create(request: Request, user: str = Depends(requi
             "mode": str(mon.get("mode") or mode),
             "tcp_port": int(mon.get("tcp_port") or tcp_port_i),
             "interval_sec": int(mon.get("interval_sec") or interval_i),
+            "warn_ms": int(mon.get("warn_ms") or warn_i),
+            "crit_ms": int(mon.get("crit_ms") or crit_i),
             "enabled": bool(mon.get("enabled") or enabled),
             "node_ids": [int(x) for x in (mon.get("node_ids") or cleaned) if int(x) > 0],
         },
@@ -2982,6 +3012,41 @@ async def api_netmon_monitors_update(monitor_id: int, request: Request, user: st
             itv = 3600
         fields["interval_sec"] = itv
 
+    if "warn_ms" in payload or "warn" in payload:
+        raw = payload.get("warn_ms", payload.get("warn"))
+        try:
+            wm = int(raw)
+        except Exception:
+            wm = 0
+        if wm < 0:
+            wm = 0
+        if wm > 600000:
+            wm = 600000
+        fields["warn_ms"] = wm
+
+    if "crit_ms" in payload or "crit" in payload:
+        raw = payload.get("crit_ms", payload.get("crit"))
+        try:
+            cm = int(raw)
+        except Exception:
+            cm = 0
+        if cm < 0:
+            cm = 0
+        if cm > 600000:
+            cm = 600000
+        fields["crit_ms"] = cm
+
+    # Ensure warn <= crit when both present and enabled
+    if fields.get("warn_ms", 0) and fields.get("crit_ms", 0):
+        try:
+            wv = int(fields.get("warn_ms") or 0)
+            cv = int(fields.get("crit_ms") or 0)
+        except Exception:
+            wv, cv = 0, 0
+        if wv > 0 and cv > 0 and wv > cv:
+            fields["warn_ms"], fields["crit_ms"] = cv, wv
+
+
     if "node_ids" in payload or "nodes" in payload:
         node_ids = payload.get("node_ids") or payload.get("nodes") or []
         if not isinstance(node_ids, list):
@@ -3013,6 +3078,8 @@ async def api_netmon_monitors_update(monitor_id: int, request: Request, user: st
             "mode": str(mon2.get("mode") or "ping"),
             "tcp_port": int(mon2.get("tcp_port") or 443),
             "interval_sec": int(mon2.get("interval_sec") or 5),
+            "warn_ms": int(mon2.get("warn_ms") or 0),
+            "crit_ms": int(mon2.get("crit_ms") or 0),
             "enabled": bool(mon2.get("enabled") or 0),
             "node_ids": [int(x) for x in (mon2.get("node_ids") or []) if int(x) > 0],
             "last_run_ts_ms": int(mon2.get("last_run_ts_ms") or 0),

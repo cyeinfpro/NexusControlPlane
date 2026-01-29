@@ -1824,8 +1824,10 @@ body.modal-open{ overflow:hidden; }
 
 .netmon-chart-card .netmon-canvas-wrap{
   padding: 0 12px 12px;
-
   position: relative;
+  display:flex;
+  flex-direction:column;
+  gap:8px;
 }
 
 .netmon-canvas{
@@ -1848,6 +1850,21 @@ body.modal-open{ overflow:hidden; }
   cursor: crosshair;
 }
 
+.netmon-nav-canvas{
+  width: 100%;
+  height: 44px;
+  display:block;
+  border-radius: 10px;
+  background: rgba(2,6,23,0.28);
+  border: 1px solid rgba(148,163,184,0.12);
+  cursor: ew-resize;
+  touch-action: none;
+}
+
+.netmon-nav-canvas.is-dragging{
+  cursor: grabbing;
+}
+
 .netmon-realtime-btn{
   position:absolute;
   top: 18px;
@@ -1859,6 +1876,20 @@ body.modal-open{ overflow:hidden; }
 .netmon-chart-card.netmon-history{
   outline: 1px solid rgba(148,163,184,0.18);
   outline-offset: 0;
+}
+
+/* Level accents (threshold status) */
+.netmon-chart-card.netmon-level-ok{
+  border-color: rgba(34,197,94,0.28);
+  box-shadow: 0 0 0 1px rgba(34,197,94,0.10) inset, var(--glow);
+}
+.netmon-chart-card.netmon-level-warn{
+  border-color: rgba(245,158,11,0.28);
+  box-shadow: 0 0 0 1px rgba(245,158,11,0.12) inset, var(--glow);
+}
+.netmon-chart-card.netmon-level-crit{
+  border-color: rgba(248,113,113,0.30);
+  box-shadow: 0 0 0 1px rgba(248,113,113,0.14) inset, var(--glow);
 }
 
 .netmon-legend{ margin-top: 10px; }
@@ -1971,7 +2002,9 @@ body.modal-open{ overflow:hidden; }
 }
 .netmon-pill .k{ font-size: 11px; color: var(--muted); letter-spacing: 0.02em; }
 .netmon-pill .v{ font-size: 12px; font-weight: 900; color: rgba(226,232,240,0.95); }
-.netmon-pill.warn{ border-color: rgba(248,113,113,0.35); background: rgba(127,29,29,0.12); }
+.netmon-pill.warn{ border-color: rgba(245,158,11,0.40); background: rgba(120,53,15,0.14); }
+.netmon-pill.crit{ border-color: rgba(248,113,113,0.45); background: rgba(127,29,29,0.16); }
+.netmon-pill.ok{ border-color: rgba(34,197,94,0.38); background: rgba(20,83,45,0.12); }
 
 /* Fullscreen */
 body.netmon-noscroll{ overflow:hidden; }
@@ -1990,9 +2023,9 @@ body.netmon-noscroll{ overflow:hidden; }
   box-shadow: 0 30px 90px rgba(0,0,0,0.60);
 }
 .netmon-chart-card.netmon-fullscreen .netmon-canvas{
-  height: calc(100vh - 260px);
+  height: calc(100vh - 312px);
 }
 @media (max-width: 720px){
   .netmon-chart-card.netmon-fullscreen{ inset: 62px 10px 10px 10px; }
-  .netmon-chart-card.netmon-fullscreen .netmon-canvas{ height: calc(100vh - 270px); }
+  .netmon-chart-card.netmon-fullscreen .netmon-canvas{ height: calc(100vh - 324px); }
 }
