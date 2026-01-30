@@ -23,6 +23,15 @@ def _pbkdf2(password: str, salt: bytes, iterations: int) -> bytes:
 
 
 def ensure_secret_key() -> str:
+    # Allow overriding the session/share secret via env so multiple panel instances
+    # behind a load balancer can validate the same cookies & share tokens.
+    #
+    # Recommended for HA deployments:
+    #   export REALM_PANEL_SECRET_KEY='<a stable random string>'
+    env_key = (os.getenv("REALM_PANEL_SECRET_KEY") or "").strip()
+    if len(env_key) > 10:
+        return env_key
+
     os.makedirs(os.path.dirname(SECRET_PATH), exist_ok=True)
     if os.path.exists(SECRET_PATH) and os.path.getsize(SECRET_PATH) > 10:
         return open(SECRET_PATH, "r", encoding="utf-8").read().strip()

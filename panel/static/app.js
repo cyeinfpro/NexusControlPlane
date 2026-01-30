@@ -5553,8 +5553,17 @@ class NetMonChart{
     const st = NETMON_STATE;
     let link = null;
 
-    // If we're already on a share link, reuse its token and just encode the new range in query.
-    if(st && st.shareToken){
+    // Only copy/build locally when we are *already* on a shared read-only URL
+    // (i.e. the token exists in the current URL). On the管理页, even if we
+    // previously generated a token, the current URL usually has no `t=...`.
+    // In that case we must call backend to generate a correct share link.
+    let hasUrlToken = false;
+    try{
+      const p = new URLSearchParams(window.location.search || '');
+      hasUrlToken = !!p.get('t');
+    }catch(_e){ hasUrlToken = false; }
+
+    if(hasUrlToken && st && st.shareToken){
       link = this.getShareUrlForRange(from, to);
     }else{
       // Request a signed token from backend (requires login)
@@ -5578,7 +5587,6 @@ class NetMonChart{
       try{
         const res = await fetchJSON('/api/netmon/share', {method:'POST', body: JSON.stringify(payload)});
         link = (res && res.url) ? String(res.url) : null;
-        try{ if(res && res.token && st){ st.shareToken = String(res.token); } }catch(_e){}
         if(!link) throw new Error((res && res.error) ? String(res.error) : 'share_failed');
       }catch(e){
         const msg = (e && e.message) ? e.message : String(e);
@@ -5616,8 +5624,15 @@ class NetMonChart{
     const st = NETMON_STATE;
     let link = null;
 
-    // On a share page: just copy current URL (already contains a valid token).
-    if(st && st.shareToken){
+    // Only copy current URL when it is *already* a share URL (contains t=...).
+    // Avoid accidentally copying /netmon (管理页) which always requires login.
+    let hasUrlToken = false;
+    try{
+      const p = new URLSearchParams(window.location.search || '');
+      hasUrlToken = !!p.get('t');
+    }catch(_e){ hasUrlToken = false; }
+
+    if(hasUrlToken){
       link = window.location.href;
     }else{
       // Request a signed share URL from backend (requires login)
@@ -5646,7 +5661,6 @@ class NetMonChart{
       try{
         const res = await fetchJSON('/api/netmon/share', {method:'POST', body: JSON.stringify(payload)});
         link = (res && res.url) ? String(res.url) : null;
-        try{ if(res && res.token && st){ st.shareToken = String(res.token); } }catch(_e){}
         if(!link) throw new Error((res && res.error) ? String(res.error) : 'share_failed');
       }catch(e){
         const msg = (e && e.message) ? e.message : String(e);
@@ -5833,7 +5847,7 @@ class NetMonChart{
     if(bodyEl) bodyEl.innerHTML = `<div class="muted sm">加载中…</div>`;
 
     try{
-      const url = `/api/netmon/range?mid=${encodeURIComponent(String(this.monitorId))}&from=${encodeURIComponent(String(Math.round(from)))}&to=${encodeURIComponent(String(Math.round(to)))}`;
+      let url = `/api/netmon/range?mid=${encodeURIComponent(String(this.monitorId))}&from=${encodeURIComponent(String(Math.round(from)))}&to=${encodeURIComponent(String(Math.round(to)))}`;
       try{ if(st && st.shareToken){ url += `&t=${encodeURIComponent(String(st.shareToken))}`; } }catch(_e){}
       const res = await fetchJSON(url);
       if(!res || res.ok === false){

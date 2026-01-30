@@ -1054,8 +1054,8 @@ def require_login_or_share_page(request: Request, allow_page: str) -> str:
     user = request.session.get("user")
     if user:
         return user
-    if not _NETMON_SHARE_PUBLIC:
-        raise HTTPException(status_code=302, headers={"Location": "/login"})
+    # Share links should be viewable without login as long as the signed token is valid.
+    # (Important for load-balancer scenarios where visitors do not have a session cookie.)
     payload = _verify_share_token(request.query_params.get("t") or "")
     if payload and str(payload.get("page") or "") == str(allow_page):
         request.state.share = payload
@@ -1076,8 +1076,7 @@ def require_login_or_share_api(request: Request) -> str:
     user = request.session.get("user")
     if user:
         return user
-    if not _NETMON_SHARE_PUBLIC:
-        raise HTTPException(status_code=401, detail="Not logged in")
+    # Allow anonymous read-only access via signed share token.
     token = request.query_params.get("t") or request.headers.get("X-Share-Token") or ""
     payload = _verify_share_token(token)
     if payload:
