@@ -135,6 +135,17 @@ a{color:inherit}
 }
 .nav-link:hover{border-color:var(--line);background:var(--surface-2);color:var(--text)}
 
+/* Nav: desktop vs mobile (hamburger) */
+.nav-desktop{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.nav-mobile{display:none}
+
+@media (max-width: 640px){
+  .nav{gap:8px}
+  .nav-desktop{display:none}
+  .nav-mobile{display:inline-block}
+}
+
+
 /*
   NOTE
   ----
@@ -1712,6 +1723,108 @@ body.modal-open{ overflow:hidden; }
 /* =========================
    NetMon page (network fluctuation monitor)
    ========================= */
+
+/* NetMon: head actions (mobile tidy) */
+.netmon-head-menu{ display:none; }
+@media (max-width: 640px){
+  .netmon-head-extra{ display:none; }
+  .netmon-head-menu{ display:inline-block; }
+  .netmon-head-actions{ width:100%; flex-wrap:nowrap; }
+  .netmon-head-actions #netmonNewBtn{ flex:1; }
+}
+
+/* NetMon: toolbar responsive grid */
+@media (max-width: 720px){
+  .netmon-toolbar .row{
+    display:grid;
+    grid-template-columns: 1fr 1fr;
+    gap:10px;
+    align-items:stretch;
+  }
+  .netmon-toolbar .row > .col{
+    width:100%;
+    max-width:none !important;
+    min-width:0 !important;
+  }
+  .netmon-toolbar .col.nm-search,
+  .netmon-toolbar .col.nm-status,
+  .netmon-toolbar .col.nm-refresh{
+    grid-column: 1 / -1;
+  }
+  .netmon-toolbar .help{ display:none; }
+  .netmon-toolbar input.input,
+  .netmon-toolbar select.select{
+    width:100%;
+  }
+}
+@media (max-width: 420px){
+  .netmon-toolbar .row{ grid-template-columns: 1fr; }
+}
+
+/* NetMon: card header & actions (mobile) */
+.netmon-actions-desktop{
+  display:flex;
+  flex-direction:column;
+  align-items:flex-end;
+  gap:8px;
+}
+@media (min-width: 680px){
+  .netmon-actions-desktop{ flex-direction:row; align-items:center; }
+}
+.netmon-actions-mobile{
+  display:none;
+  align-items:center;
+  gap:8px;
+  justify-content:flex-end;
+}
+@media (max-width: 720px){
+  .netmon-actions-desktop{ display:none; }
+  .netmon-actions-mobile{ display:flex; }
+  .netmon-chart-card .card-header.netmon-card-head{
+    flex-direction:column;
+    align-items:stretch;
+    gap:10px;
+  }
+  .netmon-chart-card .card-header.netmon-card-head .netmon-actions{
+    width:100%;
+    justify-content:flex-end;
+  }
+}
+
+/* Mobile: keep pills/legend in one tidy row (scrollable) */
+@media (max-width: 720px){
+  .netmon-stats-wrap,
+  .netmon-legend-wrap{
+    flex-wrap:nowrap;
+    overflow-x:auto;
+    -webkit-overflow-scrolling:touch;
+    padding-bottom:2px;
+  }
+  .netmon-stats-wrap::-webkit-scrollbar,
+  .netmon-legend-wrap::-webkit-scrollbar{ display:none; }
+  .netmon-pill,
+  .netmon-legend-item{ flex:0 0 auto; }
+}
+
+/* Mobile: slightly denser plot */
+@media (max-width: 420px){
+  .netmon-canvas{ height: 200px; }
+  .netmon-nav-canvas{ height: 40px; }
+}
+
+/* Mobile: realtime button doesn't cover too much */
+@media (max-width: 720px){
+  .netmon-realtime-btn{ top: 12px; right: 12px; }
+  .netmon-events-list{ max-height: 140px; }
+}
+
+/* Menu item danger (for destructive ops in mobile overflow menu) */
+.menu-item.danger{ color: rgba(254,202,202,0.95); }
+.menu-item.danger:hover{
+  background: rgba(248,113,113,0.10);
+  border-color: rgba(248,113,113,0.22);
+}
+
 .node-list.netmon-form{
   padding: 10px 12px 12px;
   display:flex;
@@ -2202,6 +2315,32 @@ body.netmon-wall .netmon-realtime-btn{ display:none !important; }
 @media (max-width: 720px){
   body.netmon-wall .netmon-charts{ grid-template-columns: 1fr; }
   .netmon-wallbar{ top: 0; border-radius: 12px; }
+
+  /* Mobile wallbar: turn the control cluster into a clean grid */
+  .netmon-wallbar{
+    flex-direction:column;
+    align-items:stretch;
+    gap: 10px;
+  }
+  .netmon-wall-mid{ justify-content:flex-start; }
+  .netmon-wall-right{
+    display:grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px;
+    align-items:stretch;
+    justify-content:stretch;
+  }
+  .netmon-wall-right > *{ min-width:0; }
+  .netmon-wall-ctrl{ width:100%; }
+  .netmon-wall-ctrl input,
+  .netmon-wall-ctrl select{ width:100% !important; }
+
+  /* Buttons: make key actions full width */
+  body.netmon-wall #netmonRefreshBtn,
+  body.netmon-wall #netmonWallFullscreen,
+  body.netmon-wall .netmon-wall-right a.btn.secondary{
+    grid-column: 1 / -1;
+  }
 }
 
 /* =========================

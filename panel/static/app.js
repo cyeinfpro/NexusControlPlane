@@ -3900,6 +3900,13 @@ function initNetMonPage(){
 
   // Chart card actions (event delegation)
   chartsBox.addEventListener('click', async (e)=>{
+    try{
+      const pop = e.target.closest && e.target.closest('.menu-pop');
+      if(pop){
+        const det = pop.closest && pop.closest('details.menu');
+        if(det) det.open = false;
+      }
+    }catch(_e){}
     const fullBtn = e.target.closest && e.target.closest('button.netmon-full');
     if(fullBtn){
       e.preventDefault();
@@ -4622,7 +4629,9 @@ function _netmonCreateMonitorCard(m){
   card.setAttribute('data-mid', String(m.id));
 
   const ro = !!(NETMON_STATE && NETMON_STATE.readOnly);
-  const actions = ro ? `
+
+  // Desktop: keep explicit buttons; Mobile: compact icon bar + overflow menu.
+  const actionsDesktop = ro ? `
         <button class="btn xs ghost netmon-full" type="button" data-mid="${escapeHtml(String(m.id))}" title="全屏查看该图表">全屏</button>
         <button class="btn xs ghost netmon-share" type="button" data-mid="${escapeHtml(String(m.id))}" title="复制只读展示链接（包含当前视图/隐藏曲线）">分享</button>
         <button class="btn xs ghost netmon-export" type="button" data-mid="${escapeHtml(String(m.id))}" title="导出当前图表为 PNG">PNG</button>
@@ -4633,6 +4642,35 @@ function _netmonCreateMonitorCard(m){
         <button class="btn xs ghost netmon-edit" type="button" data-mid="${escapeHtml(String(m.id))}">编辑</button>
         <button class="btn xs ghost netmon-toggle" type="button" data-mid="${escapeHtml(String(m.id))}">停用</button>
         <button class="btn xs danger netmon-delete" type="button" data-mid="${escapeHtml(String(m.id))}">删除</button>
+  `;
+
+  const actionsMobile = ro ? `
+        <button class="btn icon xs ghost netmon-full" type="button" data-mid="${escapeHtml(String(m.id))}" title="全屏">⛶</button>
+        <button class="btn icon xs ghost netmon-share" type="button" data-mid="${escapeHtml(String(m.id))}" title="分享链接">🔗</button>
+        <button class="btn icon xs ghost netmon-export" type="button" data-mid="${escapeHtml(String(m.id))}" title="导出 PNG">⬇</button>
+  ` : `
+        <button class="btn icon xs ghost netmon-full" type="button" data-mid="${escapeHtml(String(m.id))}" title="全屏">⛶</button>
+        <button class="btn icon xs ghost netmon-share" type="button" data-mid="${escapeHtml(String(m.id))}" title="分享链接">🔗</button>
+        <button class="btn icon xs ghost netmon-export" type="button" data-mid="${escapeHtml(String(m.id))}" title="导出 PNG">⬇</button>
+
+        <details class="menu netmon-actions-menu">
+          <summary class="btn icon xs ghost" aria-label="更多操作">⋯</summary>
+          <div class="menu-pop">
+            <button class="menu-item netmon-edit" type="button" data-mid="${escapeHtml(String(m.id))}">编辑</button>
+            <button class="menu-item netmon-toggle" type="button" data-mid="${escapeHtml(String(m.id))}">停用</button>
+            <div class="menu-sep"></div>
+            <button class="menu-item danger netmon-delete" type="button" data-mid="${escapeHtml(String(m.id))}">删除</button>
+          </div>
+        </details>
+  `;
+
+  const actions = `
+    <div class="netmon-actions-desktop">
+      ${actionsDesktop}
+    </div>
+    <div class="netmon-actions-mobile">
+      ${actionsMobile}
+    </div>
   `;
 
   card.innerHTML = `
@@ -4698,8 +4736,10 @@ function _netmonUpdateMonitorCard(card, m){
     sub.textContent = `${mode}${mode==='tcping' ? ('/' + (m.tcp_port || 443)) : ''} · ${interval}s · 节点 ${nodeCount}${thrTxt}${lastTxt} ${extra}`;
   }
 
-  const toggleBtn = card.querySelector('button.netmon-toggle');
-  if(toggleBtn) toggleBtn.textContent = enabled ? '停用' : '启用';
+  const toggleBtns = card.querySelectorAll('button.netmon-toggle');
+  if(toggleBtns && toggleBtns.length){
+    toggleBtns.forEach((b)=>{ try{ b.textContent = enabled ? '停用' : '启用'; }catch(_e){} });
+  }
 
   card.classList.toggle('netmon-disabled', !enabled);
 }
