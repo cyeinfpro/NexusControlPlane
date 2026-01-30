@@ -7716,14 +7716,604 @@ class NetMonChart{
 
     if(this.eventsFoot){
       if(!events.length){
+        try{ this.eventsFoot.style.display = ''; }catch(_e){}
         this.eventsFoot.innerHTML = `<div class="muted sm">当前窗口内无异常</div>`;
       }else{
-        // keep it minimal
+        try{ this.eventsFoot.style.display = 'none'; }catch(_e){}
         this.eventsFoot.innerHTML = ``;
       }
     }
   }
 }
 
+
+
+// =========================
+// NetMon Abnormal Center (one modal shows all abnormal segments)
+// =========================
+
+let NETMON_AB_MODAL = null;
+let NETMON_AB_VIEW = null; // {mid,target,events,xMin,xMax,selectedKey,q,filter,focusFrom,focusTo}
+
+function _netmonCloseAbModal(){
+  try{ if(NETMON_AB_MODAL) NETMON_AB_MODAL.style.display = 'none'; }catch(_e){}
+  NETMON_AB_VIEW = null;
+  try{ document.body.classList.remove('modal-open'); }catch(_e){}
+}
+
+function _netmonAbKey(ev){
+  return `${Math.round(Number(ev && ev.start)||0)}-${Math.round(Number(ev && ev.end)||0)}-${Math.round(Number(ev && ev.lvl)||0)}`;
+}
+
+function _netmonAbGetSelectedEvent(){
+  if(!NETMON_AB_VIEW || !Array.isArray(NETMON_AB_VIEW.events)) return null;
+  const key = NETMON_AB_VIEW.selectedKey;
+  if(!key) return null;
+  for(const ev of NETMON_AB_VIEW.events){
+    if(ev && _netmonAbKey(ev) === key) return ev;
+  }
+  return null;
+}
+
+function _netmonEnsureAbModal(){
+  if(NETMON_AB_MODAL) return NETMON_AB_MODAL;
+  const m = document.createElement('div');
+  m.id = 'netmonAbModal';
+  m.className = 'modal netmon-ab-modal';
+  m.style.display = 'none';
+
+  m.innerHTML = `
+    <div class="modal-inner netmon-ab-inner">
+      <div class="netmon-ab-head">
+        <div style="min-width:0;">
+          <div class="h2">异常中心</div>
+          <div class="muted sm" id="netmonAbTitle" style="margin-top:4px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;"></div>
+        </div>
+        <div class="right" style="display:flex; gap:8px; align-items:center;">
+          <button class="btn xs ghost" type="button" data-action="close">关闭</button>
+        </div>
+      </div>
+
+      <div class="netmon-ab-summary" id="netmonAbSummary"></div>
+
+      <div class="netmon-ab-body">
+        <div class="netmon-ab-list">
+          <div class="netmon-ab-tools">
+            <input class="input sm" id="netmonAbSearch" placeholder="搜索 节点/时间/max/fail…" />
+            <select class="select sm" id="netmonAbFilter" style="max-width:120px;">
+              <option value="all">全部</option>
+              <option value="crit">CRIT</option>
+              <option value="warn">WARN</option>
+              <option value="fail">FAIL</option>
+            </select>
+          </div>
+          <div class="netmon-ab-listbox" id="netmonAbList"></div>
+        </div>
+
+        <div class="netmon-ab-detail" id="netmonAbDetail">
+          <div class="muted sm">选择一段异常查看详情</div>
+        </div>
+      </div>
+    </div>
+  `;
+
+  const escSel = (s)=>{
+    try{
+      if(window.CSS && CSS.escape) return CSS.escape(String(s||''));
+    }catch(_e){}
+    return String(s||'').replace(/"/g, '');
+  };
+
+  // Backdrop click closes
+  m.addEventListener('click', (e)=>{
+    try{
+      if(e.target === m){
+        _netmonCloseAbModal();
+        return;
+      }
+
+      const actEl = (e.target && e.target.closest) ? e.target.closest('[data-action]') : null;
+      if(actEl){
+        const act = String(actEl.getAttribute('data-action') || '');
+        if(act === 'close'){
+          _netmonCloseAbModal();
+          return;
+        }
+        const ev = _netmonAbGetSelectedEvent();
+        if(!ev || !NETMON_AB_VIEW) return;
+        const midStr = String(NETMON_AB_VIEW.mid || '');
+        const ch = (NETMON_STATE && NETMON_STATE.charts) ? NETMON_STATE.charts[midStr] : null;
+
+        if(act === 'jump'){
+          if(ch && ch.jumpToRange){
+            ch.jumpToRange(Number(ev.start), Number(ev.end));
+            _netmonCloseAbModal();
+          }
+          return;
+        }
+        if(act === 'copy'){
+          if(ch && ch.copyShareLinkForRange){
+            ch.copyShareLinkForRange(Number(ev.start), Number(ev.end));
+          }
+          return;
+        }
+      }
+
+      const row = (e.target && e.target.closest) ? e.target.closest('.netmon-ab-row') : null;
+      if(row){
+        const key = row.getAttribute('data-key');
+        if(key) _netmonAbSelect(key, {scroll:true});
+      }
+    }catch(_e){}
+  });
+
+  // Inputs
+  setTimeout(()=>{
+    try{
+      const qEl = m.querySelector('#netmonAbSearch');
+      const fEl = m.querySelector('#netmonAbFilter');
+      if(qEl){
+        qEl.addEventListener('input', ()=>{
+          if(!NETMON_AB_VIEW) return;
+          NETMON_AB_VIEW.q = String(qEl.value || '').trim().toLowerCase();
+          _netmonAbRenderList();
+        });
+      }
+      if(fEl){
+        fEl.addEventListener('change', ()=>{
+          if(!NETMON_AB_VIEW) return;
+          NETMON_AB_VIEW.filter = String(fEl.value || 'all');
+          _netmonAbRenderList();
+        });
+      }
+    }catch(_e){}
+  }, 0);
+
+  // ESC closes
+  window.addEventListener('keydown', (e)=>{
+    try{
+      if(e.key === 'Escape' && NETMON_AB_MODAL && NETMON_AB_MODAL.style.display !== 'none'){
+        _netmonCloseAbModal();
+      }
+    }catch(_e){}
+  });
+
+  document.body.appendChild(m);
+  NETMON_AB_MODAL = m;
+  return m;
+}
+
+function _netmonOpenAbModal(opts){
+  const modal = _netmonEnsureAbModal();
+  const o = (opts && typeof opts === 'object') ? opts : {};
+
+  const events = Array.isArray(o.events) ? o.events.slice() : [];
+  events.sort((a,b)=>{
+    const at = Number(a && a.start) || 0;
+    const bt = Number(b && b.start) || 0;
+    return bt - at;
+  });
+
+  NETMON_AB_VIEW = {
+    mid: o.mid,
+    target: String(o.target || ''),
+    events,
+    xMin: (o.xMin != null ? Number(o.xMin) : null),
+    xMax: (o.xMax != null ? Number(o.xMax) : null),
+    q: '',
+    filter: 'all',
+    selectedKey: null,
+    focusFrom: (o.focusFrom != null ? Number(o.focusFrom) : null),
+    focusTo: (o.focusTo != null ? Number(o.focusTo) : null),
+  };
+
+  // Reset controls
+  try{
+    const qEl = modal.querySelector('#netmonAbSearch');
+    const fEl = modal.querySelector('#netmonAbFilter');
+    if(qEl) qEl.value = '';
+    if(fEl) fEl.value = 'all';
+  }catch(_e){}
+
+  // Title
+  try{
+    const tEl = modal.querySelector('#netmonAbTitle');
+    if(tEl){
+      const range = (NETMON_AB_VIEW.xMin != null && NETMON_AB_VIEW.xMax != null)
+        ? `${_netmonFormatTs(NETMON_AB_VIEW.xMin)} ~ ${_netmonFormatTs(NETMON_AB_VIEW.xMax)}`
+        : '';
+      const target = NETMON_AB_VIEW.target;
+      tEl.textContent = target ? `${target}${range ? (' · ' + range) : ''}` : (range || '异常窗口');
+    }
+  }catch(_e){}
+
+  // Summary
+  try{
+    const sEl = modal.querySelector('#netmonAbSummary');
+    if(sEl){
+      const total = events.length;
+      const critCnt = events.filter(ev=>ev && Number(ev.lvl) >= 2).length;
+      const warnCnt = events.filter(ev=>ev && Number(ev.lvl) === 1).length;
+      const failCnt = events.filter(ev=>ev && (Number(ev.total)||0) > 0 && (Number(ev.fail)||0) > 0).length;
+      const pills = [];
+      pills.push(`<span class="nm-pill ghost"><span class="k">区间异常</span><span class="v">${total}</span></span>`);
+      if(critCnt) pills.push(`<span class="nm-pill crit"><span class="k">CRIT</span><span class="v">${critCnt}</span></span>`);
+      if(warnCnt) pills.push(`<span class="nm-pill warn"><span class="k">WARN</span><span class="v">${warnCnt}</span></span>`);
+      if(failCnt) pills.push(`<span class="nm-pill"><span class="k">FAIL</span><span class="v">${failCnt}</span></span>`);
+      if(!total) pills.push(`<span class="nm-pill ok"><span class="k">状态</span><span class="v">OK</span></span>`);
+      sEl.innerHTML = pills.join('');
+    }
+  }catch(_e){}
+
+  // Open
+  modal.style.display = '';
+  try{ document.body.classList.add('modal-open'); }catch(_e){}
+
+  // Initial selection
+  let focusKey = null;
+  try{
+    const fx = NETMON_AB_VIEW.focusFrom;
+    const fy = NETMON_AB_VIEW.focusTo;
+    if(Number.isFinite(fx)){
+      const hit = events.find(ev=>{
+        if(!ev) return false;
+        const a = Number(ev.start)||0;
+        const b = Number(ev.end)||0;
+        if(!Number.isFinite(a) || !Number.isFinite(b) || b<=a) return false;
+        if(fy != null && Number.isFinite(fy)) return a <= fx && b >= fy;
+        return a <= fx && b >= fx;
+      });
+      if(hit) focusKey = _netmonAbKey(hit);
+    }
+  }catch(_e){}
+  if(!focusKey && events.length) focusKey = _netmonAbKey(events[0]);
+  if(focusKey) NETMON_AB_VIEW.selectedKey = focusKey;
+
+  _netmonAbRenderList();
+  _netmonAbRenderDetail();
+
+  // Scroll selected into view
+  if(focusKey){
+    setTimeout(()=>{
+      try{
+        const row = modal.querySelector(`.netmon-ab-row[data-key="${focusKey}"]`);
+        if(row && row.scrollIntoView) row.scrollIntoView({block:'nearest'});
+      }catch(_e){}
+    }, 30);
+  }
+}
+
+function _netmonAbRenderList(){
+  if(!NETMON_AB_MODAL || !NETMON_AB_VIEW) return;
+  const listEl = NETMON_AB_MODAL.querySelector('#netmonAbList');
+  if(!listEl) return;
+
+  const q = String(NETMON_AB_VIEW.q || '').trim().toLowerCase();
+  const mode = String(NETMON_AB_VIEW.filter || 'all');
+  const st = NETMON_STATE;
+  const nodesMeta = (st && st.nodesMeta && typeof st.nodesMeta === 'object') ? st.nodesMeta : {};
+
+  const out = [];
+  for(const ev of (NETMON_AB_VIEW.events || [])){
+    if(!ev) continue;
+    const lvl = Number(ev.lvl)||0;
+
+    if(mode === 'crit' && lvl < 2) continue;
+    if(mode === 'warn' && lvl !== 1) continue;
+    if(mode === 'fail' && !((Number(ev.total)||0) > 0 && (Number(ev.fail)||0) > 0)) continue;
+
+    let nodeName = '';
+    try{
+      if(ev.maxNid && nodesMeta[String(ev.maxNid)]){
+        nodeName = String(nodesMeta[String(ev.maxNid)].name || nodesMeta[String(ev.maxNid)].display_ip || '');
+      }
+    }catch(_e){}
+
+    const timeTxt = `${_netmonFormatClock(ev.start)}~${_netmonFormatClock(ev.end)}`;
+    const durTxt = _netmonFormatDur((Number(ev.end)||0) - (Number(ev.start)||0));
+
+    const metaParts = [];
+    if(ev.maxV != null && Number.isFinite(Number(ev.maxV))) metaParts.push(`max ${Number(ev.maxV).toFixed(1)}ms`);
+    if(nodeName) metaParts.push(nodeName);
+    if((Number(ev.total)||0) > 0 && (Number(ev.fail)||0) > 0) metaParts.push(`fail ${Math.round(ev.fail)}/${Math.round(ev.total)}`);
+    const metaTxt = metaParts.join(' · ');
+
+    if(q){
+      const hay = `${timeTxt} ${durTxt} ${metaTxt}`.toLowerCase();
+      if(!hay.includes(q)) continue;
+    }
+
+    const key = _netmonAbKey(ev);
+    const lvTxt = (lvl >= 2) ? 'CRIT' : 'WARN';
+    const lvCls = (lvl >= 2) ? 'crit' : 'warn';
+    const selCls = (NETMON_AB_VIEW.selectedKey === key) ? 'sel' : '';
+
+    out.push(`
+      <div class="netmon-ab-row ${selCls}" data-key="${key}">
+        <div class="lv ${lvCls}">${lvTxt}</div>
+        <div class="time mono">${escapeHtml(timeTxt)}</div>
+        <div class="dur mono muted">${escapeHtml(durTxt)}</div>
+        <div class="meta muted sm">${escapeHtml(metaTxt || '')}</div>
+      </div>
+    `);
+  }
+
+  if(!out.length){
+    listEl.innerHTML = `<div class="muted sm" style="padding:10px;">无匹配异常</div>`;
+  }else{
+    listEl.innerHTML = out.join('');
+  }
+}
+
+function _netmonAbSelect(key, opts){
+  if(!NETMON_AB_VIEW) return;
+  const k = String(key || '');
+  if(!k) return;
+  if(NETMON_AB_VIEW.selectedKey === k) return;
+  NETMON_AB_VIEW.selectedKey = k;
+  _netmonAbRenderList();
+  _netmonAbRenderDetail();
+
+  if(opts && opts.scroll && NETMON_AB_MODAL){
+    try{
+      const row = NETMON_AB_MODAL.querySelector(`.netmon-ab-row[data-key="${k}"]`);
+      if(row && row.scrollIntoView) row.scrollIntoView({block:'nearest'});
+    }catch(_e){}
+  }
+}
+
+async function _netmonAbRenderDetail(){
+  if(!NETMON_AB_MODAL || !NETMON_AB_VIEW) return;
+  const detailEl = NETMON_AB_MODAL.querySelector('#netmonAbDetail');
+  if(!detailEl) return;
+
+  const ev = _netmonAbGetSelectedEvent();
+  if(!ev){
+    detailEl.innerHTML = `<div class="muted sm">当前窗口内无异常</div>`;
+    return;
+  }
+
+  const mid = Number(NETMON_AB_VIEW.mid) || 0;
+  const from = Math.round(Number(ev.start)||0);
+  const to = Math.round(Number(ev.end)||0);
+  if(mid <= 0 || !Number.isFinite(from) || !Number.isFinite(to) || to <= from){
+    detailEl.innerHTML = `<div class="muted" style="color:var(--bad);">异常区间参数无效</div>`;
+    return;
+  }
+
+  const headTxt = `${(Number(ev.lvl)||0) >= 2 ? 'CRIT' : 'WARN'} · ${_netmonFormatTs(from)} ~ ${_netmonFormatTs(to)} · ${_netmonFormatDur(to-from)}`;
+  detailEl.innerHTML = `<div class="netmon-ab-detail-title mono">${escapeHtml(headTxt)}</div><div class="muted sm">加载中…</div>`;
+
+  // Cache HTML for this range
+  let cache = null;
+  try{
+    if(!window.__NETMON_AB_CACHE__) window.__NETMON_AB_CACHE__ = new Map();
+    if(window.__NETMON_AB_CACHE__ instanceof Map) cache = window.__NETMON_AB_CACHE__;
+  }catch(_e){}
+  const cacheKey = `${mid}|${from}|${to}`;
+  try{
+    if(cache && cache.has(cacheKey)){
+      detailEl.innerHTML = cache.get(cacheKey);
+      return;
+    }
+  }catch(_e){}
+
+  try{
+    const st = NETMON_STATE;
+    let url = `/api/netmon/range?mid=${encodeURIComponent(String(mid))}&from=${encodeURIComponent(String(from))}&to=${encodeURIComponent(String(to))}`;
+    try{ if(st && st.shareToken){ url += `&t=${encodeURIComponent(String(st.shareToken))}`; } }catch(_e){}
+
+    const res = await fetchJSON(url);
+    if(!res || res.ok === false){
+      throw new Error(res && res.error ? res.error : '加载失败');
+    }
+
+    const mInfo = res.monitor || {};
+    const nodesMeta = (res.nodes && typeof res.nodes === 'object') ? res.nodes : (st ? st.nodesMeta : {});
+    const series = (res.series && typeof res.series === 'object') ? res.series : {};
+
+    let warnThr = Number(mInfo.warn_ms) || 0;
+    let critThr = Number(mInfo.crit_ms) || 0;
+    if(warnThr > 0 && critThr > 0 && warnThr > critThr){
+      const tmp = warnThr; warnThr = critThr; critThr = tmp;
+    }
+
+    const nodeIdsRaw = Array.isArray(mInfo.node_ids) ? mInfo.node_ids : Object.keys(series);
+    const nodeIds = [];
+    for(const nid of nodeIdsRaw){
+      const s = String(nid);
+      if(!nodeIds.includes(s)) nodeIds.push(s);
+    }
+    for(const k of Object.keys(series)){
+      const s = String(k);
+      if(!nodeIds.includes(s)) nodeIds.push(s);
+    }
+
+    const _p95 = (vals)=>{
+      const n = vals.length;
+      if(!n) return null;
+      if(n >= 3){
+        const sorted = vals.slice().sort((a,b)=>a-b);
+        const idx = Math.min(sorted.length - 1, Math.floor(0.95 * (sorted.length - 1)));
+        return sorted[idx];
+      }
+      return Math.max(...vals);
+    };
+
+    const stats = [];
+    let gMax = null;
+    let gMaxNid = null;
+    const gVals = [];
+    let gTotal = 0;
+    let gFail = 0;
+
+    for(const nid of nodeIds){
+      const pts = Array.isArray(series[nid]) ? series[nid] : [];
+      const vals = [];
+      let total = 0;
+      let fail = 0;
+
+      for(const p of pts){
+        if(!p) continue;
+        total += 1;
+        gTotal += 1;
+
+        if(p.ok){
+          const v = Number(p.v);
+          if(Number.isFinite(v)){
+            vals.push(v);
+            gVals.push(v);
+            if(gMax == null || v > gMax){
+              gMax = v;
+              gMaxNid = nid;
+            }
+          }else{
+            fail += 1;
+            gFail += 1;
+          }
+        }else{
+          fail += 1;
+          gFail += 1;
+        }
+      }
+
+      const okCnt = vals.length;
+      const maxV = okCnt ? Math.max(...vals) : null;
+      let avgV = null;
+      if(okCnt){
+        let sum = 0;
+        for(const v of vals) sum += v;
+        avgV = sum / okCnt;
+      }
+      const p95 = _p95(vals);
+      const failRate = total > 0 ? (fail / total) : 0;
+
+      let sev = 0;
+      if(failRate >= 0.5) sev = 2;
+      else if(critThr > 0 && maxV != null && maxV >= critThr) sev = 2;
+      else if(warnThr > 0 && maxV != null && maxV >= warnThr) sev = 1;
+      else if(failRate > 0) sev = 1;
+
+      let nm = '节点-' + nid;
+      let online = null;
+      try{
+        if(nodesMeta && nodesMeta[nid]){
+          nm = String(nodesMeta[nid].name || nodesMeta[nid].display_ip || nm);
+          online = !!nodesMeta[nid].online;
+        }
+      }catch(_e){}
+
+      stats.push({nid, name:nm, online, total, fail, failRate, okCnt, maxV, avgV, p95, sev});
+    }
+
+    const totNodes = stats.length;
+    const impacted = stats.filter(s=>s && s.sev > 0).length;
+    const impactedRatio = totNodes ? (impacted / totNodes) : 0;
+    const failRateAll = gTotal ? (gFail / gTotal) : 0;
+    const p95All = _p95(gVals);
+
+    let hintCls = 'ok';
+    let hint = '';
+    if(impactedRatio >= 0.7 && (failRateAll >= 0.2 || (critThr > 0 && gMax != null && gMax >= critThr))){
+      hintCls = 'crit';
+      hint = '全局异常：多节点同时失败/超阈，疑似目标侧或公网链路波动。';
+    }else if(impactedRatio <= 0.25 && impacted > 0){
+      hintCls = 'warn';
+      hint = '局部异常：少数节点异常，疑似单节点出口/线路问题。';
+    }else if(impactedRatio >= 0.7 && impacted > 0){
+      hintCls = 'warn';
+      hint = '多节点异常：可能区域性链路抖动或目标端拥塞。';
+    }else if(impacted > 0){
+      hintCls = 'warn';
+      hint = '部分节点异常：建议对比异常节点出口/ISP/路由。';
+    }else{
+      hintCls = 'ok';
+      hint = '该区间无明显异常（阈值较高或数据不足）。';
+    }
+
+    let maxNodeName = '';
+    try{
+      if(gMaxNid && nodesMeta && nodesMeta[String(gMaxNid)]){
+        maxNodeName = String(nodesMeta[String(gMaxNid)].name || '');
+      }
+    }catch(_e){}
+    if(!maxNodeName && gMaxNid) maxNodeName = '节点-' + gMaxNid;
+
+    const kpis = [];
+    kpis.push(`<span class="nm-pill ${hintCls}"><span class="k">影响节点</span><span class="v">${impacted}/${totNodes || 0}</span></span>`);
+    if(gMax != null){
+      const maxTxt = `${Number(gMax).toFixed(1)}ms`;
+      kpis.push(`<span class="nm-pill ${hintCls}"><span class="k">峰值</span><span class="v">${escapeHtml(maxTxt)}${maxNodeName ? (' · ' + escapeHtml(maxNodeName)) : ''}</span></span>`);
+    }
+    if(p95All != null){
+      kpis.push(`<span class="nm-pill"><span class="k">P95</span><span class="v">${Number(p95All).toFixed(1)}ms</span></span>`);
+    }
+    if(gTotal > 0){
+      kpis.push(`<span class="nm-pill ${(failRateAll>0)?'warn':'ok'}"><span class="k">失败率</span><span class="v">${Math.round(failRateAll*100)}% (${gFail}/${gTotal})</span></span>`);
+    }
+    if(warnThr > 0) kpis.push(`<span class="nm-pill warn"><span class="k">Warn</span><span class="v">${warnThr}ms</span></span>`);
+    if(critThr > 0) kpis.push(`<span class="nm-pill crit"><span class="k">Crit</span><span class="v">${critThr}ms</span></span>`);
+
+    stats.sort((a,b)=>{
+      if(a.sev !== b.sev) return b.sev - a.sev;
+      const ap = (a.p95 != null) ? a.p95 : -1;
+      const bp = (b.p95 != null) ? b.p95 : -1;
+      if(ap !== bp) return bp - ap;
+      const am = (a.maxV != null) ? a.maxV : -1;
+      const bm = (b.maxV != null) ? b.maxV : -1;
+      if(am !== bm) return bm - am;
+      return (b.failRate || 0) - (a.failRate || 0);
+    });
+
+    let table = `<div class="netmon-ab-tablewrap"><table class="netmon-ab-table"><thead><tr>
+      <th style="width:240px;">节点</th>
+      <th>最大</th>
+      <th>平均</th>
+      <th>P95</th>
+      <th>失败率</th>
+      <th>样本</th>
+    </tr></thead><tbody>`;
+
+    for(const s of stats){
+      const rowCls = (s.sev >= 2) ? 'crit' : ((s.sev >= 1) ? 'warn' : '');
+      const maxTxt = (s.maxV != null && Number.isFinite(s.maxV)) ? `${s.maxV.toFixed(1)}ms` : '—';
+      const avgTxt = (s.avgV != null && Number.isFinite(s.avgV)) ? `${s.avgV.toFixed(1)}ms` : '—';
+      const p95Txt = (s.p95 != null && Number.isFinite(s.p95)) ? `${s.p95.toFixed(1)}ms` : '—';
+      const frTxt = (s.total > 0) ? `${Math.round(s.failRate*100)}%` : '—';
+      const smpTxt = `${s.total || 0}`;
+      const dotCls = (s.online === null) ? 'offline' : (s.online ? 'online' : 'offline');
+      const nm = escapeHtml(String(s.name || ('节点-' + s.nid)));
+
+      table += `<tr class="${rowCls}">
+        <td><span class="n-dot ${dotCls}" aria-hidden="true"></span><span class="mono">${nm}</span></td>
+        <td class="mono">${escapeHtml(maxTxt)}</td>
+        <td class="mono">${escapeHtml(avgTxt)}</td>
+        <td class="mono">${escapeHtml(p95Txt)}</td>
+        <td class="mono">${escapeHtml(frTxt)}</td>
+        <td class="mono muted">${escapeHtml(smpTxt)}</td>
+      </tr>`;
+    }
+
+    table += `</tbody></table></div>`;
+
+    const html = `
+      <div class="netmon-ab-detail-title mono">${escapeHtml(headTxt)}</div>
+      <div class="netmon-ab-hint ${hintCls}"><span class="dot" aria-hidden="true"></span><div class="txt">${escapeHtml(hint)}</div></div>
+      <div class="netmon-ab-kpis">${kpis.join('')}</div>
+      ${table}
+      <div class="netmon-ab-actions">
+        <button class="btn xs ghost" type="button" data-action="jump">定位到图表</button>
+        <button class="btn xs" type="button" data-action="copy">复制只读链接</button>
+      </div>
+    `;
+
+    detailEl.innerHTML = html;
+    try{ if(cache) cache.set(cacheKey, html); }catch(_e){}
+
+  }catch(e){
+    const msg = (e && e.message) ? e.message : String(e);
+    detailEl.innerHTML = `<div class="netmon-ab-detail-title mono">${escapeHtml(headTxt)}</div><div class="muted" style="color:var(--bad);">加载失败：${escapeHtml(msg)}</div>`;
+  }
+}
 // Expose for template inline init
 window.initNetMonPage = initNetMonPage;
