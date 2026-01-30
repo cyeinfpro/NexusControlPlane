@@ -6,13 +6,7 @@
   <div class="page-title">
     <h1 class="h1">网络波动 · 只读展示</h1>
     <div class="meta netmon-meta">
-      <span class="meta-item netmon-meta-short">只读展示 · 交互图表 · 异常时间轴</span>
-      <details class="menu netmon-help">
-        <summary class="btn xs ghost">说明</summary>
-        <div class="menu-pop" style="min-width:300px;">
-          <div class="muted sm" style="white-space:normal; line-height:1.5;">只读展示页：隐藏新建/编辑/停用/删除等管理操作。支持缩放/拖拽、框选缩放、十字线对齐多节点数值、异常事件时间轴、mini-map 时间导航条、回到实时、导出 PNG。</div>
-        </div>
-      </details>
+      <span class="meta-item">只读展示 · 支持缩放/拖拽/悬浮读数</span>
     </div>
   </div>
   <div class="right" style="display:flex; gap:10px; align-items:center;">
@@ -25,7 +19,6 @@
     <div class="col nm-win">
       <label class="label">展示窗口</label>
       <input class="input" id="netmonViewWindow" type="number" min="1" max="1440" value="10">
-      <div class="help">单位：分钟（仅影响图表展示，不影响后台采集）</div>
     </div>
     <div class="col nm-auto">
       <label class="label">自动刷新</label>
@@ -66,7 +59,7 @@
 {% endblock %}
 
 {% block scripts %}
-<script src="/static/app.js?v=61.0"></script>
+<script src="/static/app.js?v=62.0"></script>
 <script>
 // Read-only display page (share / wallboard)
 window.__NETMON_NODE_GROUPS__ = [];

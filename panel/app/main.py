@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import time
+import base64
 import hmac
 import hashlib
 import secrets
@@ -11,7 +12,7 @@ import uuid
 import io
 import zipfile
 from datetime import datetime
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlencode
 from pathlib import Path
 from typing import Any, Dict, Optional, List
 
@@ -188,13 +189,23 @@ if _NETMON_RETENTION_DAYS > 90:
     _NETMON_RETENTION_DAYS = 90
 
 try:
-    _NETMON_HTTP_TIMEOUT = float((os.getenv("REALM_NETMON_HTTP_TIMEOUT") or "3.5").strip() or 3.5)
+    _NETMON_HTTP_TIMEOUT = float((os.getenv("REALM_NETMON_HTTP_TIMEOUT") or "8.0").strip() or 3.5)
 except Exception:
     _NETMON_HTTP_TIMEOUT = 3.5
 if _NETMON_HTTP_TIMEOUT < 1.5:
     _NETMON_HTTP_TIMEOUT = 1.5
 if _NETMON_HTTP_TIMEOUT > 20:
     _NETMON_HTTP_TIMEOUT = 20.0
+
+
+try:
+    _NETMON_PROBE_TIMEOUT = float((os.getenv("REALM_NETMON_PROBE_TIMEOUT") or "2.5").strip() or 2.5)
+except Exception:
+    _NETMON_PROBE_TIMEOUT = 2.5
+if _NETMON_PROBE_TIMEOUT < 0.5:
+    _NETMON_PROBE_TIMEOUT = 0.5
+if _NETMON_PROBE_TIMEOUT > 10:
+    _NETMON_PROBE_TIMEOUT = 10.0
 
 try:
     _NETMON_MAX_CONCURRENCY = int((os.getenv("REALM_NETMON_CONCURRENCY") or "40").strip() or 40)
@@ -282,15 +293,56 @@ async def _netmon_collect_one(mon: Dict[str, Any], nodes_map: Dict[int, Dict[str
     ts_ms = int(time.time() * 1000)
 
     # One target per monitor, but agent API supports batch.
-    body = {"mode": mode, "targets": [target], "tcp_port": tcp_port, "timeout": 1.5}
+    body = {"mode": mode, "targets": [target], "tcp_port": tcp_port, "timeout": float(_NETMON_PROBE_TIMEOUT)}
 
     async def _one(n: Dict[str, Any]):
         nid = int(n.get("id") or 0)
-        try:
-            data = await _netmon_call_agent(n, body, timeout=_NETMON_HTTP_TIMEOUT)
-            return nid, data
-        except Exception as exc:
-            return nid, {"ok": False, "error": str(exc)}
+
+        # HTTP timeout should always be larger than probe timeout + overhead
+        http_timeout = float(max(_NETMON_HTTP_TIMEOUT, float(_NETMON_PROBE_TIMEOUT) + 3.0))
+
+        def _should_retry_err(s: str) -> bool:
+            s = (s or "").lower()
+            # Only retry typical transient failures/timeouts
+            for kw in ("timeout", "timed out", "temporar", "connection aborted", "connection reset", "broken pipe"):
+                if kw in s:
+                    return True
+            return False
+
+        # Try at most 2 times on transient failures.
+        last = None
+        for attempt in range(2):
+            try:
+                data = await _netmon_call_agent(n, body, timeout=http_timeout)
+                last = data
+            except Exception as exc:
+                last = {"ok": False, "error": str(exc)}
+
+            # If agent call failed, retry on transient errors
+            if not isinstance(last, dict) or last.get("ok") is not True:
+                err = str(last.get("error") if isinstance(last, dict) else last)
+                if attempt == 0 and _should_retry_err(err):
+                    await asyncio.sleep(0.12)
+                    continue
+                return nid, (last if isinstance(last, dict) else {"ok": False, "error": "agent_failed"})
+
+            # Agent call ok: check item result
+            try:
+                res_map = last.get("results") if isinstance(last.get("results"), dict) else {}
+                item = res_map.get(target) if isinstance(res_map, dict) else None
+                if isinstance(item, dict) and item.get("ok"):
+                    return nid, last
+                err = str(item.get("error") or "probe_failed") if isinstance(item, dict) else "probe_failed"
+                if attempt == 0 and _should_retry_err(err):
+                    await asyncio.sleep(0.08)
+                    continue
+            except Exception:
+                # If parsing failed, don't retry aggressively
+                pass
+
+            return nid, last
+
+        return nid, (last if isinstance(last, dict) else {"ok": False, "error": "probe_failed"})
 
     results = await asyncio.gather(*[_one(n) for n in nodes])
 
@@ -667,6 +719,108 @@ def require_login_page(request: Request) -> str:
     return user
 
 
+# ------------------------ NetMon share token (read-only, no-login) ------------------------
+
+_NETMON_SHARE_PUBLIC = (os.getenv("REALM_NETMON_SHARE_PUBLIC") or "1").strip() not in ("0", "false", "False")
+try:
+    _NETMON_SHARE_TTL_SEC = int((os.getenv("REALM_NETMON_SHARE_TTL_SEC") or "604800").strip() or 604800)  # default 7d
+except Exception:
+    _NETMON_SHARE_TTL_SEC = 604800
+if _NETMON_SHARE_TTL_SEC < 300:
+    _NETMON_SHARE_TTL_SEC = 300
+if _NETMON_SHARE_TTL_SEC > 30 * 86400:
+    _NETMON_SHARE_TTL_SEC = 30 * 86400
+
+
+def _b64url_encode(b: bytes) -> str:
+    return base64.urlsafe_b64encode(b).decode("utf-8").rstrip("=")
+
+
+def _b64url_decode(s: str) -> bytes:
+    s = str(s or "").strip()
+    if not s:
+        return b""
+    pad = "=" * (-len(s) % 4)
+    return base64.urlsafe_b64decode(s + pad)
+
+
+def _share_canon(obj: Any) -> str:
+    return json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _make_share_token(payload: Dict[str, Any]) -> str:
+    try:
+        exp = int(time.time()) + int(_NETMON_SHARE_TTL_SEC)
+    except Exception:
+        exp = int(time.time()) + 86400
+    p = dict(payload or {})
+    p["exp"] = exp
+    raw = _share_canon(p).encode("utf-8")
+    sig = hmac.new(secret.encode("utf-8"), raw, hashlib.sha256).hexdigest()
+    return f"{_b64url_encode(raw)}.{sig}"
+
+
+def _verify_share_token(token: str) -> Optional[Dict[str, Any]]:
+    try:
+        tok = str(token or "").strip()
+        if not tok or "." not in tok:
+            return None
+        b64, sig = tok.split(".", 1)
+        raw = _b64url_decode(b64)
+        if not raw:
+            return None
+        exp_sig = hmac.new(secret.encode("utf-8"), raw, hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(exp_sig, str(sig or "").strip()):
+            return None
+        obj = json.loads(raw.decode("utf-8", errors="ignore"))
+        if not isinstance(obj, dict):
+            return None
+        exp = int(obj.get("exp") or 0)
+        if exp and int(time.time()) > exp:
+            return None
+        return obj
+    except Exception:
+        return None
+
+
+def require_login_or_share_page(request: Request, allow_page: str) -> str:
+    """Allow either a logged-in session OR a valid share token for a given page."""
+    user = request.session.get("user")
+    if user:
+        return user
+    if not _NETMON_SHARE_PUBLIC:
+        raise HTTPException(status_code=302, headers={"Location": "/login"})
+    payload = _verify_share_token(request.query_params.get("t") or "")
+    if payload and str(payload.get("page") or "") == str(allow_page):
+        request.state.share = payload
+        return ""
+    raise HTTPException(status_code=302, headers={"Location": "/login"})
+
+
+def require_login_or_share_view_page(request: Request) -> str:
+    return require_login_or_share_page(request, "view")
+
+
+def require_login_or_share_wall_page(request: Request) -> str:
+    return require_login_or_share_page(request, "wall")
+
+
+def require_login_or_share_api(request: Request) -> str:
+    """Allow either a logged-in session OR a valid share token for API calls."""
+    user = request.session.get("user")
+    if user:
+        return user
+    if not _NETMON_SHARE_PUBLIC:
+        raise HTTPException(status_code=401, detail="Not logged in")
+    token = request.query_params.get("t") or request.headers.get("X-Share-Token") or ""
+    payload = _verify_share_token(token)
+    if payload:
+        request.state.share = payload
+        return "__share__"
+    raise HTTPException(status_code=401, detail="Not logged in")
+
+
+
 @app.get("/login", response_class=HTMLResponse)
 async def login_page(request: Request):
     if not _has_credentials():
@@ -806,7 +960,7 @@ async def index(request: Request, user: str = Depends(require_login_page)):
         "index.html",
         {
             "request": request,
-            "user": user,
+            "user": (user or None),
             "nodes": nodes,
             "dashboard_groups": dashboard_groups,
             "flash": _flash(request),
@@ -886,7 +1040,7 @@ async def netmon_page(request: Request, user: str = Depends(require_login_page))
         "netmon.html",
         {
             "request": request,
-            "user": user,
+            "user": (user or None),
             "node_groups": node_groups,
             "flash": _flash(request),
             "title": "网络波动监控",
@@ -895,7 +1049,7 @@ async def netmon_page(request: Request, user: str = Depends(require_login_page))
 
 
 @app.get("/netmon/view", response_class=HTMLResponse)
-async def netmon_view_page(request: Request, user: str = Depends(require_login_page)):
+async def netmon_view_page(request: Request, user: str = Depends(require_login_or_share_view_page)):
     """Read-only NetMon display page (for sharing / wallboard).
 
     Notes:
@@ -907,7 +1061,7 @@ async def netmon_view_page(request: Request, user: str = Depends(require_login_p
         "netmon_view.html",
         {
             "request": request,
-            "user": user,
+            "user": (user or None),
             "flash": _flash(request),
             "title": "网络波动 · 只读展示",
         },
@@ -915,7 +1069,7 @@ async def netmon_view_page(request: Request, user: str = Depends(require_login_p
 
 
 @app.get("/netmon/wall", response_class=HTMLResponse)
-async def netmon_wall_page(request: Request, user: str = Depends(require_login_page)):
+async def netmon_wall_page(request: Request, user: str = Depends(require_login_or_share_wall_page)):
     """NetMon wallboard (read-only).
 
     Designed for NOC / TV screens:
@@ -927,7 +1081,7 @@ async def netmon_wall_page(request: Request, user: str = Depends(require_login_p
         "netmon_wall.html",
         {
             "request": request,
-            "user": user,
+            "user": (user or None),
             "flash": _flash(request),
             "title": "网络波动 · 大屏展示",
         },
@@ -2741,7 +2895,7 @@ async def api_nodes_list(user: str = Depends(require_login)):
 
 
 @app.get("/api/netmon/snapshot")
-async def api_netmon_snapshot(request: Request, user: str = Depends(require_login)):
+async def api_netmon_snapshot(request: Request, user: str = Depends(require_login_or_share_api)):
     """Return NetMon monitors + samples (history window).
 
     Query:
@@ -2753,6 +2907,40 @@ async def api_netmon_snapshot(request: Request, user: str = Depends(require_logi
     raw_sec = qp.get("window_sec")
     raw_mid = qp.get("mid") or qp.get("monitor_id")
     raw_rollup = qp.get("rollup_ms") or qp.get("resolution_ms")
+
+    # Share-token access: enforce monitor scope & default window
+    share_ctx = getattr(request.state, "share", None)
+    if isinstance(share_ctx, dict):
+        try:
+            smid = int(share_ctx.get("mid") or 0)
+        except Exception:
+            smid = 0
+        if smid > 0:
+            raw_mid = str(smid)
+
+        # Share link may carry a fixed range or a window size; use it as an upper bound.
+        try:
+            s_win = int(share_ctx.get("win") or 0)
+        except Exception:
+            s_win = 0
+
+        try:
+            s_from = int(share_ctx.get("from") or 0)
+        except Exception:
+            s_from = 0
+        try:
+            s_to = int(share_ctx.get("to") or 0)
+        except Exception:
+            s_to = 0
+
+        if s_from > 0 and s_to > s_from:
+            # Bound the returned dataset to the shared fixed window (+ small pad).
+            span_ms = max(1000, s_to - s_from)
+            pad_ms = min(int(span_ms * 0.15), 5 * 60 * 1000)
+            need_sec = int((span_ms + pad_ms * 2) / 1000) + 1
+            raw_sec = str(max(10, min(24 * 3600, need_sec)))
+        elif s_win > 0:
+            raw_min = str(max(1, min(24 * 60, s_win)))
 
     window_sec = None
     if raw_sec is not None and str(raw_sec).strip() != "":
@@ -2984,7 +3172,7 @@ async def api_netmon_snapshot(request: Request, user: str = Depends(require_logi
 
 
 @app.get("/api/netmon/range")
-async def api_netmon_range(request: Request, user: str = Depends(require_login)):
+async def api_netmon_range(request: Request, user: str = Depends(require_login_or_share_api)):
     """Return raw samples for one monitor within a time range.
 
     This is used for the "abnormal event detail" diagnosis modal.
@@ -3006,6 +3194,16 @@ async def api_netmon_range(request: Request, user: str = Depends(require_login))
         mid = int(str(raw_mid).strip()) if raw_mid is not None else 0
     except Exception:
         mid = 0
+
+    # Share-token access: force monitor scope
+    share_ctx = getattr(request.state, "share", None)
+    if isinstance(share_ctx, dict):
+        try:
+            smid = int(share_ctx.get("mid") or 0)
+        except Exception:
+            smid = 0
+        if smid > 0:
+            mid = smid
     if mid <= 0:
         return JSONResponse({"ok": False, "error": "mid 无效"}, status_code=400)
 
@@ -3019,6 +3217,45 @@ async def api_netmon_range(request: Request, user: str = Depends(require_login))
         to_ms = 0
     if from_ms <= 0 or to_ms <= 0 or to_ms <= from_ms:
         return JSONResponse({"ok": False, "error": "from/to 无效"}, status_code=400)
+
+
+    # Share-token access: keep range within allowed window (best-effort clamp)
+    share_ctx = getattr(request.state, "share", None)
+    if isinstance(share_ctx, dict):
+        now_ms = int(time.time() * 1000)
+        # Allowed window derived from token:
+        # - fixed range: within [from - 10m, to + 10m]
+        # - follow window: within last win minutes
+        try:
+            s_from = int(share_ctx.get("from") or 0)
+        except Exception:
+            s_from = 0
+        try:
+            s_to = int(share_ctx.get("to") or 0)
+        except Exception:
+            s_to = 0
+        try:
+            s_win = int(share_ctx.get("win") or 0)
+        except Exception:
+            s_win = 0
+
+        if s_from > 0 and s_to > s_from:
+            allow_from = max(0, s_from - 10 * 60 * 1000)
+            allow_to = s_to + 10 * 60 * 1000
+        else:
+            if s_win <= 0:
+                s_win = 10
+            s_win = max(1, min(24 * 60, s_win))
+            allow_to = now_ms + 60 * 1000
+            allow_from = max(0, allow_to - s_win * 60 * 1000)
+
+        # Clamp
+        if from_ms < allow_from:
+            from_ms = allow_from
+        if to_ms > allow_to:
+            to_ms = allow_to
+        if to_ms <= from_ms:
+            return JSONResponse({"ok": False, "error": "range 超出分享窗口"}, status_code=403)
 
     # Safety: cap maximum range (default 6h)
     max_span_ms = 6 * 3600 * 1000
@@ -3106,6 +3343,120 @@ async def api_netmon_range(request: Request, user: str = Depends(require_login))
         "nodes": nodes_meta,
         "series": series,
     }
+@app.post("/api/netmon/share")
+async def api_netmon_share(request: Request, user: str = Depends(require_login)):
+    """Create a signed share link for read-only NetMon page.
+
+    Body (json):
+      - page: 'view' | 'wall' (default 'view')
+      - mid: monitor id (required)
+      - mode: 'follow' | 'fixed'
+      - from/to/span/win/hidden: optional view state
+      - rollup_ms: optional resolution hint (0/raw or bucket ms)
+    """
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+
+    page = str(payload.get("page") or "view").strip().lower()
+    if page not in ("view", "wall"):
+        page = "view"
+
+    try:
+        mid = int(payload.get("mid") or payload.get("monitor_id") or 0)
+    except Exception:
+        mid = 0
+    mon = None
+    if mid <= 0:
+        if page != "wall":
+            return JSONResponse({"ok": False, "error": "mid 无效"}, status_code=400)
+    else:
+        # Verify monitor exists
+        mon = get_netmon_monitor(mid)
+        if not mon:
+            return JSONResponse({"ok": False, "error": "monitor 不存在"}, status_code=404)
+
+    mode = str(payload.get("mode") or "follow").strip().lower()
+    if mode not in ("follow", "fixed"):
+        mode = "follow"
+
+    def _num(v):
+        try:
+            x = int(float(v))
+            return x
+        except Exception:
+            return None
+
+    s_from = _num(payload.get("from"))
+    s_to = _num(payload.get("to"))
+    span = _num(payload.get("span"))
+    win = _num(payload.get("win"))
+
+    # Keep hidden nodes within monitor scope
+    hidden_in = payload.get("hidden") or []
+    hidden: list[str] = []
+    if isinstance(hidden_in, str):
+        hidden_in = [x for x in hidden_in.split(",") if x.strip()]
+    if isinstance(hidden_in, list):
+        allow = set(str(int(x)) for x in ((mon.get("node_ids") or []) if mon else []) if str(x).isdigit())
+        for x in hidden_in:
+            s = str(x or "").strip()
+            if not s:
+                continue
+            if s in allow and s not in hidden:
+                hidden.append(s)
+    hidden = hidden[:60]
+
+    rollup_ms = _num(payload.get("rollup_ms"))
+    if rollup_ms is not None and rollup_ms < 0:
+        rollup_ms = 0
+
+    token_payload: Dict[str, Any] = {
+        "page": page,
+        "mode": mode,
+    }
+    if mid > 0:
+        token_payload["mid"] = int(mid)
+    if win is not None:
+        token_payload["win"] = int(max(1, min(24 * 60, win)))
+    if mode == "fixed" and s_from is not None and s_to is not None and s_to > s_from:
+        token_payload["from"] = int(s_from)
+        token_payload["to"] = int(s_to)
+    elif span is not None and span > 0:
+        token_payload["span"] = int(span)
+
+    if hidden:
+        token_payload["hidden"] = hidden
+    if rollup_ms is not None:
+        token_payload["rollup_ms"] = int(rollup_ms)
+
+    # Create token
+    token = _make_share_token(token_payload)
+
+    # Build URL (include view state in query for front-end convenience)
+    base = str(request.base_url).rstrip("/")
+    path = "/netmon/view" if page == "view" else "/netmon/wall"
+    q: Dict[str, Any] = {"ro": "1", "v": "1", "t": token}
+    if mid > 0:
+        q["mid"] = str(mid)
+    if "win" in token_payload:
+        q["win"] = str(token_payload["win"])
+    if mode == "fixed" and "from" in token_payload and "to" in token_payload:
+        q["mode"] = "fixed"
+        q["from"] = str(token_payload["from"])
+        q["to"] = str(token_payload["to"])
+    elif "span" in token_payload:
+        q["mode"] = "follow"
+        q["span"] = str(token_payload["span"])
+    if hidden:
+        q["hidden"] = ",".join(hidden)
+    if rollup_ms is not None:
+        q["rollup_ms"] = str(int(rollup_ms))
+    url = f"{base}{path}?{urlencode(q)}"
+
+    return {"ok": True, "url": url, "token": token}
+
 
 
 @app.get("/api/netmon/monitors")

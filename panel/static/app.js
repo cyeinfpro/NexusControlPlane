@@ -3698,6 +3698,15 @@ function initNetMonPage(){
     readOnly = !!window.__NETMON_READONLY__;
   }
 
+  // Share token (no-login read-only link)
+  let shareToken = null;
+  try{
+    const params = new URLSearchParams(window.location.search || '');
+    shareToken = params.get('t');
+  }catch(_e){
+    shareToken = null;
+  }
+
   // Build node checkbox list for modal
   const nodesMeta = {};
   _netmonBuildNodes(groups, document.getElementById('netmonMNodes'), nodesMeta);
@@ -3730,6 +3739,7 @@ function initNetMonPage(){
 
     nodesMeta: nodesMeta,       // from template (fallback). will be replaced by snapshot.nodes
     readOnly: readOnly,
+    shareToken: (shareToken || null),
     monitors: [],
     monitorsMap: {},
     series: {},
@@ -4316,6 +4326,12 @@ async function netmonRefresh(force){
       const u = st.urlState;
       if(st.readOnly && u && u.mid){
         url += `&mid=${encodeURIComponent(String(u.mid))}`;
+      }
+    }catch(_e){}
+
+    try{
+      if(st.shareToken){
+        url += `&t=${encodeURIComponent(String(st.shareToken))}`;
       }
     }catch(_e){}
 
@@ -5251,6 +5267,17 @@ class NetMonChart{
             this.jumpToRange(from, to);
           }
         }
+
+        // Mobile-friendly: tap the whole row to jump
+        const row = e.target && e.target.closest ? e.target.closest('.netmon-evt-row') : null;
+        if(row){
+          const from = Number(row.getAttribute('data-from'));
+          const to = Number(row.getAttribute('data-to'));
+          if(Number.isFinite(from) && Number.isFinite(to) && to > from){
+            e.preventDefault();
+            this.jumpToRange(from, to);
+          }
+        }
       });
     }
 
@@ -5381,6 +5408,20 @@ class NetMonChart{
       url.searchParams.delete('to');
     }
 
+    // Keep server-side rollup selection in the link (optional)
+    try{
+      if(st && st.resolutionMs != null){
+        url.searchParams.set('rollup_ms', String(Math.max(0, Math.round(Number(st.resolutionMs)||0))));
+      }
+    }catch(_e){}
+
+    // If we're already on a share link, preserve its token for re-share.
+    try{
+      if(st && st.shareToken){
+        url.searchParams.set('t', String(st.shareToken));
+      }
+    }catch(_e){}
+
     url.searchParams.set('v', '1');
     return url.toString();
   }
@@ -5399,12 +5440,58 @@ class NetMonChart{
     url.searchParams.set('from', String(Math.round(Number(from) || 0)));
     url.searchParams.set('to', String(Math.round(Number(to) || 0)));
     url.searchParams.delete('span');
+    // Keep server-side rollup selection in the link (optional)
+    try{
+      if(st && st.resolutionMs != null){
+        url.searchParams.set('rollup_ms', String(Math.max(0, Math.round(Number(st.resolutionMs)||0))));
+      }
+    }catch(_e){}
+
+    // If we're already on a share link, preserve its token for re-share.
+    try{
+      if(st && st.shareToken){
+        url.searchParams.set('t', String(st.shareToken));
+      }
+    }catch(_e){}
+
     url.searchParams.set('v', '1');
     return url.toString();
   }
 
   async copyShareLinkForRange(from, to){
-    const link = this.getShareUrlForRange(from, to);
+    const st = NETMON_STATE;
+    let link = null;
+
+    // If we're already on a share link, reuse its token and just encode the new range in query.
+    if(st && st.shareToken){
+      link = this.getShareUrlForRange(from, to);
+    }else{
+      // Request a signed token from backend (requires login)
+      const payload = {
+        page: 'view',
+        mid: Number(this.monitorId),
+        mode: 'fixed',
+        from: Math.round(Number(from) || 0),
+        to: Math.round(Number(to) || 0),
+      };
+
+      try{
+        if(st && st.windowMin) payload.win = Number(st.windowMin) || 10;
+        if(this.hiddenNodes && this.hiddenNodes.size > 0){
+          payload.hidden = Array.from(this.hiddenNodes).map(x=>String(x));
+        }
+        if(st && st.resolutionMs != null) payload.rollup_ms = Math.max(0, Math.round(Number(st.resolutionMs)||0));
+      }catch(_e){}
+
+      try{
+        const res = await fetchJSON('/api/netmon/share', {method:'POST', body: JSON.stringify(payload)});
+        link = (res && res.url) ? String(res.url) : null;
+      }catch(_e){
+        // Fallback (will still require login)
+        link = this.getShareUrlForRange(from, to);
+      }
+    }
+
     try{
       if(navigator.clipboard && navigator.clipboard.writeText){
         await navigator.clipboard.writeText(link);
@@ -5431,7 +5518,45 @@ class NetMonChart{
   }
 
   async copyShareLink(){
-    const link = this.getShareUrl();
+    const st = NETMON_STATE;
+    let link = null;
+
+    // On a share page: just copy current URL (already contains a valid token).
+    if(st && st.shareToken){
+      link = window.location.href;
+    }else{
+      // Request a signed share URL from backend (requires login)
+      const payload = { page: 'view', mid: Number(this.monitorId) };
+
+      try{
+        if(st && st.windowMin) payload.win = Number(st.windowMin) || 10;
+        if(this.hiddenNodes && this.hiddenNodes.size > 0){
+          payload.hidden = Array.from(this.hiddenNodes).map(x=>String(x));
+        }
+        if(st && st.resolutionMs != null) payload.rollup_ms = Math.max(0, Math.round(Number(st.resolutionMs)||0));
+      }catch(_e){}
+
+      // Preserve current view mode
+      try{
+        if(this.viewMode === 'fixed' && this.fixed && this.fixed.xMin != null && this.fixed.xMax != null){
+          payload.mode = 'fixed';
+          payload.from = Math.round(Number(this.fixed.xMin) || 0);
+          payload.to = Math.round(Number(this.fixed.xMax) || 0);
+        }else{
+          payload.mode = 'follow';
+          if(this.spanMs != null) payload.span = Math.round(Number(this.spanMs) || 0);
+        }
+      }catch(_e){}
+
+      try{
+        const res = await fetchJSON('/api/netmon/share', {method:'POST', body: JSON.stringify(payload)});
+        link = (res && res.url) ? String(res.url) : null;
+      }catch(_e){
+        // Fallback (will still require login)
+        link = this.getShareUrl();
+      }
+    }
+
     try{
       if(navigator.clipboard && navigator.clipboard.writeText){
         await navigator.clipboard.writeText(link);
@@ -5611,6 +5736,7 @@ class NetMonChart{
 
     try{
       const url = `/api/netmon/range?mid=${encodeURIComponent(String(this.monitorId))}&from=${encodeURIComponent(String(Math.round(from)))}&to=${encodeURIComponent(String(Math.round(to)))}`;
+      try{ if(st && st.shareToken){ url += `&t=${encodeURIComponent(String(st.shareToken))}`; } }catch(_e){}
       const res = await fetchJSON(url);
       if(!res || res.ok === false){
         throw new Error(res && res.error ? res.error : '加载失败');
@@ -7448,7 +7574,7 @@ class NetMonChart{
       if(nodeTxt) extra += ` · ${nodeTxt}`;
 
       rows.push(`
-        <div class="netmon-evt-row ${cls}">
+        <div class="netmon-evt-row ${cls}" data-from="${Math.round(ev.start)}" data-to="${Math.round(ev.end)}" role="button" tabindex="0">
           <span class="netmon-evt-dot ${cls}" aria-hidden="true"></span>
           <span class="netmon-evt-lv mono">${escapeHtml(stTxt)}</span>
           <span class="netmon-evt-time mono">${escapeHtml(timeTxt)}</span>

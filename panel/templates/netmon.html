@@ -6,13 +6,7 @@
   <div class="page-title">
     <h1 class="h1">网络波动监控</h1>
     <div class="meta netmon-meta">
-      <span class="meta-item netmon-meta-short">后台持续采集 · 交互图表 · 异常时间轴 · 分享/导出</span>
-      <details class="menu netmon-help">
-        <summary class="btn xs ghost">说明</summary>
-        <div class="menu-pop" style="min-width:320px;">
-          <div class="muted sm" style="white-space:normal; line-height:1.5;">后台持续采集 · 打开页面可直接查看历史曲线（时间-延迟坐标图）。每个目标一张图，多节点同图对比。支持：滚轮缩放、拖拽平移、十字线对齐多节点数值、点击/双击图例控制曲线、Shift+拖拽框选缩放、底部时间导航条（mini-map）快速选窗；历史模式会出现“回到实时”按钮；双击图表可重置视图；异常事件时间轴（点击区间跳转定位）、后端分辨率分层聚合；一键导出 PNG、复制只读展示分享链接。</div>
-        </div>
-      </details>
+      <span class="meta-item netmon-meta-short">实时 / 历史 · 框选缩放 · 悬浮读数 · 分享只读页</span>
     </div>
   </div>
   <div class="right netmon-head-actions">
@@ -38,7 +32,6 @@
     <div class="col nm-win">
       <label class="label">展示窗口</label>
       <input class="input" id="netmonViewWindow" type="number" min="1" max="1440" value="10">
-      <div class="help">单位：分钟（仅影响图表展示，不影响后台采集）</div>
     </div>
     <div class="col nm-auto">
       <label class="label">自动刷新</label>
@@ -64,7 +57,6 @@
     <div class="col nm-search">
       <label class="label">快速搜索</label>
       <input class="input" id="netmonSearch" placeholder="按目标/ID 搜索…">
-      <div class="help">支持模糊匹配</div>
     </div>
     <div class="col nm-filter">
       <label class="label">筛选</label>
@@ -103,7 +95,6 @@
     <div class="form" style="margin-top:10px;">
       <label class="label">目标 IP / 域名</label>
       <input class="input mono" id="netmonMTarget" placeholder="例如：1.1.1.1 或 example.com 或 example.com:443">
-      <div class="help">tcping 支持“host:port”；若未写端口，将使用默认端口。</div>
 
       <div class="row" style="gap:10px; margin-top:10px;">
         <div class="col" style="max-width:190px;">
@@ -120,7 +111,6 @@
         <div class="col" style="max-width:170px;">
           <label class="label">采集间隔</label>
           <input class="input" id="netmonMInterval" type="number" min="1" max="3600" value="5">
-          <div class="help">单位：秒</div>
         </div>
       </div>
 
@@ -128,15 +118,12 @@
         <div class="col" style="max-width:170px;">
           <label class="label">告警阈值（Warn）</label>
           <input class="input" id="netmonMWarn" type="number" min="0" max="600000" value="0">
-          <div class="help">单位：ms；0 表示关闭</div>
         </div>
         <div class="col" style="max-width:170px;">
           <label class="label">严重阈值（Crit）</label>
           <input class="input" id="netmonMCrit" type="number" min="0" max="600000" value="0">
-          <div class="help">单位：ms；0 表示关闭</div>
         </div>
         <div class="col" style="flex:1;">
-          <div class="help" style="margin-top:24px;">两者都设置时将自动保持 Warn ≤ Crit；图表会显示阈值线与超阈背景。</div>
         </div>
       </div>
 
@@ -162,7 +149,7 @@
 {% endblock %}
 
 {% block scripts %}
-<script src="/static/app.js?v=61.0"></script>
+<script src="/static/app.js?v=62.0"></script>
 <script>
 window.__NETMON_NODE_GROUPS__ = {{ (node_groups or [])|tojson }};
 window.addEventListener('DOMContentLoaded', ()=>{

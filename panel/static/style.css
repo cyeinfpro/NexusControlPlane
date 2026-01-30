@@ -92,6 +92,12 @@ body{
 
 @media (max-width: 720px){
   :root{ --sticky-top:58px; }
+
+  .netmon-toolbar .help{ display:none; }
+  .netmon-meta .muted{ display:none; }
+  .netmon-events-bar{ height:16px; }
+  .netmon-event{ min-width:12px; }
+  .netmon-event, .netmon-evt-row{ touch-action: manipulation; }
 }
 
 @media (max-width: 420px){
@@ -2193,7 +2199,7 @@ body.modal-open{ overflow:hidden; }
   border-radius: 10px;
   border: 1px solid rgba(148,163,184,0.14);
   background: rgba(2,6,23,0.10);
-}
+ cursor:pointer; }
 
 .netmon-evt-row.warn{ border-color: rgba(245,158,11,0.22); }
 .netmon-evt-row.crit{ border-color: rgba(248,113,113,0.24); }
@@ -2211,8 +2217,11 @@ body.modal-open{ overflow:hidden; }
 .netmon-evt-meta{ overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 
 @media (max-width: 820px){
-  .netmon-evt-row{ grid-template-columns: 8px 50px 1fr; }
-  .netmon-evt-meta, .netmon-evt-row .btn{ display:none; }
+  .netmon-evt-row{ grid-template-columns: 8px 52px 1fr 64px; }
+  .netmon-evt-meta{ display:none; }
+  .netmon-evt-row .btn[data-action="jump"]{ display:none; }
+  .netmon-evt-row .btn[data-action="detail"]{ display:inline-flex; justify-self:end; height:26px; padding:0 10px; border-radius:999px; }
+  .netmon-evt-row:active{ background:rgba(255,255,255,0.04); }
 }
 
 /* Stats pills */
