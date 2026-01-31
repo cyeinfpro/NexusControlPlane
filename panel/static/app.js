@@ -1112,16 +1112,38 @@ function renderRules(){
   // 小屏用卡片，大屏用表格
   const isMobile = window.matchMedia('(max-width: 1024px)').matches;
 
-  // Filter (listen / remote / remark)
+  // Filter (listen / remote / remark / note / tags)
   const f = (RULE_FILTER || '').trim().toLowerCase();
+  const filterType = (document.getElementById('ruleFilterSelect') || {}).value || 'all';
+  const tagFilter = (document.getElementById('tagFilterSelect') || {}).value || '';
   const items = [];
   eps.forEach((e, idx)=>{
+    // Text search filter
     if(f){
       const hay = `${e.listen||''}
 ${formatRemote(e)}
 ${(e.remark||'')}
+${(e.note||'')}
+${(e.tags||[]).join(' ')}
 ${endpointType(e)}`.toLowerCase();
       if(!hay.includes(f)) return;
+    }
+    // Type filter
+    if(filterType === 'running' && e.disabled) return;
+    if(filterType === 'disabled' && !e.disabled) return;
+    if(filterType === 'favorite' && !e.favorite) return;
+    if(filterType === 'wss'){
+      const hasWss = (e.listen_transport||'').includes('ws') || (e.remote_transport||'').includes('ws') ||
+                     ((e.extra_config||{}).listen_transport||'').includes('ws') || ((e.extra_config||{}).remote_transport||'').includes('ws');
+      if(!hasWss) return;
+    }
+    if(filterType === 'lb'){
+      const isLb = (e.remotes && e.remotes.length > 1) || (e.extra_remotes && e.extra_remotes.length > 0);
+      if(!isLb) return;
+    }
+    // Tag filter
+    if(tagFilter){
+      if(!e.tags || !e.tags.includes(tagFilter)) return;
     }
     items.push({e, idx});
   });
@@ -1168,7 +1190,19 @@ ${endpointType(e)}`.toLowerCase();
       const lockInfo = getRuleLockInfo(e);
 
       const tr = document.createElement('tr');
+      tr.className = (typeof BatchOps !== 'undefined' && BatchOps.selected && BatchOps.selected.has(idx)) ? 'selected' : '';
+      tr.dataset.ruleIdx = idx;
+      
+      // Build metadata display
+      const note = e.note || '';
+      const tags = e.tags || [];
+      const favorite = e.favorite;
+      const notePreview = note.length > 30 ? note.slice(0, 30) + '...' : note;
+      const tagsHtml = tags.slice(0, 3).map(t => `<span class="tag-badge">${escapeHtml(t)}</span>`).join('');
+      const moreTagsHtml = tags.length > 3 ? `<span class="muted sm">+${tags.length - 3}</span>` : '';
+      
       tr.innerHTML = `
+        <td><input type="checkbox" class="rule-checkbox" ${(typeof BatchOps !== 'undefined' && BatchOps.selected && BatchOps.selected.has(idx)) ? 'checked' : ''} onchange="BatchOps.toggle(${idx}, this.checked)" /></td>
         <td>${rowNo}</td>
         <td>${statusPill(e)}</td>
         <td class="listen">
@@ -1178,6 +1212,11 @@ ${endpointType(e)}`.toLowerCase();
         <td class="health">${healthHtml}</td>
         <td class="stat" title="当前已建立连接：${escapeHtml(est)}">${statsError ? '—' : escapeHtml(connActive)}</td>
         <td class="stat">${total == null ? '—' : formatBytes(total)}</td>
+        <td class="meta-cell">
+          ${favorite ? '<span title="已收藏">⭐</span> ' : ''}
+          ${notePreview ? `<div class="rule-note" title="${escapeHtml(note)}">${escapeHtml(notePreview)}</div>` : ''}
+          <div>${tagsHtml}${moreTagsHtml}</div>
+        </td>
         <td class="actions">
           ${lockInfo && lockInfo.locked ? `
             <span class="pill ghost" title="${escapeHtml(lockInfo.reason || '该规则已锁定（只读）')}">🔒 已锁定</span>
@@ -1185,6 +1224,8 @@ ${endpointType(e)}`.toLowerCase();
             <div class="action-inline">
               <button class="btn xs icon ghost" title="编辑" onclick="editRule(${idx})">✎</button>
               <button class="btn xs icon" title="${e.disabled?'启用':'暂停'}" onclick="toggleRule(${idx})">${e.disabled?'▶':'⏸'}</button>
+              <button class="btn xs icon ghost" title="备注/标签" onclick="RuleMeta.openEditor(${idx})">🏷</button>
+              <button class="btn xs icon ghost" title="流量历史" onclick="TrafficChart.openModal(${idx})">📊</button>
               <button class="btn xs icon ghost" title="删除" onclick="deleteRule(${idx})">🗑</button>
             </div>
           `}
@@ -1200,6 +1241,32 @@ ${endpointType(e)}`.toLowerCase();
   }else{
     if(mobileWrap) mobileWrap.style.display = 'none';
     table.style.display = '';
+  }
+  
+  // Update batch operations UI
+  if(typeof BatchOps !== 'undefined' && BatchOps.updateUI){
+    BatchOps.updateUI();
+  }
+  
+  // Populate tag filter dropdown
+  const tagSelect = document.getElementById('tagFilterSelect');
+  if(tagSelect){
+    const currentVal = tagSelect.value;
+    const allTags = new Set();
+    eps.forEach(e => {
+      if(e.tags && Array.isArray(e.tags)){
+        e.tags.forEach(t => allTags.add(t));
+      }
+    });
+    // Keep first option, remove others
+    while(tagSelect.options.length > 1) tagSelect.remove(1);
+    Array.from(allTags).sort().forEach(tag => {
+      const opt = document.createElement('option');
+      opt.value = tag;
+      opt.textContent = tag;
+      tagSelect.appendChild(opt);
+    });
+    tagSelect.value = currentVal;
   }
 }
 

@@ -4891,3 +4891,171 @@ async def api_graph(request: Request, node_id: int, user: str = Depends(require_
                 }
             )
     return {"ok": True, "elements": elements}
+
+
+# ==================== Batch Operations API ====================
+
+@app.post("/api/nodes/{node_id}/rules/batch")
+async def api_batch_rules(node_id: int, request: Request, user=Depends(require_login)):
+    """批量操作规则"""
+    node = get_node(node_id)
+    if not node:
+        return JSONResponse({"ok": False, "error": "节点不存在"}, status_code=404)
+    
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse({"ok": False, "error": "Invalid JSON"}, status_code=400)
+    
+    action = payload.get("action")  # enable, disable, delete, copy
+    indices = payload.get("indices", [])  # 规则索引列表
+    
+    if not isinstance(indices, list) or not indices:
+        return JSONResponse({"ok": False, "error": "indices 必须是非空数组"}, status_code=400)
+    
+    # 获取当前规则池
+    desired_ver, pool = get_desired_pool(node_id)
+    if not isinstance(pool, dict):
+        rep = get_last_report(node_id)
+        pool = rep.get("pool") if isinstance(rep, dict) else None
+    
+    if not isinstance(pool, dict):
+        return JSONResponse({"ok": False, "error": "无法获取当前规则池"}, status_code=400)
+    
+    endpoints = pool.get("endpoints", [])
+    if not isinstance(endpoints, list):
+        endpoints = []
+    
+    import copy as copy_module
+    modified = False
+    
+    if action == "enable":
+        for idx in indices:
+            if 0 <= idx < len(endpoints):
+                endpoints[idx]["disabled"] = False
+                modified = True
+    
+    elif action == "disable":
+        for idx in indices:
+            if 0 <= idx < len(endpoints):
+                endpoints[idx]["disabled"] = True
+                modified = True
+    
+    elif action == "delete":
+        for idx in sorted(indices, reverse=True):
+            if 0 <= idx < len(endpoints):
+                endpoints.pop(idx)
+                modified = True
+    
+    elif action == "copy":
+        for idx in indices:
+            if 0 <= idx < len(endpoints):
+                new_ep = copy_module.deepcopy(endpoints[idx])
+                new_ep["disabled"] = True
+                if new_ep.get("note"):
+                    new_ep["note"] = f"[复制] {new_ep.get('note', '')}"
+                else:
+                    new_ep["note"] = "[复制]"
+                endpoints.append(new_ep)
+                modified = True
+    
+    else:
+        return JSONResponse({"ok": False, "error": f"未知操作: {action}"}, status_code=400)
+    
+    if not modified:
+        return {"ok": True, "modified": False}
+    
+    pool["endpoints"] = endpoints
+    new_ver, _ = set_desired_pool(node_id, pool)
+    
+    applied = False
+    try:
+        data = await agent_post(node["base_url"], node["api_key"], "/api/v1/pool", {"pool": pool}, _node_verify_tls(node))
+        if isinstance(data, dict) and data.get("ok", True):
+            await agent_post(node["base_url"], node["api_key"], "/api/v1/apply", {}, _node_verify_tls(node))
+            applied = True
+    except Exception:
+        pass
+    
+    return {
+        "ok": True,
+        "modified": True,
+        "desired_version": new_ver,
+        "applied": applied,
+        "rule_count": len(endpoints),
+    }
+
+
+@app.post("/api/nodes/{node_id}/rules/{rule_index}/metadata")
+async def api_update_rule_metadata(node_id: int, rule_index: int, request: Request, user=Depends(require_login)):
+    """更新规则元数据（备注、标签、收藏）"""
+    node = get_node(node_id)
+    if not node:
+        return JSONResponse({"ok": False, "error": "节点不存在"}, status_code=404)
+    
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse({"ok": False, "error": "Invalid JSON"}, status_code=400)
+    
+    desired_ver, pool = get_desired_pool(node_id)
+    if not isinstance(pool, dict):
+        rep = get_last_report(node_id)
+        pool = rep.get("pool") if isinstance(rep, dict) else None
+    
+    if not isinstance(pool, dict):
+        return JSONResponse({"ok": False, "error": "无法获取当前规则池"}, status_code=400)
+    
+    endpoints = pool.get("endpoints", [])
+    if not isinstance(endpoints, list):
+        return JSONResponse({"ok": False, "error": "规则列表无效"}, status_code=400)
+    
+    if rule_index < 0 or rule_index >= len(endpoints):
+        return JSONResponse({"ok": False, "error": "规则索引无效"}, status_code=400)
+    
+    ep = endpoints[rule_index]
+    
+    if "note" in payload:
+        ep["note"] = str(payload["note"])[:500]
+    
+    if "tags" in payload:
+        tags = payload["tags"]
+        if isinstance(tags, list):
+            ep["tags"] = [str(t)[:50] for t in tags[:10]]
+        elif isinstance(tags, str):
+            ep["tags"] = [t.strip()[:50] for t in tags.split(",") if t.strip()][:10]
+    
+    if "favorite" in payload:
+        ep["favorite"] = bool(payload["favorite"])
+    
+    pool["endpoints"] = endpoints
+    new_ver, _ = set_desired_pool(node_id, pool)
+    
+    return {
+        "ok": True,
+        "desired_version": new_ver,
+        "rule": ep,
+    }
+
+
+@app.get("/api/nodes/{node_id}/traffic/rollup")
+async def api_get_traffic_rollup(
+    node_id: int,
+    rule_idx: int = None,
+    since: int = None,
+    bucket: int = 60000,
+    user=Depends(require_login),
+):
+    """获取聚合的流量历史数据（暂返回空数据，需要配合历史记录功能）"""
+    node = get_node(node_id)
+    if not node:
+        return JSONResponse({"ok": False, "error": "节点不存在"}, status_code=404)
+    
+    # 暂时返回空数据，因为流量历史需要后台定时收集
+    return {
+        "ok": True,
+        "node_id": node_id,
+        "data": [],
+        "ts": int(time.time() * 1000),
+        "message": "流量历史功能需要配合数据采集服务使用"
+    }
