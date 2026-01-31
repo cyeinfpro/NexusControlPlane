@@ -637,7 +637,7 @@
       <div class="h2">流量/连接历史</div>
       <button class="btn xs ghost" type="button" onclick="TrafficChart.closeModal()">×</button>
     </div>
-    <div class="row" style="gap:8px;margin-top:12px;">
+    <div class="row" style="gap:8px;margin-top:12px;flex-wrap:wrap;">
       <select class="select" id="trafficRange" onchange="TrafficChart.loadData()">
         <option value="3600000">最近1小时</option>
         <option value="21600000">最近6小时</option>
@@ -645,6 +645,10 @@
         <option value="604800000">最近7天</option>
       </select>
       <button class="btn xs" onclick="TrafficChart.loadData()">刷新</button>
+      <button class="btn xs ghost" onclick="TrafficChart.collectNow()" title="立即从节点采集当前数据点">📥 采集数据</button>
+    </div>
+    <div class="muted sm" style="margin-top:8px;">
+      💡 数据在节点每次上报时自动采集（约30秒/次），也可点击"采集数据"手动触发
     </div>
     <div class="card" style="padding:16px;margin-top:12px;">
       <canvas id="trafficChart" height="300"></canvas>

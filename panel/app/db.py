@@ -1031,7 +1031,10 @@ def list_traffic_history_rollup(
     rule_index: Optional[int] = None,
     db_path: str = DEFAULT_DB_PATH,
 ) -> List[Dict[str, Any]]:
-    """List traffic history with time-bucket aggregation."""
+    """List traffic history with time-bucket aggregation.
+    
+    If rule_index is None, aggregates across all rules for the node.
+    """
     try:
         since = int(since_ts_ms)
     except Exception:
@@ -1048,6 +1051,7 @@ def list_traffic_history_rollup(
 
     with connect(db_path) as conn:
         if rule_index is not None:
+            # Query for specific rule
             sql = """
                 SELECT
                     node_id,
@@ -1066,10 +1070,11 @@ def list_traffic_history_rollup(
             """
             rows = conn.execute(sql, (bms, node_id, rule_index, since)).fetchall()
         else:
+            # Aggregate across all rules for the node
             sql = """
                 SELECT
                     node_id,
-                    rule_index,
+                    -1 AS rule_index,
                     (ts_ms - (ts_ms % ?)) AS bucket_ts_ms,
                     SUM(connections) AS connections,
                     SUM(connections_active) AS connections_active,
@@ -1079,7 +1084,7 @@ def list_traffic_history_rollup(
                     COUNT(*) AS cnt
                 FROM traffic_history
                 WHERE node_id = ? AND ts_ms >= ?
-                GROUP BY node_id, rule_index, bucket_ts_ms
+                GROUP BY node_id, bucket_ts_ms
                 ORDER BY bucket_ts_ms ASC
             """
             rows = conn.execute(sql, (bms, node_id, since)).fetchall()

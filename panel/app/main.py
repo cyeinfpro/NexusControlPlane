@@ -54,6 +54,11 @@ from .db import (
     list_netmon_samples_rollup,
     insert_netmon_samples,
     prune_netmon_samples,
+    
+    # Traffic history
+    insert_traffic_history,
+    list_traffic_history_rollup,
+    prune_traffic_history,
 )
 from .agents import agent_get, agent_post, agent_ping
 
@@ -736,6 +741,35 @@ async def _start_netmon_bg() -> None:
     app.state.netmon_bg_started = True
     try:
         asyncio.create_task(_netmon_bg_loop())
+    except Exception:
+        pass
+
+
+# Traffic history pruning background task
+_TRAFFIC_PRUNE_INTERVAL = 3600  # 1 hour
+_TRAFFIC_MAX_AGE_MS = 7 * 24 * 3600 * 1000  # 7 days
+
+
+async def _traffic_history_prune_loop() -> None:
+    """Background task to prune old traffic history records."""
+    while True:
+        try:
+            await asyncio.sleep(_TRAFFIC_PRUNE_INTERVAL)
+            cutoff = int(time.time() * 1000) - _TRAFFIC_MAX_AGE_MS
+            deleted = prune_traffic_history(cutoff)
+            if deleted > 0:
+                print(f"[traffic_prune] Deleted {deleted} old traffic history records")
+        except Exception as e:
+            print(f"[traffic_prune] Error: {e}")
+
+
+@app.on_event("startup")
+async def _start_traffic_prune_bg() -> None:
+    if getattr(app.state, "traffic_prune_started", False):
+        return
+    app.state.traffic_prune_started = True
+    try:
+        asyncio.create_task(_traffic_history_prune_loop())
     except Exception:
         pass
 
@@ -1729,6 +1763,46 @@ async def api_agent_report(request: Request, payload: Dict[str, Any]):
             last_seen_at=now,
             agent_ack_version=int(ack_version) if ack_version is not None else None,
         )
+    except Exception:
+        # 不要让写库失败影响 agent
+        pass
+
+    # ===== 保存流量历史数据 =====
+    # 从report中提取stats并保存到traffic_history表
+    try:
+        stats = report.get("stats") if isinstance(report, dict) else None
+        if isinstance(stats, dict):
+            ts_ms = int(time.time() * 1000)
+            # stats格式: {"rule_listen": {"rx_bytes": ..., "tx_bytes": ..., "connections": ...}, ...}
+            # 或者 {"0": {...}, "1": {...}} (按索引)
+            pool_data = report.get("pool") if isinstance(report, dict) else None
+            endpoints = pool_data.get("endpoints", []) if isinstance(pool_data, dict) else []
+            
+            for key, stat in stats.items():
+                if not isinstance(stat, dict):
+                    continue
+                # 确定rule_index
+                rule_idx = -1
+                try:
+                    rule_idx = int(key)
+                except ValueError:
+                    # key可能是listen地址，需要找到对应的索引
+                    for i, ep in enumerate(endpoints):
+                        if isinstance(ep, dict) and ep.get("listen") == key:
+                            rule_idx = i
+                            break
+                
+                if rule_idx >= 0:
+                    insert_traffic_history(
+                        node_id=node_id,
+                        rule_index=rule_idx,
+                        ts_ms=ts_ms,
+                        connections=int(stat.get("connections", 0) or 0),
+                        connections_active=int(stat.get("connections_active", 0) or 0),
+                        connections_total=int(stat.get("connections_total", stat.get("connections_established", 0)) or 0),
+                        rx_bytes=int(stat.get("rx_bytes", 0) or 0),
+                        tx_bytes=int(stat.get("tx_bytes", 0) or 0),
+                    )
     except Exception:
         # 不要让写库失败影响 agent
         pass
@@ -5060,16 +5134,111 @@ async def api_get_traffic_rollup(
     bucket: int = 60000,
     user=Depends(require_login),
 ):
-    """获取聚合的流量历史数据（暂返回空数据，需要配合历史记录功能）"""
+    """获取聚合的流量历史数据"""
     node = get_node(node_id)
     if not node:
         return JSONResponse({"ok": False, "error": "节点不存在"}, status_code=404)
     
-    # 暂时返回空数据，因为流量历史需要后台定时收集
+    # Default: last 24 hours
+    now_ms = int(time.time() * 1000)
+    if since is None:
+        since = now_ms - 24 * 3600 * 1000
+    
+    # Query from database
+    try:
+        data = list_traffic_history_rollup(
+            node_id=node_id,
+            since_ts_ms=since,
+            bucket_ms=bucket,
+            rule_index=rule_idx,
+        )
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": f"查询失败: {str(e)}"}, status_code=500)
+    
     return {
         "ok": True,
         "node_id": node_id,
-        "data": [],
-        "ts": int(time.time() * 1000),
-        "message": "流量历史功能需要配合数据采集服务使用"
+        "rule_idx": rule_idx,
+        "data": data,
+        "ts": now_ms,
+    }
+
+
+@app.post("/api/nodes/{node_id}/traffic/collect")
+async def api_collect_traffic(node_id: int, user=Depends(require_login)):
+    """手动从节点收集流量数据"""
+    node = get_node(node_id)
+    if not node:
+        return JSONResponse({"ok": False, "error": "节点不存在"}, status_code=404)
+    
+    # Get stats from agent
+    try:
+        data = await agent_get(
+            node.get("base_url", ""),
+            node.get("api_key", ""),
+            "/api/v1/stats",
+            _node_verify_tls(node),
+        )
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": f"获取stats失败: {str(e)}"}, status_code=500)
+    
+    if not isinstance(data, dict):
+        return JSONResponse({"ok": False, "error": "无效的stats响应"}, status_code=500)
+    
+    # Get pool to map listen addresses to indices
+    pool_data = None
+    try:
+        pool_resp = await agent_get(
+            node.get("base_url", ""),
+            node.get("api_key", ""),
+            "/api/v1/pool",
+            _node_verify_tls(node),
+        )
+        if isinstance(pool_resp, dict):
+            pool_data = pool_resp.get("pool")
+    except Exception:
+        pass
+    
+    endpoints = pool_data.get("endpoints", []) if isinstance(pool_data, dict) else []
+    
+    # Save stats to traffic history
+    ts_ms = int(time.time() * 1000)
+    saved = 0
+    stats = data.get("stats", data)  # stats may be in "stats" key or at root
+    
+    for key, stat in stats.items():
+        if not isinstance(stat, dict):
+            continue
+        
+        # Determine rule_index
+        rule_idx = -1
+        try:
+            rule_idx = int(key)
+        except ValueError:
+            # key may be listen address
+            for i, ep in enumerate(endpoints):
+                if isinstance(ep, dict) and ep.get("listen") == key:
+                    rule_idx = i
+                    break
+        
+        if rule_idx >= 0:
+            try:
+                insert_traffic_history(
+                    node_id=node_id,
+                    rule_index=rule_idx,
+                    ts_ms=ts_ms,
+                    connections=int(stat.get("connections", 0) or 0),
+                    connections_active=int(stat.get("connections_active", 0) or 0),
+                    connections_total=int(stat.get("connections_total", stat.get("connections_established", 0)) or 0),
+                    rx_bytes=int(stat.get("rx_bytes", 0) or 0),
+                    tx_bytes=int(stat.get("tx_bytes", 0) or 0),
+                )
+                saved += 1
+            except Exception:
+                pass
+    
+    return {
+        "ok": True,
+        "saved": saved,
+        "ts": ts_ms,
     }

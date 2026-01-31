@@ -449,15 +449,61 @@
         const resp = await fetch(url);
         const data = await resp.json();
 
-        if (data.ok && data.data) {
-          this.renderChart(data.data, bucket);
-          this.updateTotals(data.data);
+        if (data.ok) {
+          if (data.data && data.data.length > 0) {
+            this.renderChart(data.data, bucket);
+            this.updateTotals(data.data);
+          } else {
+            this.renderEmptyChart();
+            this.updateTotals([]);
+          }
         } else {
           Toast.error(data.error || '获取数据失败');
         }
       } catch (err) {
         Toast.error('请求失败: ' + err.message);
       }
+    },
+
+    renderEmptyChart() {
+      const ctx = ($('trafficChart') || $('traffic_chart'))?.getContext('2d');
+      if (!ctx) return;
+
+      // Destroy existing chart
+      if (this.chart) {
+        this.chart.destroy();
+      }
+
+      // Create empty chart with message
+      this.chart = new Chart(ctx, {
+        type: 'line',
+        data: {
+          labels: ['暂无数据'],
+          datasets: [{
+            label: '暂无数据',
+            data: [0],
+            borderColor: 'rgba(128, 128, 128, 0.5)',
+            backgroundColor: 'rgba(128, 128, 128, 0.1)',
+          }]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          plugins: {
+            title: {
+              display: true,
+              text: '暂无流量历史数据，请点击「采集数据」按钮或等待节点自动上报',
+              color: '#888',
+              font: { size: 14 }
+            },
+            legend: { display: false }
+          },
+          scales: {
+            y: { display: false },
+            x: { display: false }
+          }
+        }
+      });
     },
 
     renderChart(data, bucket) {
@@ -540,15 +586,41 @@
 
     updateTotals(data) {
       let rxTotal = 0, txTotal = 0;
-      data.forEach(d => {
-        rxTotal += d.rx_bytes || 0;
-        txTotal += d.tx_bytes || 0;
-      });
+      if (data && data.length > 0) {
+        data.forEach(d => {
+          rxTotal += d.rx_bytes || 0;
+          txTotal += d.tx_bytes || 0;
+        });
+      }
 
       const rxEl = $('trafficRxTotal') || $('traffic_rx_total');
       const txEl = $('trafficTxTotal') || $('traffic_tx_total');
-      if (rxEl) rxEl.textContent = formatBytes(rxTotal);
-      if (txEl) txEl.textContent = formatBytes(txTotal);
+      if (rxEl) rxEl.textContent = data && data.length > 0 ? formatBytes(rxTotal) : '暂无数据';
+      if (txEl) txEl.textContent = data && data.length > 0 ? formatBytes(txTotal) : '暂无数据';
+    },
+
+    async collectNow() {
+      const nodeId = getNodeId();
+      if (!nodeId) {
+        Toast.error('无法获取节点ID');
+        return;
+      }
+      
+      try {
+        Toast.info('正在采集数据...');
+        const resp = await fetch(`/api/nodes/${nodeId}/traffic/collect`, { method: 'POST' });
+        const data = await resp.json();
+        
+        if (data.ok) {
+          Toast.success(`已采集 ${data.saved} 条数据`);
+          // Reload chart data
+          this.loadData();
+        } else {
+          Toast.error(data.error || '采集失败');
+        }
+      } catch (err) {
+        Toast.error('请求失败: ' + err.message);
+      }
     }
   };
 
