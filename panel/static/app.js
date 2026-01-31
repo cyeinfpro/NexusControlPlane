@@ -1269,6 +1269,8 @@ ${endpointType(e)}`.toLowerCase();
     tagSelect.value = currentVal;
   }
 }
+// Expose renderRules to window for enhanced.js
+window.renderRules = renderRules;
 
 function openModal(){ q('modal').style.display = 'flex'; }
 function closeModal(){ q('modal').style.display = 'none'; q('modalMsg').textContent=''; }
@@ -2617,6 +2619,8 @@ async function loadPool(){
     }
   }
 }
+// Expose loadPool to window for enhanced.js
+window.loadPool = loadPool;
 
 async function refreshSys(){
   try{

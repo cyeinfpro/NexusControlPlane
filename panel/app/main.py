@@ -5014,32 +5014,88 @@ async def api_batch_rules(node_id: int, request: Request, user=Depends(require_l
     if not isinstance(endpoints, list):
         endpoints = []
     
+    # 检查锁定规则 - 与编辑规则相同的约束
+    def is_rule_locked(ep):
+        if not isinstance(ep, dict):
+            return False, ""
+        ex = ep.get("extra_config") or {}
+        if not isinstance(ex, dict):
+            ex = {}
+        # WSS 隧道接收端锁定
+        if ex.get("sync_lock") is True or ex.get("sync_role") == "receiver":
+            return True, "WSS隧道接收端规则已锁定，请在发送机节点操作"
+        # 内网穿透客户端锁定
+        if ex.get("intranet_lock") is True or ex.get("intranet_role") == "client":
+            return True, "内网穿透客户端规则已锁定，请在公网入口节点操作"
+        return False, ""
+    
+    # 检查所有选中的规则是否有锁定
+    locked_indices = []
+    for idx in indices:
+        if 0 <= idx < len(endpoints):
+            locked, reason = is_rule_locked(endpoints[idx])
+            if locked:
+                locked_indices.append((idx, reason))
+    
+    if locked_indices and action in ("enable", "disable", "delete"):
+        # 对于修改/删除操作，不允许操作锁定规则
+        first_locked = locked_indices[0]
+        return JSONResponse({
+            "ok": False, 
+            "error": f"规则 #{first_locked[0]+1} 已锁定: {first_locked[1]}",
+            "locked_indices": [i for i, _ in locked_indices]
+        }, status_code=403)
+    
     import copy as copy_module
     modified = False
+    skipped = 0
     
     if action == "enable":
         for idx in indices:
             if 0 <= idx < len(endpoints):
+                locked, _ = is_rule_locked(endpoints[idx])
+                if locked:
+                    skipped += 1
+                    continue
                 endpoints[idx]["disabled"] = False
                 modified = True
     
     elif action == "disable":
         for idx in indices:
             if 0 <= idx < len(endpoints):
+                locked, _ = is_rule_locked(endpoints[idx])
+                if locked:
+                    skipped += 1
+                    continue
                 endpoints[idx]["disabled"] = True
                 modified = True
     
     elif action == "delete":
+        # 删除时要从后往前，避免索引错位
         for idx in sorted(indices, reverse=True):
             if 0 <= idx < len(endpoints):
+                locked, _ = is_rule_locked(endpoints[idx])
+                if locked:
+                    skipped += 1
+                    continue
                 endpoints.pop(idx)
                 modified = True
     
     elif action == "copy":
+        # 复制不受锁定限制，但复制出来的规则不应继承锁定状态
         for idx in indices:
             if 0 <= idx < len(endpoints):
                 new_ep = copy_module.deepcopy(endpoints[idx])
                 new_ep["disabled"] = True
+                # 清除锁定相关字段
+                if new_ep.get("extra_config"):
+                    new_ep["extra_config"].pop("sync_lock", None)
+                    new_ep["extra_config"].pop("sync_role", None)
+                    new_ep["extra_config"].pop("sync_id", None)
+                    new_ep["extra_config"].pop("sync_peer_node_id", None)
+                    new_ep["extra_config"].pop("intranet_lock", None)
+                    new_ep["extra_config"].pop("intranet_role", None)
+                    new_ep["extra_config"].pop("intranet_tunnel_id", None)
                 if new_ep.get("note"):
                     new_ep["note"] = f"[复制] {new_ep.get('note', '')}"
                 else:
@@ -5051,6 +5107,8 @@ async def api_batch_rules(node_id: int, request: Request, user=Depends(require_l
         return JSONResponse({"ok": False, "error": f"未知操作: {action}"}, status_code=400)
     
     if not modified:
+        if skipped > 0:
+            return {"ok": True, "modified": False, "skipped": skipped, "message": f"跳过了 {skipped} 条锁定规则"}
         return {"ok": True, "modified": False}
     
     pool["endpoints"] = endpoints

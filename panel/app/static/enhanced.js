@@ -133,8 +133,27 @@
       if (toolbar) {
         toolbar.style.display = count > 0 ? 'block' : 'none';
       }
+      
+      // Count locked rules in selection
+      const endpoints = getEndpoints();
+      let lockedCount = 0;
+      this.selected.forEach(idx => {
+        const ep = endpoints[idx];
+        if (ep) {
+          const ex = ep.extra_config || {};
+          if (ex.sync_lock === true || ex.sync_role === 'receiver' ||
+              ex.intranet_lock === true || ex.intranet_role === 'client') {
+            lockedCount++;
+          }
+        }
+      });
+      
       if (countEl) {
-        countEl.textContent = `已选 ${count} 项`;
+        if (lockedCount > 0) {
+          countEl.textContent = `已选 ${count} 项 (${lockedCount} 项已锁定)`;
+        } else {
+          countEl.textContent = `已选 ${count} 项`;
+        }
       }
 
       // Highlight selected rows using data-rule-idx attribute
@@ -166,13 +185,33 @@
         'delete': '删除'
       };
 
+      // Check for locked rules in selection (front-end warning)
+      const endpoints = getEndpoints();
+      const lockedCount = indices.filter(idx => {
+        const ep = endpoints[idx];
+        if (!ep) return false;
+        const ex = ep.extra_config || {};
+        return ex.sync_lock === true || ex.sync_role === 'receiver' ||
+               ex.intranet_lock === true || ex.intranet_role === 'client';
+      }).length;
+
+      if (lockedCount > 0 && action !== 'copy') {
+        Toast.warning(`选中的规则中有 ${lockedCount} 条已锁定，将被跳过`);
+      }
+
       if (action === 'delete') {
-        if (!confirm(`确定要删除选中的 ${indices.length} 条规则吗？此操作不可撤销。`)) {
+        const unlocked = indices.length - lockedCount;
+        if (unlocked === 0) {
+          Toast.error('所有选中的规则都已锁定，无法删除');
+          return;
+        }
+        if (!confirm(`确定要删除选中的 ${unlocked} 条规则吗？${lockedCount > 0 ? `(${lockedCount}条锁定规则将被跳过)` : ''}此操作不可撤销。`)) {
           return;
         }
       }
 
       try {
+        Toast.info('正在执行...');
         const resp = await fetch(`/api/nodes/${nodeId}/rules/batch`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -181,7 +220,11 @@
         const data = await resp.json();
 
         if (data.ok) {
-          Toast.success(`成功${actionNames[action]} ${data.modified || indices.length} 条规则`);
+          let msg = `成功${actionNames[action]} ${data.modified !== false ? (data.rule_count || indices.length) : 0} 条规则`;
+          if (data.skipped) {
+            msg += `，跳过 ${data.skipped} 条锁定规则`;
+          }
+          Toast.success(msg);
           this.clear();
           // Reload pool data from server
           if (typeof loadPool === 'function') {
@@ -266,6 +309,7 @@
       const favorite = !!favEl?.checked;
 
       try {
+        Toast.info('正在保存...');
         const resp = await fetch(`/api/nodes/${nodeId}/rules/${this.currentIndex}/metadata`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -275,7 +319,7 @@
 
         if (data.ok) {
           Toast.success('元数据已保存');
-          // Update local CURRENT_POOL data
+          // Update local CURRENT_POOL data immediately
           const endpoints = getEndpoints();
           if (endpoints[this.currentIndex]) {
             endpoints[this.currentIndex].note = note;
@@ -283,11 +327,13 @@
             endpoints[this.currentIndex].favorite = favorite;
           }
           this.closeEditor();
-          // Refresh rules display
-          if (typeof renderRules === 'function') {
+          // Refresh rules display - call loadPool to sync with server
+          if (typeof window.loadPool === 'function') {
+            try { await window.loadPool(); } catch(e) {}
+          } else if (typeof loadPool === 'function') {
+            try { await loadPool(); } catch(e) {}
+          } else if (typeof renderRules === 'function') {
             renderRules();
-          } else if (typeof window.loadNodeData === 'function') {
-            window.loadNodeData();
           }
         } else {
           Toast.error(data.error || '保存失败');
