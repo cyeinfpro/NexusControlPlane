@@ -2110,14 +2110,196 @@ function randomizeWss(){
   q('f_wss_insecure').checked = true;
 }
 
-function parseWeights(text){
-  if(!text) return [];
-  return text.split(/[,，]/).map(x=>x.trim()).filter(Boolean).map(x=>Number(x));
+// ------------------------------
+// Save-time validations (Feature 2)
+// - Port conflicts
+// - Remote format (host:port per line)
+// - Weights count must match remote lines
+
+function normalizeHostPort(host, port){
+  let h = String(host || '').trim();
+  let p = String(port || '').trim();
+  if(h.includes(':') && !h.startsWith('[')) h = '[' + h + ']';
+  return h + ':' + p;
 }
 
-function formatWeights(weights){
-  if(!weights || !weights.length) return '';
-  return weights.join(',');
+function parseRemoteLine(line){
+  const s = String(line || '').replace('\r', '').trim();
+  if(!s) return {ok:false, error:'空行', value:''};
+
+  if(s.startsWith('ws;') || s.startsWith('wss;')){
+    return {ok:false, error:'这里应填写 host:port，不应包含 ws; 参数', value:''};
+  }
+
+  // Allow URL with explicit port (we only use hostname:port)
+  if(s.includes('://')){
+    try{
+      const u = new URL(s);
+      const host = String(u.hostname || '').trim();
+      const portStr = String(u.port || '').trim();
+      if(!host) return {ok:false, error:'缺少主机名', value:''};
+      if(!portStr) return {ok:false, error:'缺少端口', value:''};
+      if(!/^\d+$/.test(portStr)) return {ok:false, error:'端口必须是数字', value:''};
+      const port = parseInt(portStr, 10);
+      if(!(port >= 1 && port <= 65535)) return {ok:false, error:'端口范围必须是 1-65535', value:''};
+      return {ok:true, value: normalizeHostPort(host, port)};
+    }catch(_e){
+      return {ok:false, error:'URL 解析失败', value:''};
+    }
+  }
+
+  // [ipv6]:port
+  if(s.startsWith('[')){
+    const close = s.indexOf(']');
+    if(close < 0) return {ok:false, error:'IPv6 缺少 ]', value:''};
+    const host = s.slice(1, close).trim();
+    const rest = s.slice(close + 1).trim();
+    if(!rest.startsWith(':')) return {ok:false, error:'缺少端口', value:''};
+    const portStr = rest.slice(1).trim();
+    if(!host) return {ok:false, error:'缺少主机名', value:''};
+    if(!/^\d+$/.test(portStr)) return {ok:false, error:'端口必须是数字', value:''};
+    const port = parseInt(portStr, 10);
+    if(!(port >= 1 && port <= 65535)) return {ok:false, error:'端口范围必须是 1-65535', value:''};
+    return {ok:true, value: normalizeHostPort(host, port)};
+  }
+
+  // host:port (split by last ':', supports raw IPv6:port)
+  const i = s.lastIndexOf(':');
+  if(i < 0) return {ok:false, error:'缺少端口（应为 host:port）', value:''};
+  const host = s.slice(0, i).trim();
+  const portStr = s.slice(i + 1).trim();
+  if(!host) return {ok:false, error:'缺少主机名', value:''};
+  if(!/^\d+$/.test(portStr)) return {ok:false, error:'端口必须是数字', value:''};
+  const port = parseInt(portStr, 10);
+  if(!(port >= 1 && port <= 65535)) return {ok:false, error:'端口范围必须是 1-65535', value:''};
+  return {ok:true, value: normalizeHostPort(host, port)};
+}
+
+function normalizeRemotesText(text){
+  const lines = String(text || '').split('\n').map(x=>String(x||'').trim()).filter(Boolean);
+  const remotes = [];
+  const errors = [];
+  for(let i=0;i<lines.length;i++){
+    const r = parseRemoteLine(lines[i]);
+    if(!r.ok){
+      errors.push({line: i+1, raw: lines[i], error: r.error});
+    }else{
+      remotes.push(r.value);
+    }
+  }
+  return {remotes, errors};
+}
+
+function parseWeightTokens(text){
+  return String(text || '').split(/[,，]/).map(x=>x.trim()).filter(Boolean);
+}
+
+function validateWeights(tokens, remoteCount){
+  if(!tokens || tokens.length === 0) return {ok:true, weights:[]};
+  if(remoteCount <= 1){
+    return {ok:true, weights:[], ignored:true};
+  }
+  if(tokens.length !== remoteCount){
+    return {ok:false, error:`权重数量必须与 Remote 行数一致（Remote ${remoteCount} 行，权重 ${tokens.length} 个）`};
+  }
+  const out = [];
+  for(let i=0;i<tokens.length;i++){
+    const t = tokens[i];
+    if(!/^\d+$/.test(t)){
+      return {ok:false, error:`权重必须是正整数（第 ${i+1} 个：${t}）`};
+    }
+    const n = parseInt(t, 10);
+    if(!(n > 0)){
+      return {ok:false, error:`权重必须是正整数（第 ${i+1} 个：${t}）`};
+    }
+    out.push(String(n));
+  }
+  return {ok:true, weights:out};
+}
+
+function protoSet(proto){
+  const p = String(proto || 'tcp+udp').trim().toLowerCase();
+  if(p === 'tcp') return {tcp:true, udp:false};
+  if(p === 'udp') return {tcp:false, udp:true};
+  return {tcp:true, udp:true};
+}
+
+function protoOverlap(a, b){
+  const o = [];
+  if(a.tcp && b.tcp) o.push('tcp');
+  if(a.udp && b.udp) o.push('udp');
+  return o;
+}
+
+function overlapProtoText(overlap){
+  if(!overlap || overlap.length === 0) return '';
+  if(overlap.length === 2) return 'TCP+UDP';
+  return overlap[0] === 'tcp' ? 'TCP' : 'UDP';
+}
+
+function hostInfo(host){
+  let h = String(host || '').trim();
+  if(h.startsWith('[') && h.endsWith(']')) h = h.slice(1, -1);
+  const lower = h.toLowerCase();
+  if(!h) return {fam:'unknown', wild:true, key:''};
+  if(lower === '0.0.0.0') return {fam:'v4', wild:true, key:'0.0.0.0'};
+  if(lower === '::' || lower === '0:0:0:0:0:0:0:0') return {fam:'v6', wild:true, key:'::'};
+  if(h.includes(':')) return {fam:'v6', wild:false, key:lower};
+  if(/^\d{1,3}(\.\d{1,3}){3}$/.test(h)) return {fam:'v4', wild:false, key:h};
+  return {fam:'unknown', wild:false, key:lower};
+}
+
+function hostsOverlap(aHost, bHost){
+  const a = hostInfo(aHost);
+  const b = hostInfo(bHost);
+  if(a.fam === 'unknown' || b.fam === 'unknown') return true;
+  if(a.fam !== b.fam) return a.wild || b.wild;
+  if(a.wild || b.wild) return true;
+  return a.key === b.key;
+}
+
+function getSkipIndexForPortCheck(mode){
+  if(CURRENT_EDIT_INDEX < 0) return -1;
+  const eps = (CURRENT_POOL && CURRENT_POOL.endpoints) ? CURRENT_POOL.endpoints : [];
+  const old = eps[CURRENT_EDIT_INDEX];
+  if(!old) return -1;
+  const ex = old.extra_config || {};
+  if(mode === 'tcp') return CURRENT_EDIT_INDEX;
+  if(mode === 'wss'){
+    if(ex && ex.sync_id && ex.sync_role === 'sender') return CURRENT_EDIT_INDEX;
+    return -1;
+  }
+  if(mode === 'intranet'){
+    if(ex && ex.sync_id && ex.intranet_role === 'server') return CURRENT_EDIT_INDEX;
+    return -1;
+  }
+  return -1;
+}
+
+function findPortConflict(newListen, newProtocol, skipIdx){
+  const lp = parseListenToHostPort(newListen || '');
+  const newPort = parseInt(lp.port || '0', 10);
+  const newHost = lp.host || '0.0.0.0';
+  if(!(newPort > 0)) return null;
+  const newPs = protoSet(newProtocol);
+  const eps = (CURRENT_POOL && CURRENT_POOL.endpoints) ? CURRENT_POOL.endpoints : [];
+  for(let i=0;i<eps.length;i++){
+    if(i === skipIdx) continue;
+    const e = eps[i];
+    if(!e) continue;
+    const ex = e.extra_config || {};
+    if(ex && ex.intranet_role === 'client') continue; // placeholder, doesn't bind
+    const lp2 = parseListenToHostPort(e.listen || '');
+    const port2 = parseInt(lp2.port || '0', 10);
+    if(port2 !== newPort) continue;
+    const ps2 = protoSet(e.protocol || 'tcp+udp');
+    const ov = protoOverlap(newPs, ps2);
+    if(ov.length === 0) continue;
+    const host2 = lp2.host || '0.0.0.0';
+    if(!hostsOverlap(newHost, host2)) continue;
+    return {idx:i, listen:e.listen, protocolText: overlapProtoText(ov)};
+  }
+  return null;
 }
 
 function newRule(){
@@ -2478,8 +2660,24 @@ async function saveRule(){
   syncListenComputed();
   const listen = getListenString();
   const listenPortNum = parseInt(getListenPort() || '0', 10);
+  if(!listen){ toast('本地监听不能为空', true); return; }
+  if(!(listenPortNum >= 1 && listenPortNum <= 65535)){
+    toast('本地监听端口范围必须是 1-65535', true);
+    return;
+  }
+
+  // Remote format validation + normalization
   const remotesRaw = q('f_remotes').value || '';
-  const remotes = remotesRaw.split('\n').map(x=>x.trim()).filter(Boolean).map(x=>x.replace('\\r',''));
+  const nrm = normalizeRemotesText(remotesRaw);
+  if(nrm.errors.length){
+    const e0 = nrm.errors[0];
+    toast(`目标地址格式错误（第 ${e0.line} 行）：${e0.raw}（${e0.error}）`, true);
+    return;
+  }
+  const remotes = nrm.remotes;
+  if(remotes.length === 0){ toast('目标地址不能为空', true); return; }
+  // Keep form clean (auto-canonicalize IPv6 bracket, trim spaces, etc.)
+  try{ q('f_remotes').value = remotes.join('\n'); }catch(_e){}
   const disabled = (q('f_disabled').value === '1');
 
   // meta
@@ -2488,21 +2686,39 @@ async function saveRule(){
 
   // optional weights for roundrobin (comma separated)
   const weightsRaw = q('f_weights') ? (q('f_weights').value || '').trim() : '';
-  const weights = weightsRaw ? weightsRaw.split(',').map(x=>x.trim()).filter(Boolean) : [];
+  let weightTokens = parseWeightTokens(weightsRaw);
 
   let balTxt = (q('f_balance').value || '').trim();
   let balance = balTxt ? balTxt.split(':')[0].trim() : 'roundrobin';
   if(!balance) balance = 'roundrobin';
 
   let balanceStr = balance;
-  if(balance === 'roundrobin' && weights.length > 0){
-    balanceStr = `roundrobin: ${weights.join(',')}`;
+  if(balance !== 'roundrobin'){
+    if(weightTokens.length){
+      toast('IP Hash 不支持权重，已忽略权重');
+    }
+    weightTokens = [];
   }
+  const wv = validateWeights(weightTokens, remotes.length);
+  if(!wv.ok){ toast(wv.error, true); return; }
+  if(wv.ignored && weightTokens.length){ toast('只有一个目标时无需权重，已忽略权重'); }
+  if(balance === 'roundrobin' && wv.weights.length > 0){
+    balanceStr = `roundrobin: ${wv.weights.join(',')}`;
+  }
+  // Keep weights input clean
+  try{
+    if(q('f_weights')) q('f_weights').value = (balance === 'roundrobin' && wv.weights.length) ? wv.weights.join(',') : '';
+  }catch(_e){}
 
   const protocol = q('f_protocol').value || 'tcp+udp';
 
-  if(!listen){ toast('本地监听不能为空', true); return; }
-  if(remotes.length === 0){ toast('目标地址不能为空', true); return; }
+  // Listen port conflict validation (against current node pool)
+  const skipIdx = getSkipIndexForPortCheck(typeSel);
+  const conflict = findPortConflict(listen, protocol, skipIdx);
+  if(conflict){
+    toast(`端口冲突：端口 ${listenPortNum} 已被规则 #${conflict.idx+1}（${conflict.listen}）占用（协议：${conflict.protocolText}）`, true);
+    return;
+  }
 
   // WSS 隧道：必须选择接收机，自动同步生成接收端规则
   if(typeSel === 'wss'){

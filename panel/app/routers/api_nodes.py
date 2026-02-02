@@ -42,6 +42,7 @@ from ..utils.normalize import (
     sanitize_pool,
     split_host_and_port,
 )
+from ..utils.validate import PoolValidationError, validate_pool_inplace
 
 router = APIRouter()
 
@@ -679,6 +680,12 @@ async def api_pool_set(request: Request, node_id: int, payload: Dict[str, Any], 
                     )
     except Exception:
         pass
+
+    # Save-time validation: port conflicts / remote format / weights count
+    try:
+        validate_pool_inplace(pool)
+    except PoolValidationError as exc:
+        return JSONResponse({"ok": False, "error": str(exc), "issues": [i.__dict__ for i in exc.issues]}, status_code=400)
 
     # Store desired pool on panel. Agent will pull it on next report.
     desired_ver, _ = set_desired_pool(node_id, pool)

@@ -22,6 +22,7 @@ from ..services.pool_ops import (
     upsert_endpoint_by_sync_id,
 )
 from ..utils.normalize import format_addr, normalize_host_input, split_host_port
+from ..utils.validate import PoolValidationError, validate_pool_inplace
 
 router = APIRouter()
 
@@ -304,6 +305,13 @@ async def api_wss_tunnel_save(payload: Dict[str, Any], user: str = Depends(requi
 
     upsert_endpoint_by_sync_id(sender_pool, sync_id, sender_ep)
     upsert_endpoint_by_sync_id(receiver_pool, sync_id, receiver_ep)
+
+    # Save-time validation (sender+receiver): port conflicts / remote format / weights count
+    try:
+        validate_pool_inplace(sender_pool)
+        validate_pool_inplace(receiver_pool)
+    except PoolValidationError as exc:
+        return JSONResponse({"ok": False, "error": str(exc), "issues": [i.__dict__ for i in exc.issues]}, status_code=400)
 
     s_ver, _ = set_desired_pool(sender_id, sender_pool)
     r_ver, _ = set_desired_pool(receiver_id, receiver_pool)
@@ -605,6 +613,13 @@ async def api_intranet_tunnel_save(payload: Dict[str, Any], user: str = Depends(
 
     upsert_endpoint_by_sync_id(sender_pool, sync_id, sender_ep)
     upsert_endpoint_by_sync_id(receiver_pool, sync_id, receiver_ep)
+
+    # Save-time validation (sender+receiver): port conflicts / remote format / weights count
+    try:
+        validate_pool_inplace(sender_pool)
+        validate_pool_inplace(receiver_pool)
+    except PoolValidationError as exc:
+        return JSONResponse({"ok": False, "error": str(exc), "issues": [i.__dict__ for i in exc.issues]}, status_code=400)
 
     s_ver, _ = set_desired_pool(sender_id, sender_pool)
     r_ver, _ = set_desired_pool(receiver_id, receiver_pool)
