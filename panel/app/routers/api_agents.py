@@ -80,19 +80,12 @@ async def api_agent_report(request: Request, payload: Dict[str, Any]):
     except Exception:
         agent_ack = 0
 
-    traffic_ack_version = payload.get("traffic_ack_version")
-    try:
-        traffic_ack = int(traffic_ack_version) if traffic_ack_version is not None else None
-    except Exception:
-        traffic_ack = None
-
     try:
         update_node_report(
             node_id=node_id,
             report_json=json.dumps(report, ensure_ascii=False),
             last_seen_at=now,
             agent_ack_version=int(ack_version) if ack_version is not None else None,
-            traffic_ack_version=traffic_ack,
         )
     except Exception:
         # 不要让写库失败影响 agent
@@ -259,32 +252,6 @@ async def api_agent_report(request: Request, payload: Dict[str, Any]):
                     except Exception:
                         pass
 
-    except Exception:
-        pass
-
-
-    # 下发命令：一键重置规则流量（可选）
-    try:
-        desired_reset_ver = int(node.get("desired_traffic_reset_version") or 0)
-    except Exception:
-        desired_reset_ver = 0
-
-    try:
-        ack_reset_ver = int(traffic_ack) if traffic_ack is not None else int(node.get("agent_traffic_reset_ack_version") or 0)
-    except Exception:
-        ack_reset_ver = 0
-
-    try:
-        if desired_reset_ver > 0 and desired_reset_ver > ack_reset_ver:
-            rcmd = {
-                "type": "reset_traffic",
-                "version": desired_reset_ver,
-                "reset_iptables": True,
-                "reset_baseline": True,
-                "reset_ss_cache": True,
-                "reset_conn_history": True,
-            }
-            cmds.append(sign_cmd(str(node.get("api_key") or ""), rcmd))
     except Exception:
         pass
 
