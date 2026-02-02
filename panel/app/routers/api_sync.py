@@ -89,6 +89,19 @@ async def api_wss_tunnel_save(payload: Dict[str, Any], user: str = Depends(requi
     balance = str(payload.get("balance") or "roundrobin").strip() or "roundrobin"
     protocol = str(payload.get("protocol") or "tcp+udp").strip() or "tcp+udp"
 
+    # Optional meta (remark / favorite)
+    has_remark = "remark" in payload
+    remark = None
+    if has_remark:
+        remark = str(payload.get("remark") or "").strip()
+        if len(remark) > 200:
+            remark = remark[:200]
+
+    has_favorite = "favorite" in payload
+    favorite = None
+    if has_favorite:
+        favorite = bool(payload.get("favorite", False))
+
     wss = payload.get("wss") or {}
     if not isinstance(wss, dict):
         wss = {}
@@ -122,6 +135,21 @@ async def api_wss_tunnel_save(payload: Dict[str, Any], user: str = Depends(requi
         return JSONResponse({"ok": False, "error": "WSS Host / Path 不能为空"}, status_code=400)
 
     sync_id = str(payload.get("sync_id") or "").strip() or uuid.uuid4().hex
+
+    # Validate remotes / weights / sender listen conflict
+    if not disabled:
+        try:
+            validate_remotes_list(remotes, where='')
+            validate_weights(balance, len(remotes), where='')
+        except PoolValidationError as exc:
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+        try:
+            conf = find_listen_conflict(sender_pool if 'sender_pool' in locals() else await load_pool_for_node(sender), listen, protocol, ignore_sync_id=sync_id)
+        except PoolValidationError as exc:
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+        if conf:
+            msg = f"端口冲突（{conf.get('protocol','')}）：{listen} 已被占用"
+            return JSONResponse({"ok": False, "error": msg}, status_code=400)
 
     # If editing an existing synced rule and switching receiver node, remove old receiver-side rule.
     sender_pool = await load_pool_for_node(sender)
@@ -193,7 +221,16 @@ async def api_wss_tunnel_save(payload: Dict[str, Any], user: str = Depends(requi
     receiver_host = node_host_for_realm(receiver)
     if not receiver_host:
         return JSONResponse({"ok": False, "error": "接收机 base_url 无法解析主机名，请检查节点地址"}, status_code=400)
-    sender_to_receiver = format_addr(receiver_host, receiver_port)
+        # Validate receiver listen conflict
+    if not disabled:
+        try:
+            recv_listen = format_addr('0.0.0.0', receiver_port)
+            conf = find_listen_conflict(receiver_pool, recv_listen, protocol, ignore_sync_id=sync_id)
+        except PoolValidationError as exc:
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+        if conf:
+            return JSONResponse({"ok": False, "error": f"接收机端口冲突：{receiver_port}"}, status_code=400)
+sender_to_receiver = format_addr(receiver_host, receiver_port)
 
     now_iso = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
@@ -245,6 +282,13 @@ async def api_wss_tunnel_save(payload: Dict[str, Any], user: str = Depends(requi
             "sync_updated_at": now_iso,
         },
     }
+
+    if remark is not None:
+        sender_ep["remark"] = remark
+        receiver_ep["remark"] = remark
+    if favorite is not None:
+        sender_ep["favorite"] = favorite
+        receiver_ep["favorite"] = favorite
 
     upsert_endpoint_by_sync_id(sender_pool, sync_id, sender_ep)
     upsert_endpoint_by_sync_id(receiver_pool, sync_id, receiver_ep)
@@ -374,6 +418,19 @@ async def api_intranet_tunnel_save(payload: Dict[str, Any], user: str = Depends(
     balance = str(payload.get("balance") or "roundrobin").strip() or "roundrobin"
     protocol = str(payload.get("protocol") or "tcp+udp").strip() or "tcp+udp"
 
+    # Optional meta (remark / favorite)
+    has_remark = "remark" in payload
+    remark = None
+    if has_remark:
+        remark = str(payload.get("remark") or "").strip()
+        if len(remark) > 200:
+            remark = remark[:200]
+
+    has_favorite = "favorite" in payload
+    favorite = None
+    if has_favorite:
+        favorite = bool(payload.get("favorite", False))
+
     try:
         server_port = int(payload.get("server_port") or 18443)
     except Exception:
@@ -387,6 +444,21 @@ async def api_intranet_tunnel_save(payload: Dict[str, Any], user: str = Depends(
         return JSONResponse({"ok": False, "error": "目标地址不能为空"}, status_code=400)
 
     sync_id = str(payload.get("sync_id") or "").strip() or uuid.uuid4().hex
+
+    # Validate remotes / weights / sender listen conflict
+    if not disabled:
+        try:
+            validate_remotes_list(remotes, where='')
+            validate_weights(balance, len(remotes), where='')
+        except PoolValidationError as exc:
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+        try:
+            conf = find_listen_conflict(sender_pool if 'sender_pool' in locals() else await load_pool_for_node(sender), listen, protocol, ignore_sync_id=sync_id)
+        except PoolValidationError as exc:
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+        if conf:
+            msg = f"端口冲突（{conf.get('protocol','')}）：{listen} 已被占用"
+            return JSONResponse({"ok": False, "error": msg}, status_code=400)
     token = str(payload.get("token") or "").strip() or uuid.uuid4().hex
 
     sender_pool = await load_pool_for_node(sender)
@@ -490,6 +562,13 @@ async def api_intranet_tunnel_save(payload: Dict[str, Any], user: str = Depends(
     }
 
     receiver_pool = await load_pool_for_node(receiver)
+
+    if remark is not None:
+        sender_ep["remark"] = remark
+        receiver_ep["remark"] = remark
+    if favorite is not None:
+        sender_ep["favorite"] = favorite
+        receiver_ep["favorite"] = favorite
 
     upsert_endpoint_by_sync_id(sender_pool, sync_id, sender_ep)
     upsert_endpoint_by_sync_id(receiver_pool, sync_id, receiver_ep)

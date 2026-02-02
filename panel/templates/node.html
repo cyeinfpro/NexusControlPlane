@@ -66,7 +66,7 @@
           <div class="right node-tools node-head-right" style="gap:10px; flex:0 0 auto; flex-wrap:wrap; justify-content:flex-end;">
             <div class="search-pill">
               <span class="muted">🔎</span>
-              <input class="input sm" id="ruleSearch" placeholder="搜索监听/目标…" oninput="setRuleFilter(this.value)">
+              <input class="input sm" id="ruleSearch" placeholder="搜索监听/目标/备注…" oninput="setRuleFilter(this.value)">
             </div>
             <button class="btn sm" type="button" onclick="newRule()">+ 创建转发</button>
             <button class="btn sm ghost" type="button" id="autoRefreshBtn" onclick="toggleAutoRefresh()">⟳ 自动刷新：开</button>
@@ -105,6 +105,20 @@
         </div>
 
         <div id="nodeSummary" class="summary-bar" style="display:none;"></div>
+
+<div class="dashboard-toolbar" id="rulesToolbar" style="margin:0 0 10px 0;">
+  <div class="dash-filters" id="ruleFilterChips" role="tablist" aria-label="规则筛选">
+    <button class="chip" type="button" data-rule-filter="all" aria-selected="true">全部 <strong id="ruleCountAll">0</strong></button>
+    <button class="chip" type="button" data-rule-filter="fav">收藏 <strong id="ruleCountFav">0</strong></button>
+    <button class="chip" type="button" data-rule-filter="running">运行 <strong id="ruleCountRunning">0</strong></button>
+    <button class="chip" type="button" data-rule-filter="disabled">暂停 <strong id="ruleCountDisabled">0</strong></button>
+    <button class="chip" type="button" data-rule-filter="wss">WSS <strong id="ruleCountWss">0</strong></button>
+    <button class="chip" type="button" data-rule-filter="intranet">内网 <strong id="ruleCountIntranet">0</strong></button>
+    <button class="chip" type="button" data-rule-filter="lb">LB <strong id="ruleCountLb">0</strong></button>
+    <button class="chip" type="button" data-rule-filter="locked">锁定 <strong id="ruleCountLocked">0</strong></button>
+  </div>
+  <div class="muted sm" id="ruleFilterHint">—</div>
+</div>
 
         <!-- Node system info removed (shown only in 控制台 cards) -->
 
@@ -353,6 +367,19 @@
 	        </label>
 	        <textarea class="textarea" id="f_remotes" rows="4" placeholder="203.0.113.10:443\n198.51.100.8:443"></textarea>
 	        <div class="help" id="remoteHelp"></div>
+        <div class="row" style="gap:12px; margin-top:6px; align-items:flex-end;">
+          <div class="col">
+            <label class="label">备注 <span class="muted sm">（可搜索）</span></label>
+            <input class="input" id="f_remark" placeholder="例如：客户A / Netflix / SSH 跳板">
+          </div>
+          <div class="col" style="max-width:220px;">
+            <label class="label" style="display:flex;align-items:center;gap:8px;">
+              <input type="checkbox" id="f_favorite" style="width:auto;margin:0;">
+              收藏（★）
+            </label>
+            <div class="help compact">收藏后可用上方「收藏」一键筛选。</div>
+          </div>
+        </div>
 	      </div>
 
 	      <details class="advanced-details" id="advancedDetails">
@@ -516,7 +543,7 @@
 {% endblock %}
 
 {% block scripts %}
-<script src="/static/app.js?v=67.0"></script>
+<script src="/static/app.js?v=68.0"></script>
 <script>
 window.__NODE_ID__ = {{ node.id }};
 window.__NODE_IP__ = {{ (node.display_ip or node.name)|tojson }};

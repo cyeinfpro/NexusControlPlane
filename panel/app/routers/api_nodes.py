@@ -15,6 +15,7 @@ from ..core.deps import require_login
 from ..core.settings import DEFAULT_AGENT_PORT
 from ..db import (
     add_node,
+    bump_traffic_reset_version,
     delete_node,
     get_desired_pool,
     get_group_orders,
@@ -33,6 +34,7 @@ from ..services.backup import get_pool_for_backup
 from ..services.assets import panel_public_base_url
 from ..services.node_status import is_report_fresh
 from ..services.pool_ops import load_pool_for_node, remove_endpoints_by_sync_id
+from ..services.validation import PoolValidationError, validate_pool
 from ..utils.crypto import generate_api_key
 from ..utils.normalize import (
     extract_ip_for_display,
@@ -679,6 +681,12 @@ async def api_pool_set(request: Request, node_id: int, payload: Dict[str, Any], 
     except Exception:
         pass
 
+    # Validate pool before saving
+    try:
+        validate_pool(pool)
+    except PoolValidationError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+
     # Store desired pool on panel. Agent will pull it on next report.
     desired_ver, _ = set_desired_pool(node_id, pool)
 
@@ -1027,10 +1035,25 @@ async def api_reset_traffic(request: Request, node_id: int, user: str = Depends(
             "/api/v1/traffic/reset",
             {},
             node_verify_tls(node),
+            timeout=10.0,
         )
         return data
     except Exception as exc:
-        return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
+        # Fallback: queue via agent push-report (works for private/unreachable nodes)
+        try:
+            new_ver = bump_traffic_reset_version(int(node_id))
+            return {
+                "ok": True,
+                "queued": True,
+                "desired_reset_version": new_ver,
+                "direct_error": str(exc),
+                "message": "Agent 直连失败，已改为排队等待节点上报后自动执行",
+            }
+        except Exception as exc2:
+            return JSONResponse(
+                {"ok": False, "error": f"{exc}; 同时排队失败：{exc2}"},
+                status_code=502,
+            )
 
 
 @router.get("/api/nodes/{node_id}/stats")
@@ -1159,33 +1182,95 @@ async def api_graph(request: Request, node_id: int, user: str = Depends(require_
 
 @router.post("/api/traffic/reset_all")
 async def api_reset_all_traffic(request: Request, user: str = Depends(require_login)):
-    """Reset rule traffic counters for all nodes (best-effort)."""
+    """Reset rule traffic counters for all nodes.
+
+    Strategy:
+    - Try direct panel -> agent call first (retry once).
+    - If direct call fails, queue a signed push-report command (agent -> panel),
+      so private/unreachable nodes will reset next time they report.
+    """
     nodes = list_nodes()
+    import asyncio
+
     if not nodes:
-        return {"ok": True, "total": 0, "ok_count": 0, "fail_count": 0, "results": []}
+        return {"ok": True, "total": 0, "ok_count": 0, "queued_count": 0, "fail_count": 0, "results": []}
 
     sem = asyncio.Semaphore(10)
 
-    async def _one(n: Dict[str, Any]) -> Dict[str, Any]:
+    async def _direct(n: Dict[str, Any]) -> Dict[str, Any]:
         nid = int(n.get("id") or 0)
         name = n.get("name") or f"Node-{nid}"
+        base_url = n.get("base_url", "")
+        api_key = n.get("api_key", "")
+        verify_tls = node_verify_tls(n)
+
+        # 1) Try direct reset (retry once)
+        last_err: str = ""
         async with sem:
-            try:
-                data = await agent_post(
-                    n.get("base_url", ""),
-                    n.get("api_key", ""),
-                    "/api/v1/traffic/reset",
-                    {},
-                    node_verify_tls(n),
-                    timeout=8.0,
-                )
-                ok = bool((data or {}).get("ok", True)) if isinstance(data, dict) else True
-                return {"node_id": nid, "name": name, "ok": ok, "detail": data if isinstance(data, dict) else {}}
-            except Exception as exc:
-                return {"node_id": nid, "name": name, "ok": False, "error": str(exc)}
+            for attempt in range(2):
+                try:
+                    data = await agent_post(
+                        base_url,
+                        api_key,
+                        "/api/v1/traffic/reset",
+                        {},
+                        verify_tls,
+                        timeout=10.0,
+                    )
+                    ok = bool((data or {}).get("ok", True)) if isinstance(data, dict) else True
+                    return {
+                        "node_id": nid,
+                        "name": name,
+                        "ok": ok,
+                        "queued": False,
+                        "detail": data if isinstance(data, dict) else {},
+                    }
+                except Exception as exc:
+                    last_err = str(exc)
+                    if attempt == 0:
+                        await asyncio.sleep(0.2)
 
-    results = await asyncio.gather(*[_one(n) for n in nodes])
-    ok_count = sum(1 for r in results if r.get("ok"))
-    fail_count = max(0, len(results) - ok_count)
-    return {"ok": True, "total": len(results), "ok_count": ok_count, "fail_count": fail_count, "results": results}
+        # direct failed (exception)
+        return {"node_id": nid, "name": name, "ok": False, "queued": False, "direct_error": last_err}
 
+    direct_results = await asyncio.gather(*[_direct(n) for n in nodes])
+
+    # 2) Queue fallback sequentially to avoid DB-lock contention
+    results: List[Dict[str, Any]] = []
+    for r in direct_results:
+        if r.get("ok") or not r.get("direct_error"):
+            results.append(r)
+            continue
+
+        nid = int(r.get("node_id") or 0)
+        name = r.get("name") or f"Node-{nid}"
+        last_err = str(r.get("direct_error") or "")
+        try:
+            new_ver = bump_traffic_reset_version(nid)
+            results.append(
+                {
+                    "node_id": nid,
+                    "name": name,
+                    "ok": True,
+                    "queued": True,
+                    "desired_reset_version": new_ver,
+                    "direct_error": last_err,
+                }
+            )
+        except Exception as exc2:
+            results.append(
+                {"node_id": nid, "name": name, "ok": False, "queued": False, "error": f"{last_err}; queue failed: {exc2}"}
+            )
+
+    ok_count = sum(1 for r in results if r.get("ok") and not r.get("queued"))
+    queued_count = sum(1 for r in results if r.get("ok") and r.get("queued"))
+    fail_count = sum(1 for r in results if not r.get("ok"))
+
+    return {
+        "ok": True,
+        "total": len(results),
+        "ok_count": ok_count,
+        "queued_count": queued_count,
+        "fail_count": fail_count,
+        "results": results,
+    }

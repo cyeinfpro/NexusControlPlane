@@ -1,3 +1,15 @@
+
+function _isValidHostPort(s){try{const m=s.trim();if(!m)return false;let hp=m;if(m.includes('://')){const u=new URL(m);hp=`${u.hostname}:${u.port}`;}const parts=hp.split(':');if(parts.length<2)return false;const port=parseInt(parts.pop(),10);return port>=1&&port<=65535;}catch(e){return false;}}
+function validateRuleBeforeSave(rule){
+  if(!rule.disabled){
+    if(rule.listen){const port=parseInt(rule.listen.split(':').pop(),10);if(!(port>=1&&port<=65535)) throw new Error('listen 端口范围 1-65535');}
+    const remotes=[].concat(rule.remote||[], rule.remotes||[]).filter(Boolean);
+    if(remotes.length===0) throw new Error('目标地址不能为空');
+    remotes.forEach(r=>{if(!_isValidHostPort(r)) throw new Error('目标地址格式错误: '+r);});
+    const balance=rule.balance||'';
+    if(balance.includes(':')){const w=balance.split(':')[1].split(',').filter(Boolean);if(w.length>0 && w.length!==remotes.length) throw new Error('权重数量必须与目标行数一致');}
+  }
+}
 async function fetchJSON(url, options={}){
   const res = await fetch(url, {
     headers: {"Content-Type":"application/json"},
@@ -103,6 +115,336 @@ function setRuleFilter(v){
   renderRules();
 }
 window.setRuleFilter = setRuleFilter;
+
+// Rule filter kind (chips)
+let RULE_FILTER_KIND = 'all';
+function setRuleFilterKind(kind){
+  const k = (String(kind || '').trim() || 'all');
+  RULE_FILTER_KIND = k;
+  try{ localStorage.setItem('nexus_rule_filter_kind', RULE_FILTER_KIND); }catch(_e){}
+  try{ updateRuleFilterChipsUI(); }catch(_e){}
+  renderRules();
+}
+window.setRuleFilterKind = setRuleFilterKind;
+
+function isFavoriteRule(e){
+  if(!e || typeof e !== 'object') return false;
+  return e.favorite === true || e.fav === true || e.star === true || e.starred === true;
+}
+
+// Remote list helpers (for search/filter)
+// - For sync sender rules, prefer showing original remotes
+function getRuleOriginalRemotes(e){
+  try{
+    const ex = (e && e.extra_config) ? e.extra_config : {};
+    // WSS auto-sync sender: keep original remotes (user targets)
+    if(ex && ex.sync_role === 'sender' && Array.isArray(ex.sync_original_remotes) && ex.sync_original_remotes.length){
+      return ex.sync_original_remotes.map(x=>String(x||'').trim()).filter(Boolean);
+    }
+    // Intranet tunnel sender: keep original remotes (user targets)
+    if(ex && ex.intranet_role === 'sender' && Array.isArray(ex.intranet_original_remotes) && ex.intranet_original_remotes.length){
+      return ex.intranet_original_remotes.map(x=>String(x||'').trim()).filter(Boolean);
+    }
+  }catch(_e){}
+  return null;
+}
+
+function getRuleRemotesForCount(e){
+  const orig = getRuleOriginalRemotes(e);
+  const rs = [];
+  if(orig) rs.push(...orig);
+  else{
+    try{
+      if(Array.isArray(e.remotes)) rs.push(...e.remotes);
+      else if(e.remote) rs.push(e.remote);
+      if(Array.isArray(e.extra_remotes)) rs.push(...e.extra_remotes);
+    }catch(_e){}
+  }
+  // de-dup
+  const seen = new Set();
+  const out = [];
+  for(const x of rs){
+    const t = String(x||'').trim();
+    if(!t) continue;
+    if(seen.has(t)) continue;
+    seen.add(t);
+    out.push(t);
+  }
+  return out;
+}
+
+function getRuleRemotesForSearch(e){
+  const rs = [];
+  try{
+    const orig = getRuleOriginalRemotes(e);
+    if(orig) rs.push(...orig);
+    if(Array.isArray(e.remotes)) rs.push(...e.remotes);
+    else if(e.remote) rs.push(e.remote);
+    if(Array.isArray(e.extra_remotes)) rs.push(...e.extra_remotes);
+  }catch(_e){}
+  // de-dup
+  const seen = new Set();
+  const out = [];
+  for(const x of rs){
+    const t = String(x||'').trim();
+    if(!t) continue;
+    if(seen.has(t)) continue;
+    seen.add(t);
+    out.push(t);
+  }
+  return out;
+}
+
+function initRuleFilterChipsUI(){
+  const wrap = document.getElementById('ruleFilterChips');
+  if(!wrap) return;
+  // Restore last filter selection
+  try{
+    const saved = localStorage.getItem('nexus_rule_filter_kind');
+    if(saved) RULE_FILTER_KIND = String(saved||'all').trim() || 'all';
+  }catch(_e){}
+  wrap.querySelectorAll('[data-rule-filter]').forEach((btn)=>{
+    btn.addEventListener('click', ()=>{
+      const k = btn.getAttribute('data-rule-filter') || 'all';
+      setRuleFilterKind(k);
+    });
+  });
+  updateRuleFilterChipsUI();
+}
+
+function updateRuleFilterChipsUI(){
+  const wrap = document.getElementById('ruleFilterChips');
+  if(!wrap) return;
+  wrap.querySelectorAll('[data-rule-filter]').forEach((btn)=>{
+    const k = btn.getAttribute('data-rule-filter') || 'all';
+    const active = (String(k) === String(RULE_FILTER_KIND));
+    btn.classList.toggle('active', active);
+    btn.setAttribute('aria-selected', active ? 'true' : 'false');
+  });
+}
+
+function ruleMatchesKind(e, kind){
+  const k = String(kind || 'all');
+  if(k === 'all') return true;
+  if(k === 'fav') return isFavoriteRule(e);
+  if(k === 'running') return !e.disabled;
+  if(k === 'disabled') return !!e.disabled;
+  if(k === 'wss') return tunnelMode(e) === 'wss';
+  if(k === 'intranet') return tunnelMode(e) === 'intranet';
+  if(k === 'lb') return getRuleRemotesForCount(e).length > 1;
+  if(k === 'locked') {
+    try{ return !!(getRuleLockInfo(e) && getRuleLockInfo(e).locked); }catch(_e){ return false; }
+  }
+  return true;
+}
+
+function _setText(id, text){
+  const el = document.getElementById(id);
+  if(el) el.textContent = String(text == null ? '' : text);
+}
+
+function updateRuleFilterCounts(eps){
+  const counts = {all:0,fav:0,running:0,disabled:0,wss:0,intranet:0,lb:0,locked:0};
+  const list = Array.isArray(eps) ? eps : [];
+  counts.all = list.length;
+  for(const e of list){
+    if(!e || typeof e !== 'object') continue;
+    if(isFavoriteRule(e)) counts.fav += 1;
+    if(e.disabled) counts.disabled += 1;
+    else counts.running += 1;
+    const m = tunnelMode(e);
+    if(m === 'wss') counts.wss += 1;
+    if(m === 'intranet') counts.intranet += 1;
+    if(getRuleRemotesForCount(e).length > 1) counts.lb += 1;
+    try{ if(getRuleLockInfo(e) && getRuleLockInfo(e).locked) counts.locked += 1; }catch(_e){}
+  }
+  _setText('ruleCountAll', counts.all);
+  _setText('ruleCountFav', counts.fav);
+  _setText('ruleCountRunning', counts.running);
+  _setText('ruleCountDisabled', counts.disabled);
+  _setText('ruleCountWss', counts.wss);
+  _setText('ruleCountIntranet', counts.intranet);
+  _setText('ruleCountLb', counts.lb);
+  _setText('ruleCountLocked', counts.locked);
+  return counts;
+}
+
+function updateRuleFilterHint(shown, total, qobj, kind){
+  const el = document.getElementById('ruleFilterHint');
+  if(!el) return;
+  const map = {all:'全部', fav:'收藏', running:'运行', disabled:'暂停', wss:'WSS', intranet:'内网', lb:'LB', locked:'锁定'};
+  const parts = [];
+  const k = String(kind || 'all');
+  if(k && k !== 'all') parts.push(`筛选：${map[k] || k}`);
+  if(qobj && qobj.raw){
+    parts.push(`搜索：${qobj.raw}`);
+  }
+  parts.push(`显示 ${shown} / ${total}`);
+  el.textContent = parts.join(' · ');
+}
+
+function parseRuleSearch(text){
+  const raw = String(text || '').trim();
+  if(!raw) return {raw:'', pos:[], neg:[]};
+  const pos = [];
+  const neg = [];
+  const re = /"([^"]+)"|'([^']+)'|(\S+)/g;
+  let m;
+  while((m = re.exec(raw))){
+    const tok = String(m[1] || m[2] || m[3] || '').trim();
+    if(!tok) continue;
+    const t = tok.toLowerCase();
+    if(t.startsWith('-') || t.startsWith('!')){
+      const v = t.slice(1).trim();
+      if(v) neg.push(v);
+    }else{
+      pos.push(t);
+    }
+  }
+  return {raw, pos, neg};
+}
+
+function _extractPort(addr){
+  const s = String(addr || '').trim();
+  if(!s) return null;
+  // [::]:443
+  let m = s.match(/^\[[^\]]+\]:(\d+)$/);
+  if(m) return parseInt(m[1], 10);
+  // host:port / ipv4:port / ipv6 best effort (take last :digits)
+  m = s.match(/:(\d+)$/);
+  if(m) return parseInt(m[1], 10);
+  // pure port
+  if(/^\d+$/.test(s)) return parseInt(s, 10);
+  return null;
+}
+
+function _matchPortToken(e, val){
+  const v = String(val || '').trim();
+  if(!v) return true;
+  let minP = null;
+  let maxP = null;
+  let m = v.match(/^(\d+)\s*[-~…]+\s*(\d+)$/);
+  if(!m) m = v.match(/^(\d+)\s*\.\.\s*(\d+)$/);
+  if(m){
+    minP = parseInt(m[1], 10);
+    maxP = parseInt(m[2], 10);
+  }else if(/^\d+$/.test(v)){
+    minP = maxP = parseInt(v, 10);
+  }else{
+    return false;
+  }
+  if(minP == null || maxP == null) return false;
+  if(minP > maxP){ const t = minP; minP = maxP; maxP = t; }
+
+  const ports = [];
+  const lp = _extractPort(e.listen);
+  if(lp != null) ports.push(lp);
+  for(const r of getRuleRemotesForSearch(e)){
+    const p = _extractPort(r);
+    if(p != null) ports.push(p);
+  }
+  for(const p of ports){
+    if(p >= minP && p <= maxP) return true;
+  }
+  return false;
+}
+
+function buildRuleHaystack(e){
+  const ex = (e && e.extra_config) ? e.extra_config : {};
+  const remotes = getRuleRemotesForSearch(e).join('\n');
+  const parts = [
+    e.listen || '',
+    remotes,
+    e.remark || '',
+    endpointType(e),
+    e.protocol || '',
+    e.balance || '',
+    e.through || '',
+    e.interface || '',
+    e.listen_transport || '',
+    e.remote_transport || '',
+    // sync / intranet / wss meta
+    (ex && ex.sync_id) ? String(ex.sync_id) : '',
+    (ex && ex.sync_role) ? String(ex.sync_role) : '',
+    (ex && ex.sync_peer_node_id) ? String(ex.sync_peer_node_id) : '',
+    (ex && ex.sync_peer_node_name) ? String(ex.sync_peer_node_name) : '',
+    (ex && ex.sync_from_node_id) ? String(ex.sync_from_node_id) : '',
+    (ex && ex.sync_from_node_name) ? String(ex.sync_from_node_name) : '',
+    (ex && ex.listen_ws_host) ? String(ex.listen_ws_host) : '',
+    (ex && ex.listen_ws_path) ? String(ex.listen_ws_path) : '',
+    (ex && ex.listen_tls_servername) ? String(ex.listen_tls_servername) : '',
+    (ex && ex.remote_ws_host) ? String(ex.remote_ws_host) : '',
+    (ex && ex.remote_ws_path) ? String(ex.remote_ws_path) : '',
+    (ex && ex.remote_tls_sni) ? String(ex.remote_tls_sni) : '',
+    (ex && ex.intranet_role) ? String(ex.intranet_role) : '',
+    (ex && ex.intranet_peer_node_id) ? String(ex.intranet_peer_node_id) : '',
+    (ex && ex.intranet_peer_node_name) ? String(ex.intranet_peer_node_name) : '',
+    (ex && ex.intranet_server_port) ? String(ex.intranet_server_port) : '',
+    (ex && ex.intranet_server_host) ? String(ex.intranet_server_host) : '',
+    (ex && ex.intranet_remote_target) ? String(ex.intranet_remote_target) : '',
+    (ex && Array.isArray(ex.intranet_remote_targets)) ? ex.intranet_remote_targets.join(',') : '',
+  ];
+  if(isFavoriteRule(e)) parts.push('favorite', '收藏', 'star', '★');
+  if(e.disabled) parts.push('disabled', '暂停', 'off');
+  else parts.push('running', '启用', 'on');
+  try{ if(getRuleLockInfo(e) && getRuleLockInfo(e).locked) parts.push('locked', '锁定', '🔒'); }catch(_e){}
+  return parts.join('\n').toLowerCase();
+}
+
+function matchRuleToken(e, hay, token){
+  const t = String(token || '').trim();
+  if(!t) return true;
+  const i = t.indexOf(':');
+  if(i > 0){
+    const key = t.slice(0, i).trim();
+    const val = t.slice(i + 1).trim();
+    if(!val) return true;
+    if(key === 'listen' || key === 'l'){
+      return String(e.listen || '').toLowerCase().includes(val);
+    }
+    if(key === 'remote' || key === 'r' || key === 'to'){
+      return getRuleRemotesForSearch(e).join('\n').toLowerCase().includes(val);
+    }
+    if(key === 'remark' || key === 'note' || key === 'm'){
+      return String(e.remark || '').toLowerCase().includes(val);
+    }
+    if(key === 'type' || key === 'mode'){
+      const m = String(tunnelMode(e) || '').toLowerCase();
+      return m.includes(val) || endpointType(e).toLowerCase().includes(val);
+    }
+    if(key === 'status'){
+      const v = val;
+      if(['run','running','on','ok','启用','运行'].some(x=>v.startsWith(x))) return !e.disabled;
+      if(['pause','paused','off','disabled','停','暂停'].some(x=>v.startsWith(x))) return !!e.disabled;
+      return hay.includes(v);
+    }
+    if(key === 'fav' || key === 'star' || key === 'favorite'){
+      const v = val;
+      if(['0','false','no','off','否','n'].includes(v)) return !isFavoriteRule(e);
+      if(['1','true','yes','on','是','y','★','star'].includes(v)) return isFavoriteRule(e);
+      return isFavoriteRule(e);
+    }
+    if(key === 'port' || key === 'p'){
+      return _matchPortToken(e, val);
+    }
+    // unknown key: fallback to raw includes
+    return hay.includes(t);
+  }
+  return hay.includes(t);
+}
+
+function matchRuleSearch(e, hay, qobj){
+  if(!qobj) return true;
+  for(const t of (qobj.pos || [])){
+    if(!matchRuleToken(e, hay, t)) return false;
+  }
+  for(const t of (qobj.neg || [])){
+    if(matchRuleToken(e, hay, t)) return false;
+  }
+  return true;
+}
+
+
 
 function showTab(name){
   document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
@@ -1064,6 +1406,9 @@ function renderRuleCard(e, idx, rowNo, stats, statsError){
   const healthHtml = renderHealthMobile(stats.health, statsError, idx);
   const activeTitle = statsError ? '' : `title="当前已建立连接：${est}"`;
   const lockInfo = getRuleLockInfo(e);
+  const fav = isFavoriteRule(e);
+  const remark = (e && e.remark != null) ? String(e.remark).trim() : '';
+  const remarkHtml = remark ? `<div class="rule-sub muted sm" title="${escapeHtml(remark)}">📝 ${escapeHtml(remark)}</div>` : '';
 
   const actionsHtml = (lockInfo && lockInfo.locked) ? `
     <div class="rule-actions">
@@ -1083,9 +1428,11 @@ function renderRuleCard(e, idx, rowNo, stats, statsError){
         <div class="rule-topline">
           <span class="rule-idx">#${rowNo}</span>
           ${statusPill(e)}
+          <button class="btn xs icon ghost" title="${fav ? '取消收藏' : '收藏'}" onclick="toggleFavorite(${idx})">${fav ? '★' : '☆'}</button>
         </div>
         <div class="rule-listen mono">${escapeHtml(e.listen)}</div>
         <div class="rule-sub muted sm">${endpointType(e)}</div>
+        ${remarkHtml}
       </div>
       <div class="rule-right">
         <span class="pill ghost" ${activeTitle}>活跃 ${escapeHtml(connActive)}</span>
@@ -1099,38 +1446,54 @@ function renderRuleCard(e, idx, rowNo, stats, statsError){
   </div>`;
 }
 
+
 function renderRules(){
-  q('rulesLoading').style.display = 'none';
+  const loading = q('rulesLoading');
+  if(loading) loading.style.display = 'none';
   const table = q('rulesTable');
   const tbody = q('rulesBody');
   const mobileWrap = q('rulesMobile');
-  tbody.innerHTML = '';
+  if(tbody) tbody.innerHTML = '';
   if(mobileWrap) mobileWrap.innerHTML = '';
-  const eps = (CURRENT_POOL && CURRENT_POOL.endpoints) ? CURRENT_POOL.endpoints : [];
+  const eps = (CURRENT_POOL && Array.isArray(CURRENT_POOL.endpoints)) ? CURRENT_POOL.endpoints : [];
   const statsLookup = buildStatsLookup();
   const statsLoading = q('statsLoading');
 
   // 小屏用卡片，大屏用表格
   const isMobile = window.matchMedia('(max-width: 1024px)').matches;
 
-  // Filter (listen / remote / remark)
-  const f = (RULE_FILTER || '').trim().toLowerCase();
+  // Update filter chips & counts
+  try{ updateRuleFilterCounts(eps); }catch(_e){}
+  try{ updateRuleFilterChipsUI(); }catch(_e){}
+
+  let qobj = null;
+  try{ qobj = parseRuleSearch(RULE_FILTER); }catch(_e){ qobj = {raw:'', pos:[], neg:[]}; }
+
+  const hasQuery = !!(qobj && (qobj.pos && qobj.pos.length || qobj.neg && qobj.neg.length));
+  const hasKind = String(RULE_FILTER_KIND || 'all') !== 'all';
+
   const items = [];
-  eps.forEach((e, idx)=>{
-    if(f){
-      const hay = `${e.listen||''}
-${formatRemote(e)}
-${(e.remark||'')}
-${endpointType(e)}`.toLowerCase();
-      if(!hay.includes(f)) return;
+  for(let idx = 0; idx < eps.length; idx++){
+    const e = eps[idx];
+    if(!e || typeof e !== 'object') continue;
+    if(!ruleMatchesKind(e, RULE_FILTER_KIND)) continue;
+    const hay = buildRuleHaystack(e);
+    if(hasQuery){
+      if(!matchRuleSearch(e, hay, qobj)) continue;
     }
     items.push({e, idx});
-  });
+  }
+
+  try{ updateRuleFilterHint(items.length, eps.length, hasQuery ? qobj : null, RULE_FILTER_KIND); }catch(_e){}
 
   if(!items.length){
-    q('rulesLoading').style.display = '';
-    q('rulesLoading').textContent = f ? '未找到匹配规则' : '暂无规则';
-    table.style.display = 'none';
+    if(loading){
+      loading.style.display = '';
+      const hasAny = eps.length > 0;
+      const hasFilter = hasKind || hasQuery;
+      loading.textContent = hasAny ? (hasFilter ? '未找到匹配规则' : '暂无规则') : '暂无规则';
+    }
+    if(table) table.style.display = 'none';
     if(mobileWrap) mobileWrap.style.display = 'none';
     if(statsLoading){
       statsLoading.style.display = 'none';
@@ -1159,7 +1522,7 @@ ${endpointType(e)}`.toLowerCase();
       const card = document.createElement('div');
       card.innerHTML = renderRuleCard(e, idx, rowNo, stats, statsError);
       mobileWrap.appendChild(card.firstElementChild);
-    }else{
+    }else if(tbody){
       const healthHtml = renderHealthExpanded(stats.health, statsLookup.error);
       const rx = statsError ? null : (stats.rx_bytes || 0);
       const tx = statsError ? null : (stats.tx_bytes || 0);
@@ -1167,14 +1530,23 @@ ${endpointType(e)}`.toLowerCase();
       const connActive = statsError ? 0 : (stats.connections_active ?? 0);
       const est = statsError ? 0 : (stats.connections_established ?? stats.connections ?? 0);
       const lockInfo = getRuleLockInfo(e);
+      const fav = isFavoriteRule(e);
+      const remark = (e && e.remark != null) ? String(e.remark).trim() : '';
+      const remarkHtml = remark ? `<div class="muted sm" title="${escapeHtml(remark)}">📝 ${escapeHtml(remark)}</div>` : '';
 
       const tr = document.createElement('tr');
       tr.innerHTML = `
         <td>${rowNo}</td>
-        <td>${statusPill(e)}</td>
+        <td>
+          <div class="row" style="gap:8px;align-items:center;">
+            ${statusPill(e)}
+            <button class="btn xs icon ghost" title="${fav ? '取消收藏' : '收藏'}" onclick="toggleFavorite(${idx})">${fav ? '★' : '☆'}</button>
+          </div>
+        </td>
         <td class="listen">
           <div class="mono">${escapeHtml(e.listen)}</div>
           <div class="muted sm">${endpointType(e)}</div>
+          ${remarkHtml}
         </td>
         <td class="health">${healthHtml}</td>
         <td class="stat" title="当前已建立连接：${escapeHtml(est)}">${statsError ? '—' : escapeHtml(connActive)}</td>
@@ -1197,12 +1569,13 @@ ${endpointType(e)}`.toLowerCase();
 
   if(isMobile && mobileWrap){
     mobileWrap.style.display = '';
-    table.style.display = 'none';
+    if(table) table.style.display = 'none';
   }else{
     if(mobileWrap) mobileWrap.style.display = 'none';
-    table.style.display = '';
+    if(table) table.style.display = '';
   }
 }
+
 
 function openModal(){ q('modal').style.display = 'flex'; }
 function closeModal(){ q('modal').style.display = 'none'; q('modalMsg').textContent=''; }
@@ -1801,6 +2174,9 @@ function newRule(){
   syncListenComputed();
 
   setField('f_remotes','');
+  if(q('f_remark')) setField('f_remark','');
+  if(q('f_favorite')) q('f_favorite').checked = false;
+
   q('f_disabled').value = '0';
 
   // 新建规则：默认启用，不显示“状态”字段（更聚焦）
@@ -1857,6 +2233,8 @@ function editRule(idx){
   syncListenComputed();
   // synced sender rule should show original targets (not the peer receiver ip:port)
   setField('f_remotes', formatRemoteForInput(e));
+  if(q('f_remark')) setField('f_remark', (e && e.remark != null) ? e.remark : '');
+  if(q('f_favorite')) q('f_favorite').checked = isFavoriteRule(e);
 
   q('f_disabled').value = e.disabled ? '1':'0';
   const balance = e.balance || 'roundrobin';
@@ -1914,6 +2292,29 @@ function editRule(idx){
 
   openModal();
 }
+
+async function toggleFavorite(idx){
+  try{
+    if(!CURRENT_POOL || !Array.isArray(CURRENT_POOL.endpoints)) return;
+    const e = CURRENT_POOL.endpoints[idx];
+    if(!e || typeof e !== 'object') return;
+    const next = !isFavoriteRule(e);
+    e.favorite = next;
+    // keep legacy keys clean (optional)
+    try{
+      if('fav' in e) delete e.fav;
+      if('star' in e) delete e.star;
+      if('starred' in e) delete e.starred;
+    }catch(_e){}
+    await savePool(next ? '已加入收藏' : '已取消收藏');
+  }catch(err){
+    const msg = (err && err.message) ? err.message : String(err || '收藏操作失败');
+    toast(msg, true);
+    // revert local view
+    try{ await loadPool(); }catch(_e){}
+  }
+}
+window.toggleFavorite = toggleFavorite;
 
 async function toggleRule(idx){
   const e = CURRENT_POOL.endpoints[idx];
@@ -2070,7 +2471,8 @@ async function deleteRule(idx){
   renderRules();
 }
 
-async function saveRule(){
+async function validateRuleBeforeSave(rule);
+  saveRule(){
   const typeSel = q('f_type').value;
   // Listen: port-only UI
   syncListenComputed();
@@ -2079,6 +2481,8 @@ async function saveRule(){
   const remotesRaw = q('f_remotes').value || '';
   const remotes = remotesRaw.split('\n').map(x=>x.trim()).filter(Boolean).map(x=>x.replace('\\r',''));
   const disabled = (q('f_disabled').value === '1');
+  const remark = q('f_remark') ? (q('f_remark').value || '').trim() : '';
+  const favorite = q('f_favorite') ? !!q('f_favorite').checked : false;
 
   // optional weights for roundrobin (comma separated)
   const weightsRaw = q('f_weights') ? (q('f_weights').value || '').trim() : '';
@@ -2131,6 +2535,8 @@ async function saveRule(){
       protocol,
       receiver_port: receiverPortTxt ? parseInt(receiverPortTxt,10) : null,
       sync_id: syncId || undefined,
+      remark,
+      favorite,
       wss
     };
 
@@ -2179,7 +2585,9 @@ async function saveRule(){
       protocol,
       server_port,
       server_host: server_host || null,
-      sync_id: syncId || undefined
+      sync_id: syncId || undefined,
+      remark,
+      favorite
     };
 
     try{
@@ -2203,6 +2611,8 @@ async function saveRule(){
 
   // 普通转发（单机）
   const endpoint = { listen, remotes, disabled, balance: balanceStr, protocol };
+  if(remark) endpoint.remark = remark;
+  if(favorite) endpoint.favorite = true;
 
     try{
       setLoading(true);
@@ -2468,9 +2878,14 @@ async function resetNodeTraffic(){
       body: JSON.stringify({})
     });
     if(res && res.ok){
-      toast('已重置：正在刷新统计…');
-      // Force agent stats to avoid 3s push-report cache showing old values
-      await refreshStats(true);
+      if(res.queued){
+        toast('已加入队列：等待节点上报后自动重置');
+        try{ await refreshStats(false); }catch(_e){}
+      }else{
+        toast('已重置：正在刷新统计…');
+        // Force agent stats to avoid 3s push-report cache showing old values
+        await refreshStats(true);
+      }
     }else{
       toast((res && res.error) ? res.error : '重置失败', true);
     }
@@ -2484,7 +2899,7 @@ window.resetNodeTraffic = resetNodeTraffic;
 async function resetAllTraffic(){
   const ok1 = confirm(
     '⚠️ 批量操作：将对所有已接入节点执行“重置规则流量统计”。\n\n' +
-    '离线/不可达节点会失败，但不影响其它节点。\n\n' +
+    '不可达节点将自动排队，待节点上报后执行（不需要逐台操作）。\n\n' +
     '是否继续？'
   );
   if(!ok1) return;
@@ -2494,18 +2909,39 @@ async function resetAllTraffic(){
     const res = await fetchJSON('/api/traffic/reset_all', { method:'POST', body: JSON.stringify({}) });
     if(res && res.ok){
       const okN = res.ok_count ?? 0;
+      const queuedN = res.queued_count ?? 0;
       const failN = res.fail_count ?? 0;
-      toast(`已完成：成功 ${okN}，失败 ${failN}` + (failN ? '（点击查看详情）' : ''));
+      const needDetail = (queuedN || failN);
+      toast(`已完成：成功 ${okN}，已排队 ${queuedN}，失败 ${failN}` + (needDetail ? '（点击查看详情）' : ''));
 
-      if(failN && Array.isArray(res.results)){
+      if(needDetail && Array.isArray(res.results)){
+        const queued = res.results.filter(r=>r.ok && r.queued);
         const failed = res.results.filter(r=>!r.ok);
-        const lines = failed.slice(0, 30).map(r=>{
-          const name = r.name || ('Node-' + r.node_id);
-          const err = r.error || 'failed';
-          return `${name}: ${err}`;
-        });
-        const more = failed.length > 30 ? `\n… 还有 ${failed.length - 30} 个失败节点未展示` : '';
-        alert('以下节点重置失败：\n\n' + lines.join('\n') + more);
+        let msg = '';
+
+        if(queued.length){
+          const lines = queued.slice(0, 30).map(r=>{
+            const name = r.name || ('Node-' + r.node_id);
+            const err = r.direct_error || '';
+            return err ? `${name}（直连失败已排队）：${err}` : `${name}（已排队）`;
+          });
+          const more = queued.length > 30 ? `\n… 还有 ${queued.length - 30} 个已排队节点未展示` : '';
+          msg += '以下节点已排队（等待节点上报后自动执行）：\n\n' + lines.join('\n') + more;
+        }
+
+        if(failed.length){
+          const lines = failed.slice(0, 30).map(r=>{
+            const name = r.name || ('Node-' + r.node_id);
+            const err = r.error || 'failed';
+            return `${name}: ${err}`;
+          });
+          const more = failed.length > 30 ? `\n… 还有 ${failed.length - 30} 个失败节点未展示` : '';
+          msg += (msg ? '\n\n' : '') + '以下节点重置失败（直连失败且排队也失败）：\n\n' + lines.join('\n') + more;
+        }
+
+        if(msg){
+          alert(msg);
+        }
       }
     }else{
       toast((res && res.error) ? res.error : '重置失败', true);
@@ -2638,6 +3074,9 @@ function initNodePage(){
   // ✅ Load nodes list for WSS auto-sync receiver selector
   // (otherwise the receiver dropdown stays empty and cannot be selected)
   loadNodesList();
+
+  // Rule filter chips (收藏/状态/类型等)
+  try{ initRuleFilterChipsUI(); }catch(_e){}
 
   // Sidebar node groups: collapsible
   try{

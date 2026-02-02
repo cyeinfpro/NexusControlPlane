@@ -24,6 +24,12 @@ CREATE TABLE IF NOT EXISTS nodes (
   desired_pool_version INTEGER NOT NULL DEFAULT 0,
   agent_ack_version INTEGER NOT NULL DEFAULT 0,
 
+  -- Rule traffic reset (panel -> agent)
+  desired_traffic_reset_version INTEGER NOT NULL DEFAULT 0,
+  agent_traffic_reset_ack_version INTEGER NOT NULL DEFAULT 0,
+  traffic_reset_at TEXT,
+  traffic_reset_msg TEXT NOT NULL DEFAULT '',
+
   -- Agent software update (panel -> agent)
   desired_agent_version TEXT NOT NULL DEFAULT '',
   desired_agent_update_id TEXT NOT NULL DEFAULT '',
@@ -120,6 +126,16 @@ def ensure_db(db_path: str = DEFAULT_DB_PATH) -> None:
             conn.execute("ALTER TABLE nodes ADD COLUMN desired_pool_version INTEGER NOT NULL DEFAULT 0")
         if "agent_ack_version" not in columns:
             conn.execute("ALTER TABLE nodes ADD COLUMN agent_ack_version INTEGER NOT NULL DEFAULT 0")
+
+        # Traffic reset related columns (panel -> agent)
+        if "desired_traffic_reset_version" not in columns:
+            conn.execute("ALTER TABLE nodes ADD COLUMN desired_traffic_reset_version INTEGER NOT NULL DEFAULT 0")
+        if "agent_traffic_reset_ack_version" not in columns:
+            conn.execute("ALTER TABLE nodes ADD COLUMN agent_traffic_reset_ack_version INTEGER NOT NULL DEFAULT 0")
+        if "traffic_reset_at" not in columns:
+            conn.execute("ALTER TABLE nodes ADD COLUMN traffic_reset_at TEXT")
+        if "traffic_reset_msg" not in columns:
+            conn.execute("ALTER TABLE nodes ADD COLUMN traffic_reset_msg TEXT NOT NULL DEFAULT ''")
 
         # Agent update related columns
         if "desired_agent_version" not in columns:
@@ -228,20 +244,27 @@ def update_node_report(
     report_json: str,
     last_seen_at: str,
     agent_ack_version: Optional[int] = None,
+    traffic_ack_version: Optional[int] = None,
     db_path: str = DEFAULT_DB_PATH,
 ) -> None:
     """Persist last report from an agent (push mode)."""
     with connect(db_path) as conn:
-        if agent_ack_version is None:
-            conn.execute(
-                "UPDATE nodes SET last_seen_at=?, last_report_json=? WHERE id=?",
-                (last_seen_at, report_json, node_id),
-            )
-        else:
-            conn.execute(
-                "UPDATE nodes SET last_seen_at=?, last_report_json=?, agent_ack_version=? WHERE id=?",
-                (last_seen_at, report_json, int(agent_ack_version), node_id),
-            )
+        fields = ['last_seen_at=?', 'last_report_json=?']
+        vals = [last_seen_at, report_json]
+
+        if agent_ack_version is not None:
+            fields.append('agent_ack_version=?')
+            vals.append(int(agent_ack_version))
+
+        if traffic_ack_version is not None:
+            fields.append('agent_traffic_reset_ack_version=?')
+            vals.append(int(traffic_ack_version))
+
+        vals.append(int(node_id))
+        conn.execute(
+            f"UPDATE nodes SET {', '.join(fields)} WHERE id=?",
+            tuple(vals),
+        )
         conn.commit()
 
 
@@ -339,6 +362,43 @@ def set_desired_pool_version_exact(
         )
         conn.commit()
     return ver
+
+
+def bump_traffic_reset_version(
+    node_id: int,
+    db_path: str = DEFAULT_DB_PATH,
+) -> int:
+    """Bump desired_traffic_reset_version atomically and return new version.
+
+    This is used to queue a 'reset_traffic' command via agent push-report,
+    so panel can reset nodes that are not directly reachable.
+    """
+    with connect(db_path) as conn:
+        # Prefer RETURNING when available (SQLite >=3.35)
+        try:
+            row = conn.execute(
+                "UPDATE nodes SET desired_traffic_reset_version=desired_traffic_reset_version+1, traffic_reset_at=datetime('now') WHERE id=? RETURNING desired_traffic_reset_version",
+                (int(node_id),),
+            ).fetchone()
+            conn.commit()
+            return int(row[0]) if row else 0
+        except sqlite3.OperationalError:
+            try:
+                conn.execute('BEGIN IMMEDIATE')
+            except Exception:
+                pass
+            row = conn.execute(
+                'SELECT desired_traffic_reset_version FROM nodes WHERE id=?',
+                (int(node_id),),
+            ).fetchone()
+            cur_ver = int(row[0]) if row else 0
+            new_ver = cur_ver + 1
+            conn.execute(
+                "UPDATE nodes SET desired_traffic_reset_version=?, traffic_reset_at=datetime('now') WHERE id=?",
+                (new_ver, int(node_id)),
+            )
+            conn.commit()
+            return int(new_ver)
 
 
 def get_desired_pool(node_id: int, db_path: str = DEFAULT_DB_PATH) -> Tuple[int, Optional[Dict[str, Any]]]:

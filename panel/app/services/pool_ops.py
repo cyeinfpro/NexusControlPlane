@@ -85,7 +85,16 @@ def remove_endpoints_by_sync_id(pool: Dict[str, Any], sync_id: str) -> None:
 
 
 def upsert_endpoint_by_sync_id(pool: Dict[str, Any], sync_id: str, endpoint: Dict[str, Any]) -> None:
-    """Upsert an endpoint by extra_config.sync_id while preserving original ordering."""
+    """Upsert an endpoint by extra_config.sync_id while preserving original ordering.
+
+    Notes:
+      - If multiple endpoints share the same sync_id, only the first one keeps its slot,
+        others are dropped.
+      - When updating a sync endpoint, we try to preserve panel-side metadata fields
+        (e.g. remark / favorite / id / created_at / updated_at) from the existing endpoint
+        if the new endpoint does not explicitly provide them. This prevents metadata loss
+        during auto-sync updates.
+    """
     if not isinstance(pool, dict):
         return
     eps = pool.get("endpoints")
@@ -94,6 +103,7 @@ def upsert_endpoint_by_sync_id(pool: Dict[str, Any], sync_id: str, endpoint: Dic
         return
 
     keep_index: Optional[int] = None
+    old_ep: Optional[Dict[str, Any]] = None
     new_eps: list[Any] = []
     for ep in eps:
         if not isinstance(ep, dict):
@@ -104,9 +114,17 @@ def upsert_endpoint_by_sync_id(pool: Dict[str, Any], sync_id: str, endpoint: Dic
         if sid and str(sid) == str(sync_id):
             if keep_index is None:
                 keep_index = len(new_eps)
+                old_ep = ep
             # drop duplicates
             continue
         new_eps.append(ep)
+
+    # Preserve metadata from old endpoint when the new endpoint doesn't provide it.
+    # (Do NOT overwrite keys that the new endpoint explicitly sets, even if empty/False.)
+    if isinstance(old_ep, dict) and isinstance(endpoint, dict):
+        for k in ("id", "created_at", "updated_at", "remark", "favorite"):
+            if k in old_ep and k not in endpoint:
+                endpoint[k] = old_ep.get(k)
 
     if keep_index is None or keep_index < 0 or keep_index > len(new_eps):
         new_eps.append(endpoint)
@@ -114,7 +132,6 @@ def upsert_endpoint_by_sync_id(pool: Dict[str, Any], sync_id: str, endpoint: Dic
         new_eps.insert(keep_index, endpoint)
 
     pool["endpoints"] = new_eps
-
 
 def find_sync_listen_port(pool: Dict[str, Any], sync_id: str, role: Optional[str] = None) -> Optional[int]:
     """Find listen port for an endpoint identified by extra_config.sync_id."""
