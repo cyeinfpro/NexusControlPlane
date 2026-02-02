@@ -553,6 +553,12 @@ details.menu summary::-webkit-details-marker{display:none}
 /* Make pills inside rules table slightly denser */
 .rules-table .pill{padding:4px 8px;font-size:11px}
 
+/* Rule meta: favorite + remark */
+.rules-table td.listen .listen-line{display:flex;align-items:center;gap:8px}
+.rules-table td.listen .listen-text{overflow-wrap:anywhere;word-break:break-word}
+.rules-table .fav-btn.active{color:var(--warn);border-color:rgba(245,158,11,0.35);background:rgba(245,158,11,0.12)}
+.rule-remark{margin-top:4px;color:var(--muted);font-size:11px;line-height:1.25;overflow-wrap:anywhere;word-break:break-word}
+
 /* Inline action buttons (no dropdown) */
 .action-inline{display:inline-flex;align-items:center;justify-content:flex-end;gap:10px}
 .rules-actions{display:flex;gap:6px;flex-wrap:nowrap;justify-content:flex-end}
@@ -1180,6 +1186,35 @@ textarea,.textarea{min-height:90px;resize:vertical}
   max-width: 420px;
 }
 
+.node-tools .filter-pill{
+  display:flex;
+  align-items:center;
+  gap: 8px;
+  padding: 0 10px;
+  border-radius: 999px;
+  border:1px solid rgba(148,163,184,0.18);
+  background: rgba(11,15,20,0.20);
+  min-height: 34px;
+  flex: 0 0 auto;
+}
+
+.node-tools .filter-pill .filter-select{
+  appearance:none;
+  border:none;
+  outline:none;
+  background:transparent;
+  color: var(--text);
+  font-size: 12px;
+  padding: 0;
+  margin: 0;
+  width: auto;
+  min-width: 170px;
+}
+
+.node-tools .filter-pill .filter-select option{
+  color: initial;
+}
+
 .node-tools .search-pill input{
   border:none;
   outline:none;
@@ -1270,6 +1305,8 @@ textarea,.textarea{min-height:90px;resize:vertical}
   .node-main .meta{flex-wrap:wrap;}
   .node-tools .search-pill{flex:1 1 100%; width:100%;}
   .node-tools .search-pill input{min-width:0 !important; width:100%;}
+  .node-tools .filter-pill{flex:1 1 100%; width:100%;}
+  .node-tools .filter-pill .filter-select{min-width:0; width:100%;}
 }
 
 

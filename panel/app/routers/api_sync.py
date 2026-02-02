@@ -197,6 +197,52 @@ async def api_wss_tunnel_save(payload: Dict[str, Any], user: str = Depends(requi
 
     now_iso = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
+    # Panel-only meta (remark / favorite)
+    has_remark = "remark" in payload
+    has_favorite = "favorite" in payload
+
+    def _coerce_bool(v: Any) -> bool:
+        if isinstance(v, bool):
+            return v
+        s = str(v or "").strip().lower()
+        return s in ("1", "true", "yes", "y", "on")
+
+    def _find_meta(pool: Dict[str, Any]) -> Tuple[str, Optional[bool]]:
+        try:
+            for ep in (pool or {}).get("endpoints") or []:
+                if not isinstance(ep, dict):
+                    continue
+                ex0 = ep.get("extra_config") or {}
+                if not isinstance(ex0, dict):
+                    continue
+                if str(ex0.get("sync_id") or "") != str(sync_id):
+                    continue
+                r = str(ep.get("remark") or "").strip()
+                f_raw = ep.get("favorite")
+                f_val: Optional[bool] = None
+                if f_raw is not None:
+                    try:
+                        f_val = bool(f_raw)
+                    except Exception:
+                        f_val = None
+                return r, f_val
+        except Exception:
+            pass
+        return "", None
+
+    existing_remark = ""
+    existing_fav: Optional[bool] = None
+    if (not has_remark) or (not has_favorite):
+        r1, f1 = _find_meta(sender_pool)
+        r2, f2 = _find_meta(receiver_pool)
+        existing_remark = r1 or r2 or ""
+        existing_fav = f1 if f1 is not None else f2
+
+    remark = str(payload.get("remark") or "").strip() if has_remark else str(existing_remark or "").strip()
+    if len(remark) > 200:
+        remark = remark[:200]
+    favorite = _coerce_bool(payload.get("favorite")) if has_favorite else bool(existing_fav or False)
+
     sender_ep = {
         "listen": listen,
         "disabled": disabled,
@@ -220,6 +266,11 @@ async def api_wss_tunnel_save(payload: Dict[str, Any], user: str = Depends(requi
             "sync_updated_at": now_iso,
         },
     }
+
+    if remark:
+        sender_ep["remark"] = remark
+    if favorite:
+        sender_ep["favorite"] = True
 
     receiver_ep = {
         "listen": format_addr("0.0.0.0", receiver_port),
@@ -245,6 +296,11 @@ async def api_wss_tunnel_save(payload: Dict[str, Any], user: str = Depends(requi
             "sync_updated_at": now_iso,
         },
     }
+
+    if remark:
+        receiver_ep["remark"] = remark
+    if favorite:
+        receiver_ep["favorite"] = True
 
     upsert_endpoint_by_sync_id(sender_pool, sync_id, sender_ep)
     upsert_endpoint_by_sync_id(receiver_pool, sync_id, receiver_ep)
@@ -445,7 +501,55 @@ async def api_intranet_tunnel_save(payload: Dict[str, Any], user: str = Depends(
     except Exception:
         server_cert_pem = ""
 
+    receiver_pool = await load_pool_for_node(receiver)
+
     now_iso = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    # Panel-only meta (remark / favorite)
+    has_remark = "remark" in payload
+    has_favorite = "favorite" in payload
+
+    def _coerce_bool(v: Any) -> bool:
+        if isinstance(v, bool):
+            return v
+        s = str(v or "").strip().lower()
+        return s in ("1", "true", "yes", "y", "on")
+
+    def _find_meta(pool: Dict[str, Any]) -> Tuple[str, Optional[bool]]:
+        try:
+            for ep in (pool or {}).get("endpoints") or []:
+                if not isinstance(ep, dict):
+                    continue
+                ex0 = ep.get("extra_config") or {}
+                if not isinstance(ex0, dict):
+                    continue
+                if str(ex0.get("sync_id") or "") != str(sync_id):
+                    continue
+                r = str(ep.get("remark") or "").strip()
+                f_raw = ep.get("favorite")
+                f_val: Optional[bool] = None
+                if f_raw is not None:
+                    try:
+                        f_val = bool(f_raw)
+                    except Exception:
+                        f_val = None
+                return r, f_val
+        except Exception:
+            pass
+        return "", None
+
+    existing_remark = ""
+    existing_fav: Optional[bool] = None
+    if (not has_remark) or (not has_favorite):
+        r1, f1 = _find_meta(sender_pool)
+        r2, f2 = _find_meta(receiver_pool)
+        existing_remark = r1 or r2 or ""
+        existing_fav = f1 if f1 is not None else f2
+
+    remark = str(payload.get("remark") or "").strip() if has_remark else str(existing_remark or "").strip()
+    if len(remark) > 200:
+        remark = remark[:200]
+    favorite = _coerce_bool(payload.get("favorite")) if has_favorite else bool(existing_fav or False)
 
     sender_ep = {
         "listen": listen,
@@ -465,6 +569,11 @@ async def api_intranet_tunnel_save(payload: Dict[str, Any], user: str = Depends(
             "intranet_updated_at": now_iso,
         },
     }
+
+    if remark:
+        sender_ep["remark"] = remark
+    if favorite:
+        sender_ep["favorite"] = True
 
     receiver_ep = {
         "listen": format_addr("0.0.0.0", 0),
@@ -489,7 +598,10 @@ async def api_intranet_tunnel_save(payload: Dict[str, Any], user: str = Depends(
         },
     }
 
-    receiver_pool = await load_pool_for_node(receiver)
+    if remark:
+        receiver_ep["remark"] = remark
+    if favorite:
+        receiver_ep["favorite"] = True
 
     upsert_endpoint_by_sync_id(sender_pool, sync_id, sender_ep)
     upsert_endpoint_by_sync_id(receiver_pool, sync_id, receiver_ep)

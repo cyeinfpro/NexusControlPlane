@@ -96,13 +96,24 @@ function stripEditQueryParam(){
   }catch(_e){}
 }
 
-// Rules filter for quick search (listen / remote)
-let RULE_FILTER = '';
+// Rules search / filters
+// - RULE_FILTER_TEXT: full-text query (supports key:value syntax)
+// - RULE_QUICK_FILTER: quick select filter from UI
+let RULE_FILTER_TEXT = '';
+let RULE_QUICK_FILTER = '';
+let RULE_META_SAVING = false;
+
 function setRuleFilter(v){
-  RULE_FILTER = (v || '').trim();
+  RULE_FILTER_TEXT = String(v || '');
   renderRules();
 }
 window.setRuleFilter = setRuleFilter;
+
+function setRuleQuickFilter(v){
+  RULE_QUICK_FILTER = String(v || '').trim();
+  renderRules();
+}
+window.setRuleQuickFilter = setRuleQuickFilter;
 
 function showTab(name){
   document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
@@ -187,6 +198,292 @@ function formatRemoteForInput(e){
 function formatRemote(e){
   const rs = Array.isArray(e.remotes) ? e.remotes : (e.remote ? [e.remote] : []);
   return rs.join('\n');
+}
+
+function getRuleRemark(e){
+  const v = (e && (e.remark !== undefined)) ? e.remark : '';
+  return String(v || '').trim();
+}
+
+function isRuleFavorite(e){
+  const v = e && (e.favorite !== undefined) ? e.favorite : false;
+  return !!v;
+}
+
+function getFinalTargets(e){
+  // For synced tunnels, use original remotes as the "real" targets.
+  const ex = (e && e.extra_config) ? e.extra_config : {};
+  if(ex && ex.sync_role === 'sender' && Array.isArray(ex.sync_original_remotes)){
+    return ex.sync_original_remotes.map(x=>String(x||'').trim()).filter(Boolean);
+  }
+  if(ex && ex.intranet_role === 'server' && Array.isArray(ex.intranet_original_remotes)){
+    return ex.intranet_original_remotes.map(x=>String(x||'').trim()).filter(Boolean);
+  }
+  const rs = Array.isArray(e.remotes) ? e.remotes : (e.remote ? [e.remote] : []);
+  return rs.map(x=>String(x||'').trim()).filter(Boolean);
+}
+
+function getAllSearchTargets(e){
+  // Include both "current" remotes and "final" targets so searching works well for synced rules.
+  const out = [];
+  const seen = new Set();
+  const push = (arr)=>{
+    (arr||[]).forEach(x=>{
+      const s = String(x||'').trim();
+      if(!s) return;
+      if(seen.has(s)) return;
+      seen.add(s);
+      out.push(s);
+    });
+  };
+  push(Array.isArray(e && e.remotes) ? e.remotes : (e && e.remote ? [e.remote] : []));
+  push(getFinalTargets(e));
+  // also include extra_remotes if user imported old schema
+  push(Array.isArray(e && e.extra_remotes) ? e.extra_remotes : []);
+  return out;
+}
+
+function isLoadBalanceRule(e){
+  const targets = getFinalTargets(e);
+  return Array.isArray(targets) && targets.length > 1;
+}
+
+function getPeerText(e){
+  const ex = (e && e.extra_config) ? e.extra_config : {};
+  const parts = [];
+  if(ex){
+    if(ex.sync_peer_node_name) parts.push(ex.sync_peer_node_name);
+    if(ex.sync_from_node_name) parts.push(ex.sync_from_node_name);
+    if(ex.intranet_peer_node_name) parts.push(ex.intranet_peer_node_name);
+    if(ex.intranet_peer_host) parts.push(ex.intranet_peer_host);
+    if(ex.intranet_public_host) parts.push(ex.intranet_public_host);
+  }
+  return parts.map(x=>String(x||'').trim()).filter(Boolean).join(' ');
+}
+
+function buildRuleHaystack(e){
+  // A single string used for free-text matching.
+  // Keep this stable and inclusive so search "just works".
+  const parts = [];
+  parts.push(String(e && e.listen || ''));
+  parts.push(getAllSearchTargets(e).join(' '));
+  parts.push(getRuleRemark(e));
+  parts.push(endpointType(e));
+  parts.push(getPeerText(e));
+  parts.push(String(e && e.protocol || ''));
+  return parts.join(' \n ').toLowerCase();
+}
+
+function tokenizeQuery(text){
+  const raw = String(text || '').trim();
+  if(!raw) return [];
+  // Support quoted segments: "a b" and 'a b'
+  const re = /"([^"]*)"|'([^']*)'|(\S+)/g;
+  const out = [];
+  let m;
+  while((m = re.exec(raw)) !== null){
+    const tok = (m[1] !== undefined) ? m[1] : (m[2] !== undefined ? m[2] : m[3]);
+    if(tok === undefined) continue;
+    const s = String(tok).trim();
+    if(s) out.push(s);
+  }
+  return out;
+}
+
+function normQueryKey(key){
+  const k = String(key || '').trim().toLowerCase();
+  if(!k) return '';
+  if(k === 'l' || k === 'listen' || k === 'local') return 'listen';
+  if(k === 'r' || k === 'remote' || k === 'remotes' || k === 'target' || k === 'to') return 'remote';
+  if(k === 'm' || k === 'remark' || k === 'note' || k === 'memo') return 'remark';
+  if(k === 't' || k === 'type' || k === 'mode') return 'type';
+  if(k === 's' || k === 'status' || k === 'state') return 'status';
+  if(k === 'fav' || k === 'favorite' || k === 'star') return 'fav';
+  if(k === 'lb' || k === 'balance') return 'lb';
+  if(k === 'p' || k === 'port') return 'port';
+  if(k === 'peer' || k === 'node') return 'peer';
+  if(k === 'proto' || k === 'protocol') return 'protocol';
+  if(k === 'id') return 'id';
+  return k;
+}
+
+function addQueryKV(map, key, value){
+  const k = normQueryKey(key);
+  if(!k) return;
+  if(!map[k]) map[k] = [];
+  if(value === undefined || value === null) return;
+  const v = String(value).trim();
+  if(v === '') return;
+  map[k].push(v.toLowerCase());
+}
+
+function parseBoolLike(v){
+  if(typeof v === 'boolean') return v;
+  const s = String(v || '').trim().toLowerCase();
+  if(!s) return false;
+  return (s === '1' || s === 'true' || s === 'yes' || s === 'y' || s === 'on');
+}
+
+function parsePortExpr(expr){
+  const raw = String(expr || '').trim();
+  if(!raw) return null;
+  const m1 = raw.match(/^(>=|<=|>|<)\s*(\d+)$/);
+  if(m1){
+    return {op: m1[1], n: parseInt(m1[2], 10)};
+  }
+  const m2 = raw.match(/^(\d+)\s*-\s*(\d+)$/);
+  if(m2){
+    return {op: 'range', a: parseInt(m2[1], 10), b: parseInt(m2[2], 10)};
+  }
+  if(/^\d+$/.test(raw)){
+    return {op: '=', n: parseInt(raw, 10)};
+  }
+  return null;
+}
+
+function matchPort(portNum, expr){
+  const p = parseInt(portNum || 0, 10);
+  const e = parsePortExpr(expr);
+  if(!e) return false;
+  if(e.op === '=') return p === e.n;
+  if(e.op === '>') return p > e.n;
+  if(e.op === '>=') return p >= e.n;
+  if(e.op === '<') return p < e.n;
+  if(e.op === '<=') return p <= e.n;
+  if(e.op === 'range'){
+    const lo = Math.min(e.a, e.b);
+    const hi = Math.max(e.a, e.b);
+    return p >= lo && p <= hi;
+  }
+  return false;
+}
+
+function parseRuleQuery(input){
+  const q = {
+    terms: [],
+    negTerms: [],
+    kv: {},
+    not: {},
+  };
+  const tokens = tokenizeQuery(input);
+  for(const t0 of tokens){
+    let t = String(t0 || '').trim();
+    if(!t) continue;
+    let neg = false;
+    if(t.startsWith('-') && t.length > 1){
+      neg = true;
+      t = t.slice(1);
+    }
+    const lower = t.toLowerCase();
+    const idx = t.indexOf(':');
+    if(idx > 0){
+      const k = t.slice(0, idx);
+      const v = t.slice(idx+1);
+      if(neg) addQueryKV(q.not, k, v);
+      else addQueryKV(q.kv, k, v);
+      continue;
+    }
+    // Shorthands
+    const addS = (k, v)=>{ if(neg) addQueryKV(q.not, k, v); else addQueryKV(q.kv, k, v); };
+    if(['fav','favorite','star','★'].includes(lower)){ addS('fav', '1'); continue; }
+    if(['lb','balance','loadbalance'].includes(lower)){ addS('lb', '1'); continue; }
+    if(['remark','note','memo','备注'].includes(lower)){ addS('remark', '1'); continue; }
+    if(['running','enabled','on','up','运行'].includes(lower)){ addS('status', 'running'); continue; }
+    if(['disabled','paused','off','down','暂停'].includes(lower)){ addS('status', 'disabled'); continue; }
+    if(['wss','tcp','intranet'].includes(lower)){ addS('type', lower); continue; }
+    if(neg) q.negTerms.push(lower);
+    else q.terms.push(lower);
+  }
+  return q;
+}
+
+function matchRuleQuery(e, qobj){
+  const hay = buildRuleHaystack(e);
+
+  // Free-text terms (AND)
+  for(const term of (qobj.terms || [])){
+    if(!term) continue;
+    if(!hay.includes(String(term))) return false;
+  }
+  for(const term of (qobj.negTerms || [])){
+    if(!term) continue;
+    if(hay.includes(String(term))) return false;
+  }
+
+  const getListen = ()=>String(e && e.listen || '').toLowerCase();
+  const getRemote = ()=>getAllSearchTargets(e).join('\n').toLowerCase();
+  const getRemark = ()=>getRuleRemark(e).toLowerCase();
+  const getType = ()=>String(wssMode(e) || '').toLowerCase();
+  const getStatus = ()=> (e && e.disabled) ? 'disabled' : 'running';
+  const getPeer = ()=>getPeerText(e).toLowerCase();
+  const getProtocol = ()=>String(e && e.protocol || '').toLowerCase();
+  const getId = ()=>String(e && (e.id !== undefined ? e.id : '') || '').toLowerCase();
+  const portNum = parseListenToHostPort(String(e && e.listen || '')).port || '';
+
+  const matchOne = (key, val)=>{
+    const v = String(val || '').trim().toLowerCase();
+    if(!v && key !== 'remark' && key !== 'fav' && key !== 'lb') return false;
+    if(key === 'listen') return getListen().includes(v);
+    if(key === 'remote') return getRemote().includes(v);
+    if(key === 'remark'){
+      if(['1','true','yes','y','on'].includes(v)) return !!getRuleRemark(e);
+      if(['0','false','no','n','off'].includes(v)) return !getRuleRemark(e);
+      return getRemark().includes(v);
+    }
+    if(key === 'fav'){
+      if(['1','true','yes','y','on'].includes(v)) return isRuleFavorite(e);
+      if(['0','false','no','n','off'].includes(v)) return !isRuleFavorite(e);
+      // default: treat any value as true
+      return isRuleFavorite(e);
+    }
+    if(key === 'lb'){
+      if(['1','true','yes','y','on'].includes(v)) return isLoadBalanceRule(e);
+      if(['0','false','no','n','off'].includes(v)) return !isLoadBalanceRule(e);
+      return isLoadBalanceRule(e);
+    }
+    if(key === 'status'){
+      if(['running','enabled','on','up','运行'].includes(v)) return !e.disabled;
+      if(['disabled','paused','off','down','暂停'].includes(v)) return !!e.disabled;
+      return getStatus().includes(v);
+    }
+    if(key === 'type'){
+      // "tcp" matches the normal TCP/UDP rules (not wss/intranet)
+      if(v === 'tcp' || v === 'normal') return getType() === 'tcp';
+      if(v === 'wss') return getType() === 'wss';
+      if(v === 'intranet') return getType() === 'intranet';
+      return getType().includes(v);
+    }
+    if(key === 'port'){
+      const p = parseInt(portNum || 0, 10);
+      if(!p) return false;
+      return matchPort(p, v);
+    }
+    if(key === 'peer') return getPeer().includes(v);
+    if(key === 'protocol') return getProtocol().includes(v);
+    if(key === 'id') return getId().includes(v);
+    // fallback: search in hay
+    return hay.includes(v);
+  };
+
+  const applyKV = (kvMap, isNeg)=>{
+    for(const k of Object.keys(kvMap || {})){
+      const arr = kvMap[k] || [];
+      if(!arr.length) continue;
+      // OR within a key
+      const ok = arr.some(v=>matchOne(k, v));
+      if(isNeg){
+        if(ok) return false;
+      }else{
+        if(!ok) return false;
+      }
+    }
+    return true;
+  };
+
+  if(!applyKV(qobj.kv, false)) return false;
+  if(!applyKV(qobj.not, true)) return false;
+
+  return true;
 }
 
 function renderRemoteTargets(e, idx){
@@ -1065,12 +1362,20 @@ function renderRuleCard(e, idx, rowNo, stats, statsError){
   const activeTitle = statsError ? '' : `title="当前已建立连接：${est}"`;
   const lockInfo = getRuleLockInfo(e);
 
+  const fav = isRuleFavorite(e);
+  const favBtn = `<button class="btn xs icon ghost fav-btn ${fav ? 'active' : ''}" title="${fav ? '取消收藏' : '收藏'}" onclick="toggleFavorite(${idx}, event)">${fav ? '★' : '☆'}</button>`;
+
+  const remark = getRuleRemark(e);
+  const remarkHtml = remark ? `<div class="rule-remark" title="${escapeHtml(remark)}">${escapeHtml(remark)}</div>` : '';
+
   const actionsHtml = (lockInfo && lockInfo.locked) ? `
     <div class="rule-actions">
+      <button class="btn xs icon ghost" title="备注" onclick="editRemark(${idx}, event)">📝</button>
       <span class="pill ghost" title="${escapeHtml(lockInfo.reason || '该规则已锁定（只读）')}">🔒 已锁定</span>
     </div>
   ` : `
     <div class="rule-actions">
+      <button class="btn xs icon ghost" title="备注" onclick="editRemark(${idx}, event)">📝</button>
       <button class="btn xs icon ghost" title="编辑" onclick="editRule(${idx})">✎</button>
       <button class="btn xs icon" title="${e.disabled?'启用':'暂停'}" onclick="toggleRule(${idx})">${e.disabled?'▶':'⏸'}</button>
       <button class="btn xs icon ghost" title="删除" onclick="deleteRule(${idx})">🗑</button>
@@ -1082,10 +1387,12 @@ function renderRuleCard(e, idx, rowNo, stats, statsError){
       <div class="rule-left">
         <div class="rule-topline">
           <span class="rule-idx">#${rowNo}</span>
+          ${favBtn}
           ${statusPill(e)}
         </div>
         <div class="rule-listen mono">${escapeHtml(e.listen)}</div>
         <div class="rule-sub muted sm">${endpointType(e)}</div>
+        ${remarkHtml}
       </div>
       <div class="rule-right">
         <span class="pill ghost" ${activeTitle}>活跃 ${escapeHtml(connActive)}</span>
@@ -1113,23 +1420,35 @@ function renderRules(){
   // 小屏用卡片，大屏用表格
   const isMobile = window.matchMedia('(max-width: 1024px)').matches;
 
-  // Filter (listen / remote / remark)
-  const f = (RULE_FILTER || '').trim().toLowerCase();
+  // Search & filter
+  const quick = String(RULE_QUICK_FILTER || '').trim();
+  const queryText = String(RULE_FILTER_TEXT || '').trim();
+  const qobj = parseRuleQuery(queryText);
+  const hasAnyFilter = !!quick || !!queryText;
+
   const items = [];
   eps.forEach((e, idx)=>{
-    if(f){
-      const hay = `${e.listen||''}
-${formatRemote(e)}
-${(e.remark||'')}
-${endpointType(e)}`.toLowerCase();
-      if(!hay.includes(f)) return;
+    // Quick filter (UI)
+    if(quick){
+      if(quick === 'fav' && !isRuleFavorite(e)) return;
+      if(quick === 'running' && !!e.disabled) return;
+      if(quick === 'disabled' && !e.disabled) return;
+      if(quick === 'tcp' && wssMode(e) !== 'tcp') return;
+      if(quick === 'wss' && wssMode(e) !== 'wss') return;
+      if(quick === 'intranet' && wssMode(e) !== 'intranet') return;
+      if(quick === 'lb' && !isLoadBalanceRule(e)) return;
+      if(quick === 'remark' && !getRuleRemark(e)) return;
+    }
+    // Advanced query
+    if(queryText){
+      if(!matchRuleQuery(e, qobj)) return;
     }
     items.push({e, idx});
   });
 
   if(!items.length){
     q('rulesLoading').style.display = '';
-    q('rulesLoading').textContent = f ? '未找到匹配规则' : '暂无规则';
+    q('rulesLoading').textContent = hasAnyFilter ? '未找到匹配规则' : '暂无规则';
     table.style.display = 'none';
     if(mobileWrap) mobileWrap.style.display = 'none';
     if(statsLoading){
@@ -1167,23 +1486,33 @@ ${endpointType(e)}`.toLowerCase();
       const connActive = statsError ? 0 : (stats.connections_active ?? 0);
       const est = statsError ? 0 : (stats.connections_established ?? stats.connections ?? 0);
       const lockInfo = getRuleLockInfo(e);
+      const fav = isRuleFavorite(e);
+      const remark = getRuleRemark(e);
 
       const tr = document.createElement('tr');
       tr.innerHTML = `
         <td>${rowNo}</td>
         <td>${statusPill(e)}</td>
         <td class="listen">
-          <div class="mono">${escapeHtml(e.listen)}</div>
+          <div class="listen-line">
+            <button class="btn xs icon ghost fav-btn ${fav ? 'active' : ''}" title="${fav ? '取消收藏' : '收藏'}" onclick="toggleFavorite(${idx}, event)">${fav ? '★' : '☆'}</button>
+            <div class="mono listen-text">${escapeHtml(e.listen)}</div>
+          </div>
           <div class="muted sm">${endpointType(e)}</div>
+          ${remark ? `<div class="rule-remark" title="${escapeHtml(remark)}">${escapeHtml(remark)}</div>` : ''}
         </td>
         <td class="health">${healthHtml}</td>
         <td class="stat" title="当前已建立连接：${escapeHtml(est)}">${statsError ? '—' : escapeHtml(connActive)}</td>
         <td class="stat" ${statsError || total == null ? '' : `title="↓ ${escapeHtml(formatBytes(rx))}  ↑ ${escapeHtml(formatBytes(tx))}"`}>${total == null ? '—' : formatBytes(total)}</td>
         <td class="actions">
           ${lockInfo && lockInfo.locked ? `
-            <span class="pill ghost" title="${escapeHtml(lockInfo.reason || '该规则已锁定（只读）')}">🔒 已锁定</span>
+            <div class="action-inline">
+              <button class="btn xs icon ghost" title="备注" onclick="editRemark(${idx}, event)">📝</button>
+              <span class="pill ghost" title="${escapeHtml(lockInfo.reason || '该规则已锁定（只读）')}">🔒 已锁定</span>
+            </div>
           ` : `
             <div class="action-inline">
+              <button class="btn xs icon ghost" title="备注" onclick="editRemark(${idx}, event)">📝</button>
               <button class="btn xs icon ghost" title="编辑" onclick="editRule(${idx})">✎</button>
               <button class="btn xs icon" title="${e.disabled?'启用':'暂停'}" onclick="toggleRule(${idx})">${e.disabled?'▶':'⏸'}</button>
               <button class="btn xs icon ghost" title="删除" onclick="deleteRule(${idx})">🗑</button>
@@ -1801,6 +2130,8 @@ function newRule(){
   syncListenComputed();
 
   setField('f_remotes','');
+  if(q('f_remark')) setField('f_remark', '');
+  if(q('f_favorite')) q('f_favorite').checked = false;
   q('f_disabled').value = '0';
 
   // 新建规则：默认启用，不显示“状态”字段（更聚焦）
@@ -1857,6 +2188,10 @@ function editRule(idx){
   syncListenComputed();
   // synced sender rule should show original targets (not the peer receiver ip:port)
   setField('f_remotes', formatRemoteForInput(e));
+
+  // meta
+  if(q('f_remark')) setField('f_remark', getRuleRemark(e));
+  if(q('f_favorite')) q('f_favorite').checked = isRuleFavorite(e);
 
   q('f_disabled').value = e.disabled ? '1':'0';
   const balance = e.balance || 'roundrobin';
@@ -1943,6 +2278,8 @@ async function toggleRule(idx){
         disabled: newDisabled,
         balance: e.balance || 'roundrobin',
         protocol: e.protocol || 'tcp+udp',
+        remark: getRuleRemark(e),
+        favorite: isRuleFavorite(e),
         receiver_port: ex.sync_receiver_port,
         sync_id: ex.sync_id,
         wss: {
@@ -1981,6 +2318,8 @@ async function toggleRule(idx){
         disabled: newDisabled,
         balance: e.balance || 'roundrobin',
         protocol: e.protocol || 'tcp+udp',
+        remark: getRuleRemark(e),
+        favorite: isRuleFavorite(e),
         server_port: ex.intranet_server_port || 18443,
         sync_id: ex.sync_id
       };
@@ -2003,6 +2342,69 @@ async function toggleRule(idx){
   // Normal rule
   e.disabled = newDisabled;
   await savePool();
+  renderRules();
+}
+
+async function toggleFavorite(idx, ev){
+  try{
+    if(ev){
+      ev.preventDefault && ev.preventDefault();
+      ev.stopPropagation && ev.stopPropagation();
+    }
+  }catch(_e){}
+
+  if(RULE_META_SAVING) return;
+  const eps = (CURRENT_POOL && CURRENT_POOL.endpoints) ? CURRENT_POOL.endpoints : [];
+  const e = eps[idx];
+  if(!e) return;
+
+  const old = !!e.favorite;
+  if(old) delete e.favorite;
+  else e.favorite = true;
+
+  RULE_META_SAVING = true;
+  try{
+    await savePool(old ? '已取消收藏' : '已收藏');
+  }catch(err){
+    // Revert on failure
+    if(old) e.favorite = true;
+    else delete e.favorite;
+  }finally{
+    RULE_META_SAVING = false;
+  }
+  renderRules();
+}
+
+async function editRemark(idx, ev){
+  try{
+    if(ev){
+      ev.preventDefault && ev.preventDefault();
+      ev.stopPropagation && ev.stopPropagation();
+    }
+  }catch(_e){}
+
+  if(RULE_META_SAVING) return;
+  const eps = (CURRENT_POOL && CURRENT_POOL.endpoints) ? CURRENT_POOL.endpoints : [];
+  const e = eps[idx];
+  if(!e) return;
+
+  const old = getRuleRemark(e);
+  const next = prompt('规则备注（用于搜索/筛选，可留空清除）：', old);
+  if(next === null) return;
+  const v = String(next || '').trim();
+  if(v) e.remark = v;
+  else delete e.remark;
+
+  RULE_META_SAVING = true;
+  try{
+    await savePool('备注已保存');
+  }catch(err){
+    // Revert on failure
+    if(old) e.remark = old;
+    else delete e.remark;
+  }finally{
+    RULE_META_SAVING = false;
+  }
   renderRules();
 }
 
@@ -2080,6 +2482,10 @@ async function saveRule(){
   const remotes = remotesRaw.split('\n').map(x=>x.trim()).filter(Boolean).map(x=>x.replace('\\r',''));
   const disabled = (q('f_disabled').value === '1');
 
+  // meta
+  const remark = q('f_remark') ? String(q('f_remark').value || '').trim() : '';
+  const favorite = q('f_favorite') ? !!q('f_favorite').checked : false;
+
   // optional weights for roundrobin (comma separated)
   const weightsRaw = q('f_weights') ? (q('f_weights').value || '').trim() : '';
   const weights = weightsRaw ? weightsRaw.split(',').map(x=>x.trim()).filter(Boolean) : [];
@@ -2129,6 +2535,8 @@ async function saveRule(){
       disabled,
       balance: balanceStr,
       protocol,
+      remark,
+      favorite,
       receiver_port: receiverPortTxt ? parseInt(receiverPortTxt,10) : null,
       sync_id: syncId || undefined,
       wss
@@ -2177,6 +2585,8 @@ async function saveRule(){
       disabled,
       balance: balanceStr,
       protocol,
+      remark,
+      favorite,
       server_port,
       server_host: server_host || null,
       sync_id: syncId || undefined
@@ -2203,6 +2613,8 @@ async function saveRule(){
 
   // 普通转发（单机）
   const endpoint = { listen, remotes, disabled, balance: balanceStr, protocol };
+  if(remark) endpoint.remark = remark;
+  if(favorite) endpoint.favorite = true;
 
     try{
       setLoading(true);

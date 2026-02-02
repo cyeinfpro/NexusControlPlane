@@ -219,6 +219,28 @@ def sanitize_pool_fields(pool: Dict[str, Any]) -> None:
                 ):
                     if e.get(k) is not None and isinstance(e.get(k), str):
                         e[k] = e[k].strip()
+
+                # Panel-only meta fields
+                if e.get("remark") is not None:
+                    v = str(e.get("remark") or "").strip()
+                    if v:
+                        e["remark"] = v
+                    else:
+                        e.pop("remark", None)
+
+                if "favorite" in e:
+                    raw = e.get("favorite")
+                    fav = raw if isinstance(raw, bool) else str(raw or "").strip().lower() in (
+                        "1",
+                        "true",
+                        "yes",
+                        "y",
+                        "on",
+                    )
+                    if fav:
+                        e["favorite"] = True
+                    else:
+                        e.pop("favorite", None)
     except Exception:
         # Never break the caller.
         return

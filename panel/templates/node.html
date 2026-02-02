@@ -66,7 +66,22 @@
           <div class="right node-tools node-head-right" style="gap:10px; flex:0 0 auto; flex-wrap:wrap; justify-content:flex-end;">
             <div class="search-pill">
               <span class="muted">🔎</span>
-              <input class="input sm" id="ruleSearch" placeholder="搜索监听/目标…" oninput="setRuleFilter(this.value)">
+              <input class="input sm" id="ruleSearch" placeholder="搜索监听/目标/备注…（支持 type:wss status:running fav）" oninput="setRuleFilter(this.value)">
+            </div>
+
+            <div class="filter-pill" title="快速筛选">
+              <span class="muted">⛭</span>
+              <select id="ruleQuickFilter" class="filter-select" onchange="setRuleQuickFilter(this.value)">
+                <option value="">全部规则</option>
+                <option value="fav">仅收藏 ★</option>
+                <option value="running">运行中</option>
+                <option value="disabled">已暂停</option>
+                <option value="tcp">TCP/UDP</option>
+                <option value="wss">WSS 隧道</option>
+                <option value="intranet">内网穿透</option>
+                <option value="lb">负载均衡（多目标）</option>
+                <option value="remark">有备注</option>
+              </select>
             </div>
             <button class="btn sm" type="button" onclick="newRule()">+ 创建转发</button>
             <button class="btn sm ghost" type="button" id="autoRefreshBtn" onclick="toggleAutoRefresh()">⟳ 自动刷新：开</button>
@@ -353,6 +368,19 @@
 	        </label>
 	        <textarea class="textarea" id="f_remotes" rows="4" placeholder="203.0.113.10:443\n198.51.100.8:443"></textarea>
 	        <div class="help" id="remoteHelp"></div>
+
+	        <div class="row" style="gap:12px; align-items:flex-end;">
+	          <div class="col">
+	            <label class="label">备注 <span class="muted sm">（可选，用于搜索/筛选）</span></label>
+	            <input class="input" id="f_remark" placeholder="例如：客户A / 临时测试 / 走CF">
+	          </div>
+	          <div class="col" style="max-width:220px;">
+	            <label class="help" style="margin:0;">
+	              <input type="checkbox" id="f_favorite" style="transform:translateY(1px);">
+	              收藏（★）
+	            </label>
+	          </div>
+	        </div>
 	      </div>
 
 	      <details class="advanced-details" id="advancedDetails">
@@ -516,7 +544,7 @@
 {% endblock %}
 
 {% block scripts %}
-<script src="/static/app.js?v=67.0"></script>
+<script src="/static/app.js?v=68.0"></script>
 <script>
 window.__NODE_ID__ = {{ node.id }};
 window.__NODE_IP__ = {{ (node.display_ip or node.name)|tojson }};
