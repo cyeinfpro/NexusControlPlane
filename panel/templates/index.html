@@ -17,6 +17,12 @@
         <button class="menu-item" type="button" onclick="openRestoreFullModal()">全量恢复</button>
       </div>
     </details>
+    <details class="menu">
+      <summary class="btn sm ghost" aria-label="批量操作">批量操作 ▾</summary>
+      <div class="menu-pop">
+        <button class="menu-item" type="button" onclick="resetAllTraffic()">一键重置流量 <span class="muted sm">规则统计清零</span></button>
+      </div>
+    </details>
     <button class="btn sm secondary" type="button" onclick="openAgentUpdateModal()">一键更新 Agent</button>
     <button class="btn sm" type="button" onclick="openAddNodeModal()">接入节点</button>
   </div>
@@ -302,5 +308,5 @@
 {% endblock %}
 
 {% block scripts %}
-<script src="/static/app.js?v=66.0"></script>
+<script src="/static/app.js?v=67.0"></script>
 {% endblock %}

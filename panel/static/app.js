@@ -2448,7 +2448,77 @@ async function purgeAllRules(){
 }
 window.purgeAllRules = purgeAllRules;
 
-async function refreshStats(){
+async function resetNodeTraffic(){
+  const nodeId = window.__NODE_ID__;
+  if(!nodeId){ toast('缺少节点ID', true); return; }
+
+  const ok = confirm(
+    '确认重置当前节点的“规则流量统计/连接计数”？\n\n' +
+    '说明：\n' +
+    '1) 会清空该节点所有规则的流量/连接累计（面板显示从 0 重新开始）；\n' +
+    '2) 不会删除/修改任何规则；\n' +
+    '3) 历史统计无法恢复。'
+  );
+  if(!ok) return;
+
+  try{
+    toast('正在重置…');
+    const res = await fetchJSON(`/api/nodes/${nodeId}/traffic/reset`, {
+      method: 'POST',
+      body: JSON.stringify({})
+    });
+    if(res && res.ok){
+      toast('已重置：正在刷新统计…');
+      // Force agent stats to avoid 3s push-report cache showing old values
+      await refreshStats(true);
+    }else{
+      toast((res && res.error) ? res.error : '重置失败', true);
+    }
+  }catch(err){
+    toast('重置失败：' + (err && err.message ? err.message : String(err)), true);
+  }
+}
+window.resetNodeTraffic = resetNodeTraffic;
+
+
+async function resetAllTraffic(){
+  const ok1 = confirm(
+    '⚠️ 批量操作：将对所有已接入节点执行“重置规则流量统计”。\n\n' +
+    '离线/不可达节点会失败，但不影响其它节点。\n\n' +
+    '是否继续？'
+  );
+  if(!ok1) return;
+
+  try{
+    toast('正在对所有节点重置…');
+    const res = await fetchJSON('/api/traffic/reset_all', { method:'POST', body: JSON.stringify({}) });
+    if(res && res.ok){
+      const okN = res.ok_count ?? 0;
+      const failN = res.fail_count ?? 0;
+      toast(`已完成：成功 ${okN}，失败 ${failN}` + (failN ? '（点击查看详情）' : ''));
+
+      if(failN && Array.isArray(res.results)){
+        const failed = res.results.filter(r=>!r.ok);
+        const lines = failed.slice(0, 30).map(r=>{
+          const name = r.name || ('Node-' + r.node_id);
+          const err = r.error || 'failed';
+          return `${name}: ${err}`;
+        });
+        const more = failed.length > 30 ? `\n… 还有 ${failed.length - 30} 个失败节点未展示` : '';
+        alert('以下节点重置失败：\n\n' + lines.join('\n') + more);
+      }
+    }else{
+      toast((res && res.error) ? res.error : '重置失败', true);
+    }
+  }catch(err){
+    toast('重置失败：' + (err && err.message ? err.message : String(err)), true);
+  }
+}
+window.resetAllTraffic = resetAllTraffic;
+
+
+
+async function refreshStats(forceAgent=false){
   const id = window.__NODE_ID__;
   const loading = q('statsLoading');
   if(loading){
@@ -2456,7 +2526,8 @@ async function refreshStats(){
     loading.textContent = '正在加载流量统计…';
   }
   try{
-    const statsData = await fetchJSON(`/api/nodes/${id}/stats`);
+    const statsUrl = `/api/nodes/${id}/stats` + (forceAgent ? `?force=1` : ``);
+    const statsData = await fetchJSON(statsUrl);
     CURRENT_STATS = statsData;
   }catch(e){
     CURRENT_STATS = { ok: false, error: e.message, rules: [] };

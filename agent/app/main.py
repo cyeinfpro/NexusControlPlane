@@ -18,7 +18,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Body, Depends, FastAPI, HTTPException, Request
 import requests
 
 from .config import CFG
@@ -2590,6 +2590,118 @@ def _build_stats_snapshot() -> Dict[str, Any]:
         resp['warning'] = ss_err
     return resp
 
+
+def _reset_traffic_stats(
+    reset_iptables: bool = True,
+    reset_baseline: bool = True,
+    reset_ss_cache: bool = True,
+    reset_conn_history: bool = True,
+) -> Dict[str, Any]:
+    """Reset traffic/connection statistics for the *rule* counters.
+
+    What this does:
+    - Optionally zero iptables counters for REALMCOUNT_IN / REALMCOUNT_OUT / REALMCONN_IN.
+    - Clear traffic baseline state file so UI starts from 0.
+    - Clear in-memory ss/conn caches (fallback mode).
+
+    What this does NOT do:
+    - It does not reset system /proc netdev counters (node total traffic since boot).
+    """
+    out: Dict[str, Any] = {
+        "iptables": {},
+        "baseline": {"cleared": False},
+        "memory": {"cleared": False},
+    }
+
+    # 1) iptables counters
+    if reset_iptables and _iptables_available():
+        for ch in (IPT_CHAIN_IN, IPT_CHAIN_OUT, IPT_CHAIN_CONN_IN):
+            if not ch:
+                continue
+            rc, _o, _e = _run_iptables(['-t', IPT_TABLE, '-Z', ch])
+            out["iptables"][ch] = (rc == 0)
+    else:
+        out["iptables"]["enabled"] = False
+
+    # 2) baseline state file
+    if reset_baseline:
+        with _TRAFFIC_STATE_LOCK:
+            try:
+                _load_traffic_state_locked()
+            except Exception:
+                pass
+            try:
+                _TRAFFIC_STATE.clear()
+            except Exception:
+                pass
+            # Force reload-from-disk next time (disk is deleted below)
+            global _TRAFFIC_STATE_LOADED, _TRAFFIC_STATE_DIRTY
+            _TRAFFIC_STATE_LOADED = False
+            _TRAFFIC_STATE_DIRTY = False
+            try:
+                if TRAFFIC_STATE_FILE.exists():
+                    TRAFFIC_STATE_FILE.unlink()
+            except Exception:
+                pass
+        out["baseline"]["cleared"] = True
+
+    # 3) in-memory caches (ss fallback + conn window)
+    if reset_ss_cache:
+        try:
+            with _TRAFFIC_LOCK:
+                TRAFFIC_TOTALS.clear()
+        except Exception:
+            pass
+        try:
+            with _SS_CACHE_LOCK:
+                global _SS_CACHE_TS, _SS_CACHE_DATA, _SS_CACHE_ERR
+                _SS_CACHE_TS = 0.0
+                _SS_CACHE_DATA = {}
+                _SS_CACHE_ERR = None
+        except Exception:
+            pass
+
+    if reset_conn_history:
+        try:
+            with _CONN_HISTORY_LOCK:
+                _CONN_TOTAL_HISTORY.clear()
+        except Exception:
+            pass
+
+    out["memory"]["cleared"] = True
+    return out
+
+
+@app.post('/api/v1/traffic/reset')
+def api_traffic_reset(
+    payload: Dict[str, Any] = Body(default={}),
+    _: None = Depends(_api_key_required),
+) -> Dict[str, Any]:
+    """Reset rule traffic counters.
+
+    Panel usage:
+    - POST /api/v1/traffic/reset {}
+    """
+    if not isinstance(payload, dict):
+        payload = {}
+
+    reset_iptables = bool(payload.get("reset_iptables", True))
+    reset_baseline = bool(payload.get("reset_baseline", True))
+    reset_ss_cache = bool(payload.get("reset_ss_cache", True))
+    reset_conn_history = bool(payload.get("reset_conn_history", True))
+
+    detail = _reset_traffic_stats(
+        reset_iptables=reset_iptables,
+        reset_baseline=reset_baseline,
+        reset_ss_cache=reset_ss_cache,
+        reset_conn_history=reset_conn_history,
+    )
+
+    return {
+        "ok": True,
+        "time": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        "detail": detail,
+    }
 
 @app.get('/api/v1/stats')
 def api_stats(_: None = Depends(_api_key_required)) -> Dict[str, Any]:

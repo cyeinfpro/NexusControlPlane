@@ -1013,14 +1013,34 @@ async def api_apply(request: Request, node_id: int, user: str = Depends(require_
         return {"ok": False, "error": "Agent 无法访问，且面板无缓存规则（请检查网络或等待 Agent 上报）"}
 
 
+
+@router.post("/api/nodes/{node_id}/traffic/reset")
+async def api_reset_traffic(request: Request, node_id: int, user: str = Depends(require_login)):
+    """Reset rule traffic counters on a node."""
+    node = get_node(node_id)
+    if not node:
+        return JSONResponse({"ok": False, "error": "节点不存在"}, status_code=404)
+    try:
+        data = await agent_post(
+            node["base_url"],
+            node["api_key"],
+            "/api/v1/traffic/reset",
+            {},
+            node_verify_tls(node),
+        )
+        return data
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
+
+
 @router.get("/api/nodes/{node_id}/stats")
-async def api_stats(request: Request, node_id: int, user: str = Depends(require_login)):
+async def api_stats(request: Request, node_id: int, force: int = 0, user: str = Depends(require_login)):
     node = get_node(node_id)
     if not node:
         return JSONResponse({"ok": False, "error": "节点不存在"}, status_code=404)
 
-    # Push-report cache
-    if is_report_fresh(node):
+    # Push-report cache (unless forced)
+    if not force and is_report_fresh(node):
         rep = get_last_report(node_id)
         if isinstance(rep, dict) and isinstance(rep.get("stats"), dict):
             out = rep["stats"]
@@ -1135,3 +1155,37 @@ async def api_graph(request: Request, node_id: int, user: str = Depends(require_
             )
 
     return {"ok": True, "elements": elements}
+
+
+@router.post("/api/traffic/reset_all")
+async def api_reset_all_traffic(request: Request, user: str = Depends(require_login)):
+    """Reset rule traffic counters for all nodes (best-effort)."""
+    nodes = list_nodes()
+    if not nodes:
+        return {"ok": True, "total": 0, "ok_count": 0, "fail_count": 0, "results": []}
+
+    sem = asyncio.Semaphore(10)
+
+    async def _one(n: Dict[str, Any]) -> Dict[str, Any]:
+        nid = int(n.get("id") or 0)
+        name = n.get("name") or f"Node-{nid}"
+        async with sem:
+            try:
+                data = await agent_post(
+                    n.get("base_url", ""),
+                    n.get("api_key", ""),
+                    "/api/v1/traffic/reset",
+                    {},
+                    node_verify_tls(n),
+                    timeout=8.0,
+                )
+                ok = bool((data or {}).get("ok", True)) if isinstance(data, dict) else True
+                return {"node_id": nid, "name": name, "ok": ok, "detail": data if isinstance(data, dict) else {}}
+            except Exception as exc:
+                return {"node_id": nid, "name": name, "ok": False, "error": str(exc)}
+
+    results = await asyncio.gather(*[_one(n) for n in nodes])
+    ok_count = sum(1 for r in results if r.get("ok"))
+    fail_count = max(0, len(results) - ok_count)
+    return {"ok": True, "total": len(results), "ok_count": ok_count, "fail_count": fail_count, "results": results}
+
