@@ -28,6 +28,7 @@ API_KEY_FILE = Path('/etc/realm-agent/api.key')
 ACK_VER_FILE = Path('/etc/realm-agent/panel_ack.version')
 UPDATE_STATE_FILE = Path('/etc/realm-agent/agent_update.json')
 TRAFFIC_STATE_FILE = Path('/etc/realm-agent/traffic_state.json')
+TRAFFIC_RESET_ACK_FILE = Path('/etc/realm-agent/traffic_reset_ack.version')
 POOL_FULL = Path('/etc/realm/pool_full.json')
 POOL_ACTIVE = Path('/etc/realm/pool.json')
 POOL_RUN_FILTER = Path('/etc/realm/pool_to_run.jq')
@@ -1521,7 +1522,7 @@ def _wss_probe_entries(rule: Dict[str, Any]) -> List[Dict[str, str]]:
     return entries
 
 
-app = FastAPI(title='Realm Agent', version='41')
+app = FastAPI(title='Realm Agent', version='42')
 REALM_SERVICE_NAMES = [s for s in [CFG.realm_service, 'realm.service', 'realm'] if s]
 
 
@@ -1954,6 +1955,49 @@ echo \"[update] done\" | tee -a \"$LOG\"
         })
         _save_update_state(st)
 
+
+
+def _apply_reset_traffic_cmd(cmd: Dict[str, Any]) -> None:
+    """Reset rule traffic counters when panel requests it (push-report command).
+
+    cmd format (signed):
+      {type:'reset_traffic', version:int,
+       reset_iptables?:bool, reset_baseline?:bool, reset_ss_cache?:bool, reset_conn_history?:bool,
+       ts:int, nonce:str, sig:str}
+
+    Notes:
+    - Uses a monotonic version to guarantee idempotency (no repeated resets on every report).
+    - On failure we DO NOT ack, so panel will retry on next report.
+    """
+    global _LAST_SYNC_ERROR
+    try:
+        ver = int(cmd.get('version') or 0)
+    except Exception:
+        ver = 0
+    if ver <= 0:
+        return
+
+    ack = _read_int(TRAFFIC_RESET_ACK_FILE, 0)
+    if ver <= ack:
+        return
+
+    reset_iptables = bool(cmd.get('reset_iptables', True))
+    reset_baseline = bool(cmd.get('reset_baseline', True))
+    reset_ss_cache = bool(cmd.get('reset_ss_cache', True))
+    reset_conn_history = bool(cmd.get('reset_conn_history', True))
+
+    try:
+        _reset_traffic_stats(
+            reset_iptables=reset_iptables,
+            reset_baseline=reset_baseline,
+            reset_ss_cache=reset_ss_cache,
+            reset_conn_history=reset_conn_history,
+        )
+        _write_int(TRAFFIC_RESET_ACK_FILE, ver)
+    except Exception as exc:
+        _LAST_SYNC_ERROR = f'reset_traffic 失败：{exc}'
+        return
+
 def _handle_panel_commands(cmds: Any) -> None:
     if not isinstance(cmds, list) or not cmds:
         return
@@ -1965,7 +2009,7 @@ def _handle_panel_commands(cmds: Any) -> None:
 
         # Signature required for panel commands that modify state
         t = str(cmd.get('type') or '').strip()
-        if t in ('sync_pool', 'pool_patch', 'update_agent'):
+        if t in ('sync_pool', 'pool_patch', 'update_agent', 'reset_traffic'):
             if not api_key or not _verify_cmd_sig(cmd, api_key):
                 # do not crash; keep reporting error for UI
                 global _LAST_SYNC_ERROR
@@ -1978,6 +2022,8 @@ def _handle_panel_commands(cmds: Any) -> None:
             _apply_pool_patch_cmd(cmd)
         elif t == 'update_agent':
             _apply_update_agent_cmd(cmd)
+        elif t == 'reset_traffic':
+            _apply_reset_traffic_cmd(cmd)
 
 def _push_loop() -> None:
     """后台上报线程。"""
@@ -2012,6 +2058,7 @@ def _push_loop() -> None:
             payload = {
                 'node_id': AGENT_ID,
                 'ack_version': ack,
+                'traffic_ack_version': _read_int(TRAFFIC_RESET_ACK_FILE, 0),
                 'agent_version': str(app.version),
                 'agent_update': _load_update_state(),
                 'report': _build_push_report(),

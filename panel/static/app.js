@@ -2468,9 +2468,14 @@ async function resetNodeTraffic(){
       body: JSON.stringify({})
     });
     if(res && res.ok){
-      toast('已重置：正在刷新统计…');
-      // Force agent stats to avoid 3s push-report cache showing old values
-      await refreshStats(true);
+      if(res.queued){
+        toast('已加入队列：等待节点上报后自动重置');
+        try{ await refreshStats(false); }catch(_e){}
+      }else{
+        toast('已重置：正在刷新统计…');
+        // Force agent stats to avoid 3s push-report cache showing old values
+        await refreshStats(true);
+      }
     }else{
       toast((res && res.error) ? res.error : '重置失败', true);
     }
@@ -2484,7 +2489,7 @@ window.resetNodeTraffic = resetNodeTraffic;
 async function resetAllTraffic(){
   const ok1 = confirm(
     '⚠️ 批量操作：将对所有已接入节点执行“重置规则流量统计”。\n\n' +
-    '离线/不可达节点会失败，但不影响其它节点。\n\n' +
+    '不可达节点将自动排队，待节点上报后执行（不需要逐台操作）。\n\n' +
     '是否继续？'
   );
   if(!ok1) return;
@@ -2494,18 +2499,39 @@ async function resetAllTraffic(){
     const res = await fetchJSON('/api/traffic/reset_all', { method:'POST', body: JSON.stringify({}) });
     if(res && res.ok){
       const okN = res.ok_count ?? 0;
+      const queuedN = res.queued_count ?? 0;
       const failN = res.fail_count ?? 0;
-      toast(`已完成：成功 ${okN}，失败 ${failN}` + (failN ? '（点击查看详情）' : ''));
+      const needDetail = (queuedN || failN);
+      toast(`已完成：成功 ${okN}，已排队 ${queuedN}，失败 ${failN}` + (needDetail ? '（点击查看详情）' : ''));
 
-      if(failN && Array.isArray(res.results)){
+      if(needDetail && Array.isArray(res.results)){
+        const queued = res.results.filter(r=>r.ok && r.queued);
         const failed = res.results.filter(r=>!r.ok);
-        const lines = failed.slice(0, 30).map(r=>{
-          const name = r.name || ('Node-' + r.node_id);
-          const err = r.error || 'failed';
-          return `${name}: ${err}`;
-        });
-        const more = failed.length > 30 ? `\n… 还有 ${failed.length - 30} 个失败节点未展示` : '';
-        alert('以下节点重置失败：\n\n' + lines.join('\n') + more);
+        let msg = '';
+
+        if(queued.length){
+          const lines = queued.slice(0, 30).map(r=>{
+            const name = r.name || ('Node-' + r.node_id);
+            const err = r.direct_error || '';
+            return err ? `${name}（直连失败已排队）：${err}` : `${name}（已排队）`;
+          });
+          const more = queued.length > 30 ? `\n… 还有 ${queued.length - 30} 个已排队节点未展示` : '';
+          msg += '以下节点已排队（等待节点上报后自动执行）：\n\n' + lines.join('\n') + more;
+        }
+
+        if(failed.length){
+          const lines = failed.slice(0, 30).map(r=>{
+            const name = r.name || ('Node-' + r.node_id);
+            const err = r.error || 'failed';
+            return `${name}: ${err}`;
+          });
+          const more = failed.length > 30 ? `\n… 还有 ${failed.length - 30} 个失败节点未展示` : '';
+          msg += (msg ? '\n\n' : '') + '以下节点重置失败（直连失败且排队也失败）：\n\n' + lines.join('\n') + more;
+        }
+
+        if(msg){
+          alert(msg);
+        }
       }
     }else{
       toast((res && res.error) ? res.error : '重置失败', true);
