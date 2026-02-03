@@ -103,6 +103,141 @@ let RULE_FILTER_TEXT = '';
 let RULE_QUICK_FILTER = '';
 let RULE_META_SAVING = false;
 
+// Rules selection (for bulk operations)
+// - Store selection by a stable key (sync_id for tunnels; listen+protocol for normal rules)
+let RULE_SELECTED_KEYS = new Set();
+let LAST_VISIBLE_RULE_KEYS = [];
+let BULK_ACTION_RUNNING = false;
+
+function getRuleKey(e){
+  if(!e) return '';
+  const ex = (e && e.extra_config) ? e.extra_config : {};
+  // WSS tunnel rules
+  if(ex && ex.sync_id && (ex.sync_role || ex.sync_peer_node_id || ex.sync_lock)){
+    return `wss:${String(ex.sync_id)}`;
+  }
+  // Intranet tunnel rules
+  if(ex && ex.sync_id && (ex.intranet_role || ex.intranet_peer_node_id || ex.intranet_lock)){
+    return `intranet:${String(ex.sync_id)}`;
+  }
+  // Normal rules (listen+protocol should be unique per node)
+  const listen = String(e.listen || '').trim();
+  const proto = String(e.protocol || 'tcp+udp').trim().toLowerCase();
+  return `tcp:${listen}|${proto}`;
+}
+
+function getSelectedRuleItems(){
+  const eps = (CURRENT_POOL && Array.isArray(CURRENT_POOL.endpoints)) ? CURRENT_POOL.endpoints : [];
+  const out = [];
+  for(let idx=0; idx<eps.length; idx++){
+    const e = eps[idx];
+    const k = getRuleKey(e);
+    if(k && RULE_SELECTED_KEYS.has(k)){
+      out.push({idx, e, key: k});
+    }
+  }
+  return out;
+}
+
+function clearRuleSelection(){
+  RULE_SELECTED_KEYS = new Set();
+  updateBulkBar();
+  renderRules();
+}
+window.clearRuleSelection = clearRuleSelection;
+
+function setRuleSelectedByIdx(idx, checked, ev){
+  try{
+    if(ev){
+      ev.preventDefault && ev.preventDefault();
+      ev.stopPropagation && ev.stopPropagation();
+    }
+  }catch(_e){}
+  const eps = (CURRENT_POOL && Array.isArray(CURRENT_POOL.endpoints)) ? CURRENT_POOL.endpoints : [];
+  const e = eps[idx];
+  if(!e) return;
+  const k = getRuleKey(e);
+  if(!k) return;
+  if(checked) RULE_SELECTED_KEYS.add(k);
+  else RULE_SELECTED_KEYS.delete(k);
+  updateBulkBar();
+  updateSelectAllCheckbox();
+}
+window.setRuleSelectedByIdx = setRuleSelectedByIdx;
+
+function toggleSelectAllVisible(checked){
+  const on = !!checked;
+  const eps = (CURRENT_POOL && Array.isArray(CURRENT_POOL.endpoints)) ? CURRENT_POOL.endpoints : [];
+  const keys = Array.isArray(LAST_VISIBLE_RULE_KEYS) ? LAST_VISIBLE_RULE_KEYS : [];
+  for(const k of keys){
+    if(!k) continue;
+    // Skip locked rules
+    let ep = null;
+    for(const e of eps){
+      if(getRuleKey(e) === k){ ep = e; break; }
+    }
+    if(ep){
+      const li = getRuleLockInfo(ep);
+      if(li && li.locked) continue;
+    }
+    if(on) RULE_SELECTED_KEYS.add(k);
+    else RULE_SELECTED_KEYS.delete(k);
+  }
+  updateBulkBar();
+  renderRules();
+}
+window.toggleSelectAllVisible = toggleSelectAllVisible;
+
+function updateSelectAllCheckbox(){
+  const cb = document.getElementById('rulesSelectAll');
+  if(!cb) return;
+  const keys = Array.isArray(LAST_VISIBLE_RULE_KEYS) ? LAST_VISIBLE_RULE_KEYS.filter(Boolean) : [];
+  if(keys.length === 0){
+    cb.checked = false;
+    cb.indeterminate = false;
+    return;
+  }
+  let sel = 0;
+  let selectable = 0;
+  const eps = (CURRENT_POOL && Array.isArray(CURRENT_POOL.endpoints)) ? CURRENT_POOL.endpoints : [];
+  for(const k of keys){
+    let ep = null;
+    for(const e of eps){
+      if(getRuleKey(e) === k){ ep = e; break; }
+    }
+    if(ep){
+      const li = getRuleLockInfo(ep);
+      if(li && li.locked) continue;
+    }
+    selectable += 1;
+    if(RULE_SELECTED_KEYS.has(k)) sel += 1;
+  }
+  if(selectable === 0){
+    cb.checked = false;
+    cb.indeterminate = false;
+    return;
+  }
+  cb.checked = (sel === selectable);
+  cb.indeterminate = (sel > 0 && sel < selectable);
+}
+
+function updateBulkBar(){
+  // Prune removed rules from selection
+  try{
+    const eps = (CURRENT_POOL && Array.isArray(CURRENT_POOL.endpoints)) ? CURRENT_POOL.endpoints : [];
+    const exist = new Set(eps.map(getRuleKey).filter(Boolean));
+    for(const k of Array.from(RULE_SELECTED_KEYS)){
+      if(!exist.has(k)) RULE_SELECTED_KEYS.delete(k);
+    }
+  }catch(_e){}
+
+  const bar = document.getElementById('bulkBar');
+  const label = document.getElementById('bulkCount');
+  const n = RULE_SELECTED_KEYS.size;
+  if(label) label.textContent = `已选 ${n}`;
+  if(bar) bar.style.display = n > 0 ? '' : 'none';
+}
+
 function setRuleFilter(v){
   RULE_FILTER_TEXT = String(v || '');
   renderRules();
@@ -1362,6 +1497,11 @@ function renderRuleCard(e, idx, rowNo, stats, statsError){
   const healthHtml = renderHealthMobile(stats.health, statsError, idx);
   const activeTitle = statsError ? '' : `title="当前已建立连接：${est}"`;
   const lockInfo = getRuleLockInfo(e);
+  const key = getRuleKey(e);
+  const sel = key && RULE_SELECTED_KEYS.has(key);
+  const selDisabled = !!(lockInfo && lockInfo.locked);
+  const selTitle = selDisabled ? (lockInfo.reason || '该规则已锁定不可批量操作') : '选择该规则（用于批量操作）';
+  const selHtml = `<input type="checkbox" class="rule-select" ${sel ? 'checked' : ''} ${selDisabled ? 'disabled' : ''} title="${escapeHtml(selTitle)}" onchange="setRuleSelectedByIdx(${idx}, this.checked, event)">`;
 
   const fav = isRuleFavorite(e);
   const favBtn = `<button class="btn xs icon ghost fav-btn ${fav ? 'active' : ''}" title="${fav ? '取消收藏' : '收藏'}" onclick="toggleFavorite(${idx}, event)">${fav ? '★' : '☆'}</button>`;
@@ -1371,11 +1511,13 @@ function renderRuleCard(e, idx, rowNo, stats, statsError){
 
   const actionsHtml = (lockInfo && lockInfo.locked) ? `
     <div class="rule-actions">
+      <button class="btn xs icon ghost" title="复制" onclick="copyRule(${idx})">⧉</button>
       <button class="btn xs icon ghost" title="备注" onclick="editRemark(${idx}, event)">📝</button>
       <span class="pill ghost" title="${escapeHtml(lockInfo.reason || '该规则已锁定（只读）')}">🔒 已锁定</span>
     </div>
   ` : `
     <div class="rule-actions">
+      <button class="btn xs icon ghost" title="复制" onclick="copyRule(${idx})">⧉</button>
       <button class="btn xs icon ghost" title="备注" onclick="editRemark(${idx}, event)">📝</button>
       <button class="btn xs icon ghost" title="编辑" onclick="editRule(${idx})">✎</button>
       <button class="btn xs icon" title="${e.disabled?'启用':'暂停'}" onclick="toggleRule(${idx})">${e.disabled?'▶':'⏸'}</button>
@@ -1387,6 +1529,7 @@ function renderRuleCard(e, idx, rowNo, stats, statsError){
     <div class="rule-head">
       <div class="rule-left">
         <div class="rule-topline">
+          ${selHtml}
           <span class="rule-idx">#${rowNo}</span>
           ${favBtn}
           ${statusPill(e)}
@@ -1444,10 +1587,16 @@ function renderRules(){
     if(queryText){
       if(!matchRuleQuery(e, qobj)) return;
     }
-    items.push({e, idx});
+    items.push({e, idx, key: getRuleKey(e)});
   });
 
+  // Update visible keys for bulk selection helpers
+  LAST_VISIBLE_RULE_KEYS = items.map(it=>it.key).filter(Boolean);
+
   if(!items.length){
+    LAST_VISIBLE_RULE_KEYS = [];
+    updateBulkBar();
+    updateSelectAllCheckbox();
     q('rulesLoading').style.display = '';
     q('rulesLoading').textContent = hasAnyFilter ? '未找到匹配规则' : '暂无规则';
     table.style.display = 'none';
@@ -1487,11 +1636,16 @@ function renderRules(){
       const connActive = statsError ? 0 : (stats.connections_active ?? 0);
       const est = statsError ? 0 : (stats.connections_established ?? stats.connections ?? 0);
       const lockInfo = getRuleLockInfo(e);
+      const key = getRuleKey(e);
+      const sel = key && RULE_SELECTED_KEYS.has(key);
+      const selDisabled = !!(lockInfo && lockInfo.locked);
+      const selTitle = selDisabled ? (lockInfo.reason || '该规则已锁定不可批量操作') : '选择该规则（用于批量操作）';
       const fav = isRuleFavorite(e);
       const remark = getRuleRemark(e);
 
       const tr = document.createElement('tr');
       tr.innerHTML = `
+        <td class="sel"><input type="checkbox" class="rule-select" ${sel ? 'checked' : ''} ${selDisabled ? 'disabled' : ''} title="${escapeHtml(selTitle)}" onchange="setRuleSelectedByIdx(${idx}, this.checked, event)"></td>
         <td>${rowNo}</td>
         <td>${statusPill(e)}</td>
         <td class="listen">
@@ -1508,11 +1662,13 @@ function renderRules(){
         <td class="actions">
           ${lockInfo && lockInfo.locked ? `
             <div class="action-inline">
+              <button class="btn xs icon ghost" title="复制" onclick="copyRule(${idx})">⧉</button>
               <button class="btn xs icon ghost" title="备注" onclick="editRemark(${idx}, event)">📝</button>
               <span class="pill ghost" title="${escapeHtml(lockInfo.reason || '该规则已锁定（只读）')}">🔒 已锁定</span>
             </div>
           ` : `
             <div class="action-inline">
+              <button class="btn xs icon ghost" title="复制" onclick="copyRule(${idx})">⧉</button>
               <button class="btn xs icon ghost" title="备注" onclick="editRemark(${idx}, event)">📝</button>
               <button class="btn xs icon ghost" title="编辑" onclick="editRule(${idx})">✎</button>
               <button class="btn xs icon" title="${e.disabled?'启用':'暂停'}" onclick="toggleRule(${idx})">${e.disabled?'▶':'⏸'}</button>
@@ -1532,6 +1688,10 @@ function renderRules(){
     if(mobileWrap) mobileWrap.style.display = 'none';
     table.style.display = '';
   }
+
+  // Bulk selection UI
+  updateBulkBar();
+  updateSelectAllCheckbox();
 }
 
 function openModal(){ q('modal').style.display = 'flex'; }
@@ -2502,6 +2662,132 @@ function newRule(){
   openModal();
 }
 
+// Copy an existing rule as a new draft (opens the editor with fields pre-filled)
+function copyRule(idx){
+  const eps = (CURRENT_POOL && Array.isArray(CURRENT_POOL.endpoints)) ? CURRENT_POOL.endpoints : [];
+  const src = eps[idx];
+  if(!src) return;
+
+  // Copy means "new", so clear edit index to avoid overwriting existing
+  CURRENT_EDIT_INDEX = -1;
+
+  // Show status field (copy should preserve enabled/disabled)
+  try{ const sc = q('statusCol'); if(sc) sc.style.display = ''; }catch(_e){}
+
+  q('modalTitle').textContent = `复制规则 #${idx+1}`;
+
+  // Listen: port-only UI
+  const lp = parseListenToHostPort(src.listen || '');
+  if(q('f_listen_host')) setField('f_listen_host', lp.host || '0.0.0.0');
+  if(q('f_listen_port')) setField('f_listen_port', lp.port || '');
+  syncListenComputed();
+
+  // Targets
+  setField('f_remotes', formatRemoteForInput(src));
+
+  // meta
+  if(q('f_remark')) setField('f_remark', getRuleRemark(src));
+  if(q('f_favorite')) q('f_favorite').checked = isRuleFavorite(src);
+
+  // status
+  q('f_disabled').value = src.disabled ? '1' : '0';
+
+  // balance + weights
+  const balance = src.balance || 'roundrobin';
+  q('f_balance').value = balance.startsWith('iphash') ? 'iphash' : 'roundrobin';
+  const weights = balance.startsWith('roundrobin:')
+    ? balance.split(':').slice(1).join(':').trim().split(',').map(x=>x.trim()).filter(Boolean)
+    : [];
+  setField('f_weights', weights.join(','));
+  q('f_protocol').value = src.protocol || 'tcp+udp';
+
+  // Decide which mode to copy:
+  // - tunnel sender/server rules keep their mode
+  // - receiver/client generated rules are copied as "tcp" to avoid incomplete peer metadata
+  const ex = (src && src.extra_config) ? src.extra_config : {};
+  let mode = wssMode(src);
+  if(mode === 'wss'){
+    if(!(ex && ex.sync_role === 'sender')) mode = 'tcp';
+  }
+  if(mode === 'intranet'){
+    if(!(ex && ex.intranet_role === 'server')) mode = 'tcp';
+  }
+  q('f_type').value = mode;
+
+  // Reset peer selectors first
+  if(q('f_wss_receiver_node')) setField('f_wss_receiver_node','');
+  if(q('f_wss_receiver_port')) setField('f_wss_receiver_port','');
+  if(q('f_intranet_receiver_node')) setField('f_intranet_receiver_node','');
+  if(q('f_intranet_server_port')) setField('f_intranet_server_port','18443');
+
+  // Fill mode-specific fields
+  if(mode === 'wss'){
+    if(q('f_wss_receiver_node')) setField('f_wss_receiver_node', ex.sync_peer_node_id ? String(ex.sync_peer_node_id) : '');
+    if(q('f_wss_receiver_port')) setField('f_wss_receiver_port', ex.sync_receiver_port ? String(ex.sync_receiver_port) : '');
+    populateReceiverSelect();
+    fillWssFields(src);
+    fillIntranetFields({});
+    fillCommonAdvancedFields({});
+  }else if(mode === 'intranet'){
+    populateIntranetReceiverSelect();
+    fillIntranetFields(src);
+    fillWssFields({});
+    fillCommonAdvancedFields({});
+  }else{
+    // normal
+    fillWssFields({});
+    fillIntranetFields({});
+    fillCommonAdvancedFields(src);
+  }
+
+  showWssBox();
+
+  // Close/open advanced panel based on non-default values (same heuristic as edit)
+  const adv = document.getElementById('advancedDetails');
+  if(adv){
+    let openAdv = false;
+    try{
+      const host = getListenHost();
+      if(host && host !== '0.0.0.0') openAdv = true;
+      if(q('f_protocol') && String(q('f_protocol').value || '') !== 'tcp+udp') openAdv = true;
+      if(q('f_balance') && String(q('f_balance').value || '') !== 'roundrobin') openAdv = true;
+      if(q('f_weights') && String(q('f_weights').value || '').trim()) openAdv = true;
+
+      const m = q('f_type') ? String(q('f_type').value || 'tcp') : 'tcp';
+      if(m === 'intranet'){
+        if(q('f_intranet_server_port') && String(q('f_intranet_server_port').value || '').trim() && String(q('f_intranet_server_port').value).trim() !== '18443') openAdv = true;
+        if(q('f_intranet_server_host') && String(q('f_intranet_server_host').value || '').trim()) openAdv = true;
+      }else if(m === 'wss'){
+        if(q('f_wss_receiver_port') && String(q('f_wss_receiver_port').value || '').trim()) openAdv = true;
+        if(q('f_wss_tls') && String(q('f_wss_tls').value || '1') !== '1') openAdv = true;
+        if(q('f_wss_insecure') && q('f_wss_insecure').checked === false) openAdv = true;
+      }else{
+        // tcp/common advanced
+        if(q('f_through') && String(q('f_through').value || '').trim()) openAdv = true;
+        if(q('f_interface') && String(q('f_interface').value || '').trim()) openAdv = true;
+        if(q('f_listen_interface') && String(q('f_listen_interface').value || '').trim()) openAdv = true;
+        if(q('f_accept_proxy') && String(q('f_accept_proxy').value || '').trim()) openAdv = true;
+        if(q('f_accept_proxy_timeout') && String(q('f_accept_proxy_timeout').value || '').trim()) openAdv = true;
+        if(q('f_send_proxy') && String(q('f_send_proxy').value || '').trim()) openAdv = true;
+        if(q('f_send_proxy_version') && String(q('f_send_proxy_version').value || '').trim()) openAdv = true;
+        if(q('f_send_mptcp') && String(q('f_send_mptcp').value || '').trim()) openAdv = true;
+        if(q('f_accept_mptcp') && String(q('f_accept_mptcp').value || '').trim()) openAdv = true;
+        if(q('f_net_tcp_timeout') && String(q('f_net_tcp_timeout').value || '').trim()) openAdv = true;
+        if(q('f_net_udp_timeout') && String(q('f_net_udp_timeout').value || '').trim()) openAdv = true;
+        if(q('f_net_tcp_keepalive') && String(q('f_net_tcp_keepalive').value || '').trim()) openAdv = true;
+        if(q('f_net_tcp_keepalive_probe') && String(q('f_net_tcp_keepalive_probe').value || '').trim()) openAdv = true;
+        if(q('f_net_ipv6_only') && String(q('f_net_ipv6_only').value || '').trim()) openAdv = true;
+        if(q('f_listen_transport') && String(q('f_listen_transport').value || '').trim()) openAdv = true;
+        if(q('f_remote_transport') && String(q('f_remote_transport').value || '').trim()) openAdv = true;
+      }
+    }catch(_e){}
+    adv.open = openAdv;
+  }
+
+  openModal();
+}
+window.copyRule = copyRule;
+
 function editRule(idx){
   CURRENT_EDIT_INDEX = idx;
   const e = CURRENT_POOL.endpoints[idx];
@@ -2836,6 +3122,253 @@ async function deleteRule(idx){
   await savePool();
   renderRules();
 }
+
+// -------------------- Bulk operations --------------------
+
+async function bulkSetDisabled(disabled){
+  if(BULK_ACTION_RUNNING) return;
+  const wantDisabled = !!disabled;
+  const actionName = wantDisabled ? '暂停' : '启用';
+  const items = getSelectedRuleItems();
+  if(!items.length){
+    toast('请先勾选需要批量操作的规则', true);
+    return;
+  }
+
+  let ok = 0;
+  let skipped = 0;
+  let failed = 0;
+
+  // Keys for normal rules (handled in one savePool)
+  const normalKeys = [];
+
+  BULK_ACTION_RUNNING = true;
+  try{
+    setLoading(true);
+
+    // 1) Handle synced tunnel sender rules first (server-side API returns updated pools)
+    for(const it of items){
+      const e = it.e;
+      if(!e) continue;
+      const li = getRuleLockInfo(e);
+      if(li && li.locked){
+        skipped += 1;
+        continue;
+      }
+      const ex = (e && e.extra_config) ? e.extra_config : {};
+
+      // WSS sender: update both sides
+      if(ex && ex.sync_id && ex.sync_role === 'sender' && ex.sync_peer_node_id){
+        try{
+          const payload = {
+            sender_node_id: window.__NODE_ID__,
+            receiver_node_id: ex.sync_peer_node_id,
+            listen: e.listen,
+            remotes: ex.sync_original_remotes || [],
+            disabled: wantDisabled,
+            balance: e.balance || 'roundrobin',
+            protocol: e.protocol || 'tcp+udp',
+            remark: getRuleRemark(e),
+            favorite: isRuleFavorite(e),
+            receiver_port: ex.sync_receiver_port,
+            sync_id: ex.sync_id,
+            wss: {
+              host: ex.remote_ws_host || '',
+              path: ex.remote_ws_path || '',
+              sni: ex.remote_tls_sni || '',
+              tls: ex.remote_tls_enabled !== false,
+              insecure: ex.remote_tls_insecure === true
+            }
+          };
+          const res = await fetchJSON('/api/wss_tunnel/save', {method:'POST', body: JSON.stringify(payload)});
+          if(res && res.ok){
+            CURRENT_POOL = res.sender_pool;
+            ok += 1;
+          }else{
+            failed += 1;
+          }
+        }catch(err){
+          failed += 1;
+        }
+        continue;
+      }
+
+      // Intranet server: update both sides
+      if(ex && ex.sync_id && ex.intranet_role === 'server' && ex.intranet_peer_node_id){
+        try{
+          const payload = {
+            sender_node_id: window.__NODE_ID__,
+            receiver_node_id: ex.intranet_peer_node_id,
+            listen: e.listen,
+            remotes: ex.intranet_original_remotes || e.remotes || [],
+            disabled: wantDisabled,
+            balance: e.balance || 'roundrobin',
+            protocol: e.protocol || 'tcp+udp',
+            remark: getRuleRemark(e),
+            favorite: isRuleFavorite(e),
+            server_port: ex.intranet_server_port || 18443,
+            sync_id: ex.sync_id
+          };
+          const res = await fetchJSON('/api/intranet_tunnel/save', {method:'POST', body: JSON.stringify(payload)});
+          if(res && res.ok){
+            CURRENT_POOL = res.sender_pool;
+            ok += 1;
+          }else{
+            failed += 1;
+          }
+        }catch(err){
+          failed += 1;
+        }
+        continue;
+      }
+
+      // Normal rule (handled later)
+      normalKeys.push(it.key);
+    }
+
+    // 2) Apply changes to normal rules and save once
+    if(normalKeys.length){
+      const eps = (CURRENT_POOL && Array.isArray(CURRENT_POOL.endpoints)) ? CURRENT_POOL.endpoints : [];
+      for(const k of normalKeys){
+        const j = eps.findIndex(x => getRuleKey(x) === k);
+        if(j >= 0){
+          eps[j].disabled = wantDisabled;
+          ok += 1;
+        }else{
+          failed += 1;
+        }
+      }
+      await savePool();
+    }
+
+    renderRules();
+    updateBulkBar();
+    toast(`批量${actionName}完成：成功 ${ok}，跳过 ${skipped}${failed ? `，失败 ${failed}` : ''}`);
+  }catch(err){
+    toast(`批量${actionName}失败：${(err && err.message) ? err.message : String(err)}`, true);
+    try{ await loadPool(); }catch(_e){}
+  }finally{
+    setLoading(false);
+    BULK_ACTION_RUNNING = false;
+  }
+}
+window.bulkSetDisabled = bulkSetDisabled;
+
+async function bulkDeleteSelected(){
+  if(BULK_ACTION_RUNNING) return;
+  const items = getSelectedRuleItems();
+  if(!items.length){
+    toast('请先勾选需要删除的规则', true);
+    return;
+  }
+
+  let hasWssSender = false;
+  let hasIntranetSender = false;
+  let lockedCount = 0;
+  for(const it of items){
+    const e = it.e;
+    if(!e) continue;
+    const li = getRuleLockInfo(e);
+    if(li && li.locked){ lockedCount += 1; continue; }
+    const ex = (e && e.extra_config) ? e.extra_config : {};
+    if(ex && ex.sync_id && ex.sync_role === 'sender' && ex.sync_peer_node_id) hasWssSender = true;
+    if(ex && ex.sync_id && ex.intranet_role === 'server' && ex.intranet_peer_node_id) hasIntranetSender = true;
+  }
+
+  const n = items.length;
+  let msg = `确定删除选中的 ${n} 条规则吗？（不可恢复）`;
+  if(hasWssSender) msg += `\n\n注意：包含 WSS 隧道发送机规则，删除将同步删除接收机对应规则。`;
+  if(hasIntranetSender) msg += `\n\n注意：包含内网穿透公网入口规则，删除将同步删除内网出口对应配置。`;
+  if(lockedCount) msg += `\n\n其中 ${lockedCount} 条为锁定规则，将自动跳过。`;
+  if(!confirm(msg)) return;
+
+  let ok = 0;
+  let skipped = 0;
+  let failed = 0;
+  const normalKeys = [];
+
+  BULK_ACTION_RUNNING = true;
+  try{
+    setLoading(true);
+
+    // 1) Synced tunnel sender/server deletions first
+    for(const it of items){
+      const e = it.e;
+      if(!e) continue;
+      const li = getRuleLockInfo(e);
+      if(li && li.locked){
+        skipped += 1;
+        continue;
+      }
+      const ex = (e && e.extra_config) ? e.extra_config : {};
+
+      if(ex && ex.sync_id && ex.sync_role === 'sender' && ex.sync_peer_node_id){
+        try{
+          const payload = { sender_node_id: window.__NODE_ID__, receiver_node_id: ex.sync_peer_node_id, sync_id: ex.sync_id };
+          const res = await fetchJSON('/api/wss_tunnel/delete', {method:'POST', body: JSON.stringify(payload)});
+          if(res && res.ok){
+            CURRENT_POOL = res.sender_pool;
+            ok += 1;
+          }else{
+            failed += 1;
+          }
+        }catch(err){
+          failed += 1;
+        }
+        continue;
+      }
+
+      if(ex && ex.sync_id && ex.intranet_role === 'server' && ex.intranet_peer_node_id){
+        try{
+          const payload = { sender_node_id: window.__NODE_ID__, receiver_node_id: ex.intranet_peer_node_id, sync_id: ex.sync_id };
+          const res = await fetchJSON('/api/intranet_tunnel/delete', {method:'POST', body: JSON.stringify(payload)});
+          if(res && res.ok){
+            CURRENT_POOL = res.sender_pool;
+            ok += 1;
+          }else{
+            failed += 1;
+          }
+        }catch(err){
+          failed += 1;
+        }
+        continue;
+      }
+
+      // Normal rules removed in one savePool
+      normalKeys.push(it.key);
+    }
+
+    // 2) Remove normal rules locally and save once
+    if(normalKeys.length){
+      const keySet = new Set(normalKeys.filter(Boolean));
+      const eps = (CURRENT_POOL && Array.isArray(CURRENT_POOL.endpoints)) ? CURRENT_POOL.endpoints : [];
+      const before = eps.length;
+      const next = eps.filter(ep => !keySet.has(getRuleKey(ep)));
+      const removed = before - next.length;
+      CURRENT_POOL.endpoints = next;
+      if(removed > 0){
+        await savePool();
+        ok += removed;
+      }
+      const missing = normalKeys.length - removed;
+      if(missing > 0) failed += missing;
+    }
+
+    // Clear selection after delete
+    RULE_SELECTED_KEYS = new Set();
+    renderRules();
+    updateBulkBar();
+
+    toast(`批量删除完成：成功 ${ok}，跳过 ${skipped}${failed ? `，失败 ${failed}` : ''}`);
+  }catch(err){
+    toast(`批量删除失败：${(err && err.message) ? err.message : String(err)}`, true);
+    try{ await loadPool(); }catch(_e){}
+  }finally{
+    setLoading(false);
+    BULK_ACTION_RUNNING = false;
+  }
+}
+window.bulkDeleteSelected = bulkDeleteSelected;
 
 async function saveRule(){
   const typeSel = q('f_type').value;

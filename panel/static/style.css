@@ -549,6 +549,28 @@ details.menu summary::-webkit-details-marker{display:none}
 .rules-table th.health,.rules-table td.health{min-width:260px;white-space:normal}
 .rules-table th.stat,.rules-table td.stat{text-align:right;min-width:88px}
 .rules-table th.actions,.rules-table td.actions{text-align:right;min-width:120px}
+.rules-table th.sel,.rules-table td.sel{text-align:center;min-width:42px}
+
+/* Bulk operations bar */
+.bulk-bar{
+  display:flex;
+  align-items:center;
+  gap:6px;
+  flex-wrap:wrap;
+  padding:4px 6px;
+  border:1px solid rgba(148,163,184,0.20);
+  border-radius:12px;
+  background:rgba(148,163,184,0.08);
+}
+.bulk-bar .pill{margin-right:2px;}
+
+/* Rule selection checkbox */
+.rule-select{
+  width:16px;
+  height:16px;
+  cursor:pointer;
+}
+.rule-select:disabled{cursor:not-allowed;opacity:0.5}
 
 /* Make pills inside rules table slightly denser */
 .rules-table .pill{padding:4px 8px;font-size:11px}
