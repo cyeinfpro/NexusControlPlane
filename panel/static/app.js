@@ -5166,7 +5166,9 @@ function openEditNodeModalFromCard(btn){
       base_url: ds.nodeBaseUrl || '',
       group_name: ds.nodeGroup || '',
       verify_tls: String(ds.nodeVerifyTls || '0') === '1',
-      is_private: String(ds.nodeIsPrivate || '0') === '1'
+      is_private: String(ds.nodeIsPrivate || '0') === '1',
+      role: ds.nodeRole || 'normal',
+      website_root_base: ds.nodeWebsiteRoot || ''
     };
     openEditNodeModal(nodeObj);
   }catch(_e){}
@@ -5187,6 +5189,8 @@ function openEditNodeModal(nodeObj){
   const base = hasObj ? (nodeObj.base_url || nodeObj.base || '') : (window.__NODE_BASE_URL__ || '');
   const vt = hasObj ? !!nodeObj.verify_tls : !!window.__NODE_VERIFY_TLS__;
   const ipri = hasObj ? !!nodeObj.is_private : !!window.__NODE_IS_PRIVATE__;
+  const role = hasObj ? (nodeObj.role || '') : (window.__NODE_ROLE__ || '');
+  const websiteRoot = hasObj ? (nodeObj.website_root_base || nodeObj.website_root || '') : (window.__NODE_WEBSITE_ROOT__ || '');
 
   // Track current editing target (dashboard / node page share the same modal)
   const editId = hasObj ? nodeObj.id : window.__NODE_ID__;
@@ -5212,6 +5216,8 @@ function openEditNodeModal(nodeObj){
   const ipEl = document.getElementById('editNodeIp');
   const vtEl = document.getElementById('editNodeVerifyTls');
   const iprEl = document.getElementById('editNodeIsPrivate');
+  const websiteEl = document.getElementById('editNodeIsWebsite');
+  const websiteRootEl = document.getElementById('editNodeWebsiteRoot');
   const err = document.getElementById('editNodeError');
   const btn = document.getElementById('editNodeSubmit');
 
@@ -5223,6 +5229,8 @@ function openEditNodeModal(nodeObj){
   if(schemeEl) schemeEl.value = scheme;
   if(vtEl) vtEl.checked = !!vt;
   if(iprEl) iprEl.checked = !!ipri;
+  if(websiteEl) websiteEl.checked = String(role || '').toLowerCase() === 'website';
+  if(websiteRootEl) websiteRootEl.value = String(websiteRoot || '').trim() || '/www';
 
   // Show host (append :port only when non-default and present)
   let ipVal = host;
@@ -5251,6 +5259,8 @@ function applyEditedNodeToPage(data, nodeId){
     const baseUrl = String(data.base_url || data.baseUrl || '').trim();
     const verifyTls = !!data.verify_tls;
     const isPrivate = !!data.is_private;
+    const role = String(data.role || data.node_role || data.nodeRole || 'normal').trim() || 'normal';
+    const websiteRoot = String(data.website_root_base || data.website_root || '').trim();
 
     const id = (nodeId !== undefined && nodeId !== null) ? String(nodeId) : String(window.__EDITING_NODE_ID__ || window.__NODE_ID__ || '');
 
@@ -5263,6 +5273,8 @@ function applyEditedNodeToPage(data, nodeId){
         card.dataset.nodeGroup = group;
         card.dataset.nodeVerifyTls = verifyTls ? '1' : '0';
         card.dataset.nodeIsPrivate = isPrivate ? '1' : '0';
+        card.dataset.nodeRole = role;
+        card.dataset.nodeWebsiteRoot = websiteRoot;
 
         const nm = card.querySelector('.node-name');
         if(nm && name){ nm.textContent = name; nm.title = name; }
@@ -5279,6 +5291,8 @@ function applyEditedNodeToPage(data, nodeId){
         window.__NODE_GROUP__ = group;
         window.__NODE_VERIFY_TLS__ = verifyTls ? 1 : 0;
         window.__NODE_IS_PRIVATE__ = isPrivate ? 1 : 0;
+        window.__NODE_ROLE__ = role;
+        window.__NODE_WEBSITE_ROOT__ = websiteRoot;
 
         // header title
         const titleEl = document.querySelector('.node-title');
@@ -5327,6 +5341,8 @@ async function saveEditNode(){
     const ip_address = (document.getElementById('editNodeIp')?.value || '').trim();
     const verify_tls = !!document.getElementById('editNodeVerifyTls')?.checked;
     const is_private = !!document.getElementById('editNodeIsPrivate')?.checked;
+    const is_website = !!document.getElementById('editNodeIsWebsite')?.checked;
+    const website_root_base = (document.getElementById('editNodeWebsiteRoot')?.value || '').trim();
 
     if(!ip_address){
       if(err) err.textContent = '节点地址不能为空';
@@ -5342,7 +5358,7 @@ async function saveEditNode(){
       method: 'POST',
       headers: {'Content-Type':'application/json'},
       credentials: 'same-origin',
-      body: JSON.stringify({ name, group_name, scheme, ip_address, verify_tls, is_private })
+      body: JSON.stringify({ name, group_name, scheme, ip_address, verify_tls, is_private, is_website, website_root_base })
     });
     const data = await resp.json().catch(()=>({ok:false,error:'接口返回异常'}));
     if(!resp.ok || !data.ok){
@@ -5862,7 +5878,9 @@ async function createNodeFromModal(){
     const scheme = (document.getElementById("addNodeScheme")?.value || "http").trim();
     const verify_tls = !!document.getElementById("addNodeVerifyTls")?.checked;
     const is_private = !!document.getElementById("addNodeIsPrivate")?.checked;
+    const is_website = !!document.getElementById("addNodeIsWebsite")?.checked;
     const group_name = (document.getElementById("addNodeGroup")?.value || "").trim();
+    const website_root_base = (document.getElementById("addNodeWebsiteRoot")?.value || "").trim();
 
     if(!ip_address){
       if(err) err.textContent = "节点地址不能为空";
@@ -5873,7 +5891,7 @@ async function createNodeFromModal(){
     const resp = await fetch("/api/nodes/create", {
       method: "POST",
       headers: {"Content-Type":"application/json"},
-      body: JSON.stringify({name, ip_address, scheme, verify_tls, is_private, group_name}),
+      body: JSON.stringify({name, ip_address, scheme, verify_tls, is_private, is_website, group_name, website_root_base}),
       // 需要允许后端写入 Session Cookie（用于跳转到节点页后自动弹出接入命令窗口）
       credentials: "include",
     });

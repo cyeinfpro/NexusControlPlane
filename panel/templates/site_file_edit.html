@@ -1,0 +1,36 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="page-head">
+  <div class="page-title">
+    <h1 class="h1">编辑文件 · {{ site.name }}</h1>
+    <div class="meta">
+      <span class="meta-item">路径：<span class="mono">{{ path }}</span></span>
+    </div>
+  </div>
+  <div class="right">
+    <a class="btn sm ghost" href="/websites/{{ site.id }}/files?path={{ '/'.join(path.split('/')[:-1]) }}">返回目录</a>
+  </div>
+</div>
+
+{% if error %}
+  <div class="flash" style="background:rgba(239,68,68,0.15);border-color:rgba(239,68,68,0.4);">
+    {{ error }}
+  </div>
+{% endif %}
+
+<div class="card">
+  <form method="post" action="/websites/{{ site.id }}/files/save" class="form">
+    <input type="hidden" name="path" value="{{ path }}">
+    <label class="label">文件内容</label>
+    <textarea class="textarea" name="content" rows="20">{{ content }}</textarea>
+    <div class="row" style="margin-top:12px;">
+      <div class="col">
+        <a class="btn ghost" href="/websites/{{ site.id }}/files?path={{ '/'.join(path.split('/')[:-1]) }}">取消</a>
+      </div>
+      <div class="col right">
+        <button class="btn" type="submit">保存</button>
+      </div>
+    </div>
+  </form>
+</div>
+{% endblock %}

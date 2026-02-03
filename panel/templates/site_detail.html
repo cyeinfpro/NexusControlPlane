@@ -1,0 +1,74 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="page-head">
+  <div class="page-title">
+    <h1 class="h1">{{ site.name }}</h1>
+    <div class="meta">
+      <span class="meta-item">节点：{{ node.name if node else "-" }}</span>
+      <span class="meta-item">域名：{{ (site.domains or [])|join(', ') }}</span>
+    </div>
+  </div>
+  <div class="right">
+    <a class="btn sm ghost" href="/websites/{{ site.id }}/files">文件管理</a>
+    <form method="post" action="/websites/{{ site.id }}/ssl/issue" style="display:inline;">
+      <button class="btn sm secondary" type="submit">申请 SSL</button>
+    </form>
+    <form method="post" action="/websites/{{ site.id }}/ssl/renew" style="display:inline;">
+      <button class="btn sm ghost" type="submit">续期 SSL</button>
+    </form>
+  </div>
+</div>
+
+<div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(320px,1fr));">
+  <div class="card">
+    <div class="card-header">
+      <div class="card-title">站点信息</div>
+    </div>
+    <div class="table-wrap">
+      <table class="table">
+        <tbody>
+          <tr><th>站点类型</th><td>{{ site.type }}</td></tr>
+          <tr><th>Web 服务器</th><td>{{ site.web_server }}</td></tr>
+          <tr><th>根目录</th><td class="mono">{{ site.root_path or "-" }}</td></tr>
+          <tr><th>状态</th><td>{{ site.status }}</td></tr>
+          <tr><th>创建时间</th><td>{{ site.created_at }}</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-header">
+      <div class="card-title">SSL 证书</div>
+    </div>
+    {% if certs %}
+    <div class="table-wrap">
+      <table class="table">
+        <thead>
+          <tr>
+            <th>域名</th>
+            <th>状态</th>
+            <th>有效期</th>
+            <th>续期时间</th>
+            <th>错误</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for c in certs %}
+          <tr>
+            <td class="mono">{{ c.domains_text }}</td>
+            <td>{{ c.status }}</td>
+            <td>{{ c.not_before or "-" }} → {{ c.not_after or "-" }}</td>
+            <td>{{ c.renew_at or "-" }}</td>
+            <td class="mono">{{ c.last_error or "-" }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% else %}
+      <div class="muted">暂无证书</div>
+    {% endif %}
+  </div>
+</div>
+{% endblock %}

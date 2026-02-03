@@ -815,6 +815,8 @@ async def api_nodes_create(request: Request, user: str = Depends(require_login))
     scheme = str(data.get("scheme") or "http").strip().lower()
     verify_tls = bool(data.get("verify_tls")) if "verify_tls" in data else None
     is_private = bool(data.get("is_private") or False)
+    is_website = data.get("is_website")
+    website_root_base = str(data.get("website_root_base") or "").strip()
     group_name = str(data.get("group_name") or "").strip() or "默认分组"
 
     if scheme not in ("http", "https"):
@@ -839,6 +841,12 @@ async def api_nodes_create(request: Request, user: str = Depends(require_login))
     api_key = generate_api_key()
 
     display_name = name or extract_ip_for_display(base_url)
+    role = "website" if bool(is_website) else "normal"
+    root_base = website_root_base.strip()
+    if role == "website" and not root_base:
+        root_base = "/www"
+    if role != "website":
+        root_base = ""
     node_id = add_node(
         display_name,
         base_url,
@@ -846,6 +854,8 @@ async def api_nodes_create(request: Request, user: str = Depends(require_login))
         verify_tls=bool(verify_tls),
         is_private=is_private,
         group_name=group_name,
+        role=role,
+        website_root_base=root_base,
     )
 
     # 创建完成后，进入节点详情页时自动弹出“接入命令”窗口
@@ -885,6 +895,25 @@ async def api_nodes_update(node_id: int, request: Request, user: str = Depends(r
         verify_tls = bool(data.get("verify_tls")) if "verify_tls" in data else None
     else:
         verify_tls = bool(node.get("verify_tls", 0))
+
+    # role: only update when provided
+    if "is_website" in data:
+        role = "website" if bool(data.get("is_website")) else "normal"
+    else:
+        role = str(node.get("role") or "normal").strip().lower() or "normal"
+        if role not in ("normal", "website"):
+            role = "normal"
+
+    # website root base
+    if "website_root_base" in data:
+        website_root_base = str(data.get("website_root_base") or "").strip()
+    else:
+        website_root_base = str(node.get("website_root_base") or "").strip()
+
+    if role == "website" and not website_root_base:
+        website_root_base = "/www"
+    if role != "website":
+        website_root_base = ""
 
     # group name
     if group_in is None:
@@ -968,6 +997,8 @@ async def api_nodes_update(node_id: int, request: Request, user: str = Depends(r
         verify_tls=bool(verify_tls),
         is_private=is_private,
         group_name=group_name,
+        role=role,
+        website_root_base=website_root_base,
     )
 
     # Return updated fields for client-side UI refresh
@@ -985,6 +1016,8 @@ async def api_nodes_update(node_id: int, request: Request, user: str = Depends(r
                 "display_ip": display_ip,
                 "verify_tls": bool(updated.get("verify_tls") or verify_tls),
                 "is_private": bool(updated.get("is_private") or is_private),
+                "role": str(updated.get("role") or role),
+                "website_root_base": str(updated.get("website_root_base") or website_root_base),
             },
         }
     )
@@ -1001,6 +1034,8 @@ async def api_nodes_list(user: str = Depends(require_login)):
                 "base_url": n["base_url"],
                 "group_name": n.get("group_name"),
                 "is_private": bool(n.get("is_private") or 0),
+                "role": n.get("role") or "normal",
+                "website_root_base": n.get("website_root_base") or "",
             }
         )
     return {"ok": True, "nodes": out}

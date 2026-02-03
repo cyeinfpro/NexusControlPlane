@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import re
 import shutil
@@ -14,11 +15,12 @@ import hmac
 import ssl
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import Body, Depends, FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse
 import requests
 
 from .config import CFG
@@ -2753,3 +2755,471 @@ def api_traffic_reset(
 @app.get('/api/v1/stats')
 def api_stats(_: None = Depends(_api_key_required)) -> Dict[str, Any]:
     return _build_stats_snapshot()
+
+
+# =========================
+# Website Management: sites / SSL / file manager
+# =========================
+
+_WEBSITE_ROOT_BASES_CACHE: Optional[List[Path]] = None
+
+
+def _website_root_bases() -> List[Path]:
+    global _WEBSITE_ROOT_BASES_CACHE
+    if _WEBSITE_ROOT_BASES_CACHE is not None:
+        return _WEBSITE_ROOT_BASES_CACHE
+    raw = (
+        os.getenv("REALM_AGENT_WEBSITE_ROOT_BASES")
+        or os.getenv("REALM_AGENT_WEBSITE_ROOT_BASE")
+        or "/www"
+    )
+    bases: List[Path] = []
+    for item in str(raw).split(","):
+        p = (item or "").strip()
+        if not p:
+            continue
+        try:
+            bases.append(Path(p).expanduser().resolve())
+        except Exception:
+            continue
+    if not bases:
+        bases = [Path("/www").resolve()]
+    _WEBSITE_ROOT_BASES_CACHE = bases
+    return bases
+
+
+def _is_subpath(child: Path, parent: Path) -> bool:
+    try:
+        child.relative_to(parent)
+        return True
+    except Exception:
+        return False
+
+
+def _validate_root(root: str) -> Path:
+    root = (root or "").strip()
+    if not root:
+        raise HTTPException(status_code=400, detail="root 不能为空")
+    p = Path(root).expanduser()
+    if not p.is_absolute():
+        raise HTTPException(status_code=400, detail="root 必须是绝对路径")
+    resolved = p.resolve()
+    allowed = _website_root_bases()
+    if not any(_is_subpath(resolved, base) or resolved == base for base in allowed):
+        raise HTTPException(status_code=403, detail="root 不在允许范围内")
+    return resolved
+
+
+def _safe_join(root: Path, subpath: str) -> Path:
+    rel = (subpath or "").strip().lstrip("/")
+    target = (root / rel).resolve()
+    if not _is_subpath(target, root) and target != root:
+        raise HTTPException(status_code=400, detail="非法路径")
+    return target
+
+
+def _run_cmd(cmd: List[str]) -> Tuple[int, str]:
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True)
+    except Exception as exc:
+        return 1, str(exc)
+    out = (r.stdout or "") + (r.stderr or "")
+    return int(r.returncode or 0), out.strip()
+
+
+def _nginx_conf_locations() -> Tuple[Path, Optional[Path]]:
+    sites_avail = Path("/etc/nginx/sites-available")
+    sites_enabled = Path("/etc/nginx/sites-enabled")
+    if sites_avail.is_dir():
+        return sites_avail, sites_enabled if sites_enabled.is_dir() else None
+    return Path("/etc/nginx/conf.d"), None
+
+
+def _slugify(name: str) -> str:
+    safe = re.sub(r"[^a-zA-Z0-9_.-]+", "-", name or "").strip("-")
+    return safe or "site"
+
+
+def _render_nginx_conf(site_type: str, domains: List[str], root_path: str, proxy_target: str) -> str:
+    server_name = " ".join(domains)
+    if site_type == "reverse_proxy":
+        return (
+            "server {\n"
+            "  listen 80;\n"
+            f"  server_name {server_name};\n"
+            "  location / {\n"
+            f"    proxy_pass {proxy_target};\n"
+            "    proxy_set_header Host $host;\n"
+            "    proxy_set_header X-Real-IP $remote_addr;\n"
+            "    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n"
+            "    proxy_set_header X-Forwarded-Proto $scheme;\n"
+            "  }\n"
+            "}\n"
+        )
+    if site_type == "php":
+        return (
+            "server {\n"
+            "  listen 80;\n"
+            f"  server_name {server_name};\n"
+            f"  root {root_path};\n"
+            "  index index.php index.html index.htm;\n"
+            "  location / {\n"
+            "    try_files $uri $uri/ /index.php?$args;\n"
+            "  }\n"
+            "  location ~ \\.php$ {\n"
+            "    include fastcgi_params;\n"
+            "    fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;\n"
+            "    fastcgi_pass unix:/run/php/php-fpm.sock;\n"
+            "  }\n"
+            "}\n"
+        )
+    # default static
+    return (
+        "server {\n"
+        "  listen 80;\n"
+        f"  server_name {server_name};\n"
+        f"  root {root_path};\n"
+        "  index index.html index.htm;\n"
+        "  location / {\n"
+        "    try_files $uri $uri/ =404;\n"
+        "  }\n"
+        "}\n"
+    )
+
+
+def _write_nginx_conf(name: str, content: str) -> Path:
+    conf_dir, enabled_dir = _nginx_conf_locations()
+    conf_dir.mkdir(parents=True, exist_ok=True)
+    conf_name = f"nexus-{_slugify(name)}.conf"
+    conf_path = conf_dir / conf_name
+    conf_path.write_text(content, encoding="utf-8")
+    if enabled_dir:
+        enabled_dir.mkdir(parents=True, exist_ok=True)
+        link = enabled_dir / conf_name
+        if not link.exists():
+            try:
+                link.symlink_to(conf_path)
+            except Exception:
+                pass
+    return conf_path
+
+
+def _nginx_reload() -> Tuple[bool, str]:
+    # nginx -t first
+    code, out = _run_cmd(["nginx", "-t"])
+    if code != 0:
+        return False, out or "nginx -t 失败"
+    # reload
+    for cmd in (["nginx", "-s", "reload"], ["systemctl", "reload", "nginx"], ["service", "nginx", "reload"]):
+        if shutil.which(cmd[0]) is None:
+            continue
+        code, out = _run_cmd(cmd)
+        if code == 0:
+            return True, out
+    return False, "nginx reload 失败"
+
+
+def _find_acme_sh() -> Optional[str]:
+    acme = shutil.which("acme.sh")
+    if acme:
+        return acme
+    for p in ("/root/.acme.sh/acme.sh", "/usr/local/bin/acme.sh"):
+        if Path(p).exists():
+            return p
+    return None
+
+
+def _cert_dates(cert_path: Path) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    code, txt = _run_cmd(["openssl", "x509", "-noout", "-dates", "-in", str(cert_path)])
+    if code != 0:
+        return out
+    for line in txt.splitlines():
+        if line.startswith("notBefore="):
+            out["not_before"] = line.replace("notBefore=", "").strip()
+        if line.startswith("notAfter="):
+            out["not_after"] = line.replace("notAfter=", "").strip()
+    # compute renew_at (20 days before not_after)
+    if out.get("not_after"):
+        try:
+            dt = datetime.strptime(out["not_after"], "%b %d %H:%M:%S %Y %Z")
+            renew = dt - timedelta(days=20)
+            out["renew_at"] = renew.strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            pass
+    return out
+
+
+@app.post("/api/v1/website/site/create")
+def api_website_create(payload: Dict[str, Any], _: None = Depends(_api_key_required)) -> Dict[str, Any]:
+    if not isinstance(payload, dict):
+        payload = {}
+    domains = payload.get("domains") or []
+    if not isinstance(domains, list) or not domains:
+        return {"ok": False, "error": "domains 不能为空"}
+    site_type = str(payload.get("type") or "static").strip()
+    root_path = str(payload.get("root_path") or "").strip()
+    proxy_target = str(payload.get("proxy_target") or "").strip()
+    web_server = str(payload.get("web_server") or "nginx").strip().lower()
+
+    if web_server != "nginx":
+        return {"ok": False, "error": "当前仅支持 nginx"}
+    if shutil.which("nginx") is None:
+        return {"ok": False, "error": "未检测到 nginx"}
+
+    if site_type != "reverse_proxy":
+        if not root_path:
+            return {"ok": False, "error": "root_path 不能为空"}
+        try:
+            Path(root_path).mkdir(parents=True, exist_ok=True)
+            idx = Path(root_path) / "index.html"
+            if not idx.exists():
+                idx.write_text("<h1>It works!</h1>", encoding="utf-8")
+        except Exception as exc:
+            return {"ok": False, "error": f"创建目录失败：{exc}"}
+    else:
+        if not proxy_target:
+            return {"ok": False, "error": "proxy_target 不能为空"}
+
+    conf = _render_nginx_conf(site_type, domains, root_path, proxy_target)
+    conf_path = _write_nginx_conf(domains[0], conf)
+    ok, out = _nginx_reload()
+    if not ok:
+        try:
+            conf_path.unlink()
+        except Exception:
+            pass
+        return {"ok": False, "error": out}
+
+    return {"ok": True, "conf_path": str(conf_path)}
+
+
+@app.post("/api/v1/website/ssl/issue")
+def api_ssl_issue(payload: Dict[str, Any], _: None = Depends(_api_key_required)) -> Dict[str, Any]:
+    if not isinstance(payload, dict):
+        payload = {}
+    domains = payload.get("domains") or []
+    if not isinstance(domains, list) or not domains:
+        return {"ok": False, "error": "domains 不能为空"}
+    root_path = str(payload.get("root_path") or "").strip()
+    if not root_path:
+        return {"ok": False, "error": "root_path 不能为空"}
+
+    acme = _find_acme_sh()
+    if not acme:
+        return {"ok": False, "error": "未安装 acme.sh"}
+
+    cmd = [acme, "--issue"]
+    for d in domains:
+        cmd += ["-d", str(d)]
+    cmd += ["-w", root_path]
+    code, out = _run_cmd(cmd)
+    if code != 0:
+        return {"ok": False, "error": out or "证书申请失败"}
+
+    main_domain = str(domains[0])
+    safe = _slugify(main_domain)
+    cert_dir = Path("/etc/ssl/nexus") / safe
+    cert_dir.mkdir(parents=True, exist_ok=True)
+    key_path = cert_dir / "privkey.pem"
+    fullchain_path = cert_dir / "fullchain.pem"
+
+    install_cmd = [
+        acme,
+        "--install-cert",
+        "-d",
+        main_domain,
+        "--key-file",
+        str(key_path),
+        "--fullchain-file",
+        str(fullchain_path),
+        "--reloadcmd",
+        "nginx -s reload",
+    ]
+    code, out = _run_cmd(install_cmd)
+    if code != 0:
+        return {"ok": False, "error": out or "证书安装失败"}
+
+    meta = _cert_dates(fullchain_path)
+    return {
+        "ok": True,
+        "cert_dir": str(cert_dir),
+        **meta,
+    }
+
+
+@app.post("/api/v1/website/ssl/renew")
+def api_ssl_renew(payload: Dict[str, Any], _: None = Depends(_api_key_required)) -> Dict[str, Any]:
+    if not isinstance(payload, dict):
+        payload = {}
+    domains = payload.get("domains") or []
+    if not isinstance(domains, list) or not domains:
+        return {"ok": False, "error": "domains 不能为空"}
+    root_path = str(payload.get("root_path") or "").strip()
+    if not root_path:
+        return {"ok": False, "error": "root_path 不能为空"}
+
+    acme = _find_acme_sh()
+    if not acme:
+        return {"ok": False, "error": "未安装 acme.sh"}
+
+    main_domain = str(domains[0])
+    cmd = [acme, "--renew", "-d", main_domain]
+    code, out = _run_cmd(cmd)
+    if code != 0:
+        return {"ok": False, "error": out or "证书续期失败"}
+
+    safe = _slugify(main_domain)
+    cert_dir = Path("/etc/ssl/nexus") / safe
+    cert_dir.mkdir(parents=True, exist_ok=True)
+    key_path = cert_dir / "privkey.pem"
+    fullchain_path = cert_dir / "fullchain.pem"
+
+    install_cmd = [
+        acme,
+        "--install-cert",
+        "-d",
+        main_domain,
+        "--key-file",
+        str(key_path),
+        "--fullchain-file",
+        str(fullchain_path),
+        "--reloadcmd",
+        "nginx -s reload",
+    ]
+    code, out = _run_cmd(install_cmd)
+    if code != 0:
+        return {"ok": False, "error": out or "证书安装失败"}
+
+    meta = _cert_dates(fullchain_path)
+    return {
+        "ok": True,
+        "cert_dir": str(cert_dir),
+        **meta,
+    }
+
+
+@app.get("/api/v1/website/files/list")
+def api_files_list(root: str, path: str = "", _: None = Depends(_api_key_required)) -> Dict[str, Any]:
+    root_path = _validate_root(root)
+    target = _safe_join(root_path, path)
+    if not target.exists() or not target.is_dir():
+        return {"ok": False, "error": "目录不存在"}
+
+    items: List[Dict[str, Any]] = []
+    for entry in sorted(target.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower())):
+        try:
+            st = entry.stat()
+        except Exception:
+            continue
+        rel = str(entry.relative_to(root_path))
+        items.append(
+            {
+                "name": entry.name,
+                "path": rel,
+                "is_dir": entry.is_dir(),
+                "size": int(st.st_size),
+                "mtime": datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
+            }
+        )
+    return {"ok": True, "items": items}
+
+
+@app.get("/api/v1/website/files/read")
+def api_files_read(root: str, path: str, _: None = Depends(_api_key_required)) -> Dict[str, Any]:
+    root_path = _validate_root(root)
+    target = _safe_join(root_path, path)
+    if not target.exists() or not target.is_file():
+        return {"ok": False, "error": "文件不存在"}
+    if target.stat().st_size > 1024 * 1024:
+        return {"ok": False, "error": "文件过大（限制 1MB）"}
+    try:
+        content = target.read_text(encoding="utf-8", errors="replace")
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+    return {"ok": True, "content": content}
+
+
+@app.post("/api/v1/website/files/write")
+def api_files_write(payload: Dict[str, Any], _: None = Depends(_api_key_required)) -> Dict[str, Any]:
+    if not isinstance(payload, dict):
+        payload = {}
+    root_path = _validate_root(str(payload.get("root") or ""))
+    path = str(payload.get("path") or "")
+    content = str(payload.get("content") or "")
+    target = _safe_join(root_path, path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        target.write_text(content, encoding="utf-8")
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+    return {"ok": True}
+
+
+@app.post("/api/v1/website/files/mkdir")
+def api_files_mkdir(payload: Dict[str, Any], _: None = Depends(_api_key_required)) -> Dict[str, Any]:
+    if not isinstance(payload, dict):
+        payload = {}
+    root_path = _validate_root(str(payload.get("root") or ""))
+    path = str(payload.get("path") or "")
+    name = str(payload.get("name") or "").strip()
+    if not name:
+        return {"ok": False, "error": "目录名不能为空"}
+    target = _safe_join(root_path, f"{path.rstrip('/')}/{name}")
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+    return {"ok": True}
+
+
+@app.post("/api/v1/website/files/delete")
+def api_files_delete(payload: Dict[str, Any], _: None = Depends(_api_key_required)) -> Dict[str, Any]:
+    if not isinstance(payload, dict):
+        payload = {}
+    root_path = _validate_root(str(payload.get("root") or ""))
+    path = str(payload.get("path") or "")
+    target = _safe_join(root_path, path)
+    if not target.exists():
+        return {"ok": False, "error": "文件/目录不存在"}
+    try:
+        if target.is_dir():
+            shutil.rmtree(target)
+        else:
+            target.unlink()
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+    return {"ok": True}
+
+
+@app.post("/api/v1/website/files/upload")
+def api_files_upload(payload: Dict[str, Any], _: None = Depends(_api_key_required)) -> Dict[str, Any]:
+    if not isinstance(payload, dict):
+        payload = {}
+    root_path = _validate_root(str(payload.get("root") or ""))
+    path = str(payload.get("path") or "")
+    filename = str(payload.get("filename") or "upload.bin").strip()
+    filename = os.path.basename(filename) or "upload.bin"
+    content_b64 = str(payload.get("content_b64") or "")
+    if not content_b64:
+        return {"ok": False, "error": "缺少文件内容"}
+    try:
+        raw = base64.b64decode(content_b64.encode("ascii"))
+    except Exception:
+        return {"ok": False, "error": "文件内容解析失败"}
+    target = _safe_join(root_path, f"{path.rstrip('/')}/{filename}")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        target.write_bytes(raw)
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+    return {"ok": True}
+
+
+@app.get("/api/v1/website/files/raw")
+def api_files_raw(root: str, path: str, _: None = Depends(_api_key_required)):
+    root_path = _validate_root(root)
+    target = _safe_join(root_path, path)
+    if not target.exists() or not target.is_file():
+        raise HTTPException(status_code=404, detail="文件不存在")
+    return FileResponse(path=str(target), filename=target.name)

@@ -17,6 +17,7 @@ from .routers import (
     auth,
     pages,
     scripts,
+    websites,
 )
 from .services.netmon import start_background as start_netmon_background
 
@@ -46,6 +47,7 @@ app.include_router(api_nodes.router)
 app.include_router(api_groups.router)
 app.include_router(api_sync.router)
 app.include_router(api_netmon.router)
+app.include_router(websites.router)
 
 
 @app.on_event("startup")

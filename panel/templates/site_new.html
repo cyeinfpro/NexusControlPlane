@@ -1,0 +1,55 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="card" style="max-width:760px;margin:20px auto;">
+  <h1 class="h1">新建网站</h1>
+  <p class="muted">选择网站机节点并填写域名与站点类型。</p>
+  <form method="post" action="/websites/new" class="form">
+    <label class="label">网站机节点</label>
+    <select class="select" name="node_id" required>
+      {% for n in nodes %}
+        <option value="{{ n.id }}">{{ n.name }} · {{ n.base_url }}</option>
+      {% endfor %}
+    </select>
+    {% if not nodes %}
+      <div class="help" style="color:var(--bad);">暂无网站机节点，请先在接入节点时勾选“网站机”。</div>
+    {% endif %}
+
+    <label class="label">站点名称</label>
+    <input class="input" name="name" placeholder="例如：官网 / 客户A">
+
+    <label class="label">域名（支持多个）</label>
+    <input class="input" name="domains" placeholder="example.com, www.example.com" required>
+    <div class="help">多个域名用逗号或空格分隔。</div>
+
+    <label class="label">站点类型</label>
+    <select class="select" name="site_type">
+      <option value="static">静态站点</option>
+      <option value="php">PHP 站点</option>
+      <option value="reverse_proxy">反向代理</option>
+    </select>
+
+    <label class="label">Web 服务器</label>
+    <select class="select" name="web_server">
+      <option value="nginx">nginx</option>
+      <option value="apache">apache</option>
+    </select>
+
+    <label class="label">根目录</label>
+    <input class="input" name="root_path" placeholder="默认：/www/wwwroot/<domain>">
+    <div class="help">静态/PHP 站点生效；反向代理可留空。</div>
+
+    <label class="label">反向代理目标</label>
+    <input class="input" name="proxy_target" placeholder="http://127.0.0.1:8080">
+    <div class="help">仅反向代理需要填写。</div>
+
+    <div class="row" style="margin-top:14px;">
+      <div class="col">
+        <a href="/websites" class="btn ghost">返回</a>
+      </div>
+      <div class="col right">
+        <button class="btn" type="submit" {% if not nodes %}disabled{% endif %}>创建站点</button>
+      </div>
+    </div>
+  </form>
+</div>
+{% endblock %}

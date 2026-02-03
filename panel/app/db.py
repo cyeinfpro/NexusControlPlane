@@ -16,6 +16,10 @@ CREATE TABLE IF NOT EXISTS nodes (
   -- Mark as "LAN-only" node (for reverse tunnel / intranet penetration)
   is_private INTEGER NOT NULL DEFAULT 0,
   group_name TEXT NOT NULL DEFAULT '默认分组',
+  -- Node role and website management
+  role TEXT NOT NULL DEFAULT 'normal',
+  capabilities_json TEXT NOT NULL DEFAULT '{}',
+  website_root_base TEXT NOT NULL DEFAULT '',
   -- Agent push-report state (agent -> panel)
   last_seen_at TEXT,
   last_report_json TEXT,
@@ -44,6 +48,49 @@ CREATE TABLE IF NOT EXISTS nodes (
 CREATE TABLE IF NOT EXISTS group_orders (
   group_name TEXT PRIMARY KEY,
   sort_order INTEGER NOT NULL DEFAULT 0,
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- Website management
+CREATE TABLE IF NOT EXISTS sites (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  node_id INTEGER NOT NULL,
+  name TEXT NOT NULL,
+  domains_json TEXT NOT NULL DEFAULT '[]',
+  root_path TEXT NOT NULL DEFAULT '',
+  type TEXT NOT NULL DEFAULT 'static',
+  web_server TEXT NOT NULL DEFAULT 'nginx',
+  status TEXT NOT NULL DEFAULT 'running',
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS certificates (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  node_id INTEGER NOT NULL,
+  site_id INTEGER,
+  domains_json TEXT NOT NULL DEFAULT '[]',
+  issuer TEXT NOT NULL DEFAULT 'letsencrypt',
+  challenge TEXT NOT NULL DEFAULT 'http-01',
+  status TEXT NOT NULL DEFAULT 'pending',
+  not_before TEXT,
+  not_after TEXT,
+  renew_at TEXT,
+  last_error TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS tasks (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  node_id INTEGER NOT NULL,
+  type TEXT NOT NULL,
+  payload_json TEXT NOT NULL DEFAULT '{}',
+  status TEXT NOT NULL DEFAULT 'queued',
+  progress INTEGER NOT NULL DEFAULT 0,
+  result_json TEXT NOT NULL DEFAULT '{}',
+  error TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -133,6 +180,12 @@ def ensure_db(db_path: str = DEFAULT_DB_PATH) -> None:
             conn.execute("ALTER TABLE nodes ADD COLUMN is_private INTEGER NOT NULL DEFAULT 0")
         if "group_name" not in columns:
             conn.execute("ALTER TABLE nodes ADD COLUMN group_name TEXT NOT NULL DEFAULT '默认分组'")
+        if "role" not in columns:
+            conn.execute("ALTER TABLE nodes ADD COLUMN role TEXT NOT NULL DEFAULT 'normal'")
+        if "capabilities_json" not in columns:
+            conn.execute("ALTER TABLE nodes ADD COLUMN capabilities_json TEXT NOT NULL DEFAULT '{}'")
+        if "website_root_base" not in columns:
+            conn.execute("ALTER TABLE nodes ADD COLUMN website_root_base TEXT NOT NULL DEFAULT ''")
         if "last_seen_at" not in columns:
             conn.execute("ALTER TABLE nodes ADD COLUMN last_seen_at TEXT")
         if "last_report_json" not in columns:
@@ -474,10 +527,26 @@ def connect(db_path: str = DEFAULT_DB_PATH):
         conn.close()
 
 
+def _json_loads(raw: str, default: Any) -> Any:
+    try:
+        return json.loads(raw) if raw else default
+    except Exception:
+        return default
+
+
+def _parse_node_row(row: sqlite3.Row) -> Dict[str, Any]:
+    d = dict(row)
+    caps = _json_loads(str(d.get("capabilities_json") or "{}"), {})
+    if not isinstance(caps, dict):
+        caps = {}
+    d["capabilities"] = caps
+    return d
+
+
 def list_nodes(db_path: str = DEFAULT_DB_PATH) -> List[Dict[str, Any]]:
     with connect(db_path) as conn:
         rows = conn.execute("SELECT * FROM nodes ORDER BY id DESC").fetchall()
-    return [dict(r) for r in rows]
+    return [_parse_node_row(r) for r in rows]
 
 
 def get_group_orders(db_path: str = DEFAULT_DB_PATH) -> Dict[str, int]:
@@ -513,7 +582,7 @@ def upsert_group_order(group_name: str, sort_order: int, db_path: str = DEFAULT_
 def get_node(node_id: int, db_path: str = DEFAULT_DB_PATH) -> Optional[Dict[str, Any]]:
     with connect(db_path) as conn:
         row = conn.execute("SELECT * FROM nodes WHERE id=?", (node_id,)).fetchone()
-    return dict(row) if row else None
+    return _parse_node_row(row) if row else None
 
 
 def get_node_by_api_key(api_key: str, db_path: str = DEFAULT_DB_PATH) -> Optional[Dict[str, Any]]:
@@ -522,7 +591,7 @@ def get_node_by_api_key(api_key: str, db_path: str = DEFAULT_DB_PATH) -> Optiona
         return None
     with connect(db_path) as conn:
         row = conn.execute("SELECT * FROM nodes WHERE api_key=?", (api_key,)).fetchone()
-    return dict(row) if row else None
+    return _parse_node_row(row) if row else None
 
 
 def get_node_by_base_url(base_url: str, db_path: str = DEFAULT_DB_PATH) -> Optional[Dict[str, Any]]:
@@ -531,7 +600,7 @@ def get_node_by_base_url(base_url: str, db_path: str = DEFAULT_DB_PATH) -> Optio
         return None
     with connect(db_path) as conn:
         row = conn.execute("SELECT * FROM nodes WHERE base_url=?", (base_url,)).fetchone()
-    return dict(row) if row else None
+    return _parse_node_row(row) if row else None
 
 
 def update_node_basic(
@@ -542,22 +611,52 @@ def update_node_basic(
     verify_tls: bool = True,
     is_private: bool = False,
     group_name: str = '默认分组',
+    role: Optional[str] = None,
+    capabilities: Optional[Dict[str, Any]] = None,
+    website_root_base: Optional[str] = None,
     db_path: str = DEFAULT_DB_PATH,
 ) -> None:
     """Update basic node fields without touching reports/pools."""
+    fields = [
+        "name=?",
+        "base_url=?",
+        "api_key=?",
+        "verify_tls=?",
+        "is_private=?",
+        "group_name=?",
+    ]
+    params: List[Any] = [
+        (name or "").strip(),
+        (base_url or "").strip().rstrip('/'),
+        (api_key or "").strip(),
+        1 if verify_tls else 0,
+        1 if is_private else 0,
+        (group_name or '默认分组').strip() or '默认分组',
+    ]
+
+    if role is not None:
+        role_val = (role or "").strip().lower() or "normal"
+        if role_val not in ("normal", "website"):
+            role_val = "normal"
+        fields.append("role=?")
+        params.append(role_val)
+
+    if capabilities is not None:
+        try:
+            caps_json = json.dumps(capabilities or {}, ensure_ascii=False)
+        except Exception:
+            caps_json = "{}"
+        fields.append("capabilities_json=?")
+        params.append(caps_json)
+
+    if website_root_base is not None:
+        fields.append("website_root_base=?")
+        params.append((website_root_base or "").strip())
+
     with connect(db_path) as conn:
-        conn.execute(
-            "UPDATE nodes SET name=?, base_url=?, api_key=?, verify_tls=?, is_private=?, group_name=? WHERE id=?",
-            (
-                (name or "").strip(),
-                (base_url or "").strip().rstrip('/'),
-                (api_key or "").strip(),
-                1 if verify_tls else 0,
-                1 if is_private else 0,
-                (group_name or '默认分组').strip() or '默认分组',
-                int(node_id),
-            ),
-        )
+        sql = f"UPDATE nodes SET {', '.join(fields)} WHERE id=?"
+        params.append(int(node_id))
+        conn.execute(sql, params)
         conn.commit()
 
 
@@ -568,12 +667,32 @@ def add_node(
     verify_tls: bool = True,
     is_private: bool = False,
     group_name: str = '默认分组',
+    role: str = 'normal',
+    capabilities: Optional[Dict[str, Any]] = None,
+    website_root_base: str = '',
     db_path: str = DEFAULT_DB_PATH,
 ) -> int:
+    role_val = (role or "").strip().lower() or "normal"
+    if role_val not in ("normal", "website"):
+        role_val = "normal"
+    try:
+        caps_json = json.dumps(capabilities or {}, ensure_ascii=False)
+    except Exception:
+        caps_json = "{}"
     with connect(db_path) as conn:
         cur = conn.execute(
-            "INSERT INTO nodes(name, base_url, api_key, verify_tls, is_private, group_name) VALUES(?,?,?,?,?,?)",
-            (name.strip(), base_url.strip().rstrip('/'), api_key.strip(), 1 if verify_tls else 0, 1 if is_private else 0, (group_name or '默认分组').strip() or '默认分组'),
+            "INSERT INTO nodes(name, base_url, api_key, verify_tls, is_private, group_name, role, capabilities_json, website_root_base) VALUES(?,?,?,?,?,?,?,?,?)",
+            (
+                name.strip(),
+                base_url.strip().rstrip('/'),
+                api_key.strip(),
+                1 if verify_tls else 0,
+                1 if is_private else 0,
+                (group_name or '默认分组').strip() or '默认分组',
+                role_val,
+                caps_json,
+                (website_root_base or "").strip(),
+            ),
         )
         conn.commit()
         return int(cur.lastrowid)
@@ -1207,3 +1326,316 @@ def prune_rule_stats_samples(before_ts_ms: int, db_path: str = DEFAULT_DB_PATH) 
         cur = conn.execute("DELETE FROM rule_stats_samples WHERE ts_ms < ?", (cutoff,))
         conn.commit()
         return int(cur.rowcount or 0)
+
+
+# =========================
+# Website Management: sites / certificates / tasks
+# =========================
+
+def _json_dumps(obj: Any, default: str = "[]") -> str:
+    try:
+        return json.dumps(obj, ensure_ascii=False)
+    except Exception:
+        return default
+
+
+def list_sites(node_id: Optional[int] = None, db_path: str = DEFAULT_DB_PATH) -> List[Dict[str, Any]]:
+    sql = "SELECT * FROM sites"
+    params: Tuple[Any, ...] = ()
+    if node_id is not None:
+        sql += " WHERE node_id=?"
+        params = (int(node_id),)
+    sql += " ORDER BY id DESC"
+    with connect(db_path) as conn:
+        rows = conn.execute(sql, params).fetchall()
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        d = dict(r)
+        domains = _json_loads(str(d.get("domains_json") or "[]"), [])
+        if not isinstance(domains, list):
+            domains = []
+        d["domains"] = domains
+        out.append(d)
+    return out
+
+
+def get_site(site_id: int, db_path: str = DEFAULT_DB_PATH) -> Optional[Dict[str, Any]]:
+    with connect(db_path) as conn:
+        row = conn.execute("SELECT * FROM sites WHERE id=?", (int(site_id),)).fetchone()
+    if not row:
+        return None
+    d = dict(row)
+    domains = _json_loads(str(d.get("domains_json") or "[]"), [])
+    if not isinstance(domains, list):
+        domains = []
+    d["domains"] = domains
+    return d
+
+
+def add_site(
+    node_id: int,
+    name: str,
+    domains: List[str],
+    root_path: str,
+    site_type: str,
+    web_server: str = "nginx",
+    status: str = "running",
+    db_path: str = DEFAULT_DB_PATH,
+) -> int:
+    payload = _json_dumps(domains or [])
+    with connect(db_path) as conn:
+        cur = conn.execute(
+            "INSERT INTO sites(node_id, name, domains_json, root_path, type, web_server, status, created_at, updated_at) "
+            "VALUES(?,?,?,?,?,?,?,datetime('now'),datetime('now'))",
+            (
+                int(node_id),
+                (name or "").strip(),
+                payload,
+                (root_path or "").strip(),
+                (site_type or "static").strip(),
+                (web_server or "nginx").strip(),
+                (status or "running").strip(),
+            ),
+        )
+        conn.commit()
+        return int(cur.lastrowid)
+
+
+def update_site(
+    site_id: int,
+    name: Optional[str] = None,
+    domains: Optional[List[str]] = None,
+    root_path: Optional[str] = None,
+    site_type: Optional[str] = None,
+    web_server: Optional[str] = None,
+    status: Optional[str] = None,
+    db_path: str = DEFAULT_DB_PATH,
+) -> None:
+    fields: List[str] = []
+    params: List[Any] = []
+    if name is not None:
+        fields.append("name=?")
+        params.append((name or "").strip())
+    if domains is not None:
+        fields.append("domains_json=?")
+        params.append(_json_dumps(domains or []))
+    if root_path is not None:
+        fields.append("root_path=?")
+        params.append((root_path or "").strip())
+    if site_type is not None:
+        fields.append("type=?")
+        params.append((site_type or "").strip())
+    if web_server is not None:
+        fields.append("web_server=?")
+        params.append((web_server or "").strip())
+    if status is not None:
+        fields.append("status=?")
+        params.append((status or "").strip())
+    if not fields:
+        return
+    fields.append("updated_at=datetime('now')")
+    with connect(db_path) as conn:
+        conn.execute(
+            f"UPDATE sites SET {', '.join(fields)} WHERE id=?",
+            (*params, int(site_id)),
+        )
+        conn.commit()
+
+
+def delete_site(site_id: int, db_path: str = DEFAULT_DB_PATH) -> None:
+    with connect(db_path) as conn:
+        conn.execute("DELETE FROM sites WHERE id=?", (int(site_id),))
+        conn.commit()
+
+
+def list_certificates(
+    site_id: Optional[int] = None,
+    node_id: Optional[int] = None,
+    db_path: str = DEFAULT_DB_PATH,
+) -> List[Dict[str, Any]]:
+    sql = "SELECT * FROM certificates"
+    params: List[Any] = []
+    clauses: List[str] = []
+    if site_id is not None:
+        clauses.append("site_id=?")
+        params.append(int(site_id))
+    if node_id is not None:
+        clauses.append("node_id=?")
+        params.append(int(node_id))
+    if clauses:
+        sql += " WHERE " + " AND ".join(clauses)
+    sql += " ORDER BY id DESC"
+    with connect(db_path) as conn:
+        rows = conn.execute(sql, tuple(params)).fetchall()
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        d = dict(r)
+        domains = _json_loads(str(d.get("domains_json") or "[]"), [])
+        if not isinstance(domains, list):
+            domains = []
+        d["domains"] = domains
+        out.append(d)
+    return out
+
+
+def add_certificate(
+    node_id: int,
+    site_id: Optional[int],
+    domains: List[str],
+    issuer: str = "letsencrypt",
+    challenge: str = "http-01",
+    status: str = "pending",
+    not_before: Optional[str] = None,
+    not_after: Optional[str] = None,
+    renew_at: Optional[str] = None,
+    last_error: str = "",
+    db_path: str = DEFAULT_DB_PATH,
+) -> int:
+    with connect(db_path) as conn:
+        cur = conn.execute(
+            "INSERT INTO certificates(node_id, site_id, domains_json, issuer, challenge, status, "
+            "not_before, not_after, renew_at, last_error, created_at, updated_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,datetime('now'),datetime('now'))",
+            (
+                int(node_id),
+                int(site_id) if site_id is not None else None,
+                _json_dumps(domains or []),
+                (issuer or "letsencrypt").strip(),
+                (challenge or "http-01").strip(),
+                (status or "pending").strip(),
+                not_before,
+                not_after,
+                renew_at,
+                (last_error or "").strip(),
+            ),
+        )
+        conn.commit()
+        return int(cur.lastrowid)
+
+
+def update_certificate(
+    cert_id: int,
+    status: Optional[str] = None,
+    not_before: Optional[str] = None,
+    not_after: Optional[str] = None,
+    renew_at: Optional[str] = None,
+    last_error: Optional[str] = None,
+    db_path: str = DEFAULT_DB_PATH,
+) -> None:
+    fields: List[str] = []
+    params: List[Any] = []
+    if status is not None:
+        fields.append("status=?")
+        params.append((status or "").strip())
+    if not_before is not None:
+        fields.append("not_before=?")
+        params.append(not_before)
+    if not_after is not None:
+        fields.append("not_after=?")
+        params.append(not_after)
+    if renew_at is not None:
+        fields.append("renew_at=?")
+        params.append(renew_at)
+    if last_error is not None:
+        fields.append("last_error=?")
+        params.append((last_error or "").strip())
+    if not fields:
+        return
+    fields.append("updated_at=datetime('now')")
+    with connect(db_path) as conn:
+        conn.execute(
+            f"UPDATE certificates SET {', '.join(fields)} WHERE id=?",
+            (*params, int(cert_id)),
+        )
+        conn.commit()
+
+
+def list_tasks(
+    node_id: Optional[int] = None,
+    status: Optional[str] = None,
+    limit: int = 50,
+    db_path: str = DEFAULT_DB_PATH,
+) -> List[Dict[str, Any]]:
+    sql = "SELECT * FROM tasks"
+    params: List[Any] = []
+    clauses: List[str] = []
+    if node_id is not None:
+        clauses.append("node_id=?")
+        params.append(int(node_id))
+    if status is not None:
+        clauses.append("status=?")
+        params.append((status or "").strip())
+    if clauses:
+        sql += " WHERE " + " AND ".join(clauses)
+    sql += " ORDER BY id DESC LIMIT ?"
+    params.append(int(limit))
+    with connect(db_path) as conn:
+        rows = conn.execute(sql, tuple(params)).fetchall()
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        d = dict(r)
+        d["payload"] = _json_loads(str(d.get("payload_json") or "{}"), {})
+        d["result"] = _json_loads(str(d.get("result_json") or "{}"), {})
+        out.append(d)
+    return out
+
+
+def add_task(
+    node_id: int,
+    task_type: str,
+    payload: Optional[Dict[str, Any]] = None,
+    status: str = "queued",
+    progress: int = 0,
+    result: Optional[Dict[str, Any]] = None,
+    error: str = "",
+    db_path: str = DEFAULT_DB_PATH,
+) -> int:
+    with connect(db_path) as conn:
+        cur = conn.execute(
+            "INSERT INTO tasks(node_id, type, payload_json, status, progress, result_json, error, created_at, updated_at) "
+            "VALUES(?,?,?,?,?,?,?,datetime('now'),datetime('now'))",
+            (
+                int(node_id),
+                (task_type or "").strip(),
+                _json_dumps(payload or {}, "{}"),
+                (status or "queued").strip(),
+                int(progress or 0),
+                _json_dumps(result or {}, "{}"),
+                (error or "").strip(),
+            ),
+        )
+        conn.commit()
+        return int(cur.lastrowid)
+
+
+def update_task(
+    task_id: int,
+    status: Optional[str] = None,
+    progress: Optional[int] = None,
+    result: Optional[Dict[str, Any]] = None,
+    error: Optional[str] = None,
+    db_path: str = DEFAULT_DB_PATH,
+) -> None:
+    fields: List[str] = []
+    params: List[Any] = []
+    if status is not None:
+        fields.append("status=?")
+        params.append((status or "").strip())
+    if progress is not None:
+        fields.append("progress=?")
+        params.append(int(progress))
+    if result is not None:
+        fields.append("result_json=?")
+        params.append(_json_dumps(result or {}, "{}"))
+    if error is not None:
+        fields.append("error=?")
+        params.append((error or "").strip())
+    if not fields:
+        return
+    fields.append("updated_at=datetime('now')")
+    with connect(db_path) as conn:
+        conn.execute(
+            f"UPDATE tasks SET {', '.join(fields)} WHERE id=?",
+            (*params, int(task_id)),
+        )
+        conn.commit()

@@ -64,7 +64,9 @@
       data-node-base-url="{{ n.base_url or '' }}"
       data-node-group="{{ n.group_name or '' }}"
       data-node-verify-tls="{{ '1' if n.verify_tls else '0' }}"
-      data-node-is-private="{{ '1' if n.is_private else '0' }}">
+      data-node-is-private="{{ '1' if n.is_private else '0' }}"
+      data-node-role="{{ n.role or 'normal' }}"
+      data-node-website-root="{{ n.website_root_base or '' }}">
       <div class="node-top">
         <div class="node-left" style="min-width:0;">
           <div class="node-name" title="{{ n.name or ("节点-" ~ n.id) }}">{{ n.name or ("节点-" ~ n.id) }}</div>
@@ -161,7 +163,14 @@
         <div class="col">
           <label class="help"><input type="checkbox" id="addNodeIsPrivate" style="transform:translateY(1px);"> 内网机器（用于内网穿透出口）</label>
         </div>
+        <div class="col">
+          <label class="help"><input type="checkbox" id="addNodeIsWebsite" style="transform:translateY(1px);"> 网站机（可管理站点/SSL/文件）</label>
+        </div>
       </div>
+
+      <label class="label" style="margin-top:8px;">网站根目录</label>
+      <input class="input" id="addNodeWebsiteRoot" placeholder="/www" value="/www">
+      <div class="help">仅对网站机生效，用于文件管理根目录限制。</div>
 
       <div id="addNodeError" class="muted" style="margin-top:8px;color:var(--bad);"></div>
 
@@ -210,7 +219,14 @@
         <div class="col">
           <label class="help"><input type="checkbox" id="editNodeIsPrivate" style="transform:translateY(1px);"> 内网机器（用于内网穿透出口）</label>
         </div>
+        <div class="col">
+          <label class="help"><input type="checkbox" id="editNodeIsWebsite" style="transform:translateY(1px);"> 网站机（可管理站点/SSL/文件）</label>
+        </div>
       </div>
+
+      <label class="label" style="margin-top:8px;">网站根目录</label>
+      <input class="input" id="editNodeWebsiteRoot" placeholder="/www">
+      <div class="help">仅对网站机生效，用于文件管理根目录限制。</div>
 
       <div id="editNodeError" class="muted" style="margin-top:8px;color:var(--bad);"></div>
 

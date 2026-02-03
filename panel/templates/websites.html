@@ -1,0 +1,78 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="page-head">
+  <div class="page-title">
+    <h1 class="h1">网站管理</h1>
+    <div class="meta">
+      <span class="meta-item">管理网站机节点、站点、SSL 与文件。</span>
+    </div>
+  </div>
+  <div class="right">
+    <a class="btn sm" href="/websites/new">新建站点</a>
+  </div>
+</div>
+
+<div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(320px,1fr));">
+  <div class="card">
+    <div class="card-header">
+      <div class="card-title">网站机节点</div>
+      <div class="muted sm">{{ nodes|length }} 台</div>
+    </div>
+    {% if nodes %}
+      {% for n in nodes %}
+      <div class="row" style="gap:8px;align-items:center;margin-bottom:8px;">
+        <div class="col">
+          <div style="font-weight:700;">{{ n.name }}</div>
+          <div class="muted sm mono">{{ n.base_url }}</div>
+        </div>
+        <div class="col right">
+          <a class="btn xs ghost" href="/nodes/{{ n.id }}">节点详情</a>
+        </div>
+      </div>
+      {% endfor %}
+    {% else %}
+      <div class="muted">暂无网站机节点，请先在接入节点时勾选“网站机”。</div>
+    {% endif %}
+  </div>
+
+  <div class="card">
+    <div class="card-header">
+      <div class="card-title">站点总览</div>
+      <div class="muted sm">{{ sites|length }} 个</div>
+    </div>
+    {% if sites %}
+    <div class="table-wrap">
+      <table class="table">
+        <thead>
+          <tr>
+            <th>站点</th>
+            <th>域名</th>
+            <th>节点</th>
+            <th>类型</th>
+            <th>状态</th>
+            <th>操作</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for s in sites %}
+          <tr>
+            <td>{{ s.name }}</td>
+            <td class="mono">{{ s.domains_text }}</td>
+            <td>{{ s.node.name if s.node else "-" }}</td>
+            <td>{{ s.type }}</td>
+            <td>{{ s.status }}</td>
+            <td>
+              <a class="btn xs ghost" href="/websites/{{ s.id }}">管理</a>
+              <a class="btn xs ghost" href="/websites/{{ s.id }}/files">文件</a>
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% else %}
+      <div class="muted">暂无站点</div>
+    {% endif %}
+  </div>
+</div>
+{% endblock %}

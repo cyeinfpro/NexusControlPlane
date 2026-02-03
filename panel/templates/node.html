@@ -332,7 +332,14 @@
         <div class="col">
           <label class="help"><input type="checkbox" id="editNodeIsPrivate" style="transform:translateY(1px);"> 内网机器（用于内网穿透出口）</label>
         </div>
+        <div class="col">
+          <label class="help"><input type="checkbox" id="editNodeIsWebsite" style="transform:translateY(1px);"> 网站机（可管理站点/SSL/文件）</label>
+        </div>
       </div>
+
+      <label class="label" style="margin-top:8px;">网站根目录</label>
+      <input class="input" id="editNodeWebsiteRoot" placeholder="/www">
+      <div class="help">仅对网站机生效，用于文件管理根目录限制。</div>
 
       <div id="editNodeError" class="muted" style="margin-top:8px;color:var(--bad);"></div>
 
@@ -769,6 +776,8 @@ window.__NODE_NAME__ = {{ (node.name or '')|tojson }};
 window.__NODE_BASE_URL__ = {{ (node.base_url or '')|tojson }};
 window.__NODE_VERIFY_TLS__ = {{ (1 if node.verify_tls else 0) }};
 window.__NODE_IS_PRIVATE__ = {{ (1 if node.is_private else 0) }};
+window.__NODE_ROLE__ = {{ (node.role or 'normal')|tojson }};
+window.__NODE_WEBSITE_ROOT__ = {{ (node.website_root_base or '')|tojson }};
 window.__NODE_GROUP__ = {{ (node.group_name or '默认分组')|tojson }};
 window.__INSTALL_CMD__ = {{ install_cmd|tojson }};
 window.__UNINSTALL_CMD__ = {{ uninstall_cmd|tojson }};

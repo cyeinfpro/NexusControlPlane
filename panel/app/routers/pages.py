@@ -232,6 +232,8 @@ async def node_new_action(
     name: str = Form(""),
     group_name: str = Form("默认分组"),
     is_private: Optional[str] = Form(None),
+    is_website: Optional[str] = Form(None),
+    website_root_base: str = Form(""),
     ip_address: str = Form(...),
     scheme: str = Form("http"),
     api_key: str = Form(""),
@@ -272,6 +274,12 @@ async def node_new_action(
     display_name = (name or "").strip() or extract_ip_for_display(base_url)
 
     verify_tls_flag = bool(verify_tls) if verify_tls is not None else (scheme == "https")
+    role = "website" if is_website else "normal"
+    root_base = (website_root_base or "").strip()
+    if role == "website" and not root_base:
+        root_base = "/www"
+    if role != "website":
+        root_base = ""
 
     node_id = add_node(
         display_name,
@@ -280,6 +288,8 @@ async def node_new_action(
         verify_tls=verify_tls_flag,
         is_private=bool(is_private),
         group_name=group_name,
+        role=role,
+        website_root_base=root_base,
     )
     request.session["show_install_cmd"] = True
     set_flash(request, "已添加机器")
@@ -292,6 +302,8 @@ async def node_add_action(
     name: str = Form(""),
     group_name: str = Form("默认分组"),
     is_private: Optional[str] = Form(None),
+    is_website: Optional[str] = Form(None),
+    website_root_base: str = Form(""),
     base_url: str = Form(...),
     api_key: str = Form(...),
     verify_tls: Optional[str] = Form(None),
@@ -316,6 +328,8 @@ async def node_add_action(
         verify_tls=verify_tls_flag,
         is_private=bool(is_private),
         group_name=group_name,
+        role="website" if is_website else "normal",
+        website_root_base=(website_root_base or "").strip() if is_website else "",
     )
     set_flash(request, "已添加节点")
     return RedirectResponse(url=f"/nodes/{node_id}", status_code=303)

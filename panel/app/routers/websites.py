@@ -1,0 +1,689 @@
+from __future__ import annotations
+
+import base64
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlencode
+
+from fastapi import APIRouter, Depends, File, Form, Request, UploadFile
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
+
+from ..clients.agent import agent_get, agent_post, AgentError
+from ..core.deps import require_login_page
+from ..core.flash import flash, set_flash
+from ..core.templates import templates
+from ..db import (
+    add_certificate,
+    add_site,
+    add_task,
+    get_node,
+    get_site,
+    list_certificates,
+    list_nodes,
+    list_sites,
+    update_certificate,
+    update_site,
+    update_task,
+)
+from ..services.apply import node_verify_tls
+
+router = APIRouter()
+
+
+def _parse_domains(raw: str) -> List[str]:
+    if not raw:
+        return []
+    parts: List[str] = []
+    for chunk in raw.replace(";", ",").replace("\n", ",").split(","):
+        item = (chunk or "").strip()
+        if not item:
+            continue
+        # split by whitespace too
+        sub = [x for x in item.split() if x.strip()]
+        if sub:
+            parts.extend(sub)
+        else:
+            parts.append(item)
+    cleaned: List[str] = []
+    for d in parts:
+        d2 = d.strip().lower().strip(".")
+        if d2 and d2 not in cleaned:
+            cleaned.append(d2)
+    return cleaned
+
+
+def _format_bytes(num: int) -> str:
+    try:
+        n = float(num)
+    except Exception:
+        return "-"
+    if n < 1024:
+        return f"{int(n)} B"
+    for unit in ("KB", "MB", "GB", "TB"):
+        n /= 1024.0
+        if n < 1024:
+            return f"{n:.1f} {unit}"
+    return f"{n:.1f} PB"
+
+
+def _agent_payload_root(site: Dict[str, Any], node: Dict[str, Any]) -> str:
+    root = str(site.get("root_path") or "").strip()
+    if not root:
+        return ""
+    # Ensure root is under node root base when possible
+    base = str(node.get("website_root_base") or "").strip()
+    if base and not root.startswith(base.rstrip("/") + "/") and root != base.rstrip("/"):
+        return root
+    return root
+
+
+@router.get("/websites", response_class=HTMLResponse)
+async def websites_index(request: Request, user: str = Depends(require_login_page)):
+    nodes = [n for n in list_nodes() if str(n.get("role") or "") == "website"]
+    sites = list_sites()
+    node_map = {int(n["id"]): n for n in nodes}
+
+    for s in sites:
+        nid = int(s.get("node_id") or 0)
+        s["node"] = node_map.get(nid)
+        s["domains_text"] = ", ".join(s.get("domains") or [])
+
+    return templates.TemplateResponse(
+        "websites.html",
+        {
+            "request": request,
+            "user": user,
+            "flash": flash(request),
+            "title": "网站管理",
+            "nodes": nodes,
+            "sites": sites,
+        },
+    )
+
+
+@router.get("/websites/new", response_class=HTMLResponse)
+async def websites_new(request: Request, user: str = Depends(require_login_page)):
+    nodes = [n for n in list_nodes() if str(n.get("role") or "") == "website"]
+    return templates.TemplateResponse(
+        "site_new.html",
+        {
+            "request": request,
+            "user": user,
+            "flash": flash(request),
+            "title": "新建网站",
+            "nodes": nodes,
+        },
+    )
+
+
+@router.post("/websites/new")
+async def websites_new_action(
+    request: Request,
+    node_id: int = Form(...),
+    name: str = Form(""),
+    domains: str = Form(""),
+    site_type: str = Form("static"),
+    web_server: str = Form("nginx"),
+    root_path: str = Form(""),
+    proxy_target: str = Form(""),
+    user: str = Depends(require_login_page),
+):
+    node = get_node(int(node_id))
+    if not node or str(node.get("role") or "") != "website":
+        set_flash(request, "请选择网站机节点")
+        return RedirectResponse(url="/websites/new", status_code=303)
+
+    domains_list = _parse_domains(domains)
+    if not domains_list:
+        set_flash(request, "域名不能为空")
+        return RedirectResponse(url="/websites/new", status_code=303)
+
+    site_type = (site_type or "static").strip()
+    if site_type not in ("static", "php", "reverse_proxy"):
+        site_type = "static"
+
+    web_server = (web_server or "nginx").strip() or "nginx"
+
+    root_base = str(node.get("website_root_base") or "").strip() or "/www"
+    root_path = (root_path or "").strip()
+    if not root_path and site_type != "reverse_proxy":
+        root_path = f"{root_base.rstrip('/')}/wwwroot/{domains_list[0]}"
+    if site_type == "reverse_proxy" and not proxy_target.strip():
+        set_flash(request, "反向代理必须填写目标地址")
+        return RedirectResponse(url="/websites/new", status_code=303)
+
+    display_name = (name or "").strip() or domains_list[0]
+
+    site_id = add_site(
+        node_id=int(node_id),
+        name=display_name,
+        domains=domains_list,
+        root_path=root_path,
+        site_type=site_type,
+        web_server=web_server,
+        status="creating",
+    )
+
+    task_id = add_task(
+        node_id=int(node_id),
+        task_type="create_site",
+        payload={
+            "site_id": site_id,
+            "domains": domains_list,
+            "root_path": root_path,
+            "type": site_type,
+            "web_server": web_server,
+            "proxy_target": (proxy_target or "").strip(),
+        },
+        status="running",
+        progress=10,
+    )
+
+    try:
+        payload = {
+            "name": display_name,
+            "domains": domains_list,
+            "root_path": root_path,
+            "type": site_type,
+            "web_server": web_server,
+            "proxy_target": (proxy_target or "").strip(),
+        }
+        data = await agent_post(
+            node["base_url"],
+            node["api_key"],
+            "/api/v1/website/site/create",
+            payload,
+            node_verify_tls(node),
+            timeout=12,
+        )
+        if not data.get("ok", True):
+            raise AgentError(str(data.get("error") or "创建站点失败"))
+        update_site(site_id, status="running")
+        update_task(task_id, status="success", progress=100, result=data)
+        set_flash(request, "站点创建成功")
+        return RedirectResponse(url=f"/websites/{site_id}", status_code=303)
+    except Exception as exc:
+        update_site(site_id, status="error")
+        update_task(task_id, status="failed", progress=100, error=str(exc))
+        set_flash(request, f"站点创建失败：{exc}")
+        return RedirectResponse(url=f"/websites/{site_id}", status_code=303)
+
+
+@router.get("/websites/{site_id}", response_class=HTMLResponse)
+async def website_detail(request: Request, site_id: int, user: str = Depends(require_login_page)):
+    site = get_site(int(site_id))
+    if not site:
+        set_flash(request, "站点不存在")
+        return RedirectResponse(url="/websites", status_code=303)
+    node = get_node(int(site.get("node_id") or 0))
+    certs = list_certificates(site_id=int(site_id))
+    for c in certs:
+        c["domains_text"] = ", ".join(c.get("domains") or [])
+    return templates.TemplateResponse(
+        "site_detail.html",
+        {
+            "request": request,
+            "user": user,
+            "flash": flash(request),
+            "title": site.get("name") or "站点详情",
+            "site": site,
+            "node": node,
+            "certs": certs,
+        },
+    )
+
+
+@router.post("/websites/{site_id}/ssl/issue")
+async def website_ssl_issue(request: Request, site_id: int, user: str = Depends(require_login_page)):
+    site = get_site(int(site_id))
+    if not site:
+        set_flash(request, "站点不存在")
+        return RedirectResponse(url="/websites", status_code=303)
+    node = get_node(int(site.get("node_id") or 0))
+    if not node:
+        set_flash(request, "节点不存在")
+        return RedirectResponse(url=f"/websites/{site_id}", status_code=303)
+
+    domains = site.get("domains") or []
+    if not domains:
+        set_flash(request, "站点域名为空")
+        return RedirectResponse(url=f"/websites/{site_id}", status_code=303)
+
+    cert_id = None
+    existing = list_certificates(site_id=int(site_id))
+    if existing:
+        cert_id = int(existing[0].get("id") or 0)
+
+    task_id = add_task(
+        node_id=int(site.get("node_id") or 0),
+        task_type="ssl_issue",
+        payload={"site_id": site_id, "domains": domains},
+        status="running",
+        progress=10,
+    )
+
+    try:
+        data = await agent_post(
+            node["base_url"],
+            node["api_key"],
+            "/api/v1/website/ssl/issue",
+            {"domains": domains, "root_path": site.get("root_path") or ""},
+            node_verify_tls(node),
+            timeout=20,
+        )
+        if not data.get("ok", True):
+            raise AgentError(str(data.get("error") or "证书申请失败"))
+
+        if cert_id:
+            update_certificate(
+                cert_id,
+                status="valid",
+                not_before=data.get("not_before"),
+                not_after=data.get("not_after"),
+                renew_at=data.get("renew_at"),
+                last_error="",
+            )
+        else:
+            add_certificate(
+                node_id=int(site.get("node_id") or 0),
+                site_id=int(site_id),
+                domains=domains,
+                status="valid",
+                not_before=data.get("not_before"),
+                not_after=data.get("not_after"),
+                renew_at=data.get("renew_at"),
+                last_error="",
+            )
+        update_task(task_id, status="success", progress=100, result=data)
+        set_flash(request, "证书申请成功")
+    except Exception as exc:
+        if cert_id:
+            update_certificate(cert_id, status="failed", last_error=str(exc))
+        else:
+            add_certificate(
+                node_id=int(site.get("node_id") or 0),
+                site_id=int(site_id),
+                domains=domains,
+                status="failed",
+                last_error=str(exc),
+            )
+        update_task(task_id, status="failed", progress=100, error=str(exc))
+        set_flash(request, f"证书申请失败：{exc}")
+
+    return RedirectResponse(url=f"/websites/{site_id}", status_code=303)
+
+
+@router.post("/websites/{site_id}/ssl/renew")
+async def website_ssl_renew(request: Request, site_id: int, user: str = Depends(require_login_page)):
+    site = get_site(int(site_id))
+    if not site:
+        set_flash(request, "站点不存在")
+        return RedirectResponse(url="/websites", status_code=303)
+    node = get_node(int(site.get("node_id") or 0))
+    if not node:
+        set_flash(request, "节点不存在")
+        return RedirectResponse(url=f"/websites/{site_id}", status_code=303)
+
+    domains = site.get("domains") or []
+    if not domains:
+        set_flash(request, "站点域名为空")
+        return RedirectResponse(url=f"/websites/{site_id}", status_code=303)
+
+    existing = list_certificates(site_id=int(site_id))
+    cert_id = int(existing[0].get("id") or 0) if existing else None
+
+    task_id = add_task(
+        node_id=int(site.get("node_id") or 0),
+        task_type="ssl_renew",
+        payload={"site_id": site_id, "domains": domains},
+        status="running",
+        progress=10,
+    )
+
+    try:
+        data = await agent_post(
+            node["base_url"],
+            node["api_key"],
+            "/api/v1/website/ssl/renew",
+            {"domains": domains, "root_path": site.get("root_path") or ""},
+            node_verify_tls(node),
+            timeout=20,
+        )
+        if not data.get("ok", True):
+            raise AgentError(str(data.get("error") or "证书续期失败"))
+
+        if cert_id:
+            update_certificate(
+                cert_id,
+                status="valid",
+                not_before=data.get("not_before"),
+                not_after=data.get("not_after"),
+                renew_at=data.get("renew_at"),
+                last_error="",
+            )
+        else:
+            add_certificate(
+                node_id=int(site.get("node_id") or 0),
+                site_id=int(site_id),
+                domains=domains,
+                status="valid",
+                not_before=data.get("not_before"),
+                not_after=data.get("not_after"),
+                renew_at=data.get("renew_at"),
+                last_error="",
+            )
+
+        update_task(task_id, status="success", progress=100, result=data)
+        set_flash(request, "证书续期成功")
+    except Exception as exc:
+        if cert_id:
+            update_certificate(cert_id, status="failed", last_error=str(exc))
+        else:
+            add_certificate(
+                node_id=int(site.get("node_id") or 0),
+                site_id=int(site_id),
+                domains=domains,
+                status="failed",
+                last_error=str(exc),
+            )
+        update_task(task_id, status="failed", progress=100, error=str(exc))
+        set_flash(request, f"证书续期失败：{exc}")
+    return RedirectResponse(url=f"/websites/{site_id}", status_code=303)
+
+
+@router.get("/websites/{site_id}/files", response_class=HTMLResponse)
+async def website_files(request: Request, site_id: int, path: str = "", user: str = Depends(require_login_page)):
+    site = get_site(int(site_id))
+    if not site:
+        set_flash(request, "站点不存在")
+        return RedirectResponse(url="/websites", status_code=303)
+    node = get_node(int(site.get("node_id") or 0))
+    if not node:
+        set_flash(request, "节点不存在")
+        return RedirectResponse(url=f"/websites/{site_id}", status_code=303)
+
+    root = _agent_payload_root(site, node)
+    if not root:
+        set_flash(request, "该站点没有可管理的根目录")
+        return RedirectResponse(url=f"/websites/{site_id}", status_code=303)
+
+    err_msg = ""
+    items: List[Dict[str, Any]] = []
+    try:
+        q = urlencode({"root": root, "path": path})
+        data = await agent_get(
+            node["base_url"],
+            node["api_key"],
+            f"/api/v1/website/files/list?{q}",
+            node_verify_tls(node),
+            timeout=10,
+        )
+        if not data.get("ok", True):
+            raise AgentError(str(data.get("error") or "读取目录失败"))
+        items = data.get("items") or []
+    except Exception as exc:
+        err_msg = str(exc)
+
+    for it in items:
+        it["size_h"] = _format_bytes(int(it.get("size") or 0))
+
+    # build breadcrumbs
+    crumbs: List[Tuple[str, str]] = [("根目录", "")]
+    if path:
+        segs = [s for s in path.split("/") if s]
+        accum = []
+        for s in segs:
+            accum.append(s)
+            crumbs.append((s, "/".join(accum)))
+
+    return templates.TemplateResponse(
+        "site_files.html",
+        {
+            "request": request,
+            "user": user,
+            "flash": flash(request),
+            "title": f"文件管理 · {site.get('name')}",
+            "site": site,
+            "node": node,
+            "path": path,
+            "root": root,
+            "items": items,
+            "breadcrumbs": crumbs,
+            "error": err_msg,
+        },
+    )
+
+
+@router.post("/websites/{site_id}/files/mkdir")
+async def website_files_mkdir(
+    request: Request,
+    site_id: int,
+    path: str = Form(""),
+    name: str = Form(""),
+    user: str = Depends(require_login_page),
+):
+    site = get_site(int(site_id))
+    node = get_node(int(site.get("node_id") or 0)) if site else None
+    if not site or not node:
+        set_flash(request, "站点不存在")
+        return RedirectResponse(url="/websites", status_code=303)
+
+    root = _agent_payload_root(site, node)
+    if not root:
+        set_flash(request, "该站点没有可管理的根目录")
+        return RedirectResponse(url=f"/websites/{site_id}", status_code=303)
+
+    name = (name or "").strip()
+    if not name:
+        set_flash(request, "目录名不能为空")
+        return RedirectResponse(url=f"/websites/{site_id}/files?path={path}", status_code=303)
+
+    try:
+        await agent_post(
+            node["base_url"],
+            node["api_key"],
+            "/api/v1/website/files/mkdir",
+            {"root": root, "path": path, "name": name},
+            node_verify_tls(node),
+            timeout=10,
+        )
+        set_flash(request, "目录创建成功")
+    except Exception as exc:
+        set_flash(request, f"创建目录失败：{exc}")
+    return RedirectResponse(url=f"/websites/{site_id}/files?path={path}", status_code=303)
+
+
+@router.post("/websites/{site_id}/files/upload")
+async def website_files_upload(
+    request: Request,
+    site_id: int,
+    path: str = Form(""),
+    file: UploadFile = File(...),
+    user: str = Depends(require_login_page),
+):
+    site = get_site(int(site_id))
+    node = get_node(int(site.get("node_id") or 0)) if site else None
+    if not site or not node:
+        set_flash(request, "站点不存在")
+        return RedirectResponse(url="/websites", status_code=303)
+
+    root = _agent_payload_root(site, node)
+    if not root:
+        set_flash(request, "该站点没有可管理的根目录")
+        return RedirectResponse(url=f"/websites/{site_id}", status_code=303)
+
+    try:
+        raw = await file.read()
+        if len(raw) > 4 * 1024 * 1024:
+            raise RuntimeError("文件过大（当前限制 4MB）")
+        payload = {
+            "root": root,
+            "path": path,
+            "filename": file.filename or "upload.bin",
+            "content_b64": base64.b64encode(raw).decode("ascii"),
+        }
+        await agent_post(
+            node["base_url"],
+            node["api_key"],
+            "/api/v1/website/files/upload",
+            payload,
+            node_verify_tls(node),
+            timeout=15,
+        )
+        set_flash(request, "上传成功")
+    except Exception as exc:
+        set_flash(request, f"上传失败：{exc}")
+
+    return RedirectResponse(url=f"/websites/{site_id}/files?path={path}", status_code=303)
+
+
+@router.get("/websites/{site_id}/files/edit", response_class=HTMLResponse)
+async def website_files_edit(
+    request: Request,
+    site_id: int,
+    path: str,
+    user: str = Depends(require_login_page),
+):
+    site = get_site(int(site_id))
+    node = get_node(int(site.get("node_id") or 0)) if site else None
+    if not site or not node:
+        set_flash(request, "站点不存在")
+        return RedirectResponse(url="/websites", status_code=303)
+
+    root = _agent_payload_root(site, node)
+    if not root:
+        set_flash(request, "该站点没有可管理的根目录")
+        return RedirectResponse(url=f"/websites/{site_id}", status_code=303)
+
+    content = ""
+    error = ""
+    try:
+        q = urlencode({"root": root, "path": path})
+        data = await agent_get(
+            node["base_url"],
+            node["api_key"],
+            f"/api/v1/website/files/read?{q}",
+            node_verify_tls(node),
+            timeout=10,
+        )
+        if not data.get("ok", True):
+            raise AgentError(str(data.get("error") or "读取文件失败"))
+        content = str(data.get("content") or "")
+    except Exception as exc:
+        error = str(exc)
+
+    return templates.TemplateResponse(
+        "site_file_edit.html",
+        {
+            "request": request,
+            "user": user,
+            "flash": flash(request),
+            "title": f"编辑文件 · {site.get('name')}",
+            "site": site,
+            "node": node,
+            "path": path,
+            "content": content,
+            "error": error,
+        },
+    )
+
+
+@router.post("/websites/{site_id}/files/save")
+async def website_files_save(
+    request: Request,
+    site_id: int,
+    path: str = Form(""),
+    content: str = Form(""),
+    user: str = Depends(require_login_page),
+):
+    site = get_site(int(site_id))
+    node = get_node(int(site.get("node_id") or 0)) if site else None
+    if not site or not node:
+        set_flash(request, "站点不存在")
+        return RedirectResponse(url="/websites", status_code=303)
+
+    root = _agent_payload_root(site, node)
+    if not root:
+        set_flash(request, "该站点没有可管理的根目录")
+        return RedirectResponse(url=f"/websites/{site_id}", status_code=303)
+
+    try:
+        await agent_post(
+            node["base_url"],
+            node["api_key"],
+            "/api/v1/website/files/write",
+            {"root": root, "path": path, "content": content},
+            node_verify_tls(node),
+            timeout=10,
+        )
+        set_flash(request, "保存成功")
+    except Exception as exc:
+        set_flash(request, f"保存失败：{exc}")
+    return RedirectResponse(url=f"/websites/{site_id}/files?path={'/'.join(path.split('/')[:-1])}", status_code=303)
+
+
+@router.post("/websites/{site_id}/files/delete")
+async def website_files_delete(
+    request: Request,
+    site_id: int,
+    path: str = Form(""),
+    user: str = Depends(require_login_page),
+):
+    site = get_site(int(site_id))
+    node = get_node(int(site.get("node_id") or 0)) if site else None
+    if not site or not node:
+        set_flash(request, "站点不存在")
+        return RedirectResponse(url="/websites", status_code=303)
+
+    root = _agent_payload_root(site, node)
+    if not root:
+        set_flash(request, "该站点没有可管理的根目录")
+        return RedirectResponse(url=f"/websites/{site_id}", status_code=303)
+
+    try:
+        await agent_post(
+            node["base_url"],
+            node["api_key"],
+            "/api/v1/website/files/delete",
+            {"root": root, "path": path},
+            node_verify_tls(node),
+            timeout=10,
+        )
+        set_flash(request, "删除成功")
+    except Exception as exc:
+        set_flash(request, f"删除失败：{exc}")
+    return RedirectResponse(url=f"/websites/{site_id}/files?path={'/'.join(path.split('/')[:-1])}", status_code=303)
+
+
+@router.get("/websites/{site_id}/files/download")
+async def website_files_download(
+    request: Request,
+    site_id: int,
+    path: str,
+    user: str = Depends(require_login_page),
+):
+    site = get_site(int(site_id))
+    node = get_node(int(site.get("node_id") or 0)) if site else None
+    if not site or not node:
+        set_flash(request, "站点不存在")
+        return RedirectResponse(url="/websites", status_code=303)
+
+    root = _agent_payload_root(site, node)
+    if not root:
+        set_flash(request, "该站点没有可管理的根目录")
+        return RedirectResponse(url=f"/websites/{site_id}", status_code=303)
+
+    # Lightweight proxy: fetch file bytes from agent and return
+    import httpx
+
+    url = f"{node['base_url'].rstrip('/')}/api/v1/website/files/raw"
+    params = {"root": root, "path": path}
+    headers = {"X-API-Key": node.get("api_key") or ""}
+    async with httpx.AsyncClient(timeout=20, verify=node_verify_tls(node)) as client:
+        r = await client.get(url, params=params, headers=headers)
+    if r.status_code != 200:
+        set_flash(request, f"下载失败（HTTP {r.status_code}）")
+        return RedirectResponse(url=f"/websites/{site_id}/files?path={'/'.join(path.split('/')[:-1])}", status_code=303)
+
+    filename = path.split("/")[-1] or "download.bin"
+    headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+    return Response(content=r.content, media_type="application/octet-stream", headers=headers)
