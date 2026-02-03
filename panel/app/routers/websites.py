@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import base64
+import os
+import uuid
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlencode
 
@@ -15,6 +17,10 @@ from ..db import (
     add_certificate,
     add_site,
     add_task,
+    delete_certificates_by_node,
+    delete_certificates_by_site,
+    delete_site,
+    delete_sites_by_node,
     get_node,
     get_site,
     list_certificates,
@@ -27,6 +33,8 @@ from ..db import (
 from ..services.apply import node_verify_tls
 
 router = APIRouter()
+UPLOAD_CHUNK_SIZE = 1024 * 512
+UPLOAD_MAX_BYTES = 1024 * 1024 * 200
 
 
 def _parse_domains(raw: str) -> List[str]:
@@ -142,6 +150,17 @@ async def websites_new_action(
         site_type = "static"
 
     web_server = (web_server or "nginx").strip() or "nginx"
+    if web_server != "nginx":
+        set_flash(request, "当前仅支持 nginx")
+        return RedirectResponse(url="/websites/new", status_code=303)
+
+    # prevent duplicate domains on same node
+    existing = list_sites(node_id=int(node_id))
+    for s in existing:
+        s_domains = set([str(x).lower() for x in (s.get("domains") or [])])
+        if s_domains.intersection(set(domains_list)):
+            set_flash(request, "该节点已有重复域名的站点")
+            return RedirectResponse(url="/websites/new", status_code=303)
 
     root_base = str(node.get("website_root_base") or "").strip() or "/www"
     root_path = (root_path or "").strip()
@@ -390,6 +409,94 @@ async def website_ssl_renew(request: Request, site_id: int, user: str = Depends(
     return RedirectResponse(url=f"/websites/{site_id}", status_code=303)
 
 
+@router.post("/websites/{site_id}/delete")
+async def website_delete(
+    request: Request,
+    site_id: int,
+    delete_files: Optional[str] = Form(None),
+    delete_cert: Optional[str] = Form(None),
+    user: str = Depends(require_login_page),
+):
+    site = get_site(int(site_id))
+    if not site:
+        set_flash(request, "站点不存在")
+        return RedirectResponse(url="/websites", status_code=303)
+    node = get_node(int(site.get("node_id") or 0))
+    if not node:
+        set_flash(request, "节点不存在")
+        return RedirectResponse(url=f"/websites/{site_id}", status_code=303)
+
+    domains = site.get("domains") or []
+    payload = {
+        "domains": domains,
+        "root_path": site.get("root_path") or "",
+        "delete_root": bool(delete_files),
+        "delete_cert": bool(delete_cert),
+    }
+    try:
+        data = await agent_post(
+            node["base_url"],
+            node["api_key"],
+            "/api/v1/website/site/delete",
+            payload,
+            node_verify_tls(node),
+            timeout=20,
+        )
+        if not data.get("ok", True):
+            raise AgentError(str(data.get("error") or "删除站点失败"))
+        delete_certificates_by_site(int(site_id))
+        delete_site(int(site_id))
+        set_flash(request, "站点已删除")
+        return RedirectResponse(url="/websites", status_code=303)
+    except Exception as exc:
+        set_flash(request, f"删除站点失败：{exc}")
+        return RedirectResponse(url=f"/websites/{site_id}", status_code=303)
+
+
+@router.post("/websites/nodes/{node_id}/env/uninstall")
+async def website_env_uninstall(
+    request: Request,
+    node_id: int,
+    purge_data: Optional[str] = Form(None),
+    user: str = Depends(require_login_page),
+):
+    node = get_node(int(node_id))
+    if not node or str(node.get("role") or "") != "website":
+        set_flash(request, "节点不存在或不是网站机")
+        return RedirectResponse(url="/websites", status_code=303)
+
+    sites = list_sites(node_id=int(node_id))
+    payload = {
+        "purge_data": bool(purge_data),
+        "sites": [
+            {
+                "domains": s.get("domains") or [],
+                "root_path": s.get("root_path") or "",
+            }
+            for s in sites
+        ],
+    }
+
+    try:
+        data = await agent_post(
+            node["base_url"],
+            node["api_key"],
+            "/api/v1/website/env/uninstall",
+            payload,
+            node_verify_tls(node),
+            timeout=30,
+        )
+        if not data.get("ok", True):
+            raise AgentError(str(data.get("error") or "卸载失败"))
+        if purge_data:
+            delete_certificates_by_node(int(node_id))
+            delete_sites_by_node(int(node_id))
+        set_flash(request, "网站环境已卸载")
+    except Exception as exc:
+        set_flash(request, f"卸载失败：{exc}")
+    return RedirectResponse(url="/websites", status_code=303)
+
+
 @router.get("/websites/{site_id}/files", response_class=HTMLResponse)
 async def website_files(request: Request, site_id: int, path: str = "", user: str = Depends(require_login_page)):
     site = get_site(int(site_id))
@@ -512,23 +619,42 @@ async def website_files_upload(
         return RedirectResponse(url=f"/websites/{site_id}", status_code=303)
 
     try:
-        raw = await file.read()
-        if len(raw) > 4 * 1024 * 1024:
-            raise RuntimeError("文件过大（当前限制 4MB）")
-        payload = {
-            "root": root,
-            "path": path,
-            "filename": file.filename or "upload.bin",
-            "content_b64": base64.b64encode(raw).decode("ascii"),
-        }
-        await agent_post(
-            node["base_url"],
-            node["api_key"],
-            "/api/v1/website/files/upload",
-            payload,
-            node_verify_tls(node),
-            timeout=15,
-        )
+        filename = os.path.basename(file.filename or "upload.bin")
+        upload_id = uuid.uuid4().hex
+        offset = 0
+        total = 0
+        chunk = await file.read(UPLOAD_CHUNK_SIZE)
+        if not chunk:
+            raise RuntimeError("空文件")
+        while True:
+            next_chunk = await file.read(UPLOAD_CHUNK_SIZE)
+            done = not next_chunk
+            total += len(chunk)
+            if total > UPLOAD_MAX_BYTES:
+                raise RuntimeError("文件过大（当前限制 200MB）")
+            payload = {
+                "root": root,
+                "path": path,
+                "filename": filename,
+                "upload_id": upload_id,
+                "offset": offset,
+                "done": done,
+                "content_b64": base64.b64encode(chunk).decode("ascii"),
+            }
+            resp = await agent_post(
+                node["base_url"],
+                node["api_key"],
+                "/api/v1/website/files/upload_chunk",
+                payload,
+                node_verify_tls(node),
+                timeout=30,
+            )
+            if not resp.get("ok", True):
+                raise AgentError(str(resp.get("error") or "上传失败"))
+            offset += len(chunk)
+            if done:
+                break
+            chunk = next_chunk
         set_flash(request, "上传成功")
     except Exception as exc:
         set_flash(request, f"上传失败：{exc}")

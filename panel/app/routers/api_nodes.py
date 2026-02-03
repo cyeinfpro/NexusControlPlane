@@ -156,6 +156,8 @@ async def api_backup_full(request: Request, user: str = Depends(require_login)):
                 "api_key": n.get("api_key"),
                 "verify_tls": bool(n.get("verify_tls", 0)),
                 "group_name": n.get("group_name") or "默认分组",
+                "role": n.get("role") or "normal",
+                "website_root_base": n.get("website_root_base") or "",
             }
             for n in nodes
         ],
@@ -262,6 +264,10 @@ async def api_restore_nodes(
         api_key = (item.get("api_key") or "").strip()
         verify_tls = bool(item.get("verify_tls", False))
         is_private = bool(item.get("is_private", False))
+        role = str(item.get("role") or "normal").strip().lower() or "normal"
+        if role not in ("normal", "website"):
+            role = "normal"
+        website_root_base = str(item.get("website_root_base") or "").strip()
         group_name = (
             (item.get("group_name") or "默认分组").strip()
             if isinstance(item.get("group_name"), str)
@@ -290,6 +296,8 @@ async def api_restore_nodes(
                 verify_tls=verify_tls,
                 is_private=is_private,
                 group_name=group_name,
+                role=role,
+                website_root_base=website_root_base,
             )
             updated += 1
             if source_id_i is not None:
@@ -302,6 +310,8 @@ async def api_restore_nodes(
                 verify_tls=verify_tls,
                 is_private=is_private,
                 group_name=group_name,
+                role=role,
+                website_root_base=website_root_base,
             )
             added += 1
             if source_id_i is not None:
@@ -396,6 +406,10 @@ async def api_restore_full(
         api_key = (item.get("api_key") or "").strip()
         verify_tls = bool(item.get("verify_tls", False))
         is_private = bool(item.get("is_private", False))
+        role = str(item.get("role") or "normal").strip().lower() or "normal"
+        if role not in ("normal", "website"):
+            role = "normal"
+        website_root_base = str(item.get("website_root_base") or "").strip()
         group_name = item.get("group_name") or "默认分组"
         group_name = str(group_name).strip() or "默认分组"
         source_id = item.get("source_id")
@@ -421,6 +435,8 @@ async def api_restore_full(
                 verify_tls=verify_tls,
                 is_private=is_private,
                 group_name=group_name,
+                role=role,
+                website_root_base=website_root_base,
             )
             updated += 1
             node_id = int(existing["id"])
@@ -433,6 +449,8 @@ async def api_restore_full(
                     verify_tls=verify_tls,
                     is_private=is_private,
                     group_name=group_name,
+                    role=role,
+                    website_root_base=website_root_base,
                 )
             )
             added += 1

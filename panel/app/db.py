@@ -1448,6 +1448,13 @@ def delete_site(site_id: int, db_path: str = DEFAULT_DB_PATH) -> None:
         conn.commit()
 
 
+def delete_sites_by_node(node_id: int, db_path: str = DEFAULT_DB_PATH) -> int:
+    with connect(db_path) as conn:
+        cur = conn.execute("DELETE FROM sites WHERE node_id=?", (int(node_id),))
+        conn.commit()
+        return int(cur.rowcount or 0)
+
+
 def list_certificates(
     site_id: Optional[int] = None,
     node_id: Optional[int] = None,
@@ -1548,6 +1555,26 @@ def update_certificate(
             (*params, int(cert_id)),
         )
         conn.commit()
+
+
+def delete_certificate(cert_id: int, db_path: str = DEFAULT_DB_PATH) -> None:
+    with connect(db_path) as conn:
+        conn.execute("DELETE FROM certificates WHERE id=?", (int(cert_id),))
+        conn.commit()
+
+
+def delete_certificates_by_site(site_id: int, db_path: str = DEFAULT_DB_PATH) -> int:
+    with connect(db_path) as conn:
+        cur = conn.execute("DELETE FROM certificates WHERE site_id=?", (int(site_id),))
+        conn.commit()
+        return int(cur.rowcount or 0)
+
+
+def delete_certificates_by_node(node_id: int, db_path: str = DEFAULT_DB_PATH) -> int:
+    with connect(db_path) as conn:
+        cur = conn.execute("DELETE FROM certificates WHERE node_id=?", (int(node_id),))
+        conn.commit()
+        return int(cur.rowcount or 0)
 
 
 def list_tasks(

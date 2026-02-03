@@ -439,6 +439,17 @@ def _service_is_active(name: str) -> bool:
     return False
 
 
+def _stop_service(name: str) -> None:
+    for cmd in (["systemctl", "stop", name], ["service", name, "stop"], ["rc-service", name, "stop"]):
+        if shutil.which(cmd[0]) is None:
+            continue
+        try:
+            subprocess.run(cmd, capture_output=True, text=True)
+            return
+        except Exception:
+            continue
+
+
 def _restart_realm() -> None:
     candidates = []
     if CFG.realm_service:
@@ -2840,7 +2851,31 @@ def _slugify(name: str) -> str:
     return safe or "site"
 
 
-def _render_nginx_conf(site_type: str, domains: List[str], root_path: str, proxy_target: str) -> str:
+def _detect_php_fpm_sock() -> Optional[str]:
+    candidates = [
+        "/run/php/php-fpm.sock",
+        "/run/php/php8.3-fpm.sock",
+        "/run/php/php8.2-fpm.sock",
+        "/run/php/php8.1-fpm.sock",
+        "/run/php/php8.0-fpm.sock",
+        "/run/php/php7.4-fpm.sock",
+        "/var/run/php-fpm.sock",
+        "/run/php-fpm/www.sock",
+        "/var/run/php/php-fpm.sock",
+    ]
+    for p in candidates:
+        if Path(p).exists():
+            return p
+    return None
+
+
+def _render_nginx_conf(
+    site_type: str,
+    domains: List[str],
+    root_path: str,
+    proxy_target: str,
+    php_sock: Optional[str] = None,
+) -> str:
     server_name = " ".join(domains)
     if site_type == "reverse_proxy":
         return (
@@ -2857,6 +2892,7 @@ def _render_nginx_conf(site_type: str, domains: List[str], root_path: str, proxy
             "}\n"
         )
     if site_type == "php":
+        sock = php_sock or "/run/php/php-fpm.sock"
         return (
             "server {\n"
             "  listen 80;\n"
@@ -2869,7 +2905,7 @@ def _render_nginx_conf(site_type: str, domains: List[str], root_path: str, proxy
             "  location ~ \\.php$ {\n"
             "    include fastcgi_params;\n"
             "    fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;\n"
-            "    fastcgi_pass unix:/run/php/php-fpm.sock;\n"
+            f"    fastcgi_pass unix:{sock};\n"
             "  }\n"
             "}\n"
         )
@@ -2917,6 +2953,57 @@ def _nginx_reload() -> Tuple[bool, str]:
         if code == 0:
             return True, out
     return False, "nginx reload 失败"
+
+
+def _remove_nginx_conf_by_domain(domain: str) -> int:
+    conf_dir, enabled_dir = _nginx_conf_locations()
+    slug = _slugify(domain)
+    conf_name = f"nexus-{slug}.conf"
+    removed = 0
+    for d in (conf_dir, enabled_dir):
+        if not d:
+            continue
+        path = d / conf_name
+        try:
+            if path.exists() or path.is_symlink():
+                path.unlink()
+                removed += 1
+        except Exception:
+            pass
+    return removed
+
+
+def _purge_nginx_confs() -> int:
+    conf_dir, enabled_dir = _nginx_conf_locations()
+    removed = 0
+    for d in (conf_dir, enabled_dir):
+        if not d or not d.exists():
+            continue
+        for p in d.glob("nexus-*.conf"):
+            try:
+                p.unlink()
+                removed += 1
+            except Exception:
+                continue
+    return removed
+
+
+def _delete_site_root(root_path: str) -> Optional[str]:
+    if not root_path:
+        return "root_path 不能为空"
+    try:
+        root = _validate_root(root_path)
+    except Exception as exc:
+        return str(exc)
+    for base in _website_root_bases():
+        if root == base:
+            return "禁止删除根基目录"
+    try:
+        if root.exists():
+            shutil.rmtree(root)
+    except Exception as exc:
+        return str(exc)
+    return None
 
 
 def _find_acme_sh() -> Optional[str]:
@@ -2971,7 +3058,8 @@ def api_website_create(payload: Dict[str, Any], _: None = Depends(_api_key_requi
         if not root_path:
             return {"ok": False, "error": "root_path 不能为空"}
         try:
-            Path(root_path).mkdir(parents=True, exist_ok=True)
+            root_valid = _validate_root(root_path)
+            root_valid.mkdir(parents=True, exist_ok=True)
             idx = Path(root_path) / "index.html"
             if not idx.exists():
                 idx.write_text("<h1>It works!</h1>", encoding="utf-8")
@@ -2981,7 +3069,13 @@ def api_website_create(payload: Dict[str, Any], _: None = Depends(_api_key_requi
         if not proxy_target:
             return {"ok": False, "error": "proxy_target 不能为空"}
 
-    conf = _render_nginx_conf(site_type, domains, root_path, proxy_target)
+    php_sock = None
+    if site_type == "php":
+        php_sock = _detect_php_fpm_sock()
+        if not php_sock:
+            return {"ok": False, "error": "未检测到 php-fpm socket"}
+
+    conf = _render_nginx_conf(site_type, domains, root_path, proxy_target, php_sock)
     conf_path = _write_nginx_conf(domains[0], conf)
     ok, out = _nginx_reload()
     if not ok:
@@ -3004,6 +3098,10 @@ def api_ssl_issue(payload: Dict[str, Any], _: None = Depends(_api_key_required))
     root_path = str(payload.get("root_path") or "").strip()
     if not root_path:
         return {"ok": False, "error": "root_path 不能为空"}
+    try:
+        _validate_root(root_path)
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
 
     acme = _find_acme_sh()
     if not acme:
@@ -3058,6 +3156,10 @@ def api_ssl_renew(payload: Dict[str, Any], _: None = Depends(_api_key_required))
     root_path = str(payload.get("root_path") or "").strip()
     if not root_path:
         return {"ok": False, "error": "root_path 不能为空"}
+    try:
+        _validate_root(root_path)
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
 
     acme = _find_acme_sh()
     if not acme:
@@ -3099,6 +3201,86 @@ def api_ssl_renew(payload: Dict[str, Any], _: None = Depends(_api_key_required))
     }
 
 
+@app.post("/api/v1/website/site/delete")
+def api_website_delete(payload: Dict[str, Any], _: None = Depends(_api_key_required)) -> Dict[str, Any]:
+    if not isinstance(payload, dict):
+        payload = {}
+    domains = payload.get("domains") or []
+    if not isinstance(domains, list) or not domains:
+        return {"ok": False, "error": "domains 不能为空"}
+    root_path = str(payload.get("root_path") or "").strip()
+    delete_root = bool(payload.get("delete_root"))
+    delete_cert = bool(payload.get("delete_cert"))
+
+    removed_conf = _remove_nginx_conf_by_domain(str(domains[0]))
+    if shutil.which("nginx") is not None:
+        ok, out = _nginx_reload()
+        if not ok:
+            return {"ok": False, "error": out}
+
+    if delete_root:
+        err = _delete_site_root(root_path)
+        if err:
+            return {"ok": False, "error": f"删除站点目录失败：{err}"}
+
+    removed_cert = False
+    if delete_cert:
+        safe = _slugify(str(domains[0]))
+        cert_dir = Path("/etc/ssl/nexus") / safe
+        try:
+            if cert_dir.exists():
+                shutil.rmtree(cert_dir)
+            removed_cert = True
+        except Exception:
+            removed_cert = False
+
+    return {"ok": True, "removed_conf": removed_conf, "removed_cert": removed_cert}
+
+
+@app.post("/api/v1/website/env/uninstall")
+def api_website_env_uninstall(payload: Dict[str, Any], _: None = Depends(_api_key_required)) -> Dict[str, Any]:
+    if not isinstance(payload, dict):
+        payload = {}
+    purge_data = bool(payload.get("purge_data"))
+    sites = payload.get("sites") or []
+    if not isinstance(sites, list):
+        sites = []
+
+    for svc in ("nginx", "apache2", "httpd", "php-fpm", "php8.2-fpm", "php8.1-fpm", "php8.0-fpm"):
+        _stop_service(svc)
+
+    removed_conf = _purge_nginx_confs()
+    if shutil.which("nginx") is not None:
+        ok, out = _nginx_reload()
+        if not ok:
+            return {"ok": False, "error": out}
+
+    removed_roots = 0
+    errors: List[str] = []
+    if purge_data:
+        for s in sites:
+            if not isinstance(s, dict):
+                continue
+            err = _delete_site_root(str(s.get("root_path") or "").strip())
+            if err:
+                errors.append(err)
+            else:
+                removed_roots += 1
+        try:
+            cert_dir = Path("/etc/ssl/nexus")
+            if cert_dir.exists():
+                shutil.rmtree(cert_dir)
+        except Exception as exc:
+            errors.append(str(exc))
+
+    return {
+        "ok": True,
+        "removed_conf": removed_conf,
+        "purged_roots": removed_roots,
+        "errors": errors,
+    }
+
+
 @app.get("/api/v1/website/files/list")
 def api_files_list(root: str, path: str = "", _: None = Depends(_api_key_required)) -> Dict[str, Any]:
     root_path = _validate_root(root)
@@ -3107,17 +3289,23 @@ def api_files_list(root: str, path: str = "", _: None = Depends(_api_key_require
         return {"ok": False, "error": "目录不存在"}
 
     items: List[Dict[str, Any]] = []
-    for entry in sorted(target.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower())):
+    try:
+        entries = list(os.scandir(target))
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+    entries.sort(key=lambda e: (not e.is_dir(follow_symlinks=False), e.name.lower()))
+    for entry in entries:
         try:
-            st = entry.stat()
+            st = entry.stat(follow_symlinks=False)
+            rel = str(Path(entry.path).relative_to(root_path))
         except Exception:
             continue
-        rel = str(entry.relative_to(root_path))
         items.append(
             {
                 "name": entry.name,
                 "path": rel,
-                "is_dir": entry.is_dir(),
+                "is_dir": entry.is_dir(follow_symlinks=False),
                 "size": int(st.st_size),
                 "mtime": datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
             }
@@ -3128,6 +3316,8 @@ def api_files_list(root: str, path: str = "", _: None = Depends(_api_key_require
 @app.get("/api/v1/website/files/read")
 def api_files_read(root: str, path: str, _: None = Depends(_api_key_required)) -> Dict[str, Any]:
     root_path = _validate_root(root)
+    if not path:
+        return {"ok": False, "error": "文件路径不能为空"}
     target = _safe_join(root_path, path)
     if not target.exists() or not target.is_file():
         return {"ok": False, "error": "文件不存在"}
@@ -3146,6 +3336,8 @@ def api_files_write(payload: Dict[str, Any], _: None = Depends(_api_key_required
         payload = {}
     root_path = _validate_root(str(payload.get("root") or ""))
     path = str(payload.get("path") or "")
+    if not path:
+        return {"ok": False, "error": "文件路径不能为空"}
     content = str(payload.get("content") or "")
     target = _safe_join(root_path, path)
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -3165,6 +3357,8 @@ def api_files_mkdir(payload: Dict[str, Any], _: None = Depends(_api_key_required
     name = str(payload.get("name") or "").strip()
     if not name:
         return {"ok": False, "error": "目录名不能为空"}
+    if "/" in name or "\\" in name or ".." in name:
+        return {"ok": False, "error": "目录名非法"}
     target = _safe_join(root_path, f"{path.rstrip('/')}/{name}")
     try:
         target.mkdir(parents=True, exist_ok=True)
@@ -3179,6 +3373,8 @@ def api_files_delete(payload: Dict[str, Any], _: None = Depends(_api_key_require
         payload = {}
     root_path = _validate_root(str(payload.get("root") or ""))
     path = str(payload.get("path") or "")
+    if not path:
+        return {"ok": False, "error": "禁止删除根目录"}
     target = _safe_join(root_path, path)
     if not target.exists():
         return {"ok": False, "error": "文件/目录不存在"}
@@ -3216,9 +3412,55 @@ def api_files_upload(payload: Dict[str, Any], _: None = Depends(_api_key_require
     return {"ok": True}
 
 
+@app.post("/api/v1/website/files/upload_chunk")
+def api_files_upload_chunk(payload: Dict[str, Any], _: None = Depends(_api_key_required)) -> Dict[str, Any]:
+    if not isinstance(payload, dict):
+        payload = {}
+    root_path = _validate_root(str(payload.get("root") or ""))
+    path = str(payload.get("path") or "")
+    filename = str(payload.get("filename") or "upload.bin").strip()
+    filename = os.path.basename(filename) or "upload.bin"
+    upload_id = str(payload.get("upload_id") or "").strip()
+    if not upload_id:
+        return {"ok": False, "error": "upload_id 不能为空"}
+    try:
+        offset = int(payload.get("offset") or 0)
+    except Exception:
+        offset = 0
+    done = bool(payload.get("done"))
+    content_b64 = str(payload.get("content_b64") or "")
+    if not content_b64:
+        return {"ok": False, "error": "缺少文件内容"}
+    try:
+        raw = base64.b64decode(content_b64.encode("ascii"))
+    except Exception:
+        return {"ok": False, "error": "文件内容解析失败"}
+
+    target = _safe_join(root_path, f"{path.rstrip('/')}/{filename}")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_name(target.name + f".part.{upload_id}")
+    try:
+        mode = "r+b" if tmp.exists() else "wb"
+        with open(tmp, mode) as f:
+            if offset:
+                f.seek(offset)
+            f.write(raw)
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+    if done:
+        try:
+            os.replace(tmp, target)
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+    return {"ok": True, "done": done}
+
+
 @app.get("/api/v1/website/files/raw")
 def api_files_raw(root: str, path: str, _: None = Depends(_api_key_required)):
     root_path = _validate_root(root)
+    if not path:
+        raise HTTPException(status_code=400, detail="文件路径不能为空")
     target = _safe_join(root_path, path)
     if not target.exists() or not target.is_file():
         raise HTTPException(status_code=404, detail="文件不存在")

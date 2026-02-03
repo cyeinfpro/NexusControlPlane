@@ -70,5 +70,17 @@
       <div class="muted">暂无证书</div>
     {% endif %}
   </div>
+
+  <div class="card">
+    <div class="card-header">
+      <div class="card-title">危险操作</div>
+    </div>
+    <form method="post" action="/websites/{{ site.id }}/delete" class="form" onsubmit="return confirm('确定删除该站点吗？');">
+      <label class="help"><input type="checkbox" name="delete_files" style="transform:translateY(1px);"> 删除站点目录数据</label>
+      <label class="help"><input type="checkbox" name="delete_cert" style="transform:translateY(1px);"> 删除证书文件</label>
+      <div class="help">站点记录会从面板删除；可选清理节点上的文件与证书。</div>
+      <button class="btn sm" type="submit" style="margin-top:10px;">删除站点</button>
+    </form>
+  </div>
 </div>
 {% endblock %}
