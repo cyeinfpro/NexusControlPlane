@@ -22,6 +22,8 @@ from ..db import (
     delete_certificates_by_node,
     delete_certificates_by_site,
     delete_site,
+    delete_site_checks,
+    delete_site_events,
     delete_sites_by_node,
     get_node,
     get_site,
@@ -32,6 +34,7 @@ from ..db import (
     list_sites,
     update_certificate,
     update_site,
+    update_site_health,
     update_task,
 )
 from ..services.apply import node_verify_tls
@@ -291,10 +294,52 @@ async def websites_new_action(
         )
         if not data.get("ok", True):
             raise AgentError(str(data.get("error") or "创建站点失败"))
-        update_site(site_id, status="running")
+        # post-create health check
+        health_status = "unknown"
+        health_error = ""
+        try:
+            health = await agent_post(
+                node["base_url"],
+                node["api_key"],
+                "/api/v1/website/health",
+                {
+                    "domains": domains_list,
+                    "type": site_type,
+                    "root_path": root_path,
+                    "proxy_target": proxy_target,
+                    "root_base": _node_root_base(node),
+                },
+                node_verify_tls(node),
+                timeout=10,
+            )
+            if isinstance(health, dict):
+                if health.get("ok"):
+                    health_status = "ok"
+                else:
+                    health_status = "fail"
+                    health_error = str(health.get("error") or "")
+        except Exception as exc:
+            health_status = "fail"
+            health_error = str(exc)
+
+        update_site(site_id, status="running" if health_status != "fail" else "error")
+        try:
+            if health_status in ("ok", "fail"):
+                update_site_health(
+                    site_id,
+                    health_status,
+                    health_code=int(health.get("status_code") or 0) if isinstance(health, dict) else 0,
+                    health_latency_ms=int(health.get("latency_ms") or 0) if isinstance(health, dict) else 0,
+                    health_error=str(health.get("error") or "") if isinstance(health, dict) else health_error,
+                )
+        except Exception:
+            pass
         update_task(task_id, status="success", progress=100, result=data)
         add_site_event(site_id, "site_create", status="success", actor=str(user or ""), result=data)
-        set_flash(request, "站点创建成功")
+        if health_status == "fail":
+            set_flash(request, f"站点创建成功，但健康检查失败：{health_error or 'HTTP 探测失败'}")
+        else:
+            set_flash(request, "站点创建成功")
         return RedirectResponse(url=f"/websites/{site_id}", status_code=303)
     except Exception as exc:
         update_site(site_id, status="error")
@@ -634,6 +679,8 @@ async def website_delete(
         if not data.get("ok", True):
             raise AgentError(str(data.get("error") or "删除站点失败"))
         delete_certificates_by_site(int(site_id))
+        delete_site_events(int(site_id))
+        delete_site_checks(int(site_id))
         delete_site(int(site_id))
         warn = data.get("warnings") if isinstance(data, dict) else None
         add_site_event(int(site_id), "site_delete", status="success", actor=str(user or ""), result=data)
@@ -689,6 +736,7 @@ async def website_env_uninstall(
         if purge_data:
             delete_certificates_by_node(int(node_id))
             delete_sites_by_node(int(node_id))
+            # related events/checks are deleted in delete_sites_by_node
         errors = data.get("errors") if isinstance(data, dict) else None
         if isinstance(errors, list) and errors:
             set_flash(request, f"卸载完成，但有警告：{'；'.join([str(x) for x in errors])}")

@@ -1693,8 +1693,31 @@ def delete_site(site_id: int, db_path: str = DEFAULT_DB_PATH) -> None:
         conn.commit()
 
 
+def delete_site_events(site_id: int, db_path: str = DEFAULT_DB_PATH) -> int:
+    with connect(db_path) as conn:
+        cur = conn.execute("DELETE FROM site_events WHERE site_id=?", (int(site_id),))
+        conn.commit()
+        return int(cur.rowcount or 0)
+
+
+def delete_site_checks(site_id: int, db_path: str = DEFAULT_DB_PATH) -> int:
+    with connect(db_path) as conn:
+        cur = conn.execute("DELETE FROM site_checks WHERE site_id=?", (int(site_id),))
+        conn.commit()
+        return int(cur.rowcount or 0)
+
+
 def delete_sites_by_node(node_id: int, db_path: str = DEFAULT_DB_PATH) -> int:
     with connect(db_path) as conn:
+        # collect site ids for cleanup
+        rows = conn.execute("SELECT id FROM sites WHERE node_id=?", (int(node_id),)).fetchall()
+        for r in rows:
+            try:
+                sid = int(r["id"])
+            except Exception:
+                continue
+            conn.execute("DELETE FROM site_events WHERE site_id=?", (sid,))
+            conn.execute("DELETE FROM site_checks WHERE site_id=?", (sid,))
         cur = conn.execute("DELETE FROM sites WHERE node_id=?", (int(node_id),))
         conn.commit()
         return int(cur.rowcount or 0)

@@ -14,6 +14,7 @@ import hashlib
 import hmac
 import ssl
 import http.client
+import glob
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
@@ -2964,12 +2965,91 @@ def _start_service(name: str) -> None:
             continue
 
 
+def _nginx_main_conf() -> Tuple[Path, Path]:
+    """Return (conf_path, prefix) for nginx."""
+    conf_path = Path("/etc/nginx/nginx.conf")
+    prefix = Path("/etc/nginx")
+    try:
+        code, out = _run_cmd(["nginx", "-V"], timeout=6)
+        if out:
+            # nginx -V outputs to stderr; _run_cmd captures both.
+            m = re.search(r"--conf-path=([^\\s]+)", out)
+            if m:
+                conf_path = Path(m.group(1).strip())
+            m2 = re.search(r"--prefix=([^\\s]+)", out)
+            if m2:
+                prefix = Path(m2.group(1).strip())
+    except Exception:
+        pass
+    if not conf_path.is_absolute():
+        conf_path = (prefix / conf_path).resolve()
+    return conf_path, prefix
+
+
+def _parse_nginx_include_dirs(conf_path: Path, prefix: Path) -> List[Path]:
+    dirs: List[Path] = []
+    try:
+        text = conf_path.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return dirs
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        m = re.match(r"include\\s+([^;]+);", line)
+        if not m:
+            continue
+        pat = m.group(1).strip()
+        if "$" in pat:
+            # skip variables
+            continue
+        # normalize relative paths
+        if not pat.startswith("/"):
+            base = prefix if prefix else conf_path.parent
+            pat = str((base / pat).resolve())
+        # if wildcard, take parent dir
+        if "*" in pat:
+            p = Path(pat)
+            dirs.append(p.parent)
+        else:
+            p = Path(pat)
+            if p.is_dir():
+                dirs.append(p)
+    return dirs
+
+
 def _nginx_conf_locations() -> Tuple[Path, Optional[Path]]:
+    # explicit overrides
+    override_conf = os.getenv("REALM_NGINX_CONF_DIR")
+    override_enabled = os.getenv("REALM_NGINX_ENABLED_DIR")
+    if override_conf:
+        conf_dir = Path(override_conf).expanduser().resolve()
+        enabled_dir = Path(override_enabled).expanduser().resolve() if override_enabled else None
+        return conf_dir, enabled_dir
+
     sites_avail = Path("/etc/nginx/sites-available")
     sites_enabled = Path("/etc/nginx/sites-enabled")
     if sites_avail.is_dir():
         return sites_avail, sites_enabled if sites_enabled.is_dir() else None
-    return Path("/etc/nginx/conf.d"), None
+
+    # parse nginx.conf includes
+    conf_path, prefix = _nginx_main_conf()
+    dirs = _parse_nginx_include_dirs(conf_path, prefix)
+    # prefer sites-enabled/conf.d/vhost
+    preferred = [d for d in dirs if d.name in ("sites-enabled", "conf.d", "vhost")]
+    if preferred:
+        conf_dir = preferred[0]
+        conf_dir.mkdir(parents=True, exist_ok=True)
+        return conf_dir, None
+    if dirs:
+        conf_dir = dirs[0]
+        conf_dir.mkdir(parents=True, exist_ok=True)
+        return conf_dir, None
+
+    # fallback
+    fallback = Path("/etc/nginx/conf.d")
+    fallback.mkdir(parents=True, exist_ok=True)
+    return fallback, None
 
 
 def _slugify(name: str) -> str:
