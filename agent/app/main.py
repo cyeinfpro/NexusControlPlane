@@ -3511,12 +3511,16 @@ def _delete_site_root(root_path: str, extra_bases: Optional[List[str]] = None) -
 
 
 def _find_acme_sh() -> Optional[str]:
+    env_path = os.getenv("REALM_ACME_SH", "").strip()
+    if env_path and Path(env_path).exists():
+        return env_path
     acme = shutil.which("acme.sh")
     if acme:
         return acme
-    for p in ("/root/.acme.sh/acme.sh", "/usr/local/bin/acme.sh"):
-        if Path(p).exists():
-            return p
+    for p in ("/root/.acme.sh/acme.sh", "/usr/local/bin/acme.sh", "~/.acme.sh/acme.sh"):
+        pp = Path(p).expanduser()
+        if pp.exists():
+            return str(pp)
     return None
 
 
@@ -3851,7 +3855,12 @@ def api_ssl_issue(payload: Dict[str, Any], _: None = Depends(_api_key_required))
 
     acme = _find_acme_sh()
     if not acme:
-        return {"ok": False, "error": "未安装 acme.sh"}
+        ok, out = _install_acme_sh()
+        if not ok:
+            return {"ok": False, "error": out or "未安装 acme.sh"}
+        acme = _find_acme_sh()
+        if not acme:
+            return {"ok": False, "error": "未安装 acme.sh"}
 
     cmd = [acme, "--issue"]
     for d in domains:
@@ -3952,7 +3961,12 @@ def api_ssl_renew(payload: Dict[str, Any], _: None = Depends(_api_key_required))
 
     acme = _find_acme_sh()
     if not acme:
-        return {"ok": False, "error": "未安装 acme.sh"}
+        ok, out = _install_acme_sh()
+        if not ok:
+            return {"ok": False, "error": out or "未安装 acme.sh"}
+        acme = _find_acme_sh()
+        if not acme:
+            return {"ok": False, "error": "未安装 acme.sh"}
 
     main_domain = str(domains[0])
     cmd = [acme, "--renew", "-d", main_domain]
