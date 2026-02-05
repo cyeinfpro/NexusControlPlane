@@ -26,7 +26,7 @@
           {% if not loop.last %}<span class="sep">/</span>{% endif %}
         {% endfor %}
       </div>
-      <div class="help">支持选择文件夹批量上传（含子目录）；单文件上限 200MB（分片 + 断点续传）。</div>
+      <div class="help">支持选择文件夹批量上传（含子目录）；单文件上限 {{ upload_max_h }}（分片 + 断点续传）。</div>
     </div>
     <div class="col right toolbar">
       <form method="post" action="/websites/{{ site.id }}/files/mkdir" style="display:inline;">
@@ -75,6 +75,13 @@
             {% if not it.is_dir %}
               <a class="btn xs ghost" href="/websites/{{ site.id }}/files/edit?path={{ it.path }}">编辑</a>
               <a class="btn xs ghost" href="/websites/{{ site.id }}/files/download?path={{ it.path }}">下载</a>
+              {% if it.name.endswith('.zip') %}
+                <form method="post" action="/websites/{{ site.id }}/files/unzip" style="display:inline;">
+                  <input type="hidden" name="path" value="{{ it.path }}">
+                  <input type="hidden" name="dest" value="{{ path }}">
+                  <button class="btn xs ghost" type="submit">解压</button>
+                </form>
+              {% endif %}
             {% endif %}
             <form method="post" action="/websites/{{ site.id }}/files/delete" style="display:inline;">
               <input type="hidden" name="path" value="{{ it.path }}">
@@ -103,6 +110,7 @@ const uploadStatus = document.getElementById('uploadStatus');
 const uploadRetry = document.getElementById('uploadRetry');
 
 const CHUNK_SIZE = 1024 * 512;
+const UPLOAD_MAX_BYTES = {{ upload_max_bytes }};
 const SITE_ID = {{ site.id }};
 const CUR_PATH = {{ path|tojson }};
 
@@ -184,7 +192,7 @@ function resolveUploadTarget(file){
   return {path: CUR_PATH, filename: file.name};
 }
 
-async function uploadFile(file, uploadId, startOffset, path, filename, totalBytes, baseUploaded){
+async function uploadFile(file, uploadId, startOffset, path, filename, totalBytes, progressCb){
   let offset = startOffset || 0;
   const total = file.size;
   uploadPanel.style.display = 'block';
@@ -208,9 +216,7 @@ async function uploadFile(file, uploadId, startOffset, path, filename, totalByte
     if(!data.ok){
       throw new Error(data.error || '上传失败');
     }
-    const pct = totalBytes > 0 ? Math.min(100, Math.round(((baseUploaded + total) / totalBytes) * 100)) : 100;
-    uploadProgressFill.style.width = pct + '%';
-    uploadStatus.textContent = `已上传 ${bytesToHuman(baseUploaded + total)} / ${bytesToHuman(totalBytes)} (${pct}%)`;
+    if(progressCb) progressCb(0);
     return;
   }
   while(offset < total){
@@ -241,10 +247,7 @@ async function uploadFile(file, uploadId, startOffset, path, filename, totalByte
       throw new Error(data.error || '上传失败');
     }
     offset += chunk.size;
-    const overall = baseUploaded + offset;
-    const pct = totalBytes > 0 ? Math.min(100, Math.round((overall / totalBytes) * 100)) : 100;
-    uploadProgressFill.style.width = pct + '%';
-    uploadStatus.textContent = `已上传 ${bytesToHuman(overall)} / ${bytesToHuman(totalBytes)} (${pct}%)`;
+    if(progressCb) progressCb(chunk.size);
     localStorage.setItem(uploadKey(file, path, filename), uploadId);
   }
   localStorage.removeItem(uploadKey(file, path, filename));
@@ -264,13 +267,19 @@ uploadForm?.addEventListener('submit', async (e)=>{
     alert('请选择文件或文件夹');
     return;
   }
+  for(const f of files){
+    if(UPLOAD_MAX_BYTES && f.size > UPLOAD_MAX_BYTES){
+      alert(`文件过大：${f.name}（${bytesToHuman(f.size)}），超过限制 ${bytesToHuman(UPLOAD_MAX_BYTES)}`);
+      return;
+    }
+  }
   const totalBytes = files.reduce((s,f)=>s + (f.size || 0), 0) || 0;
   let uploadedBytes = 0;
   try{
+    const tasks = [];
     for(let i=0;i<files.length;i++){
       const file = files[i];
       const target = resolveUploadTarget(file);
-      uploadStatus.textContent = `上传中：${i+1}/${files.length} · ${file.name}`;
       const key = uploadKey(file, target.path, target.filename);
       let uploadId = localStorage.getItem(key) || '';
       if(!uploadId){
@@ -278,9 +287,30 @@ uploadForm?.addEventListener('submit', async (e)=>{
       }
       const offset = await getResumeOffset(file, uploadId, target.path, target.filename);
       uploadedBytes += offset;
-      await uploadFile(file, uploadId, offset, target.path, target.filename, totalBytes, uploadedBytes - offset);
-      uploadedBytes += (file.size - offset);
+      tasks.push({file, target, uploadId, offset, idx: i});
     }
+    const total = totalBytes || 0;
+    const updateProgress = (delta, name)=>{
+      uploadedBytes += delta;
+      const pct = total > 0 ? Math.min(100, Math.round((uploadedBytes / total) * 100)) : 100;
+      uploadProgressFill.style.width = pct + '%';
+      uploadStatus.textContent = `上传中：${name} · ${bytesToHuman(uploadedBytes)} / ${bytesToHuman(total)} (${pct}%)`;
+    };
+    const concurrency = 3;
+    let cursor = 0;
+    const worker = async ()=>{
+      while(true){
+        let t;
+        if(cursor >= tasks.length) return;
+        t = tasks[cursor++];
+        await uploadFile(t.file, t.uploadId, t.offset, t.target.path, t.target.filename, total, (d)=>updateProgress(d, t.file.name));
+      }
+    };
+    const workers = [];
+    for(let i=0;i<Math.min(concurrency, tasks.length);i++){
+      workers.push(worker());
+    }
+    await Promise.all(workers);
     window.location.reload();
   }catch(err){
     uploadStatus.textContent = String(err);
@@ -293,13 +323,19 @@ uploadRetry?.addEventListener('click', async ()=>{
   const singleFile = uploadFileInput?.files?.[0];
   const files = folderFiles.length ? folderFiles : (singleFile ? [singleFile] : []);
   if(!files.length) return;
+  for(const f of files){
+    if(UPLOAD_MAX_BYTES && f.size > UPLOAD_MAX_BYTES){
+      uploadStatus.textContent = `文件过大：${f.name}`;
+      return;
+    }
+  }
   const totalBytes = files.reduce((s,f)=>s + (f.size || 0), 0) || 0;
   let uploadedBytes = 0;
   try{
+    const tasks = [];
     for(let i=0;i<files.length;i++){
       const file = files[i];
       const target = resolveUploadTarget(file);
-      uploadStatus.textContent = `上传中：${i+1}/${files.length} · ${file.name}`;
       const key = uploadKey(file, target.path, target.filename);
       const uploadId = localStorage.getItem(key) || '';
       if(!uploadId){
@@ -308,9 +344,29 @@ uploadRetry?.addEventListener('click', async ()=>{
       }
       const offset = await getResumeOffset(file, uploadId, target.path, target.filename);
       uploadedBytes += offset;
-      await uploadFile(file, uploadId, offset, target.path, target.filename, totalBytes, uploadedBytes - offset);
-      uploadedBytes += (file.size - offset);
+      tasks.push({file, target, uploadId, offset});
     }
+    const total = totalBytes || 0;
+    const updateProgress = (delta, name)=>{
+      uploadedBytes += delta;
+      const pct = total > 0 ? Math.min(100, Math.round((uploadedBytes / total) * 100)) : 100;
+      uploadProgressFill.style.width = pct + '%';
+      uploadStatus.textContent = `上传中：${name} · ${bytesToHuman(uploadedBytes)} / ${bytesToHuman(total)} (${pct}%)`;
+    };
+    const concurrency = 3;
+    let cursor = 0;
+    const worker = async ()=>{
+      while(true){
+        if(cursor >= tasks.length) return;
+        const t = tasks[cursor++];
+        await uploadFile(t.file, t.uploadId, t.offset, t.target.path, t.target.filename, total, (d)=>updateProgress(d, t.file.name));
+      }
+    };
+    const workers = [];
+    for(let i=0;i<Math.min(concurrency, tasks.length);i++){
+      workers.push(worker());
+    }
+    await Promise.all(workers);
     window.location.reload();
   }catch(err){
     uploadStatus.textContent = String(err);

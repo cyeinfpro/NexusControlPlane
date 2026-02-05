@@ -4391,6 +4391,45 @@ def api_files_upload_status(payload: Dict[str, Any], _: None = Depends(_api_key_
     return {"ok": True, "offset": offset}
 
 
+@app.post("/api/v1/website/files/unzip")
+def api_files_unzip(payload: Dict[str, Any], _: None = Depends(_api_key_required)) -> Dict[str, Any]:
+    if not isinstance(payload, dict):
+        payload = {}
+    extra_bases = _payload_root_bases(payload)
+    root_path = _validate_root(str(payload.get("root") or ""), extra_bases)
+    path = str(payload.get("path") or "").strip()
+    dest = str(payload.get("dest") or "").strip()
+    if not path:
+        return {"ok": False, "error": "path 不能为空"}
+    if not dest:
+        # default to same directory
+        dest = str(Path(path).parent).strip(".")
+    zip_path = _safe_join(root_path, path)
+    if not zip_path.exists() or not zip_path.is_file():
+        return {"ok": False, "error": "压缩包不存在"}
+    dest_dir = _safe_join(root_path, dest)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        import zipfile
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            count = 0
+            for info in zf.infolist():
+                name = (info.filename or "").replace("\\", "/").lstrip("/")
+                if not name or name.startswith("../") or "/../" in name:
+                    continue
+                target = _safe_join(dest_dir, name)
+                if info.is_dir() or name.endswith("/"):
+                    target.mkdir(parents=True, exist_ok=True)
+                else:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    with zf.open(info, "r") as src, open(target, "wb") as dst:
+                        shutil.copyfileobj(src, dst)
+                count += 1
+        return {"ok": True, "files": count}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
 @app.get("/api/v1/website/files/raw")
 def api_files_raw(root: str, path: str, root_base: Optional[str] = None, _: None = Depends(_api_key_required)):
     extra = [root_base] if root_base else None

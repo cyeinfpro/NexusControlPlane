@@ -41,7 +41,28 @@ from ..services.apply import node_verify_tls
 
 router = APIRouter()
 UPLOAD_CHUNK_SIZE = 1024 * 512
-UPLOAD_MAX_BYTES = 1024 * 1024 * 200
+
+
+def _parse_upload_max_bytes() -> int:
+    raw_b = os.getenv("REALM_WEBSITE_UPLOAD_MAX_BYTES")
+    raw_mb = os.getenv("REALM_WEBSITE_UPLOAD_MAX_MB")
+    try:
+        if raw_b:
+            v = int(float(str(raw_b).strip()))
+            return max(1, v)
+    except Exception:
+        pass
+    try:
+        if raw_mb:
+            v = int(float(str(raw_mb).strip()))
+            return max(1, v) * 1024 * 1024
+    except Exception:
+        pass
+    # default 2GB
+    return 1024 * 1024 * 2048
+
+
+UPLOAD_MAX_BYTES = _parse_upload_max_bytes()
 
 
 def _parse_domains(raw: str) -> List[str]:
@@ -847,6 +868,8 @@ async def website_files(request: Request, site_id: int, path: str = "", user: st
             "items": items,
             "breadcrumbs": crumbs,
             "error": err_msg,
+            "upload_max_bytes": UPLOAD_MAX_BYTES,
+            "upload_max_h": _format_bytes(UPLOAD_MAX_BYTES),
         },
     )
 
@@ -1178,6 +1201,40 @@ async def website_files_delete(
     except Exception as exc:
         set_flash(request, f"删除失败：{exc}")
     return RedirectResponse(url=f"/websites/{site_id}/files?path={'/'.join(path.split('/')[:-1])}", status_code=303)
+
+
+@router.post("/websites/{site_id}/files/unzip")
+async def website_files_unzip(
+    request: Request,
+    site_id: int,
+    path: str = Form(""),
+    dest: str = Form(""),
+    user: str = Depends(require_login_page),
+):
+    site = get_site(int(site_id))
+    node = get_node(int(site.get("node_id") or 0)) if site else None
+    if not site or not node:
+        set_flash(request, "站点不存在")
+        return RedirectResponse(url="/websites", status_code=303)
+
+    root = _agent_payload_root(site, node)
+    if not root:
+        set_flash(request, "该站点没有可管理的根目录")
+        return RedirectResponse(url=f"/websites/{site_id}", status_code=303)
+
+    try:
+        await agent_post(
+            node["base_url"],
+            node["api_key"],
+            "/api/v1/website/files/unzip",
+            {"root": root, "path": path, "dest": dest, "root_base": _node_root_base(node)},
+            node_verify_tls(node),
+            timeout=60,
+        )
+        set_flash(request, "解压成功")
+    except Exception as exc:
+        set_flash(request, f"解压失败：{exc}")
+    return RedirectResponse(url=f"/websites/{site_id}/files?path={dest}", status_code=303)
 
 
 @router.get("/websites/{site_id}/files/download")
