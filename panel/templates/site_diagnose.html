@@ -37,9 +37,11 @@
       <div class="kv-item"><div class="kv-label">Nginx 配置</div><div class="kv-value"><span class="pill xs {{ 'ok' if diag.checks.nginx_test_ok else 'bad' }}">{{ 'ok' if diag.checks.nginx_test_ok else 'fail' }}</span></div></div>
       <div class="kv-item"><div class="kv-label">Nginx 运行</div><div class="kv-value"><span class="pill xs {{ 'ok' if diag.checks.nginx_active else 'warn' }}">{{ diag.checks.nginx_active if diag.checks.nginx_active is not none else 'unknown' }}</span></div></div>
       <div class="kv-item"><div class="kv-label">配置存在</div><div class="kv-value"><span class="pill xs {{ 'ok' if diag.checks.conf_exists else 'bad' }}">{{ 'ok' if diag.checks.conf_exists else 'missing' }}</span></div></div>
+      <div class="kv-item"><div class="kv-label">配置已加载</div><div class="kv-value"><span class="pill xs {{ 'ok' if diag.checks.conf_included else 'warn' }}">{{ 'ok' if diag.checks.conf_included else 'unknown' }}</span></div></div>
       <div class="kv-item"><div class="kv-label">根目录</div><div class="kv-value"><span class="pill xs {{ 'ok' if diag.checks.root_exists else 'bad' }}">{{ 'ok' if diag.checks.root_exists else 'missing' }}</span></div></div>
       <div class="kv-item"><div class="kv-label">PHP-FPM</div><div class="kv-value"><span class="pill xs {{ 'ok' if diag.checks.php_ok else 'warn' }}">{{ 'ok' if diag.checks.php_ok else 'not ready' }}</span></div></div>
       <div class="kv-item"><div class="kv-label">HTTP 探测</div><div class="kv-value"><span class="pill xs {{ 'ok' if diag.checks.http_ok else 'bad' }}">{{ diag.checks.http_status or '-' }}</span></div></div>
+      <div class="kv-item"><div class="kv-label">虚拟主机命中</div><div class="kv-value"><span class="pill xs {{ 'ok' if diag.checks.vhost_match else 'warn' if diag.checks.vhost_match is none else 'bad' }}">{{ 'ok' if diag.checks.vhost_match else 'unknown' if diag.checks.vhost_match is none else 'mismatch' }}</span></div></div>
       <div class="kv-item" style="grid-column:1 / -1;"><div class="kv-label">错误</div><div class="kv-value mono">{{ diag.error or '-' }}</div></div>
     </div>
   </div>

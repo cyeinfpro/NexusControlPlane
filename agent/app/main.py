@@ -3085,6 +3085,12 @@ def _gzip_snippet() -> str:
     )
 
 
+def _nexus_header_snippet(domain: str) -> str:
+    d = (domain or "").strip()
+    if not d:
+        return ""
+    return f"  add_header X-Nexus-Site {d} always;\n"
+
 def _render_custom_template(template: str, ctx: Dict[str, str]) -> str:
     out = template or ""
     for k, v in ctx.items():
@@ -3132,7 +3138,13 @@ def _service_active(name: str) -> Tuple[Optional[bool], str]:
     return None, "status_unknown"
 
 
-def _http_probe(host: str, port: int, host_header: str, use_tls: bool, timeout: float = 4.0) -> Tuple[bool, int, int, str]:
+def _http_probe(
+    host: str,
+    port: int,
+    host_header: str,
+    use_tls: bool,
+    timeout: float = 4.0,
+) -> Tuple[bool, int, int, str, str]:
     start = time.time()
     status = 0
     try:
@@ -3144,6 +3156,7 @@ def _http_probe(host: str, port: int, host_header: str, use_tls: bool, timeout: 
         conn.request("HEAD", "/", headers={"Host": host_header, "User-Agent": "Nexus-Health"})
         resp = conn.getresponse()
         status = int(resp.status or 0)
+        header_site = str(resp.getheader("X-Nexus-Site") or "").strip()
         try:
             resp.read(1)
         except Exception:
@@ -3151,10 +3164,10 @@ def _http_probe(host: str, port: int, host_header: str, use_tls: bool, timeout: 
         conn.close()
         latency = int((time.time() - start) * 1000)
         ok = (200 <= status < 400) or status == 405
-        return ok, status, latency, ""
+        return ok, status, latency, "", header_site
     except Exception as exc:
         latency = int((time.time() - start) * 1000)
-        return False, status, latency, str(exc)
+        return False, status, latency, str(exc), ""
 
 
 def _apply_nginx_conf(name: str, content: str) -> Tuple[bool, str, str]:
@@ -3229,6 +3242,7 @@ def _render_nginx_conf(
     cert_paths: Optional[Tuple[str, str]] = None,
 ) -> str:
     server_name = " ".join(domains)
+    nexus_header = _nexus_header_snippet(domains[0] if domains else "")
     gzip = _gzip_snippet() if gzip_enabled else ""
     has_ssl = bool(cert_paths and cert_paths[0] and cert_paths[1])
     ssl_cert = cert_paths[0] if cert_paths else ""
@@ -3239,6 +3253,7 @@ def _render_nginx_conf(
             "server {\n"
             "  listen 80;\n"
             f"  server_name {server_name};\n"
+            f"{nexus_header}"
             f"{redirect_line}"
             f"{gzip}"
             "  location / {\n"
@@ -3255,6 +3270,7 @@ def _render_nginx_conf(
                 "server {\n"
                 "  listen 443 ssl http2;\n"
                 f"  server_name {server_name};\n"
+                f"{nexus_header}"
                 f"  ssl_certificate {ssl_cert};\n"
                 f"  ssl_certificate_key {ssl_key};\n"
                 f"{gzip}"
@@ -3275,6 +3291,7 @@ def _render_nginx_conf(
             "server {\n"
             "  listen 80;\n"
             f"  server_name {server_name};\n"
+            f"{nexus_header}"
             f"  root {root_path};\n"
             "  index index.php index.html index.htm;\n"
             f"{redirect_line}"
@@ -3294,6 +3311,7 @@ def _render_nginx_conf(
                 "server {\n"
                 "  listen 443 ssl http2;\n"
                 f"  server_name {server_name};\n"
+                f"{nexus_header}"
                 f"  root {root_path};\n"
                 f"  ssl_certificate {ssl_cert};\n"
                 f"  ssl_certificate_key {ssl_key};\n"
@@ -3316,6 +3334,7 @@ def _render_nginx_conf(
         "server {\n"
         "  listen 80;\n"
         f"  server_name {server_name};\n"
+        f"{nexus_header}"
         f"  root {root_path};\n"
         "  index index.html index.htm;\n"
         f"{redirect_line}"
@@ -3330,6 +3349,7 @@ def _render_nginx_conf(
             "server {\n"
             "  listen 443 ssl http2;\n"
             f"  server_name {server_name};\n"
+            f"{nexus_header}"
             f"  root {root_path};\n"
             f"  ssl_certificate {ssl_cert};\n"
             f"  ssl_certificate_key {ssl_key};\n"
@@ -4065,32 +4085,57 @@ def _site_health(payload: Dict[str, Any], verbose: bool = False) -> Dict[str, An
         checks["php_ok"] = True
 
     # HTTP probe (local)
-    http_ok, status, latency_ms, err = _http_probe("127.0.0.1", 80, domain, False, timeout=4.5)
+    http_ok, status, latency_ms, err, header_site = _http_probe("127.0.0.1", 80, domain, False, timeout=4.5)
     used_https = False
     if not http_ok:
         # try HTTPS 443 (best-effort, no verify)
-        http_ok, status, latency_ms, err2 = _http_probe("127.0.0.1", 443, domain, True, timeout=5.5)
+        http_ok, status, latency_ms, err2, header_site = _http_probe("127.0.0.1", 443, domain, True, timeout=5.5)
         used_https = True
         if err2:
             err = err2
     checks["http_ok"] = http_ok
     checks["http_status"] = int(status or 0)
     checks["http_latency_ms"] = int(latency_ms or 0)
+    checks["http_site_header"] = header_site
     if verbose:
         checks["http_tls"] = used_https
         checks["http_error"] = err
 
+    # vhost match (only if we can detect marker)
+    vhost_match = None
+    if header_site:
+        vhost_match = header_site.strip().lower() == domain.strip().lower()
+    checks["vhost_match"] = vhost_match
+
+    if verbose:
+        # check if conf file is included in nginx -T output
+        conf_path = checks.get("conf_path") or ""
+        try:
+            code_t, out_t = _run_cmd(["nginx", "-T"], timeout=12)
+            if code_t == 0 and conf_path:
+                checks["conf_included"] = conf_path in out_t
+            else:
+                checks["conf_included"] = False
+        except Exception:
+            checks["conf_included"] = False
+
     ok = bool(checks.get("nginx_test_ok")) and bool(checks.get("conf_exists")) and bool(checks.get("root_exists")) and bool(checks.get("php_ok")) and bool(http_ok)
+    if vhost_match is False:
+        ok = False
 
     error = ""
     if not checks.get("nginx_test_ok"):
         error = "nginx -t 失败"
     elif not checks.get("conf_exists"):
         error = "Nginx 配置不存在"
+    elif verbose and checks.get("conf_included") is False:
+        error = "Nginx 未包含该配置（include 路径不匹配）"
     elif not checks.get("root_exists"):
         error = str(checks.get("root_error") or "站点根目录不存在")
     elif not checks.get("php_ok"):
         error = "php-fpm 未就绪"
+    elif vhost_match is False:
+        error = "命中默认站点（X-Nexus-Site 不匹配）"
     elif not http_ok:
         error = err or "HTTP 探测失败"
 
