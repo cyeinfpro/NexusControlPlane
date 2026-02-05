@@ -683,6 +683,12 @@ details.menu summary::-webkit-details-marker{display:none}
 .input.sm{padding:8px 10px;font-size:12px;border-radius:10px}
 
 .fm-upload-modal .modal-body{display:flex;flex-direction:column;gap:10px}
+.fm-upload-mode{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.fm-mode-btn.active{
+  background:rgba(59,130,246,0.18);
+  border-color:rgba(59,130,246,0.45);
+  box-shadow:0 0 0 1px rgba(59,130,246,0.25) inset;
+}
 .fm-upload-row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
 .fm-upload-list{
   border:1px solid var(--line);
