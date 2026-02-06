@@ -410,7 +410,10 @@
   function syncType(){
     var t = (siteType && siteType.value) || 'static';
     var showProxy = t === 'reverse_proxy';
-    if(proxyRow) proxyRow.style.display = showProxy ? '' : 'none';
+    if(proxyRow){
+      proxyRow.style.display = showProxy ? 'block' : 'none';
+      proxyRow.setAttribute('aria-hidden', showProxy ? 'false' : 'true');
+    }
     if(proxyInput) proxyInput.required = !!showProxy;
   }
 
