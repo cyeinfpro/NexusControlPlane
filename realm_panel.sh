@@ -3,6 +3,10 @@ set -euo pipefail
 
 VERSION="v38"
 REPO_ZIP_URL_DEFAULT="https://github.com/cyeinfpro/Realm/archive/refs/heads/main.zip"
+PANEL_ROOT="/opt/realm-panel"
+PANEL_STATIC_REALM_DIR="${PANEL_ROOT}/panel/static/realm"
+PANEL_REQ_STAMP="${PANEL_ROOT}/.requirements.sha256"
+PANEL_REALM_TAG_STAMP="${PANEL_STATIC_REALM_DIR}/.realm_assets_tag"
 
 info(){ echo -e "\033[33m[提示]\033[0m $*" >&2; }
 ok(){ echo -e "\033[32m[OK]\033[0m $*" >&2; }
@@ -16,28 +20,118 @@ need_root(){
 
 apt_install(){
   export DEBIAN_FRONTEND=noninteractive
-  info "安装依赖..."
+  local pkgs=(curl unzip zip jq python3 python3-venv python3-pip ca-certificates)
+  local missing=()
+  local p
+  for p in "${pkgs[@]}"; do
+    if ! dpkg -s "$p" >/dev/null 2>&1; then
+      missing+=("$p")
+    fi
+  done
+  if [[ ${#missing[@]} -eq 0 ]]; then
+    ok "依赖已满足，跳过 apt 安装"
+    return 0
+  fi
+  info "安装缺失依赖: ${missing[*]}"
   apt-get update -y >/dev/null
-  apt-get install -y curl unzip zip jq python3 python3-venv python3-pip ca-certificates >/dev/null
+  apt-get install -y "${missing[@]}" >/dev/null
+}
+
+download_file(){
+  local url="$1"
+  local out="$2"
+  local tmp="${out}.tmp"
+  if curl -fL --retry 3 --retry-delay 1 --connect-timeout 10 --max-time 300 "$url" -o "$tmp"; then
+    mv -f "$tmp" "$out"
+    return 0
+  fi
+  rm -f "$tmp" || true
+  return 1
+}
+
+latest_realm_tag(){
+  local final=""
+  final="$(curl -fsSL -o /dev/null -w '%{url_effective}' "https://github.com/zhboner/realm/releases/latest" 2>/dev/null || true)"
+  if [[ -z "$final" ]]; then
+    echo ""
+    return 0
+  fi
+  echo "${final##*/}"
 }
 
 prepare_realm_assets(){
-  local dest="/opt/realm-panel/panel/static/realm"
+  local dest="${PANEL_STATIC_REALM_DIR}"
   mkdir -p "${dest}"
-  info "拉取 realm 安装文件到面板..."
+  local latest_tag current_tag
+  latest_tag="$(latest_realm_tag)"
+  current_tag="$(cat "${PANEL_REALM_TAG_STAMP}" 2>/dev/null || true)"
+
   local archs=("x86_64" "aarch64")
   local flavors=("unknown-linux-gnu.tar.gz" "unknown-linux-musl.tar.gz")
+
+  if [[ -n "$latest_tag" && "$latest_tag" == "$current_tag" ]]; then
+    local all_present=1
+    local a f
+    for a in "${archs[@]}"; do
+      for f in "${flavors[@]}"; do
+        local fn="realm-${a}-${f}"
+        if [[ ! -s "${dest}/${fn}" ]]; then
+          all_present=0
+          break
+        fi
+      done
+    done
+    if [[ "$all_present" -eq 1 ]]; then
+      ok "realm 资源已是最新（${latest_tag}），跳过下载"
+      return 0
+    fi
+  fi
+
+  info "拉取 realm 安装文件到面板..."
+  local pids=()
+  local names=()
   for arch in "${archs[@]}"; do
     for flavor in "${flavors[@]}"; do
       local filename="realm-${arch}-${flavor}"
       local url="https://github.com/zhboner/realm/releases/latest/download/${filename}"
-      if curl -fsSL "${url}" -o "${dest}/${filename}"; then
-        ok "已下载 ${filename}"
-      else
-        err "下载失败：${filename}"
-      fi
+      (
+        download_file "${url}" "${dest}/${filename}"
+      ) &
+      pids+=($!)
+      names+=("${filename}")
     done
   done
+
+  local failed=0
+  local i
+  for i in "${!pids[@]}"; do
+    if wait "${pids[$i]}"; then
+      ok "已下载 ${names[$i]}"
+    else
+      err "下载失败：${names[$i]}"
+      failed=$((failed+1))
+    fi
+  done
+
+  if [[ "$failed" -eq 0 && -n "$latest_tag" ]]; then
+    echo "${latest_tag}" > "${PANEL_REALM_TAG_STAMP}"
+  fi
+}
+
+install_python_deps(){
+  local venv_dir="${PANEL_ROOT}/venv"
+  local req="${PANEL_ROOT}/panel/requirements.txt"
+  local req_hash old_hash
+  req_hash="$(sha256sum "$req" | awk '{print $1}')"
+  old_hash="$(cat "${PANEL_REQ_STAMP}" 2>/dev/null || true)"
+  if [[ -d "$venv_dir" && "$req_hash" == "$old_hash" ]]; then
+    ok "Python 依赖未变化，跳过 pip install"
+    return 0
+  fi
+  info "安装/更新 Python 依赖..."
+  "${venv_dir}/bin/pip" install --disable-pip-version-check -U pip wheel >/dev/null
+  "${venv_dir}/bin/pip" install --disable-pip-version-check --prefer-binary -r "$req" >/dev/null
+  echo "$req_hash" > "${PANEL_REQ_STAMP}"
 }
 
 prompt(){
@@ -268,22 +362,21 @@ install_panel(){
   fi
 
   info "部署到 /opt/realm-panel ..."
-  rm -rf /opt/realm-panel
-  mkdir -p /opt/realm-panel
-  cp -a "$PANEL_DIR" /opt/realm-panel/panel
+  rm -rf "${PANEL_ROOT}"
+  mkdir -p "${PANEL_ROOT}"
+  cp -a "$PANEL_DIR" "${PANEL_ROOT}/panel"
 
   if [[ "$asset_source" == "panel" ]]; then
     prepare_agent_bundle "$EXTRACT_ROOT"
     prepare_realm_assets
   else
     # 仍确保静态目录存在（面板自身静态资源需要）
-    mkdir -p /opt/realm-panel/panel/static
+    mkdir -p "${PANEL_ROOT}/panel/static"
   fi
 
   info "创建虚拟环境..."
-  python3 -m venv /opt/realm-panel/venv
-  /opt/realm-panel/venv/bin/pip install -U pip wheel >/dev/null
-  /opt/realm-panel/venv/bin/pip install -r /opt/realm-panel/panel/requirements.txt >/dev/null
+  python3 -m venv "${PANEL_ROOT}/venv"
+  install_python_deps
 
   info "初始化面板配置..."
   mkdir -p /etc/realm-panel
@@ -294,7 +387,7 @@ REALM_PANEL_ASSET_SOURCE=${asset_source}
 EOF
   export PANEL_USER="$user"
   export PANEL_PASS="$pass"
-  ( cd /opt/realm-panel/panel && /opt/realm-panel/venv/bin/python - <<'PY'
+  ( cd "${PANEL_ROOT}/panel" && "${PANEL_ROOT}/venv/bin/python" - <<'PY'
 import os
 from app.auth import ensure_secret_key, save_credentials
 ensure_secret_key()
@@ -334,13 +427,16 @@ update_panel(){
   fi
   ok "panel 目录：$PANEL_DIR"
   info "更新面板文件..."
-  rm -rf /opt/realm-panel/panel
-  mkdir -p /opt/realm-panel
-  cp -a "$PANEL_DIR" /opt/realm-panel/panel
+  rm -rf "${PANEL_ROOT}/panel"
+  mkdir -p "${PANEL_ROOT}"
+  cp -a "$PANEL_DIR" "${PANEL_ROOT}/panel"
   prepare_agent_bundle "$EXTRACT_ROOT"
   prepare_realm_assets
-  info "更新依赖..."
-  /opt/realm-panel/venv/bin/pip install -r /opt/realm-panel/panel/requirements.txt >/dev/null
+  if [[ ! -x "${PANEL_ROOT}/venv/bin/python" ]]; then
+    info "虚拟环境不存在，重新创建..."
+    python3 -m venv "${PANEL_ROOT}/venv"
+  fi
+  install_python_deps
   systemctl daemon-reload
   systemctl restart realm-panel.service
   ok "面板已更新并重启"
