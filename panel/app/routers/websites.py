@@ -996,6 +996,82 @@ async def website_ssl_renew(request: Request, site_id: int, user: str = Depends(
     return RedirectResponse(url=f"/websites/{site_id}", status_code=303)
 
 
+@router.post("/websites/{site_id}/https_redirect")
+async def website_https_redirect_set(
+    request: Request,
+    site_id: int,
+    enabled: Optional[str] = Form(None),
+    user: str = Depends(require_login_page),
+):
+    site = get_site(int(site_id))
+    if not site:
+        set_flash(request, "站点不存在")
+        return RedirectResponse(url="/websites", status_code=303)
+    node = get_node(int(site.get("node_id") or 0))
+    if not node:
+        set_flash(request, "节点不存在")
+        return RedirectResponse(url=f"/websites/{site_id}", status_code=303)
+
+    domains = site.get("domains") or []
+    if not domains:
+        set_flash(request, "站点域名为空，无法更新 HTTPS 跳转")
+        return RedirectResponse(url=f"/websites/{site_id}", status_code=303)
+
+    raw_flag = str(enabled or "").strip().lower()
+    https_flag = raw_flag in ("1", "true", "yes", "y", "on")
+
+    task_id = add_task(
+        node_id=int(site.get("node_id") or 0),
+        task_type="site_https_redirect",
+        payload={"site_id": site_id, "domains": domains, "https_redirect": https_flag},
+        status="running",
+        progress=10,
+    )
+    add_site_event(
+        int(site_id),
+        "site_https_redirect",
+        status="running",
+        actor=str(user or ""),
+        payload={"domains": domains, "https_redirect": https_flag},
+    )
+
+    try:
+        payload = {
+            "domains": domains,
+            "type": site.get("type") or "static",
+            "web_server": site.get("web_server") or "nginx",
+            "proxy_target": _normalize_proxy_target(site.get("proxy_target") or ""),
+            "https_redirect": https_flag,
+            "gzip_enabled": True if site.get("gzip_enabled") is None else bool(site.get("gzip_enabled")),
+            "nginx_tpl": site.get("nginx_tpl") or "",
+            "root_path": site.get("root_path") or "",
+            "root_base": _node_root_base(node),
+        }
+
+        update_task(task_id, progress=45)
+        data = await agent_post(
+            node["base_url"],
+            node["api_key"],
+            "/api/v1/website/site/create",
+            payload,
+            node_verify_tls(node),
+            timeout=45,
+        )
+        if not data.get("ok", True):
+            raise AgentError(str(data.get("error") or "更新 HTTPS 跳转失败"))
+
+        update_site(int(site_id), https_redirect=https_flag)
+        update_task(task_id, status="success", progress=100, result=data)
+        add_site_event(int(site_id), "site_https_redirect", status="success", actor=str(user or ""), result=data)
+        set_flash(request, "已开启强制 HTTPS" if https_flag else "已关闭强制 HTTPS")
+    except Exception as exc:
+        update_task(task_id, status="failed", progress=100, error=str(exc))
+        add_site_event(int(site_id), "site_https_redirect", status="failed", actor=str(user or ""), error=str(exc))
+        set_flash(request, f"更新强制 HTTPS 失败：{exc}")
+
+    return RedirectResponse(url=f"/websites/{site_id}", status_code=303)
+
+
 @router.post("/websites/{site_id}/delete")
 async def website_delete(
     request: Request,

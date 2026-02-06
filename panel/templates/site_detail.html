@@ -3,12 +3,6 @@
 {% set st = (site.status or '') %}
 {% set st_class = 'ok' if st == 'running' else ('warn' if st in ['creating','pending'] else ('bad' if st == 'error' else 'ghost')) %}
 {% set type_map = {'static':'静态', 'php':'PHP', 'reverse_proxy':'反向代理'} %}
-{% set ns = namespace(cert_valid=false) %}
-{% for c in certs %}
-  {% if (c.status or '') == 'valid' %}
-    {% set ns.cert_valid = true %}
-  {% endif %}
-{% endfor %}
 
 <div class="page-head">
   <div class="page-title">
@@ -32,24 +26,6 @@
           <a class="menu-item" href="/websites/{{ site.id }}/files">文件管理</a>
         {% endif %}
         <a class="menu-item" href="/websites/{{ site.id }}/diagnose">诊断</a>
-
-        <div class="menu-sep"></div>
-
-        {% if ns.cert_valid %}
-          <form method="post" action="/websites/{{ site.id }}/ssl/renew" style="margin:0;">
-            <button class="menu-item" type="submit">续期 SSL</button>
-          </form>
-          <form method="post" action="/websites/{{ site.id }}/ssl/issue" style="margin:0;">
-            <button class="menu-item" type="submit">重新申请 SSL</button>
-          </form>
-        {% else %}
-          <form method="post" action="/websites/{{ site.id }}/ssl/issue" style="margin:0;">
-            <button class="menu-item" type="submit">申请 SSL</button>
-          </form>
-          <form method="post" action="/websites/{{ site.id }}/ssl/renew" style="margin:0;">
-            <button class="menu-item" type="submit">续期 SSL</button>
-          </form>
-        {% endif %}
 
         <div class="menu-sep"></div>
         <a class="menu-item danger" href="#danger">删除站点…</a>
@@ -139,7 +115,19 @@
       <div class="section-head">
         <div>
           <div class="section-title">SSL 证书</div>
-          <div class="section-sub">状态与续期信息（申请/续期在右上角“操作”）。</div>
+          <div class="section-sub">状态与续期信息（可在此处直接申请/续期/切换 HTTPS 跳转）。</div>
+        </div>
+        <div class="site-ssl-actions">
+          <form method="post" action="/websites/{{ site.id }}/ssl/issue">
+            <button class="btn xs" type="submit">申请 SSL</button>
+          </form>
+          <form method="post" action="/websites/{{ site.id }}/ssl/renew">
+            <button class="btn xs ghost" type="submit" {% if not certs %}disabled title="暂无证书可续期，请先申请"{% endif %}>续期 SSL</button>
+          </form>
+          <form method="post" action="/websites/{{ site.id }}/https_redirect">
+            <input type="hidden" name="enabled" value="{{ '0' if site.https_redirect else '1' }}">
+            <button class="btn xs ghost" type="submit">{{ '关闭强制 HTTPS' if site.https_redirect else '强制 HTTPS' }}</button>
+          </form>
         </div>
       </div>
       {% if certs %}
@@ -170,7 +158,7 @@
         </table>
       </div>
       {% else %}
-        <div class="muted" style="margin-top:10px;">暂无证书（右上角“操作”里可申请 SSL）</div>
+        <div class="muted" style="margin-top:10px;">暂无证书，可点击上方“申请 SSL”。</div>
       {% endif %}
     </div>
 

@@ -12,7 +12,5 @@
     {% if site.type != 'reverse_proxy' and site.root_path %}
       <a href="/websites/{{ sid }}/files" class="{{ 'active' if '/files' in p else '' }}">文件</a>
     {% endif %}
-    <a href="/websites/{{ sid }}#ssl" class="">SSL</a>
-    <a href="/websites/{{ sid }}#danger" class="">风险</a>
   </div>
 </div>

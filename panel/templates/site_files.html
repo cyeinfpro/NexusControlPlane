@@ -111,27 +111,23 @@
           <td class="mono">{{ it.size_h }}</td>
           <td class="mono">{{ it.mtime or "-" }}</td>
           <td class="fm-actions-cell">
-            <details class="menu">
-              <summary class="btn icon xs ghost" title="操作">⋯</summary>
-              <div class="menu-pop">
-                {% if not it.is_dir %}
-                  <a class="menu-item" href="/websites/{{ site.id }}/files/edit?path={{ it.path }}">编辑</a>
-                  <a class="menu-item" href="/websites/{{ site.id }}/files/download?path={{ it.path }}">下载</a>
-                  {% if it.name.endswith('.zip') %}
-                    <form method="post" action="/websites/{{ site.id }}/files/unzip" style="margin:0;">
-                      <input type="hidden" name="path" value="{{ it.path }}">
-                      <input type="hidden" name="dest" value="{{ path }}">
-                      <button class="menu-item" type="submit">解压</button>
-                    </form>
-                  {% endif %}
-                  <div class="menu-sep"></div>
+            <div class="fm-inline-actions">
+              {% if not it.is_dir %}
+                <a class="btn xs ghost fm-act-btn" href="/websites/{{ site.id }}/files/edit?path={{ it.path }}">编辑</a>
+                <a class="btn xs ghost fm-act-btn" href="/websites/{{ site.id }}/files/download?path={{ it.path }}">下载</a>
+                {% if it.name.endswith('.zip') %}
+                  <form method="post" action="/websites/{{ site.id }}/files/unzip" class="fm-inline-form">
+                    <input type="hidden" name="path" value="{{ it.path }}">
+                    <input type="hidden" name="dest" value="{{ path }}">
+                    <button class="btn xs ghost fm-act-btn" type="submit">解压</button>
+                  </form>
                 {% endif %}
-                <form method="post" action="/websites/{{ site.id }}/files/delete" style="margin:0;" onsubmit="return confirm('确定删除吗？');">
-                  <input type="hidden" name="path" value="{{ it.path }}">
-                  <button class="menu-item danger" type="submit">删除</button>
-                </form>
-              </div>
-            </details>
+              {% endif %}
+              <form method="post" action="/websites/{{ site.id }}/files/delete" class="fm-inline-form" onsubmit="return confirm('确定删除吗？');">
+                <input type="hidden" name="path" value="{{ it.path }}">
+                <button class="btn xs ghost fm-act-btn fm-act-danger" type="submit">删除</button>
+              </form>
+            </div>
           </td>
         </tr>
         {% else %}
