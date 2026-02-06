@@ -56,6 +56,8 @@
   </div>
 </div>
 
+{% include "site_nav.html" %}
+
 <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(320px,1fr));">
   <div class="card">
     <div class="section-head">
@@ -166,7 +168,7 @@
     {% endif %}
   </div>
 
-  <div class="card">
+  <div class="card" id="ssl">
     <div class="section-head">
       <div>
         <div class="section-title">SSL 证书</div>

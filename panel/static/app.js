@@ -6010,10 +6010,18 @@ document.addEventListener('toggle', (e)=>{
 
 // 点击空白区域，关闭所有 menu
 document.addEventListener('click', (e)=>{
-  const inMenu = e.target && e.target.closest && e.target.closest('details.menu');
-  if(!inMenu){
-    closeAllMenus(null);
-  }
+  // NOTE: mobile bottom-sheet menu uses a full-screen overlay via ::before.
+  // Clicking that overlay should close the menu. In that case the event target
+  // is often the <details> itself (because pseudo-elements can't be targeted).
+  const inPop = e.target && e.target.closest && e.target.closest('details.menu .menu-pop');
+  const inSummary = e.target && e.target.closest && e.target.closest('details.menu > summary');
+  if(inPop || inSummary) return;
+  closeAllMenus(null);
+}, true);
+
+// ESC to close any open menus
+document.addEventListener('keydown', (e)=>{
+  if(e && e.key === 'Escape') closeAllMenus(null);
 }, true);
 
 // Auto-init dashboard mini system info (safe no-op on non-dashboard pages)
