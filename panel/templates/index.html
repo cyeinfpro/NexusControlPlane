@@ -340,7 +340,7 @@
     <p class="muted" style="margin-top:8px;">
       上传 <span class="mono">realm-backup-*.zip</span>（全量备份包）。系统将自动：
       <span class="mono">1)</span> 恢复节点列表；<span class="mono">2)</span> 按节点恢复 <span class="mono">rules/</span> 规则；
-      <span class="mono">3)</span> 恢复网站、证书与网络波动配置。
+      <span class="mono">3)</span> 恢复网站配置与网站文件；<span class="mono">4)</span> 恢复证书与网络波动配置。
       若节点暂时离线，将先写入面板期望配置，待 Agent 上报后自动生效。
     </p>
 
@@ -359,5 +359,5 @@
 {% endblock %}
 
 {% block scripts %}
-<script src="/static/app.js?v=73.0"></script>
+<script src="/static/app.js?v=74.0"></script>
 {% endblock %}

@@ -5844,6 +5844,7 @@ function _renderFullBackupCounts(counts){
     ['nodes', '节点'],
     ['rules', '规则快照'],
     ['sites', '网站'],
+    ['site_files', '网站文件'],
     ['certificates', '证书'],
     ['netmon_monitors', '网络波动'],
     ['files', '备份文件'],
@@ -6135,12 +6136,14 @@ async function restoreFullNow(){
     const nodes = data && data.nodes ? data.nodes : {};
     const rules = data && data.rules ? data.rules : {};
     const sites = data && data.sites ? data.sites : {};
+    const siteFiles = data && data.site_files ? data.site_files : {};
     const certs = data && data.certificates ? data.certificates : {};
     const netmon = data && data.netmon ? data.netmon : {};
     const summary =
       `节点 新增 ${Number(nodes.added||0)} / 更新 ${Number(nodes.updated||0)} / 跳过 ${Number(nodes.skipped||0)}\n` +
       `规则 恢复 ${Number(rules.restored||0)} / 未匹配 ${Number(rules.unmatched||0)} / 失败 ${Number(rules.failed||0)}\n` +
       `站点 新增 ${Number(sites.added||0)} / 更新 ${Number(sites.updated||0)} / 跳过 ${Number(sites.skipped||0)}\n` +
+      `文件 恢复 ${Number(siteFiles.restored||0)} / 未匹配 ${Number(siteFiles.unmatched||0)} / 失败 ${Number(siteFiles.failed||0)} / 跳过 ${Number(siteFiles.skipped||0)}\n` +
       `证书 新增 ${Number(certs.added||0)} / 更新 ${Number(certs.updated||0)} / 跳过 ${Number(certs.skipped||0)}\n` +
       `网络波动 新增 ${Number(netmon.added||0)} / 更新 ${Number(netmon.updated||0)} / 跳过 ${Number(netmon.skipped||0)}`;
     if(err){

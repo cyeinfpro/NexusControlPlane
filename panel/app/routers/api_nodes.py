@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
 import inspect
 import io
 import json
@@ -10,12 +12,12 @@ import uuid
 import zipfile
 from datetime import datetime
 from typing import Any, Dict, List, Optional
-from urllib.parse import urlparse
+from urllib.parse import urlencode, urlparse
 
 from fastapi import APIRouter, Depends, File, Request, UploadFile
 from fastapi.responses import JSONResponse, Response
 
-from ..clients.agent import agent_get, agent_ping, agent_post
+from ..clients.agent import agent_get, agent_get_raw, agent_ping, agent_post
 from ..core.deps import require_login
 from ..core.settings import DEFAULT_AGENT_PORT
 from ..db import (
@@ -74,6 +76,7 @@ def _backup_steps_template() -> List[Dict[str, Any]]:
         {"key": "scan", "label": "扫描数据", "status": "pending", "detail": ""},
         {"key": "rules", "label": "规则快照", "status": "pending", "detail": ""},
         {"key": "sites", "label": "网站配置", "status": "pending", "detail": ""},
+        {"key": "site_files", "label": "网站文件", "status": "pending", "detail": ""},
         {"key": "certs", "label": "证书信息", "status": "pending", "detail": ""},
         {"key": "netmon", "label": "网络波动配置", "status": "pending", "detail": ""},
         {"key": "package", "label": "打包压缩", "status": "pending", "detail": ""},
@@ -173,6 +176,110 @@ async def _emit_backup_progress(callback: Any, payload: Dict[str, Any]) -> None:
         pass
 
 
+def _clean_site_rel_path(raw: Any) -> str:
+    txt = str(raw or "").replace("\\", "/").strip().strip("/")
+    if not txt:
+        return ""
+    parts: List[str] = []
+    for seg in txt.split("/"):
+        s = str(seg or "").strip()
+        if not s or s == ".":
+            continue
+        if s == "..":
+            return ""
+        parts.append(s)
+    return "/".join(parts)
+
+
+def _site_pkg_dir_name(site: Dict[str, Any]) -> str:
+    sid = int(site.get("source_id") or site.get("id") or 0)
+    domains = site.get("domains") if isinstance(site.get("domains"), list) else []
+    hint = ""
+    if domains:
+        hint = str(domains[0] or "").strip()
+    if not hint:
+        hint = str(site.get("name") or f"site-{sid}").strip()
+    safe = safe_filename_part(hint)[:64] or "site"
+    return f"site-{sid}-{safe}"
+
+
+async def _collect_site_file_index(site: Dict[str, Any], node: Dict[str, Any]) -> Dict[str, Any]:
+    root = str(site.get("root_path") or "").strip()
+    out: Dict[str, Any] = {
+        "source_site_id": int(site.get("source_id") or site.get("id") or 0),
+        "source_node_id": int(site.get("node_source_id") or site.get("node_id") or 0),
+        "node_base_url": str(site.get("node_base_url") or node.get("base_url") or ""),
+        "root_path": root,
+        "package_dir": _site_pkg_dir_name(site),
+        "files": [],
+        "file_count": 0,
+        "total_bytes": 0,
+        "errors": [],
+    }
+    if not root:
+        out["errors"].append("站点 root_path 为空，跳过文件备份")
+        return out
+
+    root_base = str(node.get("website_root_base") or "").strip()
+    queue: List[str] = [""]
+    seen_dirs = set([""])
+    files: List[Dict[str, Any]] = []
+
+    while queue:
+        rel = queue.pop(0)
+        q = urlencode({"root": root, "path": rel, "root_base": root_base})
+        try:
+            data = await agent_get(
+                node["base_url"],
+                node["api_key"],
+                f"/api/v1/website/files/list?{q}",
+                node_verify_tls(node),
+                timeout=20,
+            )
+        except Exception as exc:
+            out["errors"].append(f"目录读取失败 [{rel or '/'}]：{exc}")
+            continue
+
+        if not data.get("ok", True):
+            out["errors"].append(f"目录读取失败 [{rel or '/'}]：{data.get('error') or 'unknown'}")
+            continue
+
+        for it in (data.get("items") or []):
+            if not isinstance(it, dict):
+                continue
+            p = _clean_site_rel_path(it.get("path"))
+            if not p:
+                continue
+            if bool(it.get("is_dir")):
+                if p not in seen_dirs:
+                    seen_dirs.add(p)
+                    queue.append(p)
+                continue
+            try:
+                size_i = max(0, int(it.get("size") or 0))
+            except Exception:
+                size_i = 0
+            files.append({"path": p, "size": size_i})
+
+    # Deduplicate by path (keep first)
+    seen_file_paths = set()
+    cleaned: List[Dict[str, Any]] = []
+    total_bytes = 0
+    for f in sorted(files, key=lambda x: str(x.get("path") or "")):
+        p = str(f.get("path") or "")
+        if not p or p in seen_file_paths:
+            continue
+        seen_file_paths.add(p)
+        sz = max(0, int(f.get("size") or 0))
+        total_bytes += sz
+        cleaned.append({"path": p, "size": sz})
+
+    out["files"] = cleaned
+    out["file_count"] = len(cleaned)
+    out["total_bytes"] = int(total_bytes)
+    return out
+
+
 async def _build_full_backup_bundle(request: Request, progress_callback: Any = None) -> Dict[str, Any]:
     await _emit_backup_progress(
         progress_callback,
@@ -187,6 +294,7 @@ async def _build_full_backup_bundle(request: Request, progress_callback: Any = N
     monitors = list_netmon_monitors()
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
 
+    fixed_zip_files = 7  # backup_meta + nodes + sites + certs + site_files_manifest + netmon + README
     await _emit_backup_progress(
         progress_callback,
         {
@@ -199,9 +307,10 @@ async def _build_full_backup_bundle(request: Request, progress_callback: Any = N
                 "nodes": len(nodes),
                 "rules": len(nodes),
                 "sites": len(sites),
+                "site_files": 0,
                 "certificates": len(certs),
                 "netmon_monitors": len(monitors),
-                "files": 6 + len(nodes),
+                "files": fixed_zip_files + len(nodes),
             },
         },
     )
@@ -264,7 +373,7 @@ async def _build_full_backup_bundle(request: Request, progress_callback: Any = N
         },
     )
 
-    # Payloads
+    # Base payloads
     await _emit_backup_progress(
         progress_callback,
         {"progress": 60, "stage": "整理网站配置", "step_key": "sites", "step_status": "running", "step_detail": f"{len(sites)} 个站点"},
@@ -322,12 +431,120 @@ async def _build_full_backup_bundle(request: Request, progress_callback: Any = N
     }
     await _emit_backup_progress(
         progress_callback,
-        {"progress": 68, "stage": "网站配置完成", "step_key": "sites", "step_status": "done", "step_detail": f"{len(sites_payload['sites'])} 条"},
+        {"progress": 66, "stage": "网站配置完成", "step_key": "sites", "step_status": "done", "step_detail": f"{len(sites_payload['sites'])} 条"},
+    )
+
+    # Build website file index (list tree first; content will be pulled in package stage)
+    site_files_manifest: Dict[str, Any] = {
+        "kind": "realm_site_files_backup",
+        "created_at": nodes_payload["created_at"],
+        "sites": [],
+        "summary": {"sites": 0, "files_total": 0, "files_ok": 0, "files_failed": 0, "bytes_total": 0},
+    }
+    site_file_total = 0
+    site_file_bytes = 0
+    site_file_failed = 0
+    total_sites = len(sites_payload["sites"])
+    await _emit_backup_progress(
+        progress_callback,
+        {"progress": 68, "stage": "扫描网站文件", "step_key": "site_files", "step_status": "running", "step_detail": f"0/{total_sites}"},
+    )
+    if total_sites:
+        for i, s in enumerate(sites_payload["sites"], start=1):
+            sid = int(s.get("source_id") or 0)
+            nid = int(s.get("node_source_id") or 0)
+            node = node_map.get(nid)
+            if not node:
+                entry = {
+                    "source_site_id": sid,
+                    "source_node_id": nid,
+                    "node_base_url": str(s.get("node_base_url") or ""),
+                    "root_path": str(s.get("root_path") or ""),
+                    "package_dir": _site_pkg_dir_name(s),
+                    "files": [],
+                    "file_count": 0,
+                    "total_bytes": 0,
+                    "errors": ["未找到站点节点，跳过文件备份"],
+                }
+            else:
+                entry = await _collect_site_file_index(s, node)
+
+            pkg_dir = str(entry.get("package_dir") or _site_pkg_dir_name(s))
+            files_idx = entry.get("files") if isinstance(entry.get("files"), list) else []
+            cleaned_files = []
+            for f in files_idx:
+                if not isinstance(f, dict):
+                    continue
+                rel_path = _clean_site_rel_path(f.get("path"))
+                if not rel_path:
+                    continue
+                size_i = max(0, int(f.get("size") or 0))
+                cleaned_files.append(
+                    {
+                        "path": rel_path,
+                        "size": size_i,
+                        "zip_path": f"websites/files/{pkg_dir}/{rel_path}",
+                    }
+                )
+            entry["files"] = cleaned_files
+            entry["file_count"] = len(cleaned_files)
+            entry["total_bytes"] = int(sum(int(x.get("size") or 0) for x in cleaned_files))
+
+            site_file_total += int(entry["file_count"])
+            site_file_bytes += int(entry["total_bytes"])
+            site_file_failed += len(entry.get("errors") or [])
+            site_files_manifest["sites"].append(entry)
+
+            p = 68 + int((i / max(1, total_sites)) * 10)
+            await _emit_backup_progress(
+                progress_callback,
+                {
+                    "progress": p,
+                    "stage": "扫描网站文件",
+                    "step_key": "site_files",
+                    "step_status": "running",
+                    "step_detail": f"{i}/{total_sites} · 已发现 {site_file_total} 个文件",
+                    "counts": {
+                        "nodes": len(nodes),
+                        "rules": len(rules_entries),
+                        "sites": len(sites_payload["sites"]),
+                        "site_files": site_file_total,
+                        "certificates": len(certs),
+                        "netmon_monitors": len(monitors),
+                        "files": fixed_zip_files + len(rules_entries) + site_file_total,
+                    },
+                },
+            )
+    site_files_manifest["summary"] = {
+        "sites": len(site_files_manifest["sites"]),
+        "files_total": site_file_total,
+        "files_ok": 0,
+        "files_failed": 0,
+        "bytes_total": site_file_bytes,
+    }
+    await _emit_backup_progress(
+        progress_callback,
+        {
+            "progress": 78,
+            "stage": "网站文件扫描完成",
+            "step_key": "site_files",
+            "step_status": "done",
+            "step_detail": f"{site_file_total} 个文件",
+            "counts": {
+                "nodes": len(nodes),
+                "rules": len(rules_entries),
+                "sites": len(sites_payload["sites"]),
+                "site_files": site_file_total,
+                "certificates": len(certs),
+                "netmon_monitors": len(monitors),
+                "files": fixed_zip_files + len(rules_entries) + site_file_total,
+            },
+        },
     )
 
     await _emit_backup_progress(
         progress_callback,
-        {"progress": 72, "stage": "整理证书信息", "step_key": "certs", "step_status": "running", "step_detail": f"{len(certs)} 条证书"},
+        {"progress": 80, "stage": "整理证书信息", "step_key": "certs", "step_status": "running", "step_detail": f"{len(certs)} 条证书"},
     )
     certs_payload = {
         "kind": "realm_certificates_backup",
@@ -354,12 +571,12 @@ async def _build_full_backup_bundle(request: Request, progress_callback: Any = N
     }
     await _emit_backup_progress(
         progress_callback,
-        {"progress": 78, "stage": "证书信息完成", "step_key": "certs", "step_status": "done", "step_detail": f"{len(certs_payload['certificates'])} 条"},
+        {"progress": 84, "stage": "证书信息完成", "step_key": "certs", "step_status": "done", "step_detail": f"{len(certs_payload['certificates'])} 条"},
     )
 
     await _emit_backup_progress(
         progress_callback,
-        {"progress": 82, "stage": "整理网络波动配置", "step_key": "netmon", "step_status": "running", "step_detail": f"{len(monitors)} 个监控"},
+        {"progress": 86, "stage": "整理网络波动配置", "step_key": "netmon", "step_status": "running", "step_detail": f"{len(monitors)} 个监控"},
     )
     monitors_payload = {
         "kind": "realm_netmon_backup",
@@ -390,7 +607,7 @@ async def _build_full_backup_bundle(request: Request, progress_callback: Any = N
     }
     await _emit_backup_progress(
         progress_callback,
-        {"progress": 88, "stage": "网络波动配置完成", "step_key": "netmon", "step_status": "done", "step_detail": f"{len(monitors_payload['monitors'])} 条"},
+        {"progress": 90, "stage": "网络波动配置完成", "step_key": "netmon", "step_status": "done", "step_detail": f"{len(monitors_payload['monitors'])} 条"},
     )
 
     meta_payload = {
@@ -398,10 +615,13 @@ async def _build_full_backup_bundle(request: Request, progress_callback: Any = N
         "created_at": nodes_payload["created_at"],
         "nodes": len(nodes),
         "sites": len(sites_payload["sites"]),
+        "site_files": int(site_file_total),
+        "site_files_failed": int(site_file_failed),
+        "site_file_bytes": int(site_file_bytes),
         "certificates": len(certs_payload["certificates"]),
         "netmon_monitors": len(monitors_payload["monitors"]),
         "rules": len(rules_entries),
-        "files": 6 + len(rules_entries),
+        "files": fixed_zip_files + len(rules_entries) + int(site_file_total),
     }
 
     await _emit_backup_progress(
@@ -409,20 +629,98 @@ async def _build_full_backup_bundle(request: Request, progress_callback: Any = N
         {"progress": 92, "stage": "打包压缩", "step_key": "package", "step_status": "running", "step_detail": f"{meta_payload['files']} 个文件"},
     )
     buf = io.BytesIO()
+    site_files_ok = 0
+    site_files_failed_transfer = 0
+    site_files_bytes_ok = 0
     with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as z:
-        z.writestr("backup_meta.json", json.dumps(meta_payload, ensure_ascii=False, indent=2))
         z.writestr("nodes.json", json.dumps(nodes_payload, ensure_ascii=False, indent=2))
         z.writestr("websites/sites.json", json.dumps(sites_payload, ensure_ascii=False, indent=2))
         z.writestr("websites/certificates.json", json.dumps(certs_payload, ensure_ascii=False, indent=2))
         z.writestr("netmon/monitors.json", json.dumps(monitors_payload, ensure_ascii=False, indent=2))
         for path, data in rules_entries:
             z.writestr(path, json.dumps(data, ensure_ascii=False, indent=2))
+
+        file_jobs: List[tuple[Dict[str, Any], Dict[str, Any]]] = []
+        for site_item in (site_files_manifest.get("sites") or []):
+            for file_item in (site_item.get("files") or []):
+                if isinstance(file_item, dict):
+                    file_jobs.append((site_item, file_item))
+        total_jobs = len(file_jobs)
+        if total_jobs:
+            for i, (site_item, file_item) in enumerate(file_jobs, start=1):
+                node = node_map.get(int(site_item.get("source_node_id") or 0))
+                rel_path = _clean_site_rel_path(file_item.get("path"))
+                zip_path = str(file_item.get("zip_path") or "").strip()
+                root = str(site_item.get("root_path") or "").strip()
+                if not node or not root or not rel_path or not zip_path:
+                    file_item["status"] = "failed"
+                    file_item["error"] = "元数据不完整，跳过"
+                    site_files_failed_transfer += 1
+                else:
+                    try:
+                        r = await agent_get_raw(
+                            node.get("base_url", ""),
+                            node.get("api_key", ""),
+                            "/api/v1/website/files/raw",
+                            node_verify_tls(node),
+                            params={
+                                "root": root,
+                                "path": rel_path,
+                                "root_base": str(node.get("website_root_base") or ""),
+                            },
+                            timeout=45,
+                        )
+                        if r.status_code != 200:
+                            raise RuntimeError(f"HTTP {r.status_code}")
+                        raw = bytes(r.content or b"")
+                        z.writestr(zip_path, raw)
+                        file_item["status"] = "ok"
+                        file_item["size"] = len(raw)
+                        site_files_ok += 1
+                        site_files_bytes_ok += len(raw)
+                    except Exception as exc:
+                        file_item["status"] = "failed"
+                        file_item["error"] = str(exc)
+                        site_files_failed_transfer += 1
+                        errs = site_item.get("errors")
+                        if not isinstance(errs, list):
+                            site_item["errors"] = []
+                        site_item["errors"].append(f"文件拉取失败：{rel_path} · {exc}")
+
+                p = 92 + int((i / max(1, total_jobs)) * 7)
+                await _emit_backup_progress(
+                    progress_callback,
+                    {
+                        "progress": p,
+                        "stage": "打包压缩",
+                        "step_key": "package",
+                        "step_status": "running",
+                        "step_detail": f"拉取网站文件 {i}/{total_jobs}",
+                    },
+                )
+
+        # Finalize file manifest/meta with actual transfer result
+        site_files_manifest["summary"] = {
+            "sites": len(site_files_manifest.get("sites") or []),
+            "files_total": total_jobs,
+            "files_ok": int(site_files_ok),
+            "files_failed": int(site_files_failed_transfer),
+            "bytes_total": int(site_files_bytes_ok),
+        }
+        z.writestr("websites/files_manifest.json", json.dumps(site_files_manifest, ensure_ascii=False, indent=2))
+
+        meta_payload["site_files"] = int(site_files_ok)
+        meta_payload["site_files_failed"] = int(site_files_failed_transfer + site_file_failed)
+        meta_payload["site_file_bytes"] = int(site_files_bytes_ok)
+        meta_payload["files"] = fixed_zip_files + len(rules_entries) + int(site_files_ok)
+        z.writestr("backup_meta.json", json.dumps(meta_payload, ensure_ascii=False, indent=2))
         z.writestr(
             "README.txt",
             "Realm 全量备份说明\n\n"
             "1) 恢复节点列表：登录面板 → 控制台 → 点击『恢复节点列表』，上传本压缩包（或解压后的 nodes.json）。\n"
             "2) 全量恢复：控制台 → 全量恢复，自动恢复 nodes/rules/websites/certificates/netmon。\n"
-            "3) 恢复单节点规则：进入节点页面 → 更多 → 恢复规则，把 rules/ 目录下对应节点的规则文件上传/粘贴即可。\n",
+            "3) 网站文件已打包在 websites/files/ 目录，恢复时会按站点映射自动回传到节点。\n"
+            "4) 恢复单节点规则：进入节点页面 → 更多 → 恢复规则，把 rules/ 目录下对应节点的规则文件上传/粘贴即可。\n",
         )
 
     filename = f"realm-backup-{ts}.zip"
@@ -439,6 +737,7 @@ async def _build_full_backup_bundle(request: Request, progress_callback: Any = N
                 "nodes": meta_payload["nodes"],
                 "rules": meta_payload["rules"],
                 "sites": meta_payload["sites"],
+                "site_files": int(meta_payload.get("site_files") or 0),
                 "certificates": meta_payload["certificates"],
                 "netmon_monitors": meta_payload["netmon_monitors"],
                 "files": meta_payload["files"],
@@ -546,6 +845,7 @@ async def api_backup_full_start(request: Request, user: str = Depends(require_lo
                 "nodes": 0,
                 "rules": 0,
                 "sites": 0,
+                "site_files": 0,
                 "certificates": 0,
                 "netmon_monitors": 0,
                 "files": 0,
@@ -574,6 +874,7 @@ async def api_backup_full_start(request: Request, user: str = Depends(require_lo
                 "nodes": int(meta.get("nodes") or 0),
                 "rules": int(meta.get("rules") or 0),
                 "sites": int(meta.get("sites") or 0),
+                "site_files": int(meta.get("site_files") or 0),
                 "certificates": int(meta.get("certificates") or 0),
                 "netmon_monitors": int(meta.get("netmon_monitors") or 0),
                 "files": int(meta.get("files") or 0),
@@ -1217,6 +1518,176 @@ async def api_restore_full(
             if source_site_id is not None:
                 site_mapping[str(source_site_id)] = int(site_id)
 
+    # ---- restore website files ----
+    site_file_restored = 0
+    site_file_failed = 0
+    site_file_skipped = 0
+    site_file_unmatched = 0
+    site_file_bytes = 0
+    site_file_failed_items: List[Dict[str, Any]] = []
+
+    files_manifest_path = _find_zip_path("websites/files_manifest.json")
+    if files_manifest_path:
+        try:
+            files_manifest = json.loads(z.read(files_manifest_path).decode("utf-8"))
+            site_file_items = (
+                files_manifest.get("sites")
+                if isinstance(files_manifest, dict) and isinstance(files_manifest.get("sites"), list)
+                else (files_manifest if isinstance(files_manifest, list) else [])
+            )
+        except Exception as exc:
+            site_file_items = []
+            site_file_failed_items.append({"path": files_manifest_path, "error": f"files_manifest 解析失败：{exc}"})
+
+        current_sites: Dict[int, Dict[str, Any]] = {}
+        try:
+            for s in list_sites():
+                sid = _as_int(s.get("id"), 0)
+                if sid > 0:
+                    current_sites[sid] = s
+        except Exception:
+            current_sites = {}
+
+        async def _upload_site_file_bytes(
+            node: Dict[str, Any],
+            root_path: str,
+            rel_path: str,
+            raw: bytes,
+        ) -> None:
+            clean_rel = _clean_site_rel_path(rel_path)
+            if not clean_rel:
+                raise RuntimeError("非法文件路径")
+            if "/" in clean_rel:
+                dir_path, filename = clean_rel.rsplit("/", 1)
+            else:
+                dir_path, filename = "", clean_rel
+            filename = filename.strip()
+            if not filename:
+                raise RuntimeError("文件名为空")
+            root_base = str(node.get("website_root_base") or "").strip()
+            upload_id = uuid.uuid4().hex
+            if not raw:
+                payload_empty = {
+                    "root": root_path,
+                    "path": dir_path,
+                    "filename": filename,
+                    "upload_id": upload_id,
+                    "offset": 0,
+                    "done": True,
+                    "allow_empty": True,
+                    "root_base": root_base,
+                }
+                resp_empty = await agent_post(
+                    node["base_url"],
+                    node["api_key"],
+                    "/api/v1/website/files/upload_chunk",
+                    payload_empty,
+                    node_verify_tls(node),
+                    timeout=20,
+                )
+                if not resp_empty.get("ok", True):
+                    raise RuntimeError(str(resp_empty.get("error") or "空文件上传失败"))
+                return
+
+            chunk_size = 512 * 1024
+            offset = 0
+            total = len(raw)
+            while offset < total:
+                chunk = raw[offset : offset + chunk_size]
+                done = (offset + len(chunk)) >= total
+                payload_chunk = {
+                    "root": root_path,
+                    "path": dir_path,
+                    "filename": filename,
+                    "upload_id": upload_id,
+                    "offset": offset,
+                    "done": done,
+                    "content_b64": base64.b64encode(chunk).decode("ascii"),
+                    "chunk_sha256": hashlib.sha256(chunk).hexdigest(),
+                    "root_base": root_base,
+                }
+                resp_chunk = await agent_post(
+                    node["base_url"],
+                    node["api_key"],
+                    "/api/v1/website/files/upload_chunk",
+                    payload_chunk,
+                    node_verify_tls(node),
+                    timeout=45,
+                )
+                if not resp_chunk.get("ok", True):
+                    raise RuntimeError(str(resp_chunk.get("error") or "文件上传失败"))
+                offset += len(chunk)
+
+        for sitem in site_file_items:
+            if not isinstance(sitem, dict):
+                continue
+            source_site_id_raw = sitem.get("source_site_id")
+            source_site_id = _as_int(source_site_id_raw, 0) if source_site_id_raw is not None else None
+            target_site_id = None
+            if source_site_id is not None and str(source_site_id) in site_mapping:
+                target_site_id = _as_int(site_mapping.get(str(source_site_id)), 0) or None
+            if not target_site_id:
+                # fallback: if source id happens to exist after restore
+                if source_site_id is not None and source_site_id in current_sites:
+                    target_site_id = int(source_site_id)
+
+            files_arr = sitem.get("files")
+            file_items = files_arr if isinstance(files_arr, list) else []
+            if not target_site_id:
+                site_file_unmatched += len(file_items)
+                continue
+
+            site_obj = current_sites.get(int(target_site_id))
+            if not site_obj:
+                site_obj = next((x for x in list_sites() if _as_int(x.get("id"), 0) == int(target_site_id)), None)
+                if site_obj:
+                    current_sites[int(target_site_id)] = site_obj
+            if not isinstance(site_obj, dict):
+                site_file_unmatched += len(file_items)
+                continue
+
+            target_node = get_node(_as_int(site_obj.get("node_id"), 0))
+            root_path = str(site_obj.get("root_path") or "").strip()
+            if not target_node or not root_path:
+                site_file_skipped += len(file_items)
+                continue
+
+            pkg_dir = str(sitem.get("package_dir") or "")
+            for fitem in file_items:
+                if not isinstance(fitem, dict):
+                    site_file_skipped += 1
+                    continue
+                rel_path = _clean_site_rel_path(fitem.get("path"))
+                if not rel_path:
+                    site_file_skipped += 1
+                    continue
+                zip_hint = str(fitem.get("zip_path") or "").strip()
+                if not zip_hint:
+                    zip_hint = f"websites/files/{pkg_dir}/{rel_path}" if pkg_dir else ""
+                if not zip_hint:
+                    site_file_failed += 1
+                    site_file_failed_items.append(
+                        {"site_id": target_site_id, "path": rel_path, "error": "缺少 zip_path"}
+                    )
+                    continue
+                zpath = _find_zip_path(zip_hint)
+                if not zpath:
+                    site_file_failed += 1
+                    site_file_failed_items.append(
+                        {"site_id": target_site_id, "path": rel_path, "error": "备份包缺少对应文件"}
+                    )
+                    continue
+                try:
+                    raw_bytes = bytes(z.read(zpath))
+                    await _upload_site_file_bytes(target_node, root_path, rel_path, raw_bytes)
+                    site_file_restored += 1
+                    site_file_bytes += len(raw_bytes)
+                except Exception as exc:
+                    site_file_failed += 1
+                    site_file_failed_items.append(
+                        {"site_id": target_site_id, "path": rel_path, "error": str(exc)}
+                    )
+
     # ---- restore website certificates ----
     cert_added = 0
     cert_updated = 0
@@ -1444,6 +1915,13 @@ async def api_restore_full(
             "skipped": site_skipped,
             "mapped": len(site_mapping),
         },
+        "site_files": {
+            "restored": site_file_restored,
+            "failed": site_file_failed,
+            "skipped": site_file_skipped,
+            "unmatched": site_file_unmatched,
+            "bytes": site_file_bytes,
+        },
         "certificates": {
             "added": cert_added,
             "updated": cert_updated,
@@ -1455,6 +1933,7 @@ async def api_restore_full(
             "skipped": mon_skipped,
         },
         "site_unmatched": site_unmatched[:50],
+        "site_file_failed": site_file_failed_items[:50],
         "cert_unmatched": cert_unmatched[:50],
         "rule_unmatched": rule_unmatched[:50],
         "rule_failed": rule_failed[:50],
