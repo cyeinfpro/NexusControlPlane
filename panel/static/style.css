@@ -2286,6 +2286,34 @@ textarea,.textarea{min-height:90px;resize:vertical}
 .node-group.collapsed .node-group-items{display:none;}
 .node-group.collapsed .node-group-toggle{transform: rotate(-90deg);}
 
+.node-item-row{
+  display:flex;
+  align-items:center;
+  gap:6px;
+  min-width:0;
+}
+
+.node-item-row .node-item{
+  flex:1 1 auto;
+  min-width:0;
+}
+
+.node-item-row .node-item-menu{
+  flex:0 0 auto;
+}
+
+.node-item-row .node-item-menu > summary{
+  width:28px;
+  min-width:28px;
+  height:28px;
+  min-height:28px;
+  padding:0;
+}
+
+.node-item-row .node-item-menu .menu-pop{
+  min-width:170px;
+}
+
 .node-item{
   display:flex;
   gap: 10px;
@@ -2432,7 +2460,8 @@ textarea,.textarea{min-height:90px;resize:vertical}
   .node-group-head{display:none;}
   .node-group-items{display:contents;}
   .node-group-divider{display:block; width:1px; height:44px; background:rgba(148,163,184,0.14); align-self:center; border-radius:999px; flex:0 0 auto;}
-  .node-item{min-width: 200px; flex:0 0 auto; scroll-snap-align:start;}
+  .node-item-row{min-width:238px; flex:0 0 auto; scroll-snap-align:start;}
+  .node-item{min-width:0; flex:1 1 auto; scroll-snap-align:none;}
   .sidebar-foot{display:none;}
   .node-tools .search-pill input{min-width: 140px;}
 }
@@ -2446,7 +2475,8 @@ textarea,.textarea{min-height:90px;resize:vertical}
      Otherwise, the popover may overflow the viewport when the button sits in the left column. */
   .node-tools details.menu{flex:1 1 100%;}
   .node-tools details.menu summary{width:100%; text-align:center;}
-  .node-item{min-width: 160px; padding: 9px; border-radius: 12px;}
+  .node-item-row{min-width:206px;}
+  .node-item{min-width:0; padding: 9px; border-radius: 12px;}
   .node-group-divider{height:40px;}
   .node-sidebar .node-meta{display:none;}
   .icon-btn{width:28px;height:28px;border-radius: 9px;}

@@ -27,14 +27,34 @@
           </div>
           <div class="node-group-items">
             {% for n in (g.nodes or []) %}
-            <a class="node-item{% if n.id == node.id %} active{% endif %}" href="/nodes/{{ n.id }}">
-              <span class="dot {% if n.online %}online{% else %}offline{% endif %}"></span>
-              <div class="node-info">
-                <div class="node-name">{{ n.name or n.display_ip or ('节点-' ~ n.id) }}</div>
-                <div class="node-meta mono">{{ n.display_ip or '-' }}</div>
-                <div class="muted sm">{{ n.group_name or '默认分组' }}</div>
-              </div>
-            </a>
+            <div class="node-item-row{% if n.id == node.id %} active{% endif %}"
+                 data-node-id="{{ n.id }}"
+                 data-node-name="{{ (n.name or '')|e }}"
+                 data-node-base-url="{{ (n.base_url or '')|e }}"
+                 data-node-group="{{ (n.group_name or '默认分组')|e }}"
+                 data-node-verify-tls="{{ 1 if n.verify_tls else 0 }}"
+                 data-node-is-private="{{ 1 if n.is_private else 0 }}"
+                 data-node-role="{{ (n.role or 'normal')|e }}"
+                 data-node-website-root="{{ (n.website_root_base or '')|e }}"
+                 data-node-display-ip="{{ (n.display_ip or '')|e }}">
+              <a class="node-item{% if n.id == node.id %} active{% endif %}" href="/nodes/{{ n.id }}">
+                <span class="dot {% if n.online %}online{% else %}offline{% endif %}"></span>
+                <div class="node-info">
+                  <div class="node-name">{{ n.name or n.display_ip or ('节点-' ~ n.id) }}</div>
+                  <div class="node-meta mono">{{ n.display_ip or '-' }}</div>
+                  <div class="muted sm">{{ n.group_name or '默认分组' }}</div>
+                </div>
+              </a>
+              <details class="menu node-item-menu">
+                <summary class="btn icon xs ghost" aria-label="节点快捷操作">⋯</summary>
+                <div class="menu-pop">
+                  <button class="menu-item" type="button" onclick="openEditNodeFromSidebar(this)">编辑节点</button>
+                  <button class="menu-item" type="button" onclick="openCommandModal('一键接入命令', window.__INSTALL_CMD__)">接入命令</button>
+                  <div class="menu-sep"></div>
+                  <button class="menu-item danger" type="button" onclick="removeNodeFromSidebar(this)">移除节点</button>
+                </div>
+              </details>
+            </div>
             {% endfor %}
           </div>
         </div>
@@ -62,6 +82,10 @@
               <span class="meta-item">分组 <span id="nodeGroupPill" class="pill xs ghost">{{ node.group_name or '默认分组' }}</span></span>
             </div>
             <div class="card-sub" style="margin-top:8px;">支持 TCP/UDP/WSS · WSS 自动同步（生成规则锁定）</div>
+            <div class="row node-head-shortcuts" style="margin-top:10px; gap:8px; flex-wrap:wrap;">
+              <button class="btn xs ghost" type="button" onclick="openEditNodeModal()">编辑节点</button>
+              <button class="btn xs ghost" type="button" onclick="openCommandModal('一键接入命令', window.__INSTALL_CMD__)">接入命令</button>
+            </div>
           </div>
           <div class="right node-tools node-head-right" style="gap:10px; flex:0 0 auto; flex-wrap:wrap; justify-content:flex-end;">
             <div class="search-pill">
@@ -84,6 +108,18 @@
               </select>
             </div>
 
+            <details class="menu">
+              <summary class="btn sm ghost">规则工具 ▾</summary>
+              <div class="menu-pop">
+                <a class="menu-item" href="/api/nodes/{{ node.id }}/backup">备份规则 <span class="muted sm">下载</span></a>
+                <button class="menu-item" type="button" id="restoreRulesBtn" onclick="triggerRestore()">恢复规则 <span class="muted sm">粘贴</span></button>
+                <div class="menu-sep"></div>
+                <button class="menu-item danger" type="button" onclick="purgeAllRules()">
+                  清空所有规则 <span class="muted sm">危险</span>
+                </button>
+              </div>
+            </details>
+
             <!-- Bulk operations (shown only when any rules are selected) -->
             <div id="bulkBar" class="bulk-bar" style="display:none;">
               <span class="pill xs ghost" id="bulkCount">已选 0</span>
@@ -96,33 +132,25 @@
             <button class="btn sm ghost" type="button" id="autoRefreshBtn" onclick="toggleAutoRefresh()">⟳ 自动刷新：开</button>
 
             <details class="menu">
-              <summary class="btn sm ghost">更多 ▾</summary>
+              <summary class="btn sm ghost">节点操作 ▾</summary>
               <div class="menu-pop">
                 <button class="menu-item" type="button" onclick="openEditNodeModal()">编辑节点 <span class="muted sm">名称/地址/分组</span></button>
-                <div class="menu-sep"></div>
                 <button class="menu-item" type="button" onclick="openCommandModal('一键接入命令', window.__INSTALL_CMD__)">
                   接入命令 <span class="muted sm">复制</span>
                 </button>
-                <button class="menu-item" type="button" onclick="openCommandModal('一键卸载 Agent', window.__UNINSTALL_CMD__)">
-                  卸载 Agent <span class="muted sm">复制</span>
+                <button class="menu-item" type="button" onclick="confirmAndShowUninstallCommand()">
+                  卸载 Agent <span class="muted sm">停止受控</span>
                 </button>
                 <div class="menu-sep"></div>
-                <a class="menu-item" href="/api/nodes/{{ node.id }}/backup">备份规则 <span class="muted sm">下载</span></a>
-                <button class="menu-item" type="button" id="restoreRulesBtn" onclick="triggerRestore()">恢复规则 <span class="muted sm">粘贴</span></button>
-                
+                <button class="menu-item" type="button" onclick="copyText(window.__NODE_NAME__ || window.__NODE_IP__ || '')">复制名称 <span class="muted sm">复制</span></button>
+                <button class="menu-item" type="button" onclick="copyText(window.__NODE_BASE_URL__ || '')">复制地址 <span class="muted sm">复制</span></button>
+                <button class="menu-item" type="button" onclick="copyText(window.__NODE_GROUP__ || '')">复制分组 <span class="muted sm">复制</span></button>
+                <div class="menu-sep"></div>
                 <button class="menu-item" type="button" onclick="resetNodeTraffic()">重置流量统计 <span class="muted sm">清零</span></button>
                 <div class="menu-sep"></div>
-                <button class="menu-item" type="button" onclick="purgeAllRules()" style="color:var(--bad);">
-                  清空所有规则 <span class="muted sm">危险</span>
+                <button class="menu-item danger" type="button" onclick="removeCurrentNode()">
+                  移除节点 <span class="muted sm">危险</span>
                 </button>
-                <div class="menu-sep"></div>
-                <form method="post" action="/nodes/{{ node.id }}/delete" style="margin:0;">
-                  <button class="menu-item" type="submit" onclick="return confirm('确认移除该节点？
-
-仅移除面板记录，不影响节点 Agent。')" style="color:var(--bad);">
-                    移除节点 <span class="muted sm">危险</span>
-                  </button>
-                </form>
               </div>
             </details>
           </div>
@@ -768,7 +796,7 @@
 {% endblock %}
 
 {% block scripts %}
-<script src="/static/app.js?v=72.0"></script>
+<script src="/static/app.js?v=77.0"></script>
 <script>
 window.__NODE_ID__ = {{ node.id }};
 window.__NODE_IP__ = {{ (node.display_ip or node.name)|tojson }};

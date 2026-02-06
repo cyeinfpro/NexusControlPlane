@@ -1773,6 +1773,73 @@ function closeCommandModal(){
   modal.style.display = 'none';
 }
 
+function normalizeNodeConfirmLabel(label, nodeId){
+  const clean = String(label || '').replace(/\s+/g, ' ').trim();
+  if(clean) return clean;
+  const idTxt = String(nodeId || '').trim();
+  return idTxt ? ('节点-' + idTxt) : '目标节点';
+}
+
+function getCurrentNodeConfirmLabel(){
+  return normalizeNodeConfirmLabel(
+    (window.__NODE_NAME__ || '').trim() || (window.__NODE_IP__ || '').trim(),
+    window.__NODE_ID__
+  );
+}
+
+function confirmAndShowUninstallCommand(){
+  const label = getCurrentNodeConfirmLabel();
+  const ok = confirm(
+    `确认查看“卸载 Agent”命令？\n\n` +
+    `执行后节点「${label}」将停止受控，面板无法继续下发配置，直到重新接入。`
+  );
+  if(!ok) return;
+  openCommandModal('一键卸载 Agent', window.__UNINSTALL_CMD__);
+}
+
+function submitNodeDeleteForm(nodeId){
+  const id = String(nodeId || '').trim();
+  if(!id) return;
+  const form = document.createElement('form');
+  form.method = 'POST';
+  form.action = `/nodes/${encodeURIComponent(id)}/delete`;
+  form.style.display = 'none';
+  document.body.appendChild(form);
+  form.submit();
+}
+
+function confirmAndRemoveNode(nodeId, nodeLabel){
+  const id = String(nodeId || '').trim();
+  if(!id){
+    toast('缺少节点ID', true);
+    return;
+  }
+  const label = normalizeNodeConfirmLabel(nodeLabel, id);
+  const ok = confirm(
+    `危险操作：将从面板移除节点「${label}」。\n\n` +
+    `仅移除面板记录，不会自动卸载节点 Agent。\n` +
+    `该操作不可恢复，是否继续？`
+  );
+  if(!ok) return;
+
+  const typed = prompt(`请输入节点名称「${label}」以确认移除：`);
+  if((typed || '').trim() !== label){
+    toast('已取消：节点名称不匹配', true);
+    return;
+  }
+  submitNodeDeleteForm(id);
+}
+
+function removeCurrentNode(){
+  const nodeId = window.__NODE_ID__;
+  const label = getCurrentNodeConfirmLabel();
+  confirmAndRemoveNode(nodeId, label);
+}
+
+window.confirmAndShowUninstallCommand = confirmAndShowUninstallCommand;
+window.confirmAndRemoveNode = confirmAndRemoveNode;
+window.removeCurrentNode = removeCurrentNode;
+
 function setField(id, v){ q(id).value = v==null?'':String(v); }
 
 
@@ -3774,19 +3841,20 @@ async function downloadNodeBackup(nodeId){
 async function purgeAllRules(){
   const nodeId = window.__NODE_ID__;
   if(!nodeId){ toast('缺少节点ID', true); return; }
+  const nodeLabel = getCurrentNodeConfirmLabel();
 
   // Step 1: confirm
   const ok1 = confirm(
-    '⚠️ 危险操作：将清空当前节点的所有规则（包含锁定规则）。\n\n' +
+    `⚠️ 危险操作：将清空节点「${nodeLabel}」的所有规则（包含锁定规则）。\n\n` +
     '继续后会先自动下载一份规则备份，然后执行清空。\n\n' +
     '是否进入下一步确认？'
   );
   if(!ok1) return;
 
-  // Step 2: require exact input
-  const typed = prompt('为防止误操作，请完整输入“确认删除”后继续：');
-  if((typed || '').trim() !== '确认删除'){
-    toast('已取消：确认文本不匹配', true);
+  // Step 2: require exact node label input (frontend), then send server required token.
+  const typed = prompt(`为防止误操作，请输入节点名称「${nodeLabel}」后继续：`);
+  if((typed || '').trim() !== nodeLabel){
+    toast('已取消：节点名称不匹配', true);
     return;
   }
 
@@ -5175,6 +5243,56 @@ function openEditNodeModalFromCard(btn){
 }
 window.openEditNodeModalFromCard = openEditNodeModalFromCard;
 
+function closeClosestMenu(el){
+  try{
+    const det = el && el.closest ? el.closest('details.menu') : null;
+    if(det) det.open = false;
+  }catch(_e){}
+}
+
+function getSidebarNodeObjFromButton(btn){
+  const row = btn && btn.closest ? btn.closest('.node-item-row') : null;
+  if(!row) return null;
+  const ds = row.dataset || {};
+  const id = ds.nodeId || row.getAttribute('data-node-id');
+  if(id === undefined || id === null || String(id).trim() === '') return null;
+  return {
+    id: String(id),
+    name: ds.nodeName || '',
+    display_ip: ds.nodeDisplayIp || '',
+    base_url: ds.nodeBaseUrl || '',
+    group_name: ds.nodeGroup || '默认分组',
+    verify_tls: String(ds.nodeVerifyTls || '0') === '1',
+    is_private: String(ds.nodeIsPrivate || '0') === '1',
+    role: ds.nodeRole || 'normal',
+    website_root_base: ds.nodeWebsiteRoot || ''
+  };
+}
+
+function openEditNodeFromSidebar(btn){
+  const nodeObj = getSidebarNodeObjFromButton(btn);
+  closeClosestMenu(btn);
+  if(!nodeObj){
+    toast('节点信息缺失', true);
+    return;
+  }
+  openEditNodeModal(nodeObj);
+}
+
+function removeNodeFromSidebar(btn){
+  const nodeObj = getSidebarNodeObjFromButton(btn);
+  closeClosestMenu(btn);
+  if(!nodeObj){
+    toast('节点信息缺失', true);
+    return;
+  }
+  const label = (String(nodeObj.name || '').trim()) || (String(nodeObj.display_ip || '').trim()) || ('节点-' + String(nodeObj.id));
+  confirmAndRemoveNode(nodeObj.id, label);
+}
+
+window.openEditNodeFromSidebar = openEditNodeFromSidebar;
+window.removeNodeFromSidebar = removeNodeFromSidebar;
+
 
 
 
@@ -5283,10 +5401,39 @@ function applyEditedNodeToPage(data, nodeId){
       }
     }catch(_e){}
 
+    // Update node-page sidebar item (row + quick-menu dataset)
+    try{
+      const row = id ? document.querySelector(`.node-item-row[data-node-id="${id}"]`) : null;
+      if(row){
+        if(name) row.dataset.nodeName = name;
+        if(displayIp) row.dataset.nodeDisplayIp = displayIp;
+        if(baseUrl) row.dataset.nodeBaseUrl = baseUrl;
+        row.dataset.nodeGroup = group;
+        row.dataset.nodeVerifyTls = verifyTls ? '1' : '0';
+        row.dataset.nodeIsPrivate = isPrivate ? '1' : '0';
+        row.dataset.nodeRole = role;
+        row.dataset.nodeWebsiteRoot = websiteRoot;
+
+        const nm = row.querySelector('.node-name');
+        if(nm){
+          nm.textContent = name || displayIp || nm.textContent;
+        }
+        const meta = row.querySelector('.node-meta');
+        if(meta && displayIp){
+          meta.textContent = displayIp;
+        }
+        const gg = row.querySelector('.node-info .muted.sm');
+        if(gg){
+          gg.textContent = group;
+        }
+      }
+    }catch(_e){}
+
     // Update current node page (only when editing the current node)
     try{
       if(window.__NODE_ID__ && id && String(window.__NODE_ID__) === String(id)){
         if(name) window.__NODE_NAME__ = name;
+        if(displayIp) window.__NODE_IP__ = displayIp;
         if(baseUrl) window.__NODE_BASE_URL__ = baseUrl;
         window.__NODE_GROUP__ = group;
         window.__NODE_VERIFY_TLS__ = verifyTls ? 1 : 0;
