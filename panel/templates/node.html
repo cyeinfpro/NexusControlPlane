@@ -134,17 +134,9 @@
             <details class="menu">
               <summary class="btn sm ghost">节点操作 ▾</summary>
               <div class="menu-pop">
-                <button class="menu-item" type="button" onclick="openEditNodeModal()">编辑节点 <span class="muted sm">名称/地址/分组</span></button>
-                <button class="menu-item" type="button" onclick="openCommandModal('一键接入命令', window.__INSTALL_CMD__)">
-                  接入命令 <span class="muted sm">复制</span>
-                </button>
                 <button class="menu-item" type="button" onclick="confirmAndShowUninstallCommand()">
                   卸载 Agent <span class="muted sm">停止受控</span>
                 </button>
-                <div class="menu-sep"></div>
-                <button class="menu-item" type="button" onclick="copyText(window.__NODE_NAME__ || window.__NODE_IP__ || '')">复制名称 <span class="muted sm">复制</span></button>
-                <button class="menu-item" type="button" onclick="copyText(window.__NODE_BASE_URL__ || '')">复制地址 <span class="muted sm">复制</span></button>
-                <button class="menu-item" type="button" onclick="copyText(window.__NODE_GROUP__ || '')">复制分组 <span class="muted sm">复制</span></button>
                 <div class="menu-sep"></div>
                 <button class="menu-item" type="button" onclick="resetNodeTraffic()">重置流量统计 <span class="muted sm">清零</span></button>
                 <div class="menu-sep"></div>
