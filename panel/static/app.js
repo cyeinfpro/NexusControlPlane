@@ -19,7 +19,6 @@ async function loadNodesList(){
     const data = await fetchJSON('/api/nodes');
     if(data && data.ok && Array.isArray(data.nodes)){
       NODES_LIST = data.nodes;
-      try{ window.NODES_LIST = NODES_LIST; }catch(_e){}
       populateReceiverSelect();
       populateIntranetReceiverSelect();
       try{ syncTunnelModeUI(); }catch(_e){}
@@ -83,7 +82,7 @@ let CURRENT_EDIT_INDEX = -1;
 let CURRENT_STATS = null;
 let CURRENT_SYS = null;
 let PENDING_COMMAND_TEXT = '';
-let NODES_LIST = (typeof window !== 'undefined' && Array.isArray(window.NODES_LIST)) ? window.NODES_LIST : [];
+let NODES_LIST = [];
 
 // Remove ?edit=1 from current URL (used for "auto open edit modal" from dashboard)
 function stripEditQueryParam(){
@@ -2225,9 +2224,7 @@ function syncTunnelModeUI(){
 function _findNodeNameById(id){
   const rid = String(id || '').trim();
   if(!rid) return '';
-  const list = Array.isArray(NODES_LIST) && NODES_LIST.length
-    ? NODES_LIST
-    : (Array.isArray(window.NODES_LIST) ? window.NODES_LIST : []);
+  const list = Array.isArray(window.NODES_LIST) ? window.NODES_LIST : [];
   for(const n of list){
     if(String(n.id) === rid){
       return n.name || n.display_ip || ('节点-' + n.id);
@@ -4883,13 +4880,7 @@ function initNodePage(){
   if(restoreBtn){
     restoreBtn.addEventListener('click', triggerRestore);
   }
-  const fType = q('f_type');
-  if(!fType){
-    // Keep page usable even if rule-modal DOM changes unexpectedly.
-    console.warn('[initNodePage] missing #f_type, skip rule-form event bindings');
-  }else{
-    fType.addEventListener('change', showWssBox);
-  }
+  q('f_type').addEventListener('change', showWssBox);
   if(q('f_wss_receiver_node')) q('f_wss_receiver_node').addEventListener('change', showWssBox);
 
   // Tunnel mode switcher cards (new UI)
@@ -5927,9 +5918,6 @@ async function createNodeFromModal(){
     if(btn){ btn.disabled = false; btn.textContent = "创建并进入"; }
   }
 }
-window.openAddNodeModal = openAddNodeModal;
-window.closeAddNodeModal = closeAddNodeModal;
-window.createNodeFromModal = createNodeFromModal;
 
 // 点击遮罩关闭
 document.addEventListener("click", (e)=>{
@@ -5958,10 +5946,7 @@ document.addEventListener("keydown", (e)=>{
 // 说明：不要依赖 inline onclick（某些浏览器缓存/模板差异会导致 onclick 失效）
 // 统一使用事件委托，确保点击永远有效。
 document.addEventListener('click', (e)=>{
-  const target = (e && e.target && e.target.closest) ? e.target : null;
-  if(!target) return;
-
-  const rbtn = target.closest('button.remote-more');
+  const rbtn = e.target.closest && e.target.closest('button.remote-more');
   if(rbtn){
     e.preventDefault();
     const wrap = rbtn.closest('.remote-wrap');
@@ -5980,7 +5965,7 @@ document.addEventListener('click', (e)=>{
     }
     return;
   }
-  const hbtn = target.closest('button.health-more');
+  const hbtn = e.target.closest && e.target.closest('button.health-more');
   if(hbtn){
     e.preventDefault();
     const wrap = hbtn.closest('.health-wrap');

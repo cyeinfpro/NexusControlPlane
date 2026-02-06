@@ -117,7 +117,9 @@
                 </button>
                 <div class="menu-sep"></div>
                 <form method="post" action="/nodes/{{ node.id }}/delete" style="margin:0;">
-                  <button class="menu-item" type="submit" onclick="return confirm('确认移除该节点？\n\n仅移除面板记录，不影响节点 Agent。')" style="color:var(--bad);">
+                  <button class="menu-item" type="submit" onclick="return confirm('确认移除该节点？
+
+仅移除面板记录，不影响节点 Agent。')" style="color:var(--bad);">
                     移除节点 <span class="muted sm">危险</span>
                   </button>
                 </form>

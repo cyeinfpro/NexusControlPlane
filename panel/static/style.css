@@ -146,12 +146,12 @@ a{color:inherit}
 
 /* Nav: desktop vs mobile (hamburger) */
 .nav-desktop{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
-.nav-mobile.menu{display:none}
+.nav-mobile{display:none}
 
 @media (max-width: 640px){
   .nav{gap:8px}
   .nav-desktop{display:none}
-  .nav-mobile.menu{display:inline-block}
+  .nav-mobile{display:inline-block}
 }
 
 
@@ -949,7 +949,7 @@ button.pill:active{transform:translateY(1px)}
 .btn.icon.xs{width:28px;min-width:28px;height:28px;min-height:28px;border-radius:10px;font-size:12px}
 
 /* Menus */
-details.menu{position:relative;display:inline-block}
+details.menu{position:relative}
 details.menu summary{list-style:none}
 details.menu summary::-webkit-details-marker{display:none}
 .menu-pop{
@@ -982,24 +982,41 @@ details.menu summary::-webkit-details-marker{display:none}
 .menu-sep{height:1px;background:rgba(148,163,184,0.16);margin:6px 4px}
 
 /*
-  Menus: prevent "flying" off-screen
-  --------------------------------
-  - .menu-float: JS positions the popover and uses fixed positioning (not clipped by overflow containers)
-  - .menu-sheet: JS forces a bottom-sheet on tight / mobile-like viewports
+  Menus
+  -----
+  Use a global portal (JS) so popovers never get clipped by overflow containers
+  and never fly off-screen.
 */
-details.menu.menu-float .menu-pop{ position:fixed; }
 
-details.menu.menu-sheet[open]::before{
-  content:"";
+/* Menu portal (injected by JS) */
+.menu-portal{
   position:fixed;
+  inset:0;
+  z-index:45; /* above topbar (20), below modal (50) */
+  pointer-events:none;
+}
+
+.menu-portal .menu-backdrop{
+  position:absolute;
   inset:0;
   background: rgba(0,0,0,0.42);
   backdrop-filter: blur(2px);
-  z-index:59;
+  pointer-events:auto;
+  display:none;
 }
 
-details.menu.menu-sheet .menu-pop{
+/* When a menu pop is portaled, it becomes fixed-position within the viewport */
+.menu-portal .menu-pop{
   position:fixed;
+  pointer-events:auto;
+  top:0;
+  left:0;
+  right:auto;
+  bottom:auto;
+}
+
+/* Bottom sheet mode (mobile/tablet) */
+.menu-portal .menu-pop.sheet{
   left:12px;
   right:12px;
   bottom: calc(12px + var(--safe-bottom));
@@ -1010,30 +1027,6 @@ details.menu.menu-sheet .menu-pop{
   overflow:auto;
   border-radius:18px;
   overscroll-behavior: contain;
-}
-
-/* Mobile: menus become a bottom sheet so they never overflow the viewport */
-@media (max-width: 640px){
-  details.menu[open]::before{
-    content:"";
-    position:fixed;
-    inset:0;
-    background: rgba(0,0,0,0.42);
-    backdrop-filter: blur(2px);
-    z-index:59;
-  }
-  details.menu .menu-pop{
-    position:fixed;
-    left:12px;
-    right:12px;
-    bottom: calc(12px + var(--safe-bottom));
-    top:auto;
-    min-width:0;
-    max-width:none;
-    max-height: min(62vh, calc(100vh - var(--sticky-top) - 24px));
-    overflow:auto;
-    border-radius:18px;
-  }
 }
 
 /* Tables */
@@ -2504,10 +2497,10 @@ body.modal-open{ overflow:hidden; }
    ========================= */
 
 /* NetMon: head actions (mobile tidy) */
-.netmon-head-menu.menu{ display:none; }
+.netmon-head-menu{ display:none; }
 @media (max-width: 640px){
   .netmon-head-extra{ display:none; }
-  .netmon-head-menu.menu{ display:inline-block; }
+  .netmon-head-menu{ display:inline-block; }
   .netmon-head-actions{ width:100%; flex-wrap:nowrap; }
   .netmon-head-actions #netmonNewBtn{ flex:1; }
 }

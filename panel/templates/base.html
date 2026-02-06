@@ -6,7 +6,7 @@
   <meta name="theme-color" content="#0B0F14">
   <title>{% if title %}{{ title }} · Nexus Network Control Plane{% else %}Nexus Network Control Plane{% endif %}</title>
   <link rel="icon" type="image/svg+xml" href="/static/nexus.svg">
-  <link rel="stylesheet" href="/static/style.css?v=68.0">
+  <link rel="stylesheet" href="/static/style.css?v=67.0">
 </head>
 <body>
   <!-- Flowing background (fixed, no seams on scroll) -->
@@ -82,8 +82,7 @@
       </div>
     </div>
   </div>
-
-  <!-- Unified menu positioning (prevents popovers from going off-screen) -->
+  <!-- Unified menu system (portal-based, avoids off-screen / clipped popovers) -->
   <script>
   (function(){
     function pxVar(name){
@@ -98,141 +97,243 @@
       }
     }
 
-    function resetMenuInlineStyle(d){
-      try{
-        if(!d) return;
-        var pop = d.querySelector && d.querySelector('.menu-pop');
-        if(!pop) return;
-        pop.style.left = '';
-        pop.style.top = '';
-        pop.style.right = '';
-        pop.style.bottom = '';
-        pop.style.maxHeight = '';
-      }catch(_e){}
+    function ensurePortal(){
+      var p = document.getElementById('menuPortal');
+      if(p) return p;
+      p = document.createElement('div');
+      p.id = 'menuPortal';
+      p.className = 'menu-portal';
+      var b = document.createElement('div');
+      b.className = 'menu-backdrop';
+      b.setAttribute('aria-hidden','true');
+      p.appendChild(b);
+      document.body.appendChild(p);
+      return p;
     }
 
-    function closeAllMenus(except){
+    var portal = ensurePortal();
+    var backdrop = portal.querySelector('.menu-backdrop');
+
+    function getSummary(d){
+      if(!d) return null;
       try{
-        document.querySelectorAll('details.menu[open]').forEach(function(d){
-          if(except && d === except) return;
-          d.removeAttribute('open');
-          d.classList.remove('menu-float','menu-sheet');
-          resetMenuInlineStyle(d);
-        });
-      }catch(_e){}
+        return d.querySelector(':scope > summary') || d.querySelector('summary');
+      }catch(e){
+        return d.querySelector('summary');
+      }
     }
 
-    function shouldUseSheet(){
+    function getPopInDetails(d){
+      return d ? d.querySelector('.menu-pop') : null;
+    }
+
+    function cleanupPop(pop){
+      if(!pop) return;
+      pop.classList.remove('sheet');
+      pop.style.left = '';
+      pop.style.top = '';
+      pop.style.right = '';
+      pop.style.bottom = '';
+      pop.style.maxHeight = '';
+      pop.style.visibility = '';
+    }
+
+    function portalize(detailsEl){
+      if(!detailsEl) return null;
+      // If already portaled, reuse
+      if(detailsEl._menuPop && detailsEl._menuPop.parentElement === portal) return detailsEl._menuPop;
+
+      var pop = getPopInDetails(detailsEl);
+      if(!pop) return null;
+
+      // Create a placeholder where the pop used to be
+      var ph = document.createElement('span');
+      ph.style.display = 'none';
+      ph.dataset.menuPlaceholder = '1';
+      detailsEl._menuPlaceholder = ph;
+      pop.parentNode.insertBefore(ph, pop);
+
+      // Move pop into portal (viewport-fixed positioning, not clipped by overflow)
+      portal.appendChild(pop);
+      // Hide until positioned (prevents a flash at top-left)
+      pop.style.visibility = 'hidden';
+      detailsEl._menuPop = pop;
+      return pop;
+    }
+
+    function restore(detailsEl){
+      if(!detailsEl) return;
+      var pop = detailsEl._menuPop;
+      var ph = detailsEl._menuPlaceholder;
+
+      if(pop && ph && ph.parentNode){
+        ph.parentNode.insertBefore(pop, ph);
+        ph.parentNode.removeChild(ph);
+      }
+
+      detailsEl._menuPop = null;
+      detailsEl._menuPlaceholder = null;
+      cleanupPop(pop);
+    }
+
+    function isCoarsePointer(){
       try{
-        var mq = window.matchMedia;
-        if(mq && mq('(max-width: 640px)').matches) return true;
-        // Landscape phones / small-height viewports
-        if(mq && mq('(max-height: 560px)').matches) return true;
-        // Touch devices (e.g., tablets) benefit from a bottom sheet
-        if(mq && mq('(pointer: coarse)').matches && mq('(max-width: 980px)').matches) return true;
-      }catch(_e){}
+        return window.matchMedia && window.matchMedia('(pointer: coarse)').matches;
+      }catch(e){ return false; }
+    }
+
+    function shouldSheet(){
+      try{
+        if(window.matchMedia && window.matchMedia('(max-width: 640px)').matches) return true;
+        if(isCoarsePointer() && window.matchMedia && window.matchMedia('(max-width: 980px)').matches) return true;
+      }catch(e){}
       return false;
     }
 
-    function positionMenu(detailsEl){
-      try{
-        if(!detailsEl || !detailsEl.open) return;
-        var pop = detailsEl.querySelector && detailsEl.querySelector('.menu-pop');
-        // `:scope` is not supported in some very old browsers; fallback to the first <summary>
-        var sum = (detailsEl.querySelector && (detailsEl.querySelector(':scope > summary') || detailsEl.querySelector('summary')));
-        if(!pop || !sum) return;
+    function positionPopover(detailsEl, pop){
+      if(!detailsEl || !pop) return;
+      var sum = getSummary(detailsEl);
+      if(!sum) return;
 
-        var vw = Math.max(320, window.innerWidth || document.documentElement.clientWidth || 0);
-        var vh = Math.max(320, window.innerHeight || document.documentElement.clientHeight || 0);
-        var margin = 10;
-        var safeTop = pxVar('--safe-top');
-        var safeBottom = pxVar('--safe-bottom');
+      var vw = Math.max(320, window.innerWidth || document.documentElement.clientWidth || 0);
+      var vh = Math.max(320, window.innerHeight || document.documentElement.clientHeight || 0);
+      var margin = 10;
+      var safeTop = pxVar('--safe-top');
+      var safeBottom = pxVar('--safe-bottom');
 
-        // Measure after open (offset sizes are stable regardless of current position)
-        resetMenuInlineStyle(detailsEl);
-        var popW = pop.offsetWidth || 200;
-        var popH = pop.offsetHeight || 120;
-        var r = sum.getBoundingClientRect();
+      cleanupPop(pop);
 
-        var spaceDown = (vh - safeBottom) - (r.bottom + margin);
-        var spaceUp = (r.top - safeTop) - margin;
+      // Measure
+      var popW = pop.offsetWidth || 220;
+      var popH = pop.offsetHeight || 160;
+      var r = sum.getBoundingClientRect();
 
-        // If viewport is too tight, force sheet mode (never off-screen)
-        var tooTight = Math.max(spaceDown, spaceUp) < 180;
-        if(shouldUseSheet() || tooTight){
-          detailsEl.classList.remove('menu-float');
-          detailsEl.classList.add('menu-sheet');
-          resetMenuInlineStyle(detailsEl);
-          return;
-        }
+      var spaceDown = (vh - safeBottom) - (r.bottom + margin);
+      var spaceUp = (r.top - safeTop) - margin;
+      var openUp = (spaceDown < Math.min(popH, 220)) && (spaceUp > spaceDown);
 
-        detailsEl.classList.remove('menu-sheet');
-        detailsEl.classList.add('menu-float');
+      var top = openUp ? (r.top - popH - 8) : (r.bottom + 8);
+      var maxH = openUp ? spaceUp : spaceDown;
+      maxH = Math.max(140, Math.min(maxH, vh - safeTop - safeBottom - 24));
 
-        var openUp = (spaceDown < popH + 12) && (spaceUp > spaceDown);
-        var top = openUp ? (r.top - popH - 8) : (r.bottom + 8);
-        var maxH = openUp ? spaceUp : spaceDown;
-        maxH = Math.max(140, Math.min(maxH, vh - safeTop - safeBottom - 24));
+      // Align right edge with summary
+      var left = r.right - popW;
+      left = Math.max(margin, Math.min(left, vw - popW - margin));
 
-        // Align right edge with summary button by default
-        var left = r.right - popW;
-        left = Math.max(margin, Math.min(left, vw - popW - margin));
+      top = Math.max(safeTop + margin, Math.min(top, vh - safeBottom - 140));
 
-        // Clamp vertical position
-        top = Math.max(safeTop + margin, Math.min(top, vh - safeBottom - 140));
-
-        pop.style.left = left + 'px';
-        pop.style.top = top + 'px';
-        pop.style.right = 'auto';
-        pop.style.bottom = 'auto';
-        pop.style.maxHeight = maxH + 'px';
-      }catch(_e){}
+      pop.style.left = left + 'px';
+      pop.style.top = top + 'px';
+      pop.style.maxHeight = maxH + 'px';
     }
 
+    function positionSheet(pop){
+      if(!pop) return;
+      cleanupPop(pop);
+      pop.classList.add('sheet');
+      // Max-height is controlled by CSS; keep it safe in case CSS vars are missing
+      pop.style.maxHeight = 'min(62vh, calc(100vh - var(--sticky-top) - 24px))';
+    }
+
+    function updateBackdrop(){
+      try{
+        var any = document.querySelector('details.menu[open]');
+        backdrop.style.display = any ? 'block' : 'none';
+      }catch(e){}
+    }
+
+    var closing = false;
+
+    function closeMenu(detailsEl){
+      if(!detailsEl) return;
+      try{ detailsEl.removeAttribute('open'); }catch(e){}
+      restore(detailsEl);
+    }
+
+    function closeAll(except){
+      if(closing) return;
+      closing = true;
+      try{
+        document.querySelectorAll('details.menu[open]').forEach(function(d){
+          if(except && d === except) return;
+          closeMenu(d);
+        });
+      }catch(e){}
+      closing = false;
+      updateBackdrop();
+    }
+
+    function openMenu(detailsEl){
+      if(!detailsEl) return;
+      closeAll(detailsEl);
+
+      var pop = portalize(detailsEl);
+      if(!pop) return;
+
+      // Position on next tick
+      setTimeout(function(){
+        if(!detailsEl.open) return;
+        if(shouldSheet()) positionSheet(pop);
+        else positionPopover(detailsEl, pop);
+        pop.style.visibility = 'visible';
+      }, 0);
+
+      updateBackdrop();
+    }
+
+    function repositionAll(){
+      try{
+        var sheet = shouldSheet();
+        document.querySelectorAll('details.menu[open]').forEach(function(d){
+          var pop = d._menuPop;
+          if(!pop || pop.parentElement !== portal) return;
+          if(sheet) positionSheet(pop);
+          else positionPopover(d, pop);
+        });
+      }catch(e){}
+    }
+
+    // Toggle handler
+    document.addEventListener('toggle', function(e){
+      var t = e.target;
+      if(!t || !(t instanceof HTMLElement)) return;
+      if(!(t.matches && t.matches('details.menu'))) return;
+      if(closing) return;
+
+      if(t.open){
+        openMenu(t);
+      }else{
+        restore(t);
+        updateBackdrop();
+      }
+    }, true);
+
+    // Backdrop click closes
+    backdrop.addEventListener('click', function(){ closeAll(null); }, true);
+
+    // Click outside closes
+    document.addEventListener('click', function(e){
+      var inSummary = e.target && e.target.closest && e.target.closest('details.menu > summary');
+      var inPop = e.target && e.target.closest && e.target.closest('.menu-pop');
+      if(inSummary || inPop) return;
+      closeAll(null);
+    }, true);
+
+    // ESC closes
+    document.addEventListener('keydown', function(e){
+      if(e && e.key === 'Escape') closeAll(null);
+    }, true);
+
+    // Keep in viewport on resize / any scroll (capture)
     var raf = null;
     function requestReposition(){
       if(raf) return;
-      raf = requestAnimationFrame(function(){
-        raf = null;
-        try{
-          document.querySelectorAll('details.menu[open]').forEach(function(d){ positionMenu(d); });
-        }catch(_e){}
-      });
+      raf = requestAnimationFrame(function(){ raf = null; repositionAll(); });
     }
-
-    // When a menu opens, close others and position it within viewport
-    document.addEventListener('toggle', function(e){
-      var t = e.target;
-      if(!(t instanceof HTMLElement)) return;
-      if(t.matches && t.matches('details.menu') && t.open){
-        closeAllMenus(t);
-        setTimeout(function(){ positionMenu(t); }, 0);
-      }
-      if(t.matches && t.matches('details.menu') && !t.open){
-        try{ t.classList.remove('menu-float','menu-sheet'); }catch(_e){}
-        resetMenuInlineStyle(t);
-      }
-    }, true);
-
-    // Click outside to close menus
-    document.addEventListener('click', function(e){
-      var inPop = e.target && e.target.closest && e.target.closest('details.menu .menu-pop');
-      var inSummary = e.target && e.target.closest && e.target.closest('details.menu > summary');
-      if(inPop || inSummary) return;
-      closeAllMenus(null);
-    }, true);
-
-    // ESC to close
-    document.addEventListener('keydown', function(e){
-      if(e && e.key === 'Escape') closeAllMenus(null);
-    }, true);
-
-    // Keep popovers inside viewport on resize/scroll
     window.addEventListener('resize', requestReposition, true);
-    window.addEventListener('scroll', requestReposition, true);
+    document.addEventListener('scroll', requestReposition, true);
   })();
   </script>
-
-  {% block scripts %}{% endblock %}
+{% block scripts %}{% endblock %}
 </body>
 </html>

@@ -949,11 +949,8 @@ async def api_nodes_update(node_id: int, request: Request, user: str = Depends(r
     parsed_old = urlparse(raw_old)
     old_scheme = (parsed_old.scheme or "http").lower()
     old_host = parsed_old.hostname or ""
-    old_had_explicit_port = parsed_old.port is not None
-    # UI hides the agent port and defaults to 18700.
-    # Keep a concrete port to avoid silently saving no-port URLs.
-    old_port = int(parsed_old.port) if old_had_explicit_port and parsed_old.port else DEFAULT_AGENT_PORT
-    old_has_port = True
+    old_port = parsed_old.port
+    old_has_port = parsed_old.port is not None
 
     scheme = str(scheme_in or old_scheme).strip().lower() or "http"
     if scheme not in ("http", "https"):
@@ -973,7 +970,7 @@ async def api_nodes_update(node_id: int, request: Request, user: str = Depends(r
         if "://" not in ip_full:
             ip_full = f"{scheme}://{ip_full}"
 
-        fallback_port = int(old_port) if old_port else DEFAULT_AGENT_PORT
+        fallback_port = int(old_port) if old_has_port and old_port else DEFAULT_AGENT_PORT
         h, p, has_p, parsed_scheme = split_host_and_port(ip_full, fallback_port)
         if not h:
             return JSONResponse({"ok": False, "error": "节点地址不能为空"}, status_code=400)
@@ -987,13 +984,13 @@ async def api_nodes_update(node_id: int, request: Request, user: str = Depends(r
             port_value = int(p)
             has_port = True
         else:
-            # preserve old explicit port; otherwise keep default agent port
-            if old_had_explicit_port and old_port:
+            # preserve old explicit port; otherwise keep no-port
+            if old_has_port and old_port:
                 port_value = int(old_port)
                 has_port = True
             else:
-                port_value = DEFAULT_AGENT_PORT
-                has_port = True
+                port_value = None
+                has_port = False
 
     base_url = f"{scheme}://{format_host_for_url(host)}"
     if has_port and port_value:
