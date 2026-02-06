@@ -580,6 +580,186 @@ a{color:inherit}
 .node-lite-meta{ color: rgba(226,232,240,0.82); font-size:12px; }
 .node-lite-badges{ margin-top:10px; display:flex; flex-wrap:wrap; gap:8px; }
 
+/* =========================
+   Website management PRO (v7)
+   - Denser, more "console"-like
+   - Better space utilization on wide screens
+   ========================= */
+
+.wm-layout{
+  display:grid;
+  grid-template-columns: minmax(0,1fr) 420px;
+  gap:12px;
+  margin-top:12px;
+}
+
+.wm-card{padding:12px; border-radius:18px;}
+
+.wm-card-head{
+  display:flex;
+  align-items:flex-start;
+  justify-content:space-between;
+  gap:10px;
+}
+
+.wm-card-title{font-weight:950; letter-spacing:0.2px;}
+.wm-card-sub{margin-top:4px; font-size:12px; color:var(--muted); line-height:1.45;}
+
+.wm-card-tools{display:flex; align-items:center; gap:8px; flex-wrap:wrap; justify-content:flex-end;}
+
+.wm-toolbar{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:10px;
+  flex-wrap:wrap;
+  margin-top:10px;
+}
+
+.wm-countline{margin-top:8px; color:var(--muted); font-size:12px;}
+
+.wm-sites{margin-top:10px; display:flex; flex-direction:column; gap:8px;}
+
+.wm-site-row{
+  position:relative;
+  display:flex;
+  align-items:flex-start;
+  justify-content:space-between;
+  gap:10px;
+  padding:10px 10px 10px 14px;
+  border-radius:16px;
+  border:1px solid rgba(148,163,184,0.16);
+  background: rgba(2,6,23,0.22);
+  overflow:hidden;
+  transition: transform .12s ease, border-color .12s ease, background .12s ease;
+}
+
+.wm-site-row::before{
+  content:"";
+  position:absolute;
+  left:0;
+  top:8px;
+  bottom:8px;
+  width:3px;
+  border-radius:999px;
+  background: rgba(148,163,184,0.28);
+}
+
+.wm-site-row[data-status="running"]::before{ background: linear-gradient(180deg, rgba(34,197,94,0.95), rgba(34,197,94,0.25)); }
+.wm-site-row[data-status="creating"]::before{ background: linear-gradient(180deg, rgba(245,158,11,0.95), rgba(245,158,11,0.25)); }
+.wm-site-row[data-status="error"]::before{ background: linear-gradient(180deg, rgba(239,68,68,0.95), rgba(239,68,68,0.25)); }
+
+.wm-site-row:hover{
+  transform: translateY(-1px);
+  border-color: rgba(34,211,238,0.32);
+  background: rgba(59,130,246,0.06);
+}
+
+.wm-site-row[data-health="fail"]{ border-color: rgba(239,68,68,0.34); }
+
+.wm-site-left{min-width:0; flex:1 1 auto;}
+
+.wm-site-line1{display:flex; align-items:center; gap:8px; flex-wrap:wrap;}
+.wm-site-name{font-weight:950; letter-spacing:0.2px;}
+
+.wm-site-line2{display:flex; align-items:center; gap:8px; margin-top:4px; flex-wrap:wrap;}
+.wm-site-domain{color: rgba(226,232,240,0.78); font-size:12px; overflow-wrap:anywhere;}
+.wm-site-hint{color: var(--muted); font-size:12px;}
+
+.wm-site-right{display:flex; align-items:flex-start; gap:10px; flex:0 0 auto; flex-wrap:wrap; justify-content:flex-end;}
+
+.wm-site-kpis{display:flex; align-items:center; gap:8px; flex-wrap:wrap; justify-content:flex-end;}
+.wm-kpi{
+  display:inline-flex;
+  align-items:center;
+  gap:6px;
+  padding:5px 8px;
+  border-radius:999px;
+  border:1px solid rgba(148,163,184,0.14);
+  background: rgba(11,15,20,0.16);
+  color: rgba(226,232,240,0.82);
+  font-size:11px;
+}
+
+.wm-site-actions{display:flex; align-items:center; gap:8px;}
+
+.wm-node-list{margin-top:10px; display:flex; flex-direction:column; gap:8px;}
+.wm-node-row{
+  display:flex;
+  align-items:flex-start;
+  justify-content:space-between;
+  gap:10px;
+  padding:10px;
+  border-radius:16px;
+  border:1px solid rgba(148,163,184,0.16);
+  background: rgba(2,6,23,0.20);
+}
+.wm-node-name{font-weight:950; letter-spacing:0.2px;}
+.wm-node-url{margin-top:4px; color:var(--muted); font-size:12px; overflow-wrap:anywhere;}
+.wm-node-meta{margin-top:6px; color:rgba(226,232,240,0.82); font-size:12px;}
+.wm-node-badges{margin-top:8px; display:flex; flex-wrap:wrap; gap:8px;}
+.wm-node-actions{display:flex; align-items:center; gap:8px; flex-shrink:0;}
+
+@media (max-width: 1160px){
+  .wm-layout{grid-template-columns: 1fr;}
+}
+
+@media (max-width: 640px){
+  .wm-site-right{width:100%; justify-content:space-between;}
+  .wm-site-actions{margin-left:auto;}
+  .wm-kpi{padding:4px 8px;}
+}
+
+/* =========================
+   Site subpages (detail / diagnose / files)
+   - Compact two-column layout
+   - Dense data tables
+   ========================= */
+
+.site-layout{
+  display:grid;
+  grid-template-columns: minmax(0,1fr) minmax(0,1fr);
+  gap:12px;
+  margin-top:12px;
+}
+
+.site-stack{
+  display:flex;
+  flex-direction:column;
+  gap:12px;
+  min-width:0;
+}
+
+@media (max-width: 1160px){
+  .site-layout{grid-template-columns: 1fr;}
+}
+
+.kv-lines{
+  display:grid;
+  gap:8px;
+  margin-top:10px;
+}
+
+.kvline .v.wrap{
+  white-space:normal;
+  overflow:visible;
+  text-overflow:clip;
+  overflow-wrap:anywhere;
+}
+
+.table.dense th,
+.table.dense td{
+  padding:6px 8px;
+}
+
+.table.dense th{ font-size:11px; }
+.table.dense td{ font-size:12px; }
+
+.table.dense .pill.xs{
+  padding:3px 7px;
+  font-size:10px;
+}
+
 /* Site sub-navigation (shared across subpages) */
 .subnav-bar{
   margin-top:10px;

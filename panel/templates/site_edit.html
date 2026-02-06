@@ -23,67 +23,27 @@
 
 {% include "site_nav.html" %}
 
-<div class="wizard-layout">
-  <!-- Left: guidance / impact -->
-  <aside class="card wizard-side">
-    <div class="section-head">
-      <div>
-        <div class="section-title">改动影响</div>
-        <div class="section-sub">保存后会立即重写 Nginx 配置并 reload（不会删除网站数据）。</div>
-      </div>
+<div class="card compact" style="margin-top:12px;">
+  <div class="section-head">
+    <div>
+      <div class="section-title">站点配置</div>
+      <div class="section-sub">保存后会立即重写 Nginx 配置并 reload；不会删除网站数据。</div>
     </div>
+    <span class="pill xs ghost">ID #{{ site.id }}</span>
+  </div>
 
-    <div class="wizard-steps">
-      <div class="wizard-step">
-        <div class="n">1</div>
-        <div>
-          <div class="t">域名变更</div>
-          <div class="d">更改域名后，旧证书可能不再匹配。建议在“SSL”重新申请/续期。</div>
-        </div>
-      </div>
-      <div class="wizard-step">
-        <div class="n">2</div>
-        <div>
-          <div class="t">反向代理</div>
-          <div class="d">系统会自动放行 <span class="mono">/.well-known/acme-challenge/</span>，避免 SSL 校验失败。</div>
-        </div>
-      </div>
-      <div class="wizard-step">
-        <div class="n">3</div>
-        <div>
-          <div class="t">自定义模板</div>
-          <div class="d">自定义模板需自行保证 challenge 可访问，否则证书申请可能失败。</div>
-        </div>
-      </div>
+  <details class="advanced-details" style="margin-top:12px;">
+    <summary>改动影响与提示</summary>
+    <div class="advanced-body">
+      <ul class="muted" style="margin:0;padding-left:18px;line-height:1.6;">
+        <li>域名变更后，旧证书可能不再匹配；请到 “SSL” 重新申请/续期。</li>
+        <li>反向代理模式下，系统会自动放行 <span class="mono">/.well-known/acme-challenge/</span> 以保证证书校验。</li>
+        <li>若使用自定义模板，请自行保证 challenge 可访问，否则 SSL 申请会失败。</li>
+      </ul>
     </div>
+  </details>
 
-    <div class="panel" style="margin-top:12px;">
-      <div class="panel-head">
-        <div class="col">
-          <div class="panel-title">快速入口</div>
-          <div class="panel-sub">常用页面直达。</div>
-        </div>
-      </div>
-      <div class="panel-actions">
-        <a class="btn xs ghost" href="/websites/{{ site.id }}">概览</a>
-        <a class="btn xs ghost" href="/websites/{{ site.id }}/diagnose">诊断</a>
-        {% if site.type != 'reverse_proxy' and site.root_path %}
-          <a class="btn xs ghost" href="/websites/{{ site.id }}/files">文件</a>
-        {% endif %}
-      </div>
-    </div>
-  </aside>
-
-  <!-- Right: form -->
-  <section class="card">
-    <div class="section-head">
-      <div>
-        <div class="section-title">站点配置</div>
-        <div class="section-sub">修改核心参数后，系统会重新生成配置并应用到节点。</div>
-      </div>
-    </div>
-
-    <form method="post" action="/websites/{{ site.id }}/edit" class="form" style="margin-top:12px;">
+  <form method="post" action="/websites/{{ site.id }}/edit" class="form" style="margin-top:12px;">
       <div class="form-section">
         <div class="section-head">
           <div>
@@ -173,7 +133,7 @@
         </div>
       </div>
     </form>
-  </section>
+
 </div>
 
 <script>

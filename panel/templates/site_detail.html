@@ -60,167 +60,131 @@
 
 {% include "site_nav.html" %}
 
-<div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(320px,1fr));">
-  <div class="card">
-    <div class="section-head">
-      <div>
-        <div class="section-title">站点概览</div>
-        <div class="section-sub">核心配置与运行信息。</div>
+<div class="site-layout">
+  <div class="site-stack">
+    <div class="card compact">
+      <div class="section-head">
+        <div>
+          <div class="section-title">站点概览</div>
+          <div class="section-sub">核心配置与运行信息（更紧凑展示）。</div>
+        </div>
+        <span class="pill xs {{ st_class }}">{{ st or 'unknown' }}</span>
       </div>
-      <span class="pill xs {{ st_class }}">{{ st or 'unknown' }}</span>
-    </div>
-    <div class="kv-grid" style="margin-top:10px;">
-      <div class="kv-item">
-        <div class="kv-label">站点类型</div>
-        <div class="kv-value">{{ type_map.get(site.type, site.type) }}</div>
-      </div>
-      <div class="kv-item">
-        <div class="kv-label">Web 服务器</div>
-        <div class="kv-value">{{ site.web_server }}</div>
-      </div>
-      <div class="kv-item">
-        <div class="kv-label">根目录</div>
-        <div class="kv-value mono">{{ site.root_path or "-" }}</div>
-      </div>
-      <div class="kv-item">
-        <div class="kv-label">反向代理</div>
-        <div class="kv-value mono">{{ site.proxy_target or "-" }}</div>
-      </div>
-      <div class="kv-item">
-        <div class="kv-label">HTTPS 跳转</div>
-        <div class="kv-value">{{ "启用" if site.https_redirect else "关闭" }}</div>
-      </div>
-      <div class="kv-item">
-        <div class="kv-label">Gzip</div>
-        <div class="kv-value">{{ "启用" if (site.gzip_enabled is none or site.gzip_enabled) else "关闭" }}</div>
-      </div>
-      <div class="kv-item">
-        <div class="kv-label">自定义模板</div>
-        <div class="kv-value">{{ "已配置" if site.nginx_tpl else "未配置" }}</div>
-      </div>
-      <div class="kv-item">
-        <div class="kv-label">创建时间</div>
-        <div class="kv-value">{{ site.created_at }}</div>
-      </div>
-    </div>
-  </div>
 
-  <div class="card">
-    <div class="section-head">
-      <div>
-        <div class="section-title">健康状态</div>
-        <div class="section-sub">实时监测结果与最近检查记录。</div>
+      <div class="kv-lines">
+        <div class="kvline"><div class="k">站点类型</div><div class="v">{{ type_map.get(site.type, site.type) }}</div></div>
+        <div class="kvline"><div class="k">Web 服务器</div><div class="v">{{ site.web_server }}</div></div>
+        <div class="kvline"><div class="k">根目录</div><div class="v mono" title="{{ site.root_path or '-' }}">{{ site.root_path or '-' }}</div></div>
+        <div class="kvline"><div class="k">反向代理</div><div class="v mono" title="{{ site.proxy_target or '-' }}">{{ site.proxy_target or '-' }}</div></div>
+        <div class="kvline"><div class="k">HTTPS 跳转</div><div class="v">{{ "启用" if site.https_redirect else "关闭" }}</div></div>
+        <div class="kvline"><div class="k">Gzip</div><div class="v">{{ "启用" if (site.gzip_enabled is none or site.gzip_enabled) else "关闭" }}</div></div>
+        <div class="kvline"><div class="k">自定义模板</div><div class="v">{{ "已配置" if site.nginx_tpl else "未配置" }}</div></div>
+        <div class="kvline"><div class="k">创建时间</div><div class="v mono">{{ site.created_at }}</div></div>
       </div>
     </div>
-    <div class="kv-grid" style="margin-top:10px;">
-      <div class="kv-item">
-        <div class="kv-label">当前状态</div>
-        <div class="kv-value">
-          {% set h = site.health_status or '' %}
-          {% set hclass = 'ok' if h == 'ok' else ('bad' if h == 'fail' else 'ghost') %}
-          <span class="pill xs {{ hclass }}">{{ h or 'unknown' }}</span>
+
+    <div class="card compact">
+      <div class="section-head">
+        <div>
+          <div class="section-title">健康状态</div>
+          <div class="section-sub">实时监测与最近检查（异常会在此处聚合）。</div>
         </div>
       </div>
-      <div class="kv-item">
-        <div class="kv-label">延迟</div>
-        <div class="kv-value">{{ site.health_latency_ms or 0 }} ms</div>
+
+      {% set h = site.health_status or '' %}
+      {% set hclass = 'ok' if h == 'ok' else ('bad' if h == 'fail' else 'ghost') %}
+      <div class="kv-lines">
+        <div class="kvline"><div class="k">当前状态</div><div class="v"><span class="pill xs {{ hclass }}">{{ h or 'unknown' }}</span></div></div>
+        <div class="kvline"><div class="k">HTTP</div><div class="v mono">{{ site.health_code or '-' }}</div></div>
+        <div class="kvline"><div class="k">延迟</div><div class="v mono">{{ site.health_latency_ms or 0 }} ms</div></div>
+        <div class="kvline"><div class="k">最近检查</div><div class="v mono">{{ site.health_checked_at or '-' }}</div></div>
+        <div class="kvline"><div class="k">错误</div><div class="v mono" title="{{ site.health_error or '' }}">{{ site.health_error or '-' }}</div></div>
       </div>
-      <div class="kv-item">
-        <div class="kv-label">HTTP 状态</div>
-        <div class="kv-value">{{ site.health_code or "-" }}</div>
-      </div>
-      <div class="kv-item">
-        <div class="kv-label">最近检查</div>
-        <div class="kv-value">{{ site.health_checked_at or "-" }}</div>
-      </div>
-      <div class="kv-item" style="grid-column:1 / -1;">
-        <div class="kv-label">错误</div>
-        <div class="kv-value mono truncate" title="{{ site.health_error or '' }}">{{ site.health_error or "-" }}</div>
-      </div>
+
+      {% if checks %}
+        <details style="margin-top:10px;">
+          <summary class="btn xs ghost">查看最近检查（{{ checks|length }}）</summary>
+          <div class="table-wrap" style="margin-top:10px;">
+            <table class="table no-sticky dense">
+              <thead>
+                <tr>
+                  <th>时间</th>
+                  <th>状态</th>
+                  <th>HTTP</th>
+                  <th>延迟</th>
+                  <th>错误</th>
+                </tr>
+              </thead>
+              <tbody>
+                {% for c in checks %}
+                {% set ok = (c.ok or 0) %}
+                <tr>
+                  <td class="mono">{{ c.checked_at }}</td>
+                  <td><span class="pill xs {{ 'ok' if ok else 'bad' }}">{{ 'ok' if ok else 'fail' }}</span></td>
+                  <td class="mono">{{ c.status_code or '-' }}</td>
+                  <td class="mono">{{ c.latency_ms or 0 }} ms</td>
+                  <td><div class="mono truncate" title="{{ c.error or '' }}">{{ c.error or '-' }}</div></td>
+                </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+        </details>
+      {% endif %}
     </div>
-    {% if checks %}
-      <details style="margin-top:12px;">
-        <summary class="btn xs ghost">查看最近检查（{{ checks|length }}）</summary>
-        <div class="table-wrap" style="margin-top:10px;">
-          <table class="table no-sticky">
-            <thead>
-              <tr>
-                <th>时间</th>
-                <th>状态</th>
-                <th>HTTP</th>
-                <th>延迟</th>
-                <th>错误</th>
-              </tr>
-            </thead>
-            <tbody>
-              {% for c in checks %}
-              {% set ok = (c.ok or 0) %}
-              <tr>
-                <td class="mono">{{ c.checked_at }}</td>
-                <td><span class="pill xs {{ 'ok' if ok else 'bad' }}">{{ 'ok' if ok else 'fail' }}</span></td>
-                <td>{{ c.status_code or "-" }}</td>
-                <td>{{ c.latency_ms or 0 }} ms</td>
-                <td><div class="mono truncate" title="{{ c.error or '' }}">{{ c.error or "-" }}</div></td>
-              </tr>
-              {% endfor %}
-            </tbody>
-          </table>
+  </div>
+
+  <div class="site-stack">
+    <div class="card compact" id="ssl">
+      <div class="section-head">
+        <div>
+          <div class="section-title">SSL 证书</div>
+          <div class="section-sub">状态与续期信息（申请/续期在右上角“操作”）。</div>
         </div>
-      </details>
-    {% endif %}
-  </div>
-
-  <div class="card" id="ssl">
-    <div class="section-head">
-      <div>
-        <div class="section-title">SSL 证书</div>
-        <div class="section-sub">证书状态与续期信息。</div>
       </div>
-    </div>
-    {% if certs %}
-    <div class="table-wrap" style="margin-top:10px;">
-      <table class="table no-sticky">
-        <thead>
-          <tr>
-            <th>域名</th>
-            <th>状态</th>
-            <th>有效期</th>
-            <th>续期时间</th>
-            <th>错误</th>
-          </tr>
-        </thead>
-        <tbody>
-          {% for c in certs %}
-          {% set cst = (c.status or '') %}
-          {% set cst_class = 'ok' if cst == 'valid' else ('warn' if cst in ['pending'] else ('bad' if cst in ['failed','expired'] else 'ghost')) %}
-          <tr>
-            <td class="mono">{{ c.domains_text }}</td>
-            <td><span class="pill xs {{ cst_class }}">{{ cst or 'unknown' }}</span></td>
-            <td>{{ c.not_before or "-" }} → {{ c.not_after or "-" }}</td>
-            <td>{{ c.renew_at or "-" }}</td>
-            <td><div class="mono truncate" title="{{ c.last_error or '' }}">{{ c.last_error or "-" }}</div></td>
-          </tr>
-          {% endfor %}
-        </tbody>
-      </table>
-    </div>
-    {% else %}
-      <div class="muted" style="margin-top:10px;">暂无证书（右上角“操作”里可申请 SSL）</div>
-    {% endif %}
-  </div>
-
-  <div class="card">
-    <div class="section-head">
-      <div>
-        <div class="section-title">变更历史</div>
-        <div class="section-sub">站点创建、删除、证书等操作记录。</div>
+      {% if certs %}
+      <div class="table-wrap" style="margin-top:10px;">
+        <table class="table no-sticky dense">
+          <thead>
+            <tr>
+              <th>域名</th>
+              <th>状态</th>
+              <th>有效期</th>
+              <th>续期时间</th>
+              <th>错误</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for c in certs %}
+            {% set cst = (c.status or '') %}
+            {% set cst_class = 'ok' if cst == 'valid' else ('warn' if cst in ['pending'] else ('bad' if cst in ['failed','expired'] else 'ghost')) %}
+            <tr>
+              <td class="mono">{{ c.domains_text }}</td>
+              <td><span class="pill xs {{ cst_class }}">{{ cst or 'unknown' }}</span></td>
+              <td class="mono">{{ c.not_before or '-' }} → {{ c.not_after or '-' }}</td>
+              <td class="mono">{{ c.renew_at or '-' }}</td>
+              <td><div class="mono truncate" title="{{ c.last_error or '' }}">{{ c.last_error or '-' }}</div></td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
       </div>
+      {% else %}
+        <div class="muted" style="margin-top:10px;">暂无证书（右上角“操作”里可申请 SSL）</div>
+      {% endif %}
     </div>
-    {% if events %}
-      <details style="margin-top:10px;">
-        <summary class="btn xs ghost">查看变更记录（{{ events|length }}）</summary>
+
+    <div class="card compact">
+      <div class="section-head">
+        <div>
+          <div class="section-title">变更历史</div>
+          <div class="section-sub">创建/删除/证书等操作记录（默认显示最近）。</div>
+        </div>
+      </div>
+
+      {% if events %}
         <div class="table-wrap" style="margin-top:10px;">
-          <table class="table no-sticky">
+          <table class="table no-sticky dense">
             <thead>
               <tr>
                 <th>时间</th>
@@ -231,7 +195,7 @@
               </tr>
             </thead>
             <tbody>
-              {% for e in events %}
+              {% for e in events[:8] %}
               {% set es = (e.status or '') %}
               {% set ecls = 'ok' if es == 'success' else ('warn' if es == 'running' else ('bad' if es in ['failed','error'] else 'ghost')) %}
               <tr>
@@ -245,24 +209,55 @@
             </tbody>
           </table>
         </div>
-      </details>
-    {% else %}
-      <div class="muted" style="margin-top:10px;">暂无变更记录</div>
-    {% endif %}
-  </div>
-
-  <div class="card" id="danger">
-    <div class="section-head">
-      <div>
-        <div class="section-title">风险操作</div>
-        <div class="section-sub">删除站点会移除面板记录，可选清理节点文件与证书。</div>
-      </div>
+        {% if events|length > 8 %}
+          <details style="margin-top:10px;">
+            <summary class="btn xs ghost">查看更多（{{ events|length }}）</summary>
+            <div class="table-wrap" style="margin-top:10px;">
+              <table class="table no-sticky dense">
+                <thead>
+                  <tr>
+                    <th>时间</th>
+                    <th>动作</th>
+                    <th>状态</th>
+                    <th>操作者</th>
+                    <th>错误</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {% for e in events %}
+                  {% set es = (e.status or '') %}
+                  {% set ecls = 'ok' if es == 'success' else ('warn' if es == 'running' else ('bad' if es in ['failed','error'] else 'ghost')) %}
+                  <tr>
+                    <td class="mono">{{ e.created_at }}</td>
+                    <td>{{ e.action }}</td>
+                    <td><span class="pill xs {{ ecls }}">{{ es }}</span></td>
+                    <td>{{ e.actor or '-' }}</td>
+                    <td><div class="mono truncate" title="{{ e.error or '' }}">{{ e.error or '-' }}</div></td>
+                  </tr>
+                  {% endfor %}
+                </tbody>
+              </table>
+            </div>
+          </details>
+        {% endif %}
+      {% else %}
+        <div class="muted" style="margin-top:10px;">暂无变更记录</div>
+      {% endif %}
     </div>
-    <form method="post" action="/websites/{{ site.id }}/delete" class="form" onsubmit="return confirm('确定删除该站点吗？');">
-      <label class="help"><input type="checkbox" name="delete_files" style="transform:translateY(1px);"> 删除站点目录数据</label>
-      <label class="help"><input type="checkbox" name="delete_cert" style="transform:translateY(1px);"> 删除证书文件</label>
-      <button class="btn sm danger" type="submit" style="margin-top:8px;">删除站点</button>
-    </form>
   </div>
+</div>
+
+<div class="card compact" id="danger" style="margin-top:12px;">
+  <div class="section-head">
+    <div>
+      <div class="section-title">风险操作</div>
+      <div class="section-sub">删除站点会移除面板记录，可选清理节点文件与证书。</div>
+    </div>
+  </div>
+  <form method="post" action="/websites/{{ site.id }}/delete" class="form" onsubmit="return confirm('确定删除该站点吗？');">
+    <label class="help"><input type="checkbox" name="delete_files" style="transform:translateY(1px);"> 删除站点目录数据</label>
+    <label class="help"><input type="checkbox" name="delete_cert" style="transform:translateY(1px);"> 删除证书文件</label>
+    <button class="btn sm danger" type="submit" style="margin-top:8px;">删除站点</button>
+  </form>
 </div>
 {% endblock %}

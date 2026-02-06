@@ -21,7 +21,7 @@
   </div>
 {% endif %}
 
-<div class="card fm-card" style="margin-top:12px;">
+<div class="card fm-card compact" style="margin-top:12px;">
   <div class="fm-pathbar">
     <div class="fm-crumbs">
       <button class="btn xs ghost" type="button" id="fmUpBtn">上一级</button>
@@ -56,9 +56,13 @@
     </div>
   </div>
 
-  <div class="help" style="margin-top:6px;">
-    支持选择文件夹批量上传（含子目录）；单文件上限 {{ upload_max_h }}（分片 + 断点续传）。如文件夹上传失败，可尝试弹窗内“兼容上传”或先压缩再上传。
-  </div>
+  <details class="advanced-details" style="margin-top:10px;">
+    <summary>上传说明</summary>
+    <div class="advanced-body muted" style="line-height:1.6;">
+      支持选择文件夹批量上传（含子目录）；单文件上限 {{ upload_max_h }}（分片 + 断点续传）。
+      若文件夹上传失败，可尝试弹窗内“兼容上传”或先压缩再上传。
+    </div>
+  </details>
 
   <div class="fm-subbar">
     <div class="muted sm" id="fmStats"></div>
@@ -72,7 +76,7 @@
   </div>
 
   <div class="table-wrap fm-table-wrap" style="margin-top:12px;">
-    <table class="table no-sticky fm-table">
+    <table class="table no-sticky fm-table dense">
       <thead>
         <tr>
           <th class="fm-sel">
@@ -107,21 +111,27 @@
           <td class="mono">{{ it.size_h }}</td>
           <td class="mono">{{ it.mtime or "-" }}</td>
           <td class="fm-actions-cell">
-            {% if not it.is_dir %}
-              <a class="btn xs ghost" href="/websites/{{ site.id }}/files/edit?path={{ it.path }}">编辑</a>
-              <a class="btn xs ghost" href="/websites/{{ site.id }}/files/download?path={{ it.path }}">下载</a>
-              {% if it.name.endswith('.zip') %}
-                <form method="post" action="/websites/{{ site.id }}/files/unzip" style="display:inline;">
+            <details class="menu">
+              <summary class="btn icon xs ghost" title="操作">⋯</summary>
+              <div class="menu-pop">
+                {% if not it.is_dir %}
+                  <a class="menu-item" href="/websites/{{ site.id }}/files/edit?path={{ it.path }}">编辑</a>
+                  <a class="menu-item" href="/websites/{{ site.id }}/files/download?path={{ it.path }}">下载</a>
+                  {% if it.name.endswith('.zip') %}
+                    <form method="post" action="/websites/{{ site.id }}/files/unzip" style="margin:0;">
+                      <input type="hidden" name="path" value="{{ it.path }}">
+                      <input type="hidden" name="dest" value="{{ path }}">
+                      <button class="menu-item" type="submit">解压</button>
+                    </form>
+                  {% endif %}
+                  <div class="menu-sep"></div>
+                {% endif %}
+                <form method="post" action="/websites/{{ site.id }}/files/delete" style="margin:0;" onsubmit="return confirm('确定删除吗？');">
                   <input type="hidden" name="path" value="{{ it.path }}">
-                  <input type="hidden" name="dest" value="{{ path }}">
-                  <button class="btn xs ghost" type="submit">解压</button>
+                  <button class="menu-item danger" type="submit">删除</button>
                 </form>
-              {% endif %}
-            {% endif %}
-            <form method="post" action="/websites/{{ site.id }}/files/delete" style="display:inline;">
-              <input type="hidden" name="path" value="{{ it.path }}">
-              <button class="btn xs ghost" type="submit">删除</button>
-            </form>
+              </div>
+            </details>
           </td>
         </tr>
         {% else %}
