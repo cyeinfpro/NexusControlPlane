@@ -146,12 +146,12 @@ a{color:inherit}
 
 /* Nav: desktop vs mobile (hamburger) */
 .nav-desktop{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
-.nav-mobile{display:none}
+.nav-mobile.menu{display:none}
 
 @media (max-width: 640px){
   .nav{gap:8px}
   .nav-desktop{display:none}
-  .nav-mobile{display:inline-block}
+  .nav-mobile.menu{display:inline-block}
 }
 
 
@@ -2504,10 +2504,10 @@ body.modal-open{ overflow:hidden; }
    ========================= */
 
 /* NetMon: head actions (mobile tidy) */
-.netmon-head-menu{ display:none; }
+.netmon-head-menu.menu{ display:none; }
 @media (max-width: 640px){
   .netmon-head-extra{ display:none; }
-  .netmon-head-menu{ display:inline-block; }
+  .netmon-head-menu.menu{ display:inline-block; }
   .netmon-head-actions{ width:100%; flex-wrap:nowrap; }
   .netmon-head-actions #netmonNewBtn{ flex:1; }
 }
