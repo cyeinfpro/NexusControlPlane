@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="v37"
+VERSION="v39"
 REPO_ZIP_URL_DEFAULT="https://github.com/cyeinfpro/Realm/archive/refs/heads/main.zip"
 DEFAULT_MODE="1"
 DEFAULT_PORT="18700"
@@ -109,6 +109,126 @@ normalize_panel_url(){
     url="http://${url}"
   fi
   echo "${url%/}"
+}
+
+read_env_value(){
+  local file="$1"
+  local key="$2"
+  local line value
+  if [[ ! -f "${file}" ]]; then
+    return 1
+  fi
+  line="$(grep -E "^(export[[:space:]]+)?${key}=" "${file}" 2>/dev/null | head -n 1 || true)"
+  if [[ -z "${line}" ]]; then
+    return 1
+  fi
+  if [[ "${line}" == export* ]]; then
+    line="${line#export }"
+  fi
+  value="${line#${key}=}"
+  value="${value%$'\r'}"
+  # trim leading/trailing spaces
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  if [[ "${value}" == \"*\" ]]; then
+    value="${value#\"}"
+    value="${value%\"}"
+  fi
+  if [[ "${value}" == \'*\' ]]; then
+    value="${value#\'}"
+    value="${value%\'}"
+  fi
+  printf "%s" "${value}"
+}
+
+hydrate_panel_context(){
+  local v env_file
+  local -a env_files=(/etc/realm-agent/panel.env /etc/realm-agent/agent.env)
+  for env_file in "${env_files[@]}"; do
+    if [[ ! -f "${env_file}" ]]; then
+      continue
+    fi
+    if [[ -z "${REALM_PANEL_URL:-}" ]]; then
+      v="$(read_env_value "${env_file}" "REALM_PANEL_URL" || true)"
+      if [[ -n "${v}" ]]; then
+        export REALM_PANEL_URL="${v}"
+        info "未显式指定 REALM_PANEL_URL，已从 Agent 记录读取（${env_file}）：${REALM_PANEL_URL}"
+      fi
+    fi
+    if [[ -z "${REALM_AGENT_ID:-}" ]]; then
+      v="$(read_env_value "${env_file}" "REALM_AGENT_ID" || true)"
+      if [[ -n "${v}" ]]; then
+        export REALM_AGENT_ID="${v}"
+      fi
+    fi
+    if [[ -z "${REALM_AGENT_HEARTBEAT_INTERVAL:-}" ]]; then
+      v="$(read_env_value "${env_file}" "REALM_AGENT_HEARTBEAT_INTERVAL" || true)"
+      if [[ -n "${v}" ]]; then
+        export REALM_AGENT_HEARTBEAT_INTERVAL="${v}"
+      fi
+    fi
+    if [[ -n "${REALM_PANEL_URL:-}" && -n "${REALM_AGENT_ID:-}" ]]; then
+      break
+    fi
+  done
+
+  # 兼容老版本：如果 panel.env 不在，但 systemd runtime env 中有值，也尝试提取。
+  if [[ -z "${REALM_PANEL_URL:-}" && -z "${REALM_AGENT_ID:-}" ]] && command_exists systemctl; then
+    local env_blob
+    env_blob="$(systemctl show -p Environment --value realm-agent.service 2>/dev/null || true)"
+    if [[ -n "${env_blob}" ]]; then
+      if [[ -z "${REALM_PANEL_URL:-}" ]]; then
+        v="$(printf "%s\n" "${env_blob}" | tr ' ' '\n' | grep -E '^REALM_PANEL_URL=' | head -n 1 | cut -d= -f2- || true)"
+        if [[ -n "${v}" ]]; then
+          export REALM_PANEL_URL="${v}"
+          info "已从 realm-agent.service 运行环境读取面板地址：${REALM_PANEL_URL}"
+        fi
+      fi
+      if [[ -z "${REALM_AGENT_ID:-}" ]]; then
+        v="$(printf "%s\n" "${env_blob}" | tr ' ' '\n' | grep -E '^REALM_AGENT_ID=' | head -n 1 | cut -d= -f2- || true)"
+        if [[ -n "${v}" ]]; then
+          export REALM_AGENT_ID="${v}"
+        fi
+      fi
+      if [[ -z "${REALM_AGENT_HEARTBEAT_INTERVAL:-}" ]]; then
+        v="$(printf "%s\n" "${env_blob}" | tr ' ' '\n' | grep -E '^REALM_AGENT_HEARTBEAT_INTERVAL=' | head -n 1 | cut -d= -f2- || true)"
+        if [[ -n "${v}" ]]; then
+          export REALM_AGENT_HEARTBEAT_INTERVAL="${v}"
+        fi
+      fi
+    fi
+  fi
+
+  # 再兜底：从正在运行的 realm-agent 主进程环境变量读取（/proc/<pid>/environ）。
+  if [[ -z "${REALM_PANEL_URL:-}" ]] && command_exists systemctl; then
+    local pid
+    pid="$(systemctl show -p MainPID --value realm-agent.service 2>/dev/null | tr -d '[:space:]' || true)"
+    if [[ "${pid}" =~ ^[0-9]+$ ]] && [[ "${pid}" -gt 1 ]] && [[ -r "/proc/${pid}/environ" ]]; then
+      local proc_env
+      proc_env="$(tr '\0' '\n' < "/proc/${pid}/environ" 2>/dev/null || true)"
+      if [[ -n "${proc_env}" ]]; then
+        if [[ -z "${REALM_PANEL_URL:-}" ]]; then
+          v="$(printf "%s\n" "${proc_env}" | grep -E '^REALM_PANEL_URL=' | head -n 1 | cut -d= -f2- || true)"
+          if [[ -n "${v}" ]]; then
+            export REALM_PANEL_URL="${v}"
+            info "已从 realm-agent 进程环境读取面板地址：${REALM_PANEL_URL}"
+          fi
+        fi
+        if [[ -z "${REALM_AGENT_ID:-}" ]]; then
+          v="$(printf "%s\n" "${proc_env}" | grep -E '^REALM_AGENT_ID=' | head -n 1 | cut -d= -f2- || true)"
+          if [[ -n "${v}" ]]; then
+            export REALM_AGENT_ID="${v}"
+          fi
+        fi
+        if [[ -z "${REALM_AGENT_HEARTBEAT_INTERVAL:-}" ]]; then
+          v="$(printf "%s\n" "${proc_env}" | grep -E '^REALM_AGENT_HEARTBEAT_INTERVAL=' | head -n 1 | cut -d= -f2- || true)"
+          if [[ -n "${v}" ]]; then
+            export REALM_AGENT_HEARTBEAT_INTERVAL="${v}"
+          fi
+        fi
+      fi
+    fi
+  fi
 }
 
 install_realm(){
@@ -522,6 +642,13 @@ main(){
       info "检测到 bindv6only=1，IPv6 仅监听将导致 IPv4 无法连接，已切换为 0.0.0.0"
       host="0.0.0.0"
     fi
+  fi
+
+  hydrate_panel_context
+  local panel_base_for_log
+  panel_base_for_log="$(normalize_panel_url "${REALM_PANEL_URL:-}")"
+  if [[ -n "${panel_base_for_log}" && -z "${REALM_AGENT_REPO_ZIP_URL:-}" && "${REALM_AGENT_GITHUB_ONLY:-}" != "1" ]]; then
+    info "仓库 ZIP 将优先使用面板地址：${panel_base_for_log}/static/realm-agent.zip"
   fi
 
   info "安装依赖..."
