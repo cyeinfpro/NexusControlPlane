@@ -29,7 +29,7 @@
   </div>
 {% endif %}
 
-<div class="site-layout">
+<div class="site-layout site-layout-diagnose">
   <div class="site-stack">
     <div class="card compact">
       <div class="section-head">
@@ -76,67 +76,74 @@
     </div>
   </div>
 
-  <div class="site-stack">
-    <div class="card compact">
+  <div class="site-stack diag-side-stack">
+    {% set csum = namespace(total=checks|length, fail=0) %}
+    {% for c in checks %}
+      {% if not (c.ok or 0) %}
+        {% set csum.fail = csum.fail + 1 %}
+      {% endif %}
+    {% endfor %}
+
+    <div class="card compact diag-mini-card">
       <div class="section-head">
         <div>
           <div class="section-title">最近检查</div>
-          <div class="section-sub">健康监测结果（默认展示最近 10 条）。</div>
+          <div class="section-sub">紧凑流式视图（默认最近 6 条）。</div>
         </div>
+        <span class="pill xs ghost">共 {{ csum.total }}</span>
       </div>
+
+      <div class="diag-mini-stats">
+        <span class="pill xs ok">成功 {{ csum.total - csum.fail }}</span>
+        <span class="pill xs {{ 'bad' if csum.fail else 'ghost' }}">失败 {{ csum.fail }}</span>
+      </div>
+
       {% if checks %}
-        <div class="table-wrap" style="margin-top:10px;">
-          <table class="table no-sticky dense">
-            <thead>
-              <tr>
-                <th>时间</th>
-                <th>状态</th>
-                <th>HTTP</th>
-                <th>延迟</th>
-                <th>错误</th>
-              </tr>
-            </thead>
-            <tbody>
-              {% for c in checks[:10] %}
-              {% set ok = (c.ok or 0) %}
-              <tr>
-                <td class="mono">{{ c.checked_at }}</td>
-                <td><span class="pill xs {{ 'ok' if ok else 'bad' }}">{{ 'ok' if ok else 'fail' }}</span></td>
-                <td class="mono">{{ c.status_code or '-' }}</td>
-                <td class="mono">{{ c.latency_ms or 0 }} ms</td>
-                <td><div class="mono truncate" title="{{ c.error or '' }}">{{ c.error or '-' }}</div></td>
-              </tr>
-              {% endfor %}
-            </tbody>
-          </table>
+        <div class="diag-feed" style="margin-top:10px;">
+          {% for c in checks[:6] %}
+            {% set ok = (c.ok or 0) %}
+            <div class="diag-feed-item">
+              <div class="diag-feed-main">
+                <span class="mono diag-feed-time">{{ c.checked_at }}</span>
+                <span class="pill xs {{ 'ok' if ok else 'bad' }}">{{ 'ok' if ok else 'fail' }}</span>
+                <span class="mono diag-feed-meta">HTTP {{ c.status_code or '-' }} · {{ c.latency_ms or 0 }} ms</span>
+              </div>
+              {% if c.error %}
+                <div class="mono diag-feed-sub" title="{{ c.error }}">{{ c.error }}</div>
+              {% endif %}
+            </div>
+          {% endfor %}
         </div>
-        {% if checks|length > 10 %}
-          <details style="margin-top:10px;">
-            <summary class="btn xs ghost">查看更多（{{ checks|length }}）</summary>
-            <div class="table-wrap" style="margin-top:10px;">
-              <table class="table no-sticky dense">
-                <thead>
-                  <tr>
-                    <th>时间</th>
-                    <th>状态</th>
-                    <th>HTTP</th>
-                    <th>延迟</th>
-                    <th>错误</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {% for c in checks %}
-                  {% set ok = (c.ok or 0) %}
-                  <tr>
-                    <td class="mono">{{ c.checked_at }}</td>
-                    <td><span class="pill xs {{ 'ok' if ok else 'bad' }}">{{ 'ok' if ok else 'fail' }}</span></td>
-                    <td class="mono">{{ c.status_code or '-' }}</td>
-                    <td class="mono">{{ c.latency_ms or 0 }} ms</td>
-                    <td><div class="mono truncate" title="{{ c.error or '' }}">{{ c.error or '-' }}</div></td>
-                  </tr>
-                  {% endfor %}
-                </tbody>
-              </table>
+
+        {% if checks|length > 6 %}
+          <details class="advanced-details" style="margin-top:10px;">
+            <summary>查看完整检查记录（{{ checks|length }}）</summary>
+            <div class="advanced-body">
+              <div class="table-wrap">
+                <table class="table no-sticky dense">
+                  <thead>
+                    <tr>
+                      <th>时间</th>
+                      <th>状态</th>
+                      <th>HTTP</th>
+                      <th>延迟</th>
+                      <th>错误</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {% for c in checks %}
+                    {% set ok = (c.ok or 0) %}
+                    <tr>
+                      <td class="mono">{{ c.checked_at }}</td>
+                      <td><span class="pill xs {{ 'ok' if ok else 'bad' }}">{{ 'ok' if ok else 'fail' }}</span></td>
+                      <td class="mono">{{ c.status_code or '-' }}</td>
+                      <td class="mono">{{ c.latency_ms or 0 }} ms</td>
+                      <td><div class="mono truncate" title="{{ c.error or '' }}">{{ c.error or '-' }}</div></td>
+                    </tr>
+                    {% endfor %}
+                  </tbody>
+                </table>
+              </div>
             </div>
           </details>
         {% endif %}
@@ -145,68 +152,82 @@
       {% endif %}
     </div>
 
-    <div class="card compact">
+    {% set esum = namespace(total=events|length, failed=0, running=0) %}
+    {% for e in events %}
+      {% set es = (e.status or '') %}
+      {% if es in ['failed','error'] %}
+        {% set esum.failed = esum.failed + 1 %}
+      {% elif es == 'running' %}
+        {% set esum.running = esum.running + 1 %}
+      {% endif %}
+    {% endfor %}
+
+    <div class="card compact diag-mini-card">
       <div class="section-head">
         <div>
           <div class="section-title">变更历史</div>
-          <div class="section-sub">站点创建、删除、证书等操作记录（默认展示最近）。</div>
+          <div class="section-sub">紧凑事件流（默认最近 6 条）。</div>
         </div>
+        <span class="pill xs ghost">共 {{ esum.total }}</span>
       </div>
+
+      <div class="diag-mini-stats">
+        <span class="pill xs ok">成功 {{ esum.total - esum.failed - esum.running }}</span>
+        <span class="pill xs warn">进行中 {{ esum.running }}</span>
+        <span class="pill xs {{ 'bad' if esum.failed else 'ghost' }}">失败 {{ esum.failed }}</span>
+      </div>
+
       {% if events %}
-        <div class="table-wrap" style="margin-top:10px;">
-          <table class="table no-sticky dense">
-            <thead>
-              <tr>
-                <th>时间</th>
-                <th>动作</th>
-                <th>状态</th>
-                <th>操作者</th>
-                <th>错误</th>
-              </tr>
-            </thead>
-            <tbody>
-              {% for e in events[:10] %}
-              {% set es = (e.status or '') %}
-              {% set ecls = 'ok' if es == 'success' else ('warn' if es == 'running' else ('bad' if es in ['failed','error'] else 'ghost')) %}
-              <tr>
-                <td class="mono">{{ e.created_at }}</td>
-                <td>{{ e.action }}</td>
-                <td><span class="pill xs {{ ecls }}">{{ es }}</span></td>
-                <td>{{ e.actor or '-' }}</td>
-                <td><div class="mono truncate" title="{{ e.error or '' }}">{{ e.error or '-' }}</div></td>
-              </tr>
-              {% endfor %}
-            </tbody>
-          </table>
+        <div class="diag-feed" style="margin-top:10px;">
+          {% for e in events[:6] %}
+            {% set es = (e.status or '') %}
+            {% set ecls = 'ok' if es == 'success' else ('warn' if es == 'running' else ('bad' if es in ['failed','error'] else 'ghost')) %}
+            <div class="diag-feed-item">
+              <div class="diag-feed-main">
+                <span class="mono diag-feed-time">{{ e.created_at }}</span>
+                <span class="pill xs {{ ecls }}">{{ es }}</span>
+                <span class="diag-feed-action">{{ e.action }}</span>
+              </div>
+              <div class="diag-feed-sub">
+                <span>{{ e.actor or '-' }}</span>
+                {% if e.error %}
+                  <span class="mono diag-feed-error" title="{{ e.error }}">{{ e.error }}</span>
+                {% endif %}
+              </div>
+            </div>
+          {% endfor %}
         </div>
-        {% if events|length > 10 %}
-          <details style="margin-top:10px;">
-            <summary class="btn xs ghost">查看更多（{{ events|length }}）</summary>
-            <div class="table-wrap" style="margin-top:10px;">
-              <table class="table no-sticky dense">
-                <thead>
-                  <tr>
-                    <th>时间</th>
-                    <th>动作</th>
-                    <th>状态</th>
-                    <th>操作者</th>
-                    <th>错误</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {% for e in events %}
-                  {% set es = (e.status or '') %}
-                  {% set ecls = 'ok' if es == 'success' else ('warn' if es == 'running' else ('bad' if es in ['failed','error'] else 'ghost')) %}
-                  <tr>
-                    <td class="mono">{{ e.created_at }}</td>
-                    <td>{{ e.action }}</td>
-                    <td><span class="pill xs {{ ecls }}">{{ es }}</span></td>
-                    <td>{{ e.actor or '-' }}</td>
-                    <td><div class="mono truncate" title="{{ e.error or '' }}">{{ e.error or '-' }}</div></td>
-                  </tr>
-                  {% endfor %}
-                </tbody>
-              </table>
+
+        {% if events|length > 6 %}
+          <details class="advanced-details" style="margin-top:10px;">
+            <summary>查看完整变更记录（{{ events|length }}）</summary>
+            <div class="advanced-body">
+              <div class="table-wrap">
+                <table class="table no-sticky dense">
+                  <thead>
+                    <tr>
+                      <th>时间</th>
+                      <th>动作</th>
+                      <th>状态</th>
+                      <th>操作者</th>
+                      <th>错误</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {% for e in events %}
+                    {% set es = (e.status or '') %}
+                    {% set ecls = 'ok' if es == 'success' else ('warn' if es == 'running' else ('bad' if es in ['failed','error'] else 'ghost')) %}
+                    <tr>
+                      <td class="mono">{{ e.created_at }}</td>
+                      <td>{{ e.action }}</td>
+                      <td><span class="pill xs {{ ecls }}">{{ es }}</span></td>
+                      <td>{{ e.actor or '-' }}</td>
+                      <td><div class="mono truncate" title="{{ e.error or '' }}">{{ e.error or '-' }}</div></td>
+                    </tr>
+                    {% endfor %}
+                  </tbody>
+                </table>
+              </div>
             </div>
           </details>
         {% endif %}

@@ -40,7 +40,6 @@
   <div class="fm-toolbar">
     <div class="fm-actions">
       <button class="btn xs" type="button" id="fmPickFiles">上传文件</button>
-      <button class="btn xs ghost" type="button" id="fmPickFolder">上传文件夹</button>
       <div class="fm-divider"></div>
       <form method="post" action="/websites/{{ site.id }}/files/mkdir" class="fm-mkdir">
         <input type="hidden" name="path" value="{{ path }}">
@@ -55,14 +54,6 @@
       </div>
     </div>
   </div>
-
-  <details class="advanced-details" style="margin-top:10px;">
-    <summary>上传说明</summary>
-    <div class="advanced-body muted" style="line-height:1.6;">
-      支持选择文件夹批量上传（含子目录）；单文件上限 {{ upload_max_h }}（分片 + 断点续传）。
-      若文件夹上传失败，可尝试弹窗内“兼容上传”或先压缩再上传。
-    </div>
-  </details>
 
   <div class="fm-subbar">
     <div class="muted sm" id="fmStats"></div>

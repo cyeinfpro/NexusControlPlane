@@ -779,6 +779,11 @@ main.container .center-wrap > .card.center-card{
   align-items:start;
 }
 
+.site-layout.site-layout-diagnose{
+  grid-template-columns:minmax(0,1.12fr) minmax(0,0.88fr);
+  align-items:start;
+}
+
 .site-layout.site-layout-detail .site-danger-card{
   border-color:rgba(248,113,113,0.20);
   background:linear-gradient(180deg, rgba(239,68,68,0.08), rgba(11,15,20,0.28));
@@ -790,6 +795,7 @@ main.container .center-wrap > .card.center-card{
 
 @media (max-width: 1280px){
   .site-layout.site-layout-detail{grid-template-columns:1fr;}
+  .site-layout.site-layout-diagnose{grid-template-columns:1fr;}
 }
 
 .kv-lines{
@@ -816,6 +822,67 @@ main.container .center-wrap > .card.center-card{
 .table.dense .pill.xs{
   padding:3px 7px;
   font-size:10px;
+}
+
+.diag-side-stack{gap:10px}
+.diag-mini-card{padding:10px}
+.diag-mini-stats{
+  display:flex;
+  gap:8px;
+  flex-wrap:wrap;
+  margin-top:8px;
+}
+.diag-feed{
+  display:flex;
+  flex-direction:column;
+  gap:6px;
+  max-height:250px;
+  overflow:auto;
+  padding-right:2px;
+}
+.diag-feed-item{
+  border:1px solid rgba(148,163,184,0.16);
+  background:rgba(2,6,23,0.22);
+  border-radius:12px;
+  padding:8px 10px;
+}
+.diag-feed-main{
+  display:flex;
+  align-items:center;
+  gap:8px;
+  flex-wrap:wrap;
+}
+.diag-feed-time{
+  color:rgba(226,232,240,0.92);
+  font-size:12px;
+}
+.diag-feed-meta{
+  color:rgba(226,232,240,0.82);
+  font-size:11px;
+}
+.diag-feed-action{
+  color:rgba(226,232,240,0.90);
+  font-size:12px;
+  font-weight:700;
+}
+.diag-feed-sub{
+  margin-top:5px;
+  font-size:11px;
+  color:var(--muted);
+  display:flex;
+  align-items:center;
+  gap:8px;
+  flex-wrap:wrap;
+}
+.diag-feed-error{
+  max-width:100%;
+  overflow:hidden;
+  text-overflow:ellipsis;
+  white-space:nowrap;
+}
+
+@media (max-width: 1160px){
+  .diag-feed{max-height:none}
 }
 
 /* Site sub-navigation (shared across subpages) */
