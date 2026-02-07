@@ -33,6 +33,7 @@ from ..db import (
     list_site_events,
     list_nodes,
     list_sites,
+    update_node_basic,
     update_certificate,
     update_site,
     update_site_health,
@@ -126,6 +127,65 @@ def _agent_payload_root(site: Dict[str, Any], node: Dict[str, Any]) -> str:
 
 def _node_root_base(node: Dict[str, Any]) -> str:
     return str(node.get("website_root_base") or "").strip()
+
+
+_ENV_CAP_ALIAS = {
+    "nginx": "nginx",
+    "php": "php-fpm",
+    "php-fpm": "php-fpm",
+    "phpfpm": "php-fpm",
+    "acme": "acme.sh",
+    "acme.sh": "acme.sh",
+}
+
+
+def _normalize_env_cap_name(raw: Any) -> str:
+    k = str(raw or "").strip().lower()
+    if not k:
+        return ""
+    return _ENV_CAP_ALIAS.get(k, k)
+
+
+def _persist_node_capabilities(node: Dict[str, Any], caps: Dict[str, Any]) -> None:
+    try:
+        update_node_basic(
+            int(node.get("id") or 0),
+            str(node.get("name") or ""),
+            str(node.get("base_url") or ""),
+            str(node.get("api_key") or ""),
+            verify_tls=bool(node.get("verify_tls")),
+            is_private=bool(node.get("is_private")),
+            group_name=str(node.get("group_name") or "默认分组"),
+            capabilities=dict(caps or {}),
+            website_root_base=str(node.get("website_root_base") or "").strip(),
+        )
+        node["capabilities"] = dict(caps or {})
+    except Exception:
+        # Best-effort UI metadata; never block main website operations.
+        pass
+
+
+def _merge_node_env_caps(node: Dict[str, Any], env_data: Any) -> None:
+    if not isinstance(node, dict) or not isinstance(env_data, dict):
+        return
+    caps = node.get("capabilities")
+    merged: Dict[str, Any] = dict(caps) if isinstance(caps, dict) else {}
+    changed = False
+
+    for key in ("installed", "already"):
+        rows = env_data.get(key)
+        if not isinstance(rows, list):
+            continue
+        for item in rows:
+            cap = _normalize_env_cap_name(item)
+            if not cap:
+                continue
+            if not bool(merged.get(cap)):
+                merged[cap] = True
+                changed = True
+
+    if changed:
+        _persist_node_capabilities(node, merged)
 
 
 def _default_nginx_template(site_type: str) -> str:
@@ -411,6 +471,7 @@ async def websites_new_action(
         )
         if not data.get("ok", True):
             raise AgentError(str(data.get("error") or "环境安装失败"))
+        _merge_node_env_caps(node, data)
     except Exception as exc:
         set_flash(request, f"环境安装失败：{exc}")
         return RedirectResponse(url="/websites?create=1", status_code=303)
@@ -715,6 +776,7 @@ async def website_edit_post(
         )
         if not ensure.get("ok", True):
             raise AgentError(str(ensure.get("error") or "环境检查失败"))
+        _merge_node_env_caps(node, ensure)
         update_task(task_id, progress=15)
 
         # If primary domain changed, remove old nginx conf first (keep data/cert)
@@ -1004,6 +1066,7 @@ async def website_ssl_issue(request: Request, site_id: int, user: str = Depends(
                 )
                 if not env_data.get("ok", True):
                     raise AgentError(f"{err}；自动安装环境失败：{env_data.get('error')}")
+                _merge_node_env_caps(node, env_data)
 
                 update_task(task_id, progress=35)
                 data = await agent_post(
@@ -1135,6 +1198,7 @@ async def website_ssl_renew(request: Request, site_id: int, user: str = Depends(
                 )
                 if not env_data.get("ok", True):
                     raise AgentError(f"{err}；自动安装环境失败：{env_data.get('error')}")
+                _merge_node_env_caps(node, env_data)
                 update_task(task_id, progress=35)
                 data = await agent_post(
                     node["base_url"],
@@ -1416,6 +1480,7 @@ async def website_env_ensure(
         )
         if not data.get("ok", True):
             raise AgentError(str(data.get("error") or "安装失败"))
+        _merge_node_env_caps(node, data)
         installed = data.get("installed") if isinstance(data, dict) else None
         already = data.get("already") if isinstance(data, dict) else None
         msg = "环境安装完成"
