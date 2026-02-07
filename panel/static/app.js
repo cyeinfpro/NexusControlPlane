@@ -2296,6 +2296,9 @@ function fillCommonAdvancedFields(e){
   const ep = e || {};
   const net = (ep.network && typeof ep.network === 'object' && !Array.isArray(ep.network)) ? ep.network : {};
   const ex = (ep.extra_config && typeof ep.extra_config === 'object' && !Array.isArray(ep.extra_config)) ? ep.extra_config : {};
+  const exQos = (ex.qos && typeof ex.qos === 'object' && !Array.isArray(ex.qos)) ? ex.qos : {};
+  const netQos = (net.qos && typeof net.qos === 'object' && !Array.isArray(net.qos)) ? net.qos : {};
+  const qos = Object.assign({}, netQos, exQos);
 
   if(q('f_through')) setField('f_through', ep.through || '');
   if(q('f_interface')) setField('f_interface', ep.interface || '');
@@ -2321,6 +2324,13 @@ function fillCommonAdvancedFields(e){
     else if(net.ipv6_only === false) q('f_net_ipv6_only').value = '0';
     else q('f_net_ipv6_only').value = '';
   }
+  const bwKbps = parseInt((qos.bandwidth_kbps != null ? qos.bandwidth_kbps : qos.bandwidth_kbit) || '0', 10);
+  const bwMbps = Number.isFinite(bwKbps) && bwKbps > 0 ? Math.max(1, Math.round(bwKbps / 1024)) : '';
+  if(q('f_qos_bandwidth_mbps')) setField('f_qos_bandwidth_mbps', bwMbps);
+  const maxConns = parseInt((qos.max_conns != null ? qos.max_conns : (qos.max_connections != null ? qos.max_connections : qos.max_conn)) || '0', 10);
+  if(q('f_qos_max_conns')) setField('f_qos_max_conns', Number.isFinite(maxConns) && maxConns > 0 ? maxConns : '');
+  const connRate = parseInt((qos.conn_rate != null ? qos.conn_rate : (qos.new_conn_per_sec != null ? qos.new_conn_per_sec : qos.conn_per_sec)) || '0', 10);
+  if(q('f_qos_conn_rate')) setField('f_qos_conn_rate', Number.isFinite(connRate) && connRate > 0 ? connRate : '');
   if(q('f_adaptive_lb')){
     q('f_adaptive_lb').checked = !(ex && ex.adaptive_lb_enabled === false);
   }
@@ -2328,6 +2338,7 @@ function fillCommonAdvancedFields(e){
 
 function applyCommonAdvancedToEndpoint(endpoint){
   const ep = endpoint || {};
+  let ex = (ep.extra_config && typeof ep.extra_config === 'object' && !Array.isArray(ep.extra_config)) ? {...ep.extra_config} : {};
 
   // bind / route
   const through = _trim(q('f_through') ? q('f_through').value : '');
@@ -2405,6 +2416,32 @@ function applyCommonAdvancedToEndpoint(endpoint){
     return {ok:false, error:'IPv6 Only 参数无效'};
   }
 
+  // QoS
+  const qos = {};
+  const q1 = readNonnegIntInput('f_qos_bandwidth_mbps', '带宽上限');
+  if(q1.error) return {ok:false, error:q1.error};
+  if(q1.set && q1.value > 0){
+    qos.bandwidth_kbps = q1.value * 1024;
+  }
+  const q2 = readNonnegIntInput('f_qos_max_conns', '最大并发连接');
+  if(q2.error) return {ok:false, error:q2.error};
+  if(q2.set && q2.value > 0){
+    qos.max_conns = q2.value;
+  }
+  const q3 = readNonnegIntInput('f_qos_conn_rate', '每秒新建连接上限');
+  if(q3.error) return {ok:false, error:q3.error};
+  if(q3.set && q3.value > 0){
+    qos.conn_rate = q3.value;
+  }
+
+  if(Object.keys(qos).length > 0){
+    ex.qos = qos;
+    net.qos = {...qos};
+  }else{
+    delete ex.qos;
+    delete net.qos;
+  }
+
   // cleanup empty network object
   try{
     const keys = Object.keys(net || {});
@@ -2412,6 +2449,17 @@ function applyCommonAdvancedToEndpoint(endpoint){
       delete ep.network;
     }else{
       ep.network = net;
+    }
+  }catch(_e){
+    // keep as-is
+  }
+
+  try{
+    const exKeys = Object.keys(ex || {});
+    if(exKeys.length === 0){
+      delete ep.extra_config;
+    }else{
+      ep.extra_config = ex;
     }
   }catch(_e){
     // keep as-is
@@ -3120,6 +3168,9 @@ function copyRule(idx){
         if(q('f_net_tcp_keepalive') && String(q('f_net_tcp_keepalive').value || '').trim()) openAdv = true;
         if(q('f_net_tcp_keepalive_probe') && String(q('f_net_tcp_keepalive_probe').value || '').trim()) openAdv = true;
         if(q('f_net_ipv6_only') && String(q('f_net_ipv6_only').value || '').trim()) openAdv = true;
+        if(q('f_qos_bandwidth_mbps') && String(q('f_qos_bandwidth_mbps').value || '').trim()) openAdv = true;
+        if(q('f_qos_max_conns') && String(q('f_qos_max_conns').value || '').trim()) openAdv = true;
+        if(q('f_qos_conn_rate') && String(q('f_qos_conn_rate').value || '').trim()) openAdv = true;
         if(q('f_listen_transport') && String(q('f_listen_transport').value || '').trim()) openAdv = true;
         if(q('f_remote_transport') && String(q('f_remote_transport').value || '').trim()) openAdv = true;
       }
@@ -3268,6 +3319,9 @@ function editRule(idx){
         if(q('f_net_tcp_keepalive') && String(q('f_net_tcp_keepalive').value || '').trim()) openAdv = true;
         if(q('f_net_tcp_keepalive_probe') && String(q('f_net_tcp_keepalive_probe').value || '').trim()) openAdv = true;
         if(q('f_net_ipv6_only') && String(q('f_net_ipv6_only').value || '').trim()) openAdv = true;
+        if(q('f_qos_bandwidth_mbps') && String(q('f_qos_bandwidth_mbps').value || '').trim()) openAdv = true;
+        if(q('f_qos_max_conns') && String(q('f_qos_max_conns').value || '').trim()) openAdv = true;
+        if(q('f_qos_conn_rate') && String(q('f_qos_conn_rate').value || '').trim()) openAdv = true;
 
         if(q('f_listen_transport') && String(q('f_listen_transport').value || '').trim()) openAdv = true;
         if(q('f_remote_transport') && String(q('f_remote_transport').value || '').trim()) openAdv = true;

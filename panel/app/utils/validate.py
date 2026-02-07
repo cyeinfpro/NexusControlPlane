@@ -79,6 +79,35 @@ def _is_positive_int(s: str) -> bool:
         return False
 
 
+def _coerce_nonneg_int(raw: Any) -> Optional[int]:
+    if raw is None:
+        return None
+    if isinstance(raw, bool):
+        return int(raw)
+    if isinstance(raw, int):
+        return int(raw)
+    if isinstance(raw, float):
+        if not (raw == raw):  # NaN
+            return None
+        n = int(raw)
+        if n < 0:
+            return None
+        return n
+    s = str(raw).strip()
+    if not s:
+        return None
+    try:
+        if s.isdigit() or (s.startswith("-") and s[1:].isdigit()):
+            n = int(s)
+        else:
+            n = int(float(s))
+        if n < 0:
+            return None
+        return n
+    except Exception:
+        return None
+
+
 def parse_host_port_str(value: Any) -> Tuple[str, int]:
     """Parse host:port into (host, port).
 
@@ -507,6 +536,90 @@ def validate_pool_inplace(pool: Dict[str, Any]) -> List[PoolValidationIssue]:
                         "udp_maybe_unintended",
                     )
                 )
+
+        # QoS (stored in extra_config.qos, mirrored to network.qos for compatibility)
+        net_obj = ep.get("network")
+        if not isinstance(net_obj, dict):
+            net_obj = {}
+        ex_qos = ex.get("qos") if isinstance(ex.get("qos"), dict) else {}
+        net_qos = net_obj.get("qos") if isinstance(net_obj.get("qos"), dict) else {}
+
+        def _pick_qos_raw(keys: Tuple[str, ...]) -> Any:
+            for src in (ex_qos, net_qos, ex, net_obj, ep):
+                if not isinstance(src, dict):
+                    continue
+                for k in keys:
+                    if k in src:
+                        return src.get(k)
+            return None
+
+        bw_kbps_raw = _pick_qos_raw(("bandwidth_kbps", "bandwidth_kbit", "bandwidth_limit_kbps", "qos_bandwidth_kbps"))
+        bw_mbps_raw = _pick_qos_raw(("bandwidth_mbps", "bandwidth_mb", "bandwidth_limit_mbps", "qos_bandwidth_mbps"))
+        max_conns_raw = _pick_qos_raw(("max_conns", "max_conn", "max_connections", "qos_max_conns"))
+        conn_rate_raw = _pick_qos_raw(
+            ("conn_rate", "conn_per_sec", "new_conn_per_sec", "new_connections_per_sec", "qos_conn_rate")
+        )
+
+        bw_kbps = _coerce_nonneg_int(bw_kbps_raw)
+        bw_mbps = _coerce_nonneg_int(bw_mbps_raw)
+        max_conns = _coerce_nonneg_int(max_conns_raw)
+        conn_rate = _coerce_nonneg_int(conn_rate_raw)
+
+        if bw_kbps is None and (bw_kbps_raw is not None and str(bw_kbps_raw).strip()):
+            issues.append(
+                PoolValidationIssue(path=f"endpoints[{idx}].extra_config.qos.bandwidth_kbps", message="QoS 带宽必须是非负整数")
+            )
+        if bw_mbps is None and (bw_mbps_raw is not None and str(bw_mbps_raw).strip()):
+            issues.append(
+                PoolValidationIssue(path=f"endpoints[{idx}].extra_config.qos.bandwidth_mbps", message="QoS 带宽(Mbps)必须是非负整数")
+            )
+        if max_conns is None and (max_conns_raw is not None and str(max_conns_raw).strip()):
+            issues.append(
+                PoolValidationIssue(path=f"endpoints[{idx}].extra_config.qos.max_conns", message="QoS 最大并发必须是非负整数")
+            )
+        if conn_rate is None and (conn_rate_raw is not None and str(conn_rate_raw).strip()):
+            issues.append(
+                PoolValidationIssue(path=f"endpoints[{idx}].extra_config.qos.conn_rate", message="QoS 每秒新建连接上限必须是非负整数")
+            )
+
+        if bw_kbps is None and bw_mbps is not None:
+            bw_kbps = int(bw_mbps) * 1024
+
+        qos_norm: Dict[str, int] = {}
+        if bw_kbps is not None and bw_kbps > 0:
+            qos_norm["bandwidth_kbps"] = int(bw_kbps)
+        if max_conns is not None and max_conns > 0:
+            qos_norm["max_conns"] = int(max_conns)
+        if conn_rate is not None and conn_rate > 0:
+            qos_norm["conn_rate"] = int(conn_rate)
+
+        if qos_norm:
+            ex["qos"] = dict(qos_norm)
+            ep["extra_config"] = ex
+
+            net_copy = dict(net_obj)
+            net_copy["qos"] = dict(qos_norm)
+            ep["network"] = net_copy
+
+            if "tcp" not in proto and "max_conns" in qos_norm:
+                warnings.append(
+                    _warn(
+                        f"endpoints[{idx}].extra_config.qos.max_conns",
+                        f"第 {idx+1} 条规则配置了 QoS 最大并发，但该规则未启用 TCP，参数不会生效",
+                        "qos_tcp_only",
+                    )
+                )
+        else:
+            if "qos" in ex:
+                ex.pop("qos", None)
+                ep["extra_config"] = ex
+            if isinstance(net_obj, dict) and "qos" in net_obj:
+                net_copy = dict(net_obj)
+                net_copy.pop("qos", None)
+                if net_copy:
+                    ep["network"] = net_copy
+                else:
+                    ep.pop("network", None)
 
         if not bool(ep.get("disabled")) and intranet_role != "client":
             active_rule_count += 1

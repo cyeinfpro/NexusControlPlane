@@ -27,6 +27,7 @@ import requests
 
 from .config import CFG
 from .intranet_tunnel import IntranetManager, load_server_cert_pem
+from .qos import apply_qos_from_pool
 
 API_KEY_FILE = Path('/etc/realm-agent/api.key')
 ACK_VER_FILE = Path('/etc/realm-agent/panel_ack.version')
@@ -1875,6 +1876,17 @@ _PUSH_STOP = threading.Event()
 _PUSH_THREAD: Optional[threading.Thread] = None
 _PUSH_LOCK = threading.Lock()  # 避免与 API 同时写 pool 文件导致竞争
 _LAST_SYNC_ERROR: Optional[str] = None
+_QOS_STATUS_LOCK = threading.Lock()
+_QOS_STATUS: Dict[str, Any] = {
+    "ok": True,
+    "backend": "none",
+    "ts": int(time.time()),
+    "message": "not_applied_yet",
+    "caps": {"iptables": False, "nftables": False, "tc": False},
+    "stats": {"ports": 0, "rules": 0, "bandwidth_rules": 0, "max_conns_rules": 0, "conn_rate_rules": 0},
+    "warnings": [],
+    "errors": [],
+}
 
 # ------------------------ Intranet Tunnel Supervisor ------------------------
 # 说明：公网节点(A) 与 内网节点(B) 之间的一对一“内网穿透”由 Agent 负责：
@@ -1883,6 +1895,44 @@ _LAST_SYNC_ERROR: Optional[str] = None
 # 这些规则在 pool 中以 extra_config.intranet_role 标记，realm 本体不会接管。
 
 _INTRANET = IntranetManager(node_id=AGENT_ID)
+
+
+def _qos_set_status(st: Dict[str, Any]) -> None:
+    with _QOS_STATUS_LOCK:
+        _QOS_STATUS.clear()
+        _QOS_STATUS.update(st)
+
+
+def _qos_get_status() -> Dict[str, Any]:
+    with _QOS_STATUS_LOCK:
+        return dict(_QOS_STATUS)
+
+
+def _qos_apply_safe(pool: Optional[Dict[str, Any]], source: str) -> None:
+    try:
+        data = apply_qos_from_pool(pool or {"endpoints": []})
+        data["source"] = source
+        _qos_set_status(data)
+    except Exception as exc:
+        _qos_set_status(
+            {
+                "ok": False,
+                "backend": "none",
+                "ts": int(time.time()),
+                "source": source,
+                "message": "qos_apply_exception",
+                "caps": {"iptables": False, "nftables": False, "tc": False},
+                "stats": {
+                    "ports": 0,
+                    "rules": 0,
+                    "bandwidth_rules": 0,
+                    "max_conns_rules": 0,
+                    "conn_rate_rules": 0,
+                },
+                "warnings": [],
+                "errors": [str(exc)],
+            }
+        )
 
 
 def _read_agent_api_key() -> str:
@@ -1910,6 +1960,7 @@ def _build_push_report() -> Dict[str, Any]:
         'time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
         'hostname': socket.gethostname(),
         'realm_active': any(_service_is_active(name) for name in REALM_SERVICE_NAMES),
+        'qos': _qos_get_status(),
     }
     pool = _load_full_pool()
     stats = _build_stats_snapshot()
@@ -1949,6 +2000,7 @@ def _apply_sync_pool_cmd(cmd: Dict[str, Any]) -> None:
             # 写入 full pool
             _write_json(POOL_FULL, pool)
             _sync_active_pool()
+            _qos_apply_safe(pool, "sync_pool")
 
             # Keep intranet tunnel supervisor in sync for LAN/NAT nodes.
             try:
@@ -2065,6 +2117,7 @@ def _apply_pool_patch_cmd(cmd: Dict[str, Any]) -> None:
             new_full['endpoints'] = new_eps
             _write_json(POOL_FULL, new_full)
             _sync_active_pool()
+            _qos_apply_safe(new_full, "pool_patch")
 
             # Keep intranet tunnel supervisor in sync for LAN/NAT nodes.
             try:
@@ -2426,15 +2479,17 @@ def _stop_push_reporter() -> None:
 @app.on_event('startup')
 def _on_startup() -> None:
     # Agent 启动后自动开启上报（若配置了 REALM_PANEL_URL + REALM_AGENT_ID）
+    full_pool = _load_full_pool()
     try:
         _reconcile_update_state()
     except Exception:
         pass
     # Apply intranet tunnel rules on boot (if any were persisted)
     try:
-        _INTRANET.apply_from_pool(_load_full_pool())
+        _INTRANET.apply_from_pool(full_pool)
     except Exception:
         pass
+    _qos_apply_safe(full_pool, "startup")
     _start_push_reporter()
 
 
@@ -2451,6 +2506,7 @@ def api_info(_: None = Depends(_api_key_required)) -> Dict[str, Any]:
         'time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
         'hostname': socket.gethostname(),
         'realm_active': any(_service_is_active(name) for name in REALM_SERVICE_NAMES),
+        'qos': _qos_get_status(),
     }
 
 
@@ -2512,6 +2568,7 @@ def api_pool_save(payload: Dict[str, Any], _: None = Depends(_api_key_required))
     with _PUSH_LOCK:
         _write_json(POOL_FULL, pool)
         _sync_active_pool()
+        _qos_apply_safe(pool, "pool_save")
         # Keep intranet tunnel supervisor in sync even if caller forgets to call /apply
         try:
             _INTRANET.apply_from_pool(_load_full_pool())
@@ -2525,11 +2582,13 @@ def api_apply(_: None = Depends(_api_key_required)) -> Dict[str, Any]:
     try:
         with _PUSH_LOCK:
             _sync_active_pool()
+            full_pool = _load_full_pool()
+            _qos_apply_safe(full_pool, "apply")
             _apply_pool_to_config()
             _restart_realm()
             # Apply intranet tunnel rules (handled by agent, not realm)
             try:
-                _INTRANET.apply_from_pool(_load_full_pool())
+                _INTRANET.apply_from_pool(full_pool)
             except Exception:
                 # do not fail apply for tunnel supervisor issues
                 pass
