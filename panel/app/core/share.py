@@ -47,9 +47,23 @@ def _share_canon(obj: Any) -> str:
     return json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
-def make_share_token(payload: Dict[str, Any]) -> str:
+def _clamp_share_ttl_sec(ttl_sec: Optional[int]) -> int:
+    if ttl_sec is None:
+        return int(_NETMON_SHARE_TTL_SEC)
     try:
-        exp = int(time.time()) + int(_NETMON_SHARE_TTL_SEC)
+        ttl = int(ttl_sec)
+    except Exception:
+        ttl = int(_NETMON_SHARE_TTL_SEC)
+    if ttl < 300:
+        ttl = 300
+    if ttl > 30 * 86400:
+        ttl = 30 * 86400
+    return ttl
+
+
+def make_share_token(payload: Dict[str, Any], ttl_sec: Optional[int] = None) -> str:
+    try:
+        exp = int(time.time()) + int(_clamp_share_ttl_sec(ttl_sec))
     except Exception:
         exp = int(time.time()) + 86400
     p = dict(payload or {})

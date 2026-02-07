@@ -40,6 +40,7 @@
   <div class="fm-toolbar">
     <div class="fm-actions">
       <button class="btn xs" type="button" id="fmPickFiles">上传文件</button>
+      <button class="btn xs ghost" type="button" id="fmShareBtn">分享选中</button>
       <div class="fm-divider"></div>
       <form method="post" action="/websites/{{ site.id }}/files/mkdir" class="fm-mkdir">
         <input type="hidden" name="path" value="{{ path }}">
@@ -85,7 +86,14 @@
         {% if (not it.is_dir) and ("." in it.name) %}
           {% set ext = it.name.rsplit(".", 1)[-1] | lower %}
         {% endif %}
-        <tr class="fm-row" data-name="{{ it.name|lower }}" data-type="{{ 'dir' if it.is_dir else 'file' }}" data-size="{{ it.size or 0 }}">
+        <tr
+          class="fm-row"
+          data-name="{{ it.name|lower }}"
+          data-display-name="{{ it.name }}"
+          data-path="{{ it.path }}"
+          data-type="{{ 'dir' if it.is_dir else 'file' }}"
+          data-size="{{ it.size or 0 }}"
+        >
           <td class="fm-sel">
             <input type="checkbox" class="fm-check fm-item-check">
           </td>
@@ -114,6 +122,13 @@
                   </form>
                 {% endif %}
               {% endif %}
+              <button
+                class="btn xs ghost fm-act-btn fm-share-one"
+                type="button"
+                data-path="{{ it.path }}"
+                data-name="{{ it.name }}"
+                data-type="{{ 'dir' if it.is_dir else 'file' }}"
+              >分享</button>
               <form method="post" action="/websites/{{ site.id }}/files/delete" class="fm-inline-form" onsubmit="return confirm('确定删除吗？');">
                 <input type="hidden" name="path" value="{{ it.path }}">
                 <button class="btn xs ghost fm-act-btn fm-act-danger" type="submit">删除</button>
@@ -172,6 +187,41 @@
   </div>
 </div>
 
+<div id="fmShareModal" class="modal" style="display:none;">
+  <div class="modal-inner modal-pro fm-share-modal">
+    <div class="modal-head">
+      <div class="title-wrap">
+        <div class="h2">文件分享</div>
+        <div class="muted sm" id="fmShareSub">生成可访问的分享链接</div>
+      </div>
+      <button class="btn xs ghost" type="button" id="fmShareCloseTop">关闭</button>
+    </div>
+    <div class="modal-body">
+      <div class="fm-share-picks" id="fmShareItems">未选择</div>
+      <div class="fm-share-ttl">
+        <span class="muted sm">有效期</span>
+        <input class="input sm" id="fmShareTtlValue" type="number" min="1" step="1" value="24">
+        <select class="select" id="fmShareTtlUnit">
+          <option value="hour">小时</option>
+          <option value="minute">分钟</option>
+          <option value="day">天</option>
+        </select>
+        <span class="muted sm" id="fmShareTtlHint"></span>
+      </div>
+      <div class="fm-share-link-row">
+        <input class="input sm mono" id="fmShareLink" placeholder="点击“生成链接”后显示" readonly>
+        <button class="btn xs ghost" type="button" id="fmShareCopy" disabled>复制</button>
+        <a class="btn xs ghost" id="fmShareOpen" href="#" target="_blank" rel="noopener" style="display:none;">打开</a>
+      </div>
+      <div class="muted sm" id="fmShareStatus"></div>
+      <div class="row" style="justify-content:flex-end;gap:10px;margin-top:6px;">
+        <button class="btn xs ghost" type="button" id="fmShareClose">取消</button>
+        <button class="btn xs" type="button" id="fmShareGen">生成链接</button>
+      </div>
+    </div>
+  </div>
+</div>
+
 <script>
 const pickFilesBtn = document.getElementById('fmPickFiles');
 const pickFolderBtn = document.getElementById('fmPickFolder');
@@ -182,6 +232,7 @@ const fmUpBtn = document.getElementById('fmUpBtn');
 const fmStats = document.getElementById('fmStats');
 const fmSelectInfo = document.getElementById('fmSelectInfo');
 const fmSelectAll = document.getElementById('fmSelectAll');
+const fmShareBtn = document.getElementById('fmShareBtn');
 const fmUploadModal = document.getElementById('fmUploadModal');
 const fmModeFiles = document.getElementById('fmModeFiles');
 const fmModeFolder = document.getElementById('fmModeFolder');
@@ -200,11 +251,27 @@ const fmModalProgress = document.getElementById('fmModalProgress');
 const fmModalProgressFill = document.getElementById('fmModalProgressFill');
 const fmModalStatus = document.getElementById('fmModalStatus');
 const fmModalRetry = document.getElementById('fmModalRetry');
+const fmShareModal = document.getElementById('fmShareModal');
+const fmShareItems = document.getElementById('fmShareItems');
+const fmShareTtlValue = document.getElementById('fmShareTtlValue');
+const fmShareTtlUnit = document.getElementById('fmShareTtlUnit');
+const fmShareTtlHint = document.getElementById('fmShareTtlHint');
+const fmShareLink = document.getElementById('fmShareLink');
+const fmShareCopy = document.getElementById('fmShareCopy');
+const fmShareOpen = document.getElementById('fmShareOpen');
+const fmShareStatus = document.getElementById('fmShareStatus');
+const fmShareClose = document.getElementById('fmShareClose');
+const fmShareCloseTop = document.getElementById('fmShareCloseTop');
+const fmShareGen = document.getElementById('fmShareGen');
 
 const CHUNK_SIZE = 1024 * 512;
 const UPLOAD_MAX_BYTES = {{ upload_max_bytes }};
 const SITE_ID = {{ site.id }};
 const CUR_PATH = {{ path|tojson }};
+const FILE_SHARE_DEFAULT_TTL_SEC = {{ file_share_default_ttl_sec }};
+const FILE_SHARE_MIN_TTL_SEC = {{ file_share_min_ttl_sec }};
+const FILE_SHARE_MAX_TTL_SEC = {{ file_share_max_ttl_sec }};
+const FILE_SHARE_MAX_ITEMS = {{ file_share_max_items }};
 const folderPickerEl = fmModalFolderInput;
 const SUPPORTS_FOLDER_PICK = !!(folderPickerEl && (('webkitdirectory' in folderPickerEl) || ('mozdirectory' in folderPickerEl)));
 const modalUI = {
@@ -216,6 +283,7 @@ const modalUI = {
 };
 let modalFiles = [];
 let lastUploadMethod = 'chunked';
+let shareItems = [];
 
 function bytesToHuman(n){
   if(!n) return '0 B';
@@ -229,16 +297,166 @@ function bytesToHuman(n){
   return v.toFixed(1) + ' ' + units[i];
 }
 
+function updateBodyModalState(){
+  const uploadOpen = !!(fmUploadModal && fmUploadModal.style.display !== 'none');
+  const shareOpen = !!(fmShareModal && fmShareModal.style.display !== 'none');
+  document.body.classList.toggle('modal-open', uploadOpen || shareOpen);
+}
+
 function openModal(){
   if(!fmUploadModal) return;
   fmUploadModal.style.display = 'flex';
-  document.body.classList.add('modal-open');
+  updateBodyModalState();
 }
 
 function closeModal(){
   if(!fmUploadModal) return;
   fmUploadModal.style.display = 'none';
-  document.body.classList.remove('modal-open');
+  updateBodyModalState();
+}
+
+function openShareModal(){
+  if(!fmShareModal) return;
+  fmShareModal.style.display = 'flex';
+  updateBodyModalState();
+}
+
+function closeShareModal(){
+  if(!fmShareModal) return;
+  fmShareModal.style.display = 'none';
+  updateBodyModalState();
+}
+
+function formatDurationLabel(sec){
+  const s = Math.max(0, parseInt(sec || 0, 10) || 0);
+  if(!s) return '0 分钟';
+  if(s % 86400 === 0){
+    return `${s / 86400} 天`;
+  }
+  if(s % 3600 === 0){
+    return `${s / 3600} 小时`;
+  }
+  if(s % 60 === 0){
+    return `${s / 60} 分钟`;
+  }
+  return `${s} 秒`;
+}
+
+function shareDurationSec(){
+  const value = parseInt(fmShareTtlValue?.value || '0', 10) || 0;
+  const unit = String(fmShareTtlUnit?.value || 'hour');
+  if(value <= 0) return 0;
+  let mul = 3600;
+  if(unit === 'minute') mul = 60;
+  if(unit === 'day') mul = 86400;
+  return value * mul;
+}
+
+function normalizeShareItems(items){
+  if(!Array.isArray(items)) return [];
+  const out = [];
+  const seen = new Map();
+  for(const row of items){
+    const pathRaw = String(row?.path || '').replace(/\\/g, '/').replace(/^\/+/, '').trim();
+    if(!pathRaw) continue;
+    const name = String(row?.name || pathRaw.split('/').pop() || pathRaw);
+    const isDir = !!row?.is_dir || String(row?.type || '').toLowerCase() === 'dir';
+    if(seen.has(pathRaw)){
+      if(isDir){
+        const idx = seen.get(pathRaw);
+        if(typeof idx === 'number' && out[idx]){
+          out[idx].is_dir = true;
+        }
+      }
+      continue;
+    }
+    seen.set(pathRaw, out.length);
+    out.push({path: pathRaw, name, is_dir: isDir});
+    if(out.length >= FILE_SHARE_MAX_ITEMS) break;
+  }
+  return out;
+}
+
+function renderShareItems(items){
+  if(!fmShareItems) return;
+  if(!items.length){
+    fmShareItems.textContent = '未选择';
+    return;
+  }
+  fmShareItems.innerHTML = '';
+  items.forEach((it)=>{
+    const row = document.createElement('div');
+    row.className = 'fm-share-item';
+    const left = document.createElement('span');
+    left.className = 'mono';
+    left.textContent = it.path;
+    const right = document.createElement('span');
+    right.className = 'muted sm';
+    right.textContent = it.is_dir ? '目录' : '文件';
+    row.appendChild(left);
+    row.appendChild(right);
+    fmShareItems.appendChild(row);
+  });
+}
+
+function setShareStatus(text, isError){
+  if(!fmShareStatus) return;
+  fmShareStatus.textContent = text || '';
+  fmShareStatus.style.color = isError ? 'rgba(248,113,113,0.95)' : '';
+}
+
+function resetShareTtl(){
+  let sec = FILE_SHARE_DEFAULT_TTL_SEC || 86400;
+  let unit = 'hour';
+  let value = Math.max(1, Math.round(sec / 3600));
+  if(sec % 86400 === 0){
+    unit = 'day';
+    value = Math.max(1, sec / 86400);
+  }else if(sec % 3600 === 0){
+    unit = 'hour';
+    value = Math.max(1, sec / 3600);
+  }else{
+    unit = 'minute';
+    value = Math.max(1, Math.round(sec / 60));
+  }
+  if(fmShareTtlValue) fmShareTtlValue.value = String(value);
+  if(fmShareTtlUnit) fmShareTtlUnit.value = unit;
+}
+
+function openShareForItems(items){
+  const picked = normalizeShareItems(items);
+  if(!picked.length){
+    alert('请先选择要分享的文件或目录');
+    return;
+  }
+  shareItems = picked;
+  resetShareTtl();
+  renderShareItems(shareItems);
+  if(fmShareLink) fmShareLink.value = '';
+  if(fmShareCopy) fmShareCopy.disabled = true;
+  if(fmShareOpen){
+    fmShareOpen.style.display = 'none';
+    fmShareOpen.removeAttribute('href');
+  }
+  setShareStatus(`已选择 ${shareItems.length} 项`, false);
+  openShareModal();
+}
+
+function collectCheckedShareItems(){
+  const rows = Array.from(document.querySelectorAll('.fm-row'));
+  const out = [];
+  rows.forEach((row)=>{
+    const box = row.querySelector('.fm-item-check');
+    if(!box || !box.checked) return;
+    const path = String(row.dataset.path || '').trim();
+    if(!path) return;
+    out.push({
+      path,
+      name: String(row.dataset.displayName || path.split('/').pop() || path),
+      is_dir: String(row.dataset.type || '').toLowerCase() === 'dir'
+    });
+  });
+  return normalizeShareItems(out);
 }
 
 function renderModalList(files){
@@ -397,13 +615,13 @@ function renderStats(shownCount){
 }
 
 function updateSelectionInfo(){
-  if(!fmSelectInfo) return;
   const checks = Array.from(document.querySelectorAll('.fm-item-check'));
   const visibleChecks = checks.filter((c)=>{
     const row = c.closest('.fm-row');
     return row && row.style.display !== 'none';
   });
   const selected = visibleChecks.filter((c)=>c.checked);
+  const selectedAll = checks.filter((c)=>c.checked);
   if(visibleChecks.length){
     if(fmSelectAll){
       fmSelectAll.checked = selected.length === visibleChecks.length;
@@ -413,7 +631,14 @@ function updateSelectionInfo(){
     fmSelectAll.checked = false;
     fmSelectAll.indeterminate = false;
   }
-  fmSelectInfo.textContent = selected.length ? `已选择 ${selected.length} 项` : '';
+  if(fmSelectInfo){
+    fmSelectInfo.textContent = selected.length ? `已选择 ${selected.length} 项` : '';
+  }
+  if(fmShareBtn){
+    const count = selectedAll.length;
+    fmShareBtn.disabled = count === 0;
+    fmShareBtn.textContent = count ? `分享选中 (${count})` : '分享选中';
+  }
 }
 
 function applySearchFilter(){
@@ -731,9 +956,125 @@ fmModalCloseTop?.addEventListener('click', modalClose);
 fmUploadModal?.addEventListener('click', (e)=>{
   if(e.target === fmUploadModal) closeModal();
 });
+const shareModalClose = ()=>{
+  closeShareModal();
+};
+fmShareClose?.addEventListener('click', shareModalClose);
+fmShareCloseTop?.addEventListener('click', shareModalClose);
+fmShareModal?.addEventListener('click', (e)=>{
+  if(e.target === fmShareModal) closeShareModal();
+});
+
+fmShareBtn?.addEventListener('click', ()=>{
+  openShareForItems(collectCheckedShareItems());
+});
+
+document.querySelectorAll('.fm-share-one').forEach((btn)=>{
+  btn.addEventListener('click', ()=>{
+    openShareForItems(
+      [
+        {
+          path: String(btn.dataset.path || ''),
+          name: String(btn.dataset.name || ''),
+          is_dir: String(btn.dataset.type || '').toLowerCase() === 'dir'
+        }
+      ]
+    );
+  });
+});
+
+fmShareTtlValue?.addEventListener('input', ()=>{
+  const sec = shareDurationSec();
+  if(sec > 0 && (sec < FILE_SHARE_MIN_TTL_SEC || sec > FILE_SHARE_MAX_TTL_SEC)){
+    setShareStatus(`有效期将自动限制为 ${formatDurationLabel(FILE_SHARE_MIN_TTL_SEC)} - ${formatDurationLabel(FILE_SHARE_MAX_TTL_SEC)}`, false);
+    return;
+  }
+  if(shareItems.length){
+    setShareStatus(`已选择 ${shareItems.length} 项`, false);
+  }
+});
+fmShareTtlUnit?.addEventListener('change', ()=>{
+  if(shareItems.length){
+    setShareStatus(`已选择 ${shareItems.length} 项`, false);
+  }
+});
+
+fmShareGen?.addEventListener('click', async ()=>{
+  if(!shareItems.length){
+    alert('请先选择要分享的文件或目录');
+    return;
+  }
+  const rawSec = shareDurationSec();
+  if(rawSec <= 0){
+    alert('请输入有效的分享时长');
+    return;
+  }
+  const ttlSec = Math.max(FILE_SHARE_MIN_TTL_SEC, Math.min(FILE_SHARE_MAX_TTL_SEC, rawSec));
+  if(fmShareGen) fmShareGen.disabled = true;
+  if(fmShareCopy) fmShareCopy.disabled = true;
+  setShareStatus('正在生成分享链接…', false);
+  try{
+    const resp = await fetch(`/websites/${SITE_ID}/files/share`, {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ items: shareItems, ttl_sec: ttlSec })
+    });
+    const data = await resp.json().catch(()=>({ok:false,error:'生成分享链接失败'}));
+    if(!data.ok){
+      throw new Error(data.error || '生成分享链接失败');
+    }
+    const url = String(data.url || '');
+    if(fmShareLink) fmShareLink.value = url;
+    if(fmShareCopy) fmShareCopy.disabled = !url;
+    if(fmShareOpen){
+      if(url){
+        fmShareOpen.href = url;
+        fmShareOpen.style.display = '';
+      }else{
+        fmShareOpen.style.display = 'none';
+      }
+    }
+    const expireText = String(data.expire_at || '');
+    const ttlText = formatDurationLabel(Number(data.ttl_sec || ttlSec));
+    setShareStatus(expireText ? `已生成，${ttlText}后过期（${expireText}）` : `已生成，${ttlText}后过期`, false);
+  }catch(err){
+    setShareStatus(String(err), true);
+  }finally{
+    if(fmShareGen) fmShareGen.disabled = false;
+  }
+});
+
+fmShareCopy?.addEventListener('click', async ()=>{
+  const text = String(fmShareLink?.value || '');
+  if(!text) return;
+  let copied = false;
+  try{
+    if(navigator.clipboard && navigator.clipboard.writeText){
+      await navigator.clipboard.writeText(text);
+      copied = true;
+    }
+  }catch(_err){
+    copied = false;
+  }
+  if(!copied && fmShareLink){
+    fmShareLink.focus();
+    fmShareLink.select();
+    try{
+      copied = document.execCommand('copy');
+    }catch(_err){
+      copied = false;
+    }
+  }
+  setShareStatus(copied ? '链接已复制' : '复制失败，请手动复制', !copied);
+});
+
 document.addEventListener('keydown', (e)=>{
-  if(e.key === 'Escape' && fmUploadModal && fmUploadModal.style.display !== 'none'){
+  if(e.key !== 'Escape') return;
+  if(fmUploadModal && fmUploadModal.style.display !== 'none'){
     closeModal();
+  }
+  if(fmShareModal && fmShareModal.style.display !== 'none'){
+    closeShareModal();
   }
 });
 
@@ -777,6 +1118,11 @@ if(!SUPPORTS_FOLDER_PICK && fmModeFolder){
   fmModeFolder.classList.add('disabled');
   fmModeFolder.title = '当前浏览器不支持文件夹选择';
 }
+if(fmShareTtlHint){
+  fmShareTtlHint.textContent = `范围：${formatDurationLabel(FILE_SHARE_MIN_TTL_SEC)} - ${formatDurationLabel(FILE_SHARE_MAX_TTL_SEC)}`;
+}
+resetShareTtl();
+setShareStatus('', false);
 
 computeTableStats();
 applySearchFilter();

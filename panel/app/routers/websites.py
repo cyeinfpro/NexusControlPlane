@@ -1,18 +1,23 @@
 from __future__ import annotations
 
 import base64
+import datetime
 import hashlib
 import os
+import tempfile
 import uuid
+import zipfile
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlencode
 
 from fastapi import APIRouter, Depends, File, Form, Request, UploadFile
-from fastapi.responses import HTMLResponse, RedirectResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response
+from starlette.background import BackgroundTask
 
 from ..clients.agent import AgentError, agent_get, agent_get_raw, agent_post
 from ..core.deps import require_login_page
 from ..core.flash import flash, set_flash
+from ..core.share import make_share_token, verify_share_token
 from ..core.templates import templates
 from ..db import (
     add_certificate,
@@ -40,6 +45,7 @@ from ..db import (
     update_task,
 )
 from ..services.apply import node_verify_tls
+from ..services.assets import panel_public_base_url
 
 router = APIRouter()
 UPLOAD_CHUNK_SIZE = 1024 * 512
@@ -65,6 +71,198 @@ def _parse_upload_max_bytes() -> int:
 
 
 UPLOAD_MAX_BYTES = _parse_upload_max_bytes()
+
+
+def _parse_int_env(name: str, default: int) -> int:
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return int(default)
+    try:
+        return int(float(raw))
+    except Exception:
+        return int(default)
+
+
+FILE_SHARE_MIN_TTL_SEC = max(300, _parse_int_env("REALM_WEBSITE_FILE_SHARE_MIN_TTL_SEC", 300))
+FILE_SHARE_MAX_TTL_SEC = max(FILE_SHARE_MIN_TTL_SEC, _parse_int_env("REALM_WEBSITE_FILE_SHARE_MAX_TTL_SEC", 30 * 86400))
+FILE_SHARE_DEFAULT_TTL_SEC = _parse_int_env("REALM_WEBSITE_FILE_SHARE_DEFAULT_TTL_SEC", 86400)
+if FILE_SHARE_DEFAULT_TTL_SEC < FILE_SHARE_MIN_TTL_SEC:
+    FILE_SHARE_DEFAULT_TTL_SEC = FILE_SHARE_MIN_TTL_SEC
+if FILE_SHARE_DEFAULT_TTL_SEC > FILE_SHARE_MAX_TTL_SEC:
+    FILE_SHARE_DEFAULT_TTL_SEC = FILE_SHARE_MAX_TTL_SEC
+FILE_SHARE_MAX_ITEMS = max(1, _parse_int_env("REALM_WEBSITE_FILE_SHARE_MAX_ITEMS", 200))
+
+
+def _parse_share_ttl_sec(raw: Any) -> int:
+    try:
+        ttl = int(float(raw))
+    except Exception:
+        ttl = int(FILE_SHARE_DEFAULT_TTL_SEC)
+    if ttl < FILE_SHARE_MIN_TTL_SEC:
+        ttl = FILE_SHARE_MIN_TTL_SEC
+    if ttl > FILE_SHARE_MAX_TTL_SEC:
+        ttl = FILE_SHARE_MAX_TTL_SEC
+    return ttl
+
+
+def _normalize_rel_path(raw: Any) -> str:
+    text = str(raw or "").replace("\\", "/").strip().lstrip("/")
+    if not text:
+        return ""
+    segs: List[str] = []
+    for seg in text.split("/"):
+        if not seg or seg == ".":
+            continue
+        if seg == "..":
+            raise ValueError("非法路径")
+        segs.append(seg)
+    return "/".join(segs)
+
+
+def _parse_share_items(raw: Any) -> List[Dict[str, Any]]:
+    rows = raw
+    if isinstance(rows, dict):
+        rows = [rows]
+    elif isinstance(rows, str):
+        rows = [x for x in rows.split(",") if x.strip()]
+    if not isinstance(rows, list):
+        return []
+
+    out: List[Dict[str, Any]] = []
+    seen: Dict[str, int] = {}
+    for row in rows:
+        path_raw: Any = row
+        is_dir = False
+        if isinstance(row, dict):
+            path_raw = row.get("path") or row.get("value") or ""
+            is_dir = bool(row.get("is_dir"))
+        path = _normalize_rel_path(path_raw)
+        if not path:
+            continue
+        idx = seen.get(path)
+        if idx is None:
+            seen[path] = len(out)
+            out.append({"path": path, "is_dir": is_dir})
+        elif is_dir:
+            out[idx]["is_dir"] = True
+    return out
+
+
+def _sanitize_download_name(raw: Any, fallback: str) -> str:
+    text = str(raw or "").strip().lower()
+    if not text:
+        text = fallback
+    parts: List[str] = []
+    for ch in text:
+        if ("a" <= ch <= "z") or ("0" <= ch <= "9") or ch in ("-", "_", "."):
+            parts.append(ch)
+        else:
+            parts.append("-")
+    name = "".join(parts).strip("-.")
+    if not name:
+        name = fallback
+    return name[:96]
+
+
+def _zip_arcname(raw: Any) -> str:
+    text = str(raw or "").replace("\\", "/").strip().lstrip("/")
+    if not text:
+        return ""
+    segs: List[str] = []
+    for seg in text.split("/"):
+        if not seg or seg == ".":
+            continue
+        if seg == "..":
+            continue
+        segs.append(seg)
+    return "/".join(segs)
+
+
+def _remove_file_quiet(path: str) -> None:
+    try:
+        if path and os.path.exists(path):
+            os.remove(path)
+    except Exception:
+        pass
+
+
+async def _agent_list_files(node: Dict[str, Any], root: str, path: str) -> List[Dict[str, Any]]:
+    q = urlencode({"root": root, "path": path, "root_base": _node_root_base(node)})
+    data = await agent_get(
+        node["base_url"],
+        node["api_key"],
+        f"/api/v1/website/files/list?{q}",
+        node_verify_tls(node),
+        timeout=20,
+    )
+    if not data.get("ok", True):
+        raise AgentError(str(data.get("error") or "读取目录失败"))
+    rows = data.get("items") or []
+    out: List[Dict[str, Any]] = []
+    for row in rows:
+        try:
+            rel = _normalize_rel_path(row.get("path"))
+        except Exception:
+            continue
+        if not rel:
+            continue
+        out.append(
+            {
+                "path": rel,
+                "name": str(row.get("name") or rel.split("/")[-1] or rel),
+                "is_dir": bool(row.get("is_dir")),
+            }
+        )
+    return out
+
+
+async def _build_share_zip(
+    node: Dict[str, Any],
+    root: str,
+    share_items: List[Dict[str, Any]],
+) -> Tuple[str, int]:
+    fd, zip_path = tempfile.mkstemp(prefix="nexus-share-", suffix=".zip")
+    os.close(fd)
+    file_count = 0
+
+    async def _add_entry(zf: zipfile.ZipFile, rel_path: str, arc_path: str, is_dir: bool) -> None:
+        nonlocal file_count
+        arc = _zip_arcname(arc_path)
+        if not arc:
+            return
+        if is_dir:
+            rows = await _agent_list_files(node, root, rel_path)
+            if not rows:
+                zf.writestr(f"{arc.rstrip('/')}/", b"")
+                return
+            for row in rows:
+                child_arc = _zip_arcname(f"{arc}/{row.get('name') or ''}")
+                await _add_entry(zf, str(row.get("path") or ""), child_arc, bool(row.get("is_dir")))
+            return
+
+        r = await agent_get_raw(
+            node.get("base_url", ""),
+            node.get("api_key", ""),
+            "/api/v1/website/files/raw",
+            node_verify_tls(node),
+            params={"root": root, "path": rel_path, "root_base": _node_root_base(node)},
+            timeout=60,
+        )
+        if r.status_code != 200:
+            raise AgentError(f"打包失败：{rel_path}（HTTP {r.status_code}）")
+        zf.writestr(arc, r.content)
+        file_count += 1
+
+    try:
+        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+            for item in share_items:
+                rel = str(item.get("path") or "")
+                arc = rel
+                await _add_entry(zf, rel, arc, bool(item.get("is_dir")))
+    except Exception:
+        _remove_file_quiet(zip_path)
+        raise
+    return zip_path, file_count
 
 
 def _parse_domains(raw: str) -> List[str]:
@@ -1555,6 +1753,10 @@ async def website_files(request: Request, site_id: int, path: str = "", user: st
             "error": err_msg,
             "upload_max_bytes": UPLOAD_MAX_BYTES,
             "upload_max_h": _format_bytes(UPLOAD_MAX_BYTES),
+            "file_share_default_ttl_sec": FILE_SHARE_DEFAULT_TTL_SEC,
+            "file_share_min_ttl_sec": FILE_SHARE_MIN_TTL_SEC,
+            "file_share_max_ttl_sec": FILE_SHARE_MAX_TTL_SEC,
+            "file_share_max_items": FILE_SHARE_MAX_ITEMS,
         },
     )
 
@@ -2017,3 +2219,120 @@ async def website_files_download(
     filename = path.split("/")[-1] or "download.bin"
     headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
     return Response(content=r.content, media_type="application/octet-stream", headers=headers)
+
+
+@router.post("/websites/{site_id}/files/share")
+async def website_files_share_link(
+    request: Request,
+    site_id: int,
+    user: str = Depends(require_login_page),
+):
+    _ = user
+    site = get_site(int(site_id))
+    node = get_node(int(site.get("node_id") or 0)) if site else None
+    if not site or not node:
+        return {"ok": False, "error": "站点不存在"}
+
+    root = _agent_payload_root(site, node)
+    if not root:
+        return {"ok": False, "error": "该站点没有可管理的根目录"}
+
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+
+    try:
+        share_items = _parse_share_items((data or {}).get("items") or (data or {}).get("paths") or [])
+    except Exception:
+        return {"ok": False, "error": "分享路径不合法"}
+    if not share_items:
+        return {"ok": False, "error": "请先选择要分享的文件或目录"}
+    if len(share_items) > FILE_SHARE_MAX_ITEMS:
+        return {"ok": False, "error": f"最多可分享 {FILE_SHARE_MAX_ITEMS} 项"}
+
+    ttl_sec = _parse_share_ttl_sec((data or {}).get("ttl_sec"))
+    token_payload = {
+        "page": "site_files_download",
+        "site_id": int(site_id),
+        "items": share_items,
+    }
+    token = make_share_token(token_payload, ttl_sec=ttl_sec)
+    base = panel_public_base_url(request)
+    url = f"{base}/share/site-files?t={token}"
+    expire_at = datetime.datetime.now() + datetime.timedelta(seconds=ttl_sec)
+    return {
+        "ok": True,
+        "url": url,
+        "ttl_sec": ttl_sec,
+        "expire_at": expire_at.strftime("%Y-%m-%d %H:%M:%S"),
+        "items": share_items,
+    }
+
+
+@router.get("/share/site-files")
+async def website_files_share_download(request: Request, t: str = ""):
+    _ = request
+    payload = verify_share_token(t)
+    if not isinstance(payload, dict) or str(payload.get("page") or "") != "site_files_download":
+        return Response(content="分享链接无效或已过期", media_type="text/plain", status_code=403)
+
+    try:
+        site_id = int(payload.get("site_id") or 0)
+    except Exception:
+        site_id = 0
+    if site_id <= 0:
+        return Response(content="分享链接无效", media_type="text/plain", status_code=400)
+
+    try:
+        share_items = _parse_share_items(payload.get("items") or payload.get("paths") or [])
+    except Exception:
+        share_items = []
+    if not share_items:
+        return Response(content="分享内容为空", media_type="text/plain", status_code=400)
+    if len(share_items) > FILE_SHARE_MAX_ITEMS:
+        share_items = share_items[:FILE_SHARE_MAX_ITEMS]
+
+    site = get_site(int(site_id))
+    node = get_node(int(site.get("node_id") or 0)) if site else None
+    if not site or not node:
+        return Response(content="站点不存在或已删除", media_type="text/plain", status_code=404)
+    root = _agent_payload_root(site, node)
+    if not root:
+        return Response(content="该站点没有可分享目录", media_type="text/plain", status_code=404)
+
+    single = share_items[0] if len(share_items) == 1 else None
+    if single and not bool(single.get("is_dir")):
+        rel_path = str(single.get("path") or "")
+        r = await agent_get_raw(
+            node.get("base_url", ""),
+            node.get("api_key", ""),
+            "/api/v1/website/files/raw",
+            node_verify_tls(node),
+            params={"root": root, "path": rel_path, "root_base": _node_root_base(node)},
+            timeout=60,
+        )
+        if r.status_code != 200:
+            return Response(content="文件不存在或无法下载", media_type="text/plain", status_code=404)
+        filename = rel_path.split("/")[-1] or "download.bin"
+        headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+        return Response(content=r.content, media_type="application/octet-stream", headers=headers)
+
+    try:
+        zip_path, file_count = await _build_share_zip(node, root, share_items)
+    except Exception as exc:
+        return Response(content=f"打包失败：{exc}", media_type="text/plain", status_code=500)
+
+    if file_count <= 0:
+        _remove_file_quiet(zip_path)
+        return Response(content="没有可下载的文件", media_type="text/plain", status_code=404)
+
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    base = _sanitize_download_name(site.get("name"), f"site-{site_id}")
+    filename = f"{base}-share-{stamp}.zip"
+    return FileResponse(
+        path=zip_path,
+        filename=filename,
+        media_type="application/zip",
+        background=BackgroundTask(_remove_file_quiet, zip_path),
+    )
