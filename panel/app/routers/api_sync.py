@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import secrets
 import uuid
@@ -50,6 +51,7 @@ def _env_float(name: str, default: float, lo: float, hi: float) -> float:
 _SYNC_PRECHECK_ENABLED = _env_flag("REALM_SYNC_SAVE_PRECHECK_ENABLED", True)
 _SYNC_PRECHECK_HTTP_TIMEOUT = _env_float("REALM_SYNC_SAVE_PRECHECK_HTTP_TIMEOUT", 4.5, 2.0, 20.0)
 _SYNC_PRECHECK_PROBE_TIMEOUT = _env_float("REALM_SYNC_SAVE_PRECHECK_PROBE_TIMEOUT", 1.2, 0.2, 6.0)
+_SYNC_APPLY_TIMEOUT = _env_float("REALM_SYNC_SAVE_APPLY_TIMEOUT", 3.0, 0.5, 20.0)
 _SYNC_PRECHECK_MAX_ISSUES = 24
 
 
@@ -87,11 +89,164 @@ def random_wss_params() -> Tuple[str, str, str]:
     return host, path, sni
 
 
+def _qos_has_value(v: Any) -> bool:
+    return v is not None and str(v).strip() != ""
+
+
+def _coerce_nonneg_int(v: Any) -> Optional[int]:
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, int):
+        return int(v) if int(v) >= 0 else None
+    if isinstance(v, float):
+        if not float(v).is_integer():
+            return None
+        iv = int(v)
+        return iv if iv >= 0 else None
+    s = str(v).strip()
+    if not s or not s.isdigit():
+        return None
+    try:
+        iv = int(s)
+    except Exception:
+        return None
+    return iv if iv >= 0 else None
+
+
+def _pick_qos_raw(sources: List[Dict[str, Any]], keys: Tuple[str, ...]) -> Any:
+    for src in sources:
+        if not isinstance(src, dict):
+            continue
+        for k in keys:
+            if k in src:
+                return src.get(k)
+    return None
+
+
+def _normalize_qos_from_sources(sources: List[Dict[str, Any]], strict: bool) -> Tuple[Dict[str, int], Optional[str]]:
+    bw_kbps_raw = _pick_qos_raw(sources, ("bandwidth_kbps", "bandwidth_kbit", "bandwidth_limit_kbps", "qos_bandwidth_kbps"))
+    bw_mbps_raw = _pick_qos_raw(sources, ("bandwidth_mbps", "bandwidth_mb", "bandwidth_limit_mbps", "qos_bandwidth_mbps"))
+    max_conns_raw = _pick_qos_raw(sources, ("max_conns", "max_conn", "max_connections", "qos_max_conns"))
+    conn_rate_raw = _pick_qos_raw(
+        sources, ("conn_rate", "conn_per_sec", "new_conn_per_sec", "new_connections_per_sec", "qos_conn_rate")
+    )
+
+    bw_kbps = _coerce_nonneg_int(bw_kbps_raw)
+    bw_mbps = _coerce_nonneg_int(bw_mbps_raw)
+    max_conns = _coerce_nonneg_int(max_conns_raw)
+    conn_rate = _coerce_nonneg_int(conn_rate_raw)
+
+    if strict:
+        if bw_kbps is None and _qos_has_value(bw_kbps_raw):
+            return {}, "qos.bandwidth_kbps 必须是非负整数"
+        if bw_mbps is None and _qos_has_value(bw_mbps_raw):
+            return {}, "qos.bandwidth_mbps 必须是非负整数"
+        if max_conns is None and _qos_has_value(max_conns_raw):
+            return {}, "qos.max_conns 必须是非负整数"
+        if conn_rate is None and _qos_has_value(conn_rate_raw):
+            return {}, "qos.conn_rate 必须是非负整数"
+
+    if bw_kbps is None and bw_mbps is not None:
+        bw_kbps = int(bw_mbps) * 1024
+
+    qos: Dict[str, int] = {}
+    if bw_kbps is not None and bw_kbps > 0:
+        qos["bandwidth_kbps"] = int(bw_kbps)
+    if max_conns is not None and max_conns > 0:
+        qos["max_conns"] = int(max_conns)
+    if conn_rate is not None and conn_rate > 0:
+        qos["conn_rate"] = int(conn_rate)
+    return qos, None
+
+
+def _normalize_qos_payload(raw: Any) -> Tuple[Dict[str, int], Optional[str]]:
+    if raw is None:
+        return {}, None
+    if not isinstance(raw, dict):
+        return {}, "qos 参数格式无效，应为对象"
+    return _normalize_qos_from_sources([raw], strict=True)
+
+
+def _extract_qos_from_endpoint(ep: Dict[str, Any]) -> Dict[str, int]:
+    if not isinstance(ep, dict):
+        return {}
+    ex = ep.get("extra_config")
+    if not isinstance(ex, dict):
+        ex = {}
+    net = ep.get("network")
+    if not isinstance(net, dict):
+        net = {}
+    ex_qos = ex.get("qos")
+    if not isinstance(ex_qos, dict):
+        ex_qos = {}
+    net_qos = net.get("qos")
+    if not isinstance(net_qos, dict):
+        net_qos = {}
+    qos, _ = _normalize_qos_from_sources([ex_qos, net_qos, ex, net, ep], strict=False)
+    return qos
+
+
+def _find_sync_qos(pool: Dict[str, Any], sync_id: str) -> Dict[str, int]:
+    sid = str(sync_id or "").strip()
+    if not sid:
+        return {}
+    try:
+        for ep in (pool or {}).get("endpoints") or []:
+            if not isinstance(ep, dict):
+                continue
+            ex0 = ep.get("extra_config") or {}
+            if not isinstance(ex0, dict):
+                continue
+            if str(ex0.get("sync_id") or "") != sid:
+                continue
+            qos = _extract_qos_from_endpoint(ep)
+            if qos:
+                return qos
+    except Exception:
+        return {}
+    return {}
+
+
 def _issue_key(issue: Dict[str, Any]) -> str:
     return (
         f"{issue.get('path') or ''}|{issue.get('code') or ''}|"
         f"{issue.get('severity') or ''}|{issue.get('message') or ''}"
     )
+
+
+async def _apply_pool_best_effort(node: Dict[str, Any], pool: Dict[str, Any]) -> None:
+    try:
+        data = await agent_post(
+            node.get("base_url", ""),
+            node.get("api_key", ""),
+            "/api/v1/pool",
+            {"pool": pool},
+            node_verify_tls(node),
+            timeout=_SYNC_APPLY_TIMEOUT,
+        )
+        if isinstance(data, dict) and data.get("ok", True):
+            await agent_post(
+                node.get("base_url", ""),
+                node.get("api_key", ""),
+                "/api/v1/apply",
+                {},
+                node_verify_tls(node),
+                timeout=_SYNC_APPLY_TIMEOUT,
+            )
+    except Exception:
+        pass
+
+
+async def _apply_pools_best_effort(items: List[Tuple[Dict[str, Any], Dict[str, Any]]]) -> None:
+    tasks = []
+    for node, pool in items:
+        if isinstance(node, dict) and isinstance(pool, dict):
+            tasks.append(_apply_pool_best_effort(node, pool))
+    if not tasks:
+        return
+    await asyncio.gather(*tasks, return_exceptions=True)
 
 
 def _append_issue(
@@ -464,34 +619,70 @@ async def api_wss_tunnel_save(payload: Dict[str, Any], user: str = Depends(requi
         remark = remark[:200]
     favorite = _coerce_bool(payload.get("favorite")) if has_favorite else bool(existing_fav or False)
 
+    has_qos = "qos" in payload
+    if has_qos:
+        qos, qos_err = _normalize_qos_payload(payload.get("qos"))
+        if qos_err:
+            return JSONResponse({"ok": False, "error": qos_err}, status_code=400)
+    else:
+        qos_sender = _find_sync_qos(sender_pool, sync_id)
+        qos_receiver = _find_sync_qos(receiver_pool, sync_id)
+        qos = qos_sender or qos_receiver
+
+    sender_extra: Dict[str, Any] = {
+        "remote_transport": "ws",
+        "remote_ws_host": wss_host,
+        "remote_ws_path": wss_path,
+        "remote_tls_enabled": bool(wss_tls),
+        "remote_tls_insecure": bool(wss_insecure),
+        "remote_tls_sni": wss_sni,
+        # sync meta
+        "sync_id": sync_id,
+        "sync_role": "sender",
+        "sync_peer_node_id": receiver_id,
+        "sync_peer_node_name": receiver.get("name"),
+        "sync_receiver_port": receiver_port,
+        "sync_original_remotes": remotes,
+        "sync_updated_at": now_iso,
+    }
+    if qos:
+        sender_extra["qos"] = dict(qos)
+
     sender_ep = {
         "listen": listen,
         "disabled": disabled,
         "balance": balance,
         "protocol": protocol,
         "remotes": [sender_to_receiver],
-        "extra_config": {
-            "remote_transport": "ws",
-            "remote_ws_host": wss_host,
-            "remote_ws_path": wss_path,
-            "remote_tls_enabled": bool(wss_tls),
-            "remote_tls_insecure": bool(wss_insecure),
-            "remote_tls_sni": wss_sni,
-            # sync meta
-            "sync_id": sync_id,
-            "sync_role": "sender",
-            "sync_peer_node_id": receiver_id,
-            "sync_peer_node_name": receiver.get("name"),
-            "sync_receiver_port": receiver_port,
-            "sync_original_remotes": remotes,
-            "sync_updated_at": now_iso,
-        },
+        "extra_config": sender_extra,
     }
+    if qos:
+        sender_ep["network"] = {"qos": dict(qos)}
 
     if remark:
         sender_ep["remark"] = remark
     if favorite:
         sender_ep["favorite"] = True
+
+    receiver_extra: Dict[str, Any] = {
+        "listen_transport": "ws",
+        "listen_ws_host": wss_host,
+        "listen_ws_path": wss_path,
+        "listen_tls_enabled": bool(wss_tls),
+        "listen_tls_insecure": bool(wss_insecure),
+        "listen_tls_servername": wss_sni,
+        # sync meta
+        "sync_id": sync_id,
+        "sync_role": "receiver",
+        "sync_lock": True,
+        "sync_from_node_id": sender_id,
+        "sync_from_node_name": sender.get("name"),
+        "sync_sender_listen": listen,
+        "sync_original_remotes": remotes,
+        "sync_updated_at": now_iso,
+    }
+    if qos:
+        receiver_extra["qos"] = dict(qos)
 
     receiver_ep = {
         "listen": format_addr("0.0.0.0", receiver_port),
@@ -499,24 +690,10 @@ async def api_wss_tunnel_save(payload: Dict[str, Any], user: str = Depends(requi
         "balance": balance,
         "protocol": protocol,
         "remotes": remotes,
-        "extra_config": {
-            "listen_transport": "ws",
-            "listen_ws_host": wss_host,
-            "listen_ws_path": wss_path,
-            "listen_tls_enabled": bool(wss_tls),
-            "listen_tls_insecure": bool(wss_insecure),
-            "listen_tls_servername": wss_sni,
-            # sync meta
-            "sync_id": sync_id,
-            "sync_role": "receiver",
-            "sync_lock": True,
-            "sync_from_node_id": sender_id,
-            "sync_from_node_name": sender.get("name"),
-            "sync_sender_listen": listen,
-            "sync_original_remotes": remotes,
-            "sync_updated_at": now_iso,
-        },
+        "extra_config": receiver_extra,
     }
+    if qos:
+        receiver_ep["network"] = {"qos": dict(qos)}
 
     if remark:
         receiver_ep["remark"] = remark
@@ -557,25 +734,10 @@ async def api_wss_tunnel_save(payload: Dict[str, Any], user: str = Depends(requi
     s_ver, _ = set_desired_pool(sender_id, sender_pool)
     r_ver, _ = set_desired_pool(receiver_id, receiver_pool)
 
-    async def _apply(node: Dict[str, Any], pool: Dict[str, Any]):
-        try:
-            data = await agent_post(
-                node["base_url"],
-                node["api_key"],
-                "/api/v1/pool",
-                {"pool": pool},
-                node_verify_tls(node),
-            )
-            if isinstance(data, dict) and data.get("ok", True):
-                await agent_post(node["base_url"], node["api_key"], "/api/v1/apply", {}, node_verify_tls(node))
-        except Exception:
-            pass
-
-    await _apply(sender, sender_pool)
-    await _apply(receiver, receiver_pool)
-
+    apply_items: List[Tuple[Dict[str, Any], Dict[str, Any]]] = [(sender, sender_pool), (receiver, receiver_pool)]
     if old_receiver and isinstance(old_receiver_pool, dict):
-        await _apply(old_receiver, old_receiver_pool)
+        apply_items.append((old_receiver, old_receiver_pool))
+    await _apply_pools_best_effort(apply_items)
 
     return {
         "ok": True,
@@ -622,22 +784,7 @@ async def api_wss_tunnel_delete(payload: Dict[str, Any], user: str = Depends(req
     s_ver, _ = set_desired_pool(sender_id, sender_pool)
     r_ver, _ = set_desired_pool(receiver_id, receiver_pool)
 
-    async def _apply(node: Dict[str, Any], pool: Dict[str, Any]):
-        try:
-            data = await agent_post(
-                node["base_url"],
-                node["api_key"],
-                "/api/v1/pool",
-                {"pool": pool},
-                node_verify_tls(node),
-            )
-            if isinstance(data, dict) and data.get("ok", True):
-                await agent_post(node["base_url"], node["api_key"], "/api/v1/apply", {}, node_verify_tls(node))
-        except Exception:
-            pass
-
-    await _apply(sender, sender_pool)
-    await _apply(receiver, receiver_pool)
+    await _apply_pools_best_effort([(sender, sender_pool), (receiver, receiver_pool)])
 
     return {
         "ok": True,
@@ -804,29 +951,63 @@ async def api_intranet_tunnel_save(payload: Dict[str, Any], user: str = Depends(
         remark = remark[:200]
     favorite = _coerce_bool(payload.get("favorite")) if has_favorite else bool(existing_fav or False)
 
+    has_qos = "qos" in payload
+    if has_qos:
+        qos, qos_err = _normalize_qos_payload(payload.get("qos"))
+        if qos_err:
+            return JSONResponse({"ok": False, "error": qos_err}, status_code=400)
+    else:
+        qos_sender = _find_sync_qos(sender_pool, sync_id)
+        qos_receiver = _find_sync_qos(receiver_pool, sync_id)
+        qos = qos_sender or qos_receiver
+
+    sender_extra: Dict[str, Any] = {
+        "intranet_role": "server",
+        "intranet_peer_node_id": receiver_id,
+        "intranet_peer_node_name": receiver.get("name"),
+        "intranet_public_host": sender_host,
+        "intranet_server_port": server_port,
+        "intranet_token": token,
+        "intranet_original_remotes": remotes,
+        "sync_id": sync_id,
+        "intranet_updated_at": now_iso,
+    }
+    if qos:
+        sender_extra["qos"] = dict(qos)
+
     sender_ep = {
         "listen": listen,
         "disabled": disabled,
         "balance": balance,
         "protocol": protocol,
         "remotes": remotes,
-        "extra_config": {
-            "intranet_role": "server",
-            "intranet_peer_node_id": receiver_id,
-            "intranet_peer_node_name": receiver.get("name"),
-            "intranet_public_host": sender_host,
-            "intranet_server_port": server_port,
-            "intranet_token": token,
-            "intranet_original_remotes": remotes,
-            "sync_id": sync_id,
-            "intranet_updated_at": now_iso,
-        },
+        "extra_config": sender_extra,
     }
+    if qos:
+        sender_ep["network"] = {"qos": dict(qos)}
 
     if remark:
         sender_ep["remark"] = remark
     if favorite:
         sender_ep["favorite"] = True
+
+    receiver_extra: Dict[str, Any] = {
+        "intranet_role": "client",
+        "intranet_lock": True,
+        "intranet_peer_node_id": sender_id,
+        "intranet_peer_node_name": sender.get("name"),
+        "intranet_peer_host": sender_host,
+        "intranet_server_port": server_port,
+        "intranet_token": token,
+        "intranet_server_cert_pem": server_cert_pem,
+        "intranet_tls_verify": bool(server_cert_pem),
+        "intranet_sender_listen": listen,
+        "intranet_original_remotes": remotes,
+        "sync_id": sync_id,
+        "intranet_updated_at": now_iso,
+    }
+    if qos:
+        receiver_extra["qos"] = dict(qos)
 
     receiver_ep = {
         "listen": format_addr("0.0.0.0", 0),
@@ -834,22 +1015,10 @@ async def api_intranet_tunnel_save(payload: Dict[str, Any], user: str = Depends(
         "balance": balance,
         "protocol": protocol,
         "remotes": remotes,
-        "extra_config": {
-            "intranet_role": "client",
-            "intranet_lock": True,
-            "intranet_peer_node_id": sender_id,
-            "intranet_peer_node_name": sender.get("name"),
-            "intranet_peer_host": sender_host,
-            "intranet_server_port": server_port,
-            "intranet_token": token,
-            "intranet_server_cert_pem": server_cert_pem,
-            "intranet_tls_verify": bool(server_cert_pem),
-            "intranet_sender_listen": listen,
-            "intranet_original_remotes": remotes,
-            "sync_id": sync_id,
-            "intranet_updated_at": now_iso,
-        },
+        "extra_config": receiver_extra,
     }
+    if qos:
+        receiver_ep["network"] = {"qos": dict(qos)}
 
     if remark:
         receiver_ep["remark"] = remark
@@ -890,25 +1059,10 @@ async def api_intranet_tunnel_save(payload: Dict[str, Any], user: str = Depends(
     s_ver, _ = set_desired_pool(sender_id, sender_pool)
     r_ver, _ = set_desired_pool(receiver_id, receiver_pool)
 
-    async def _apply(node: Dict[str, Any], pool: Dict[str, Any]):
-        try:
-            data = await agent_post(
-                node["base_url"],
-                node["api_key"],
-                "/api/v1/pool",
-                {"pool": pool},
-                node_verify_tls(node),
-            )
-            if isinstance(data, dict) and data.get("ok", True):
-                await agent_post(node["base_url"], node["api_key"], "/api/v1/apply", {}, node_verify_tls(node))
-        except Exception:
-            pass
-
-    await _apply(sender, sender_pool)
-    await _apply(receiver, receiver_pool)
-
+    apply_items: List[Tuple[Dict[str, Any], Dict[str, Any]]] = [(sender, sender_pool), (receiver, receiver_pool)]
     if old_receiver and isinstance(old_receiver_pool, dict):
-        await _apply(old_receiver, old_receiver_pool)
+        apply_items.append((old_receiver, old_receiver_pool))
+    await _apply_pools_best_effort(apply_items)
 
     return {
         "ok": True,
@@ -954,22 +1108,7 @@ async def api_intranet_tunnel_delete(payload: Dict[str, Any], user: str = Depend
     s_ver, _ = set_desired_pool(sender_id, sender_pool)
     r_ver, _ = set_desired_pool(receiver_id, receiver_pool)
 
-    async def _apply(node: Dict[str, Any], pool: Dict[str, Any]):
-        try:
-            data = await agent_post(
-                node["base_url"],
-                node["api_key"],
-                "/api/v1/pool",
-                {"pool": pool},
-                node_verify_tls(node),
-            )
-            if isinstance(data, dict) and data.get("ok", True):
-                await agent_post(node["base_url"], node["api_key"], "/api/v1/apply", {}, node_verify_tls(node))
-        except Exception:
-            pass
-
-    await _apply(sender, sender_pool)
-    await _apply(receiver, receiver_pool)
+    await _apply_pools_best_effort([(sender, sender_pool), (receiver, receiver_pool)])
 
     return {
         "ok": True,

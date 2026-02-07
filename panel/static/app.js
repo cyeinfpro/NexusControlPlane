@@ -13,6 +13,15 @@ async function fetchJSON(url, options={}){
   return data;
 }
 
+function formatRequestError(err, fallback){
+  const raw = (err && err.message) ? String(err.message) : String(err || '');
+  const msg = raw.trim() || String(fallback || '请求失败');
+  if(/load failed|failed to fetch|networkerror|network request failed/i.test(msg)){
+    return `${String(fallback || '请求失败')}：网络请求中断（可能节点离线、面板重启中或网关超时）`;
+  }
+  return msg;
+}
+
 
 async function loadNodesList(){
   try{
@@ -2292,13 +2301,93 @@ function readNonnegIntInput(id, label){
   return {set:true, value:n};
 }
 
-function fillCommonAdvancedFields(e){
+function collectQosFromEndpoint(e){
   const ep = e || {};
   const net = (ep.network && typeof ep.network === 'object' && !Array.isArray(ep.network)) ? ep.network : {};
   const ex = (ep.extra_config && typeof ep.extra_config === 'object' && !Array.isArray(ep.extra_config)) ? ep.extra_config : {};
   const exQos = (ex.qos && typeof ex.qos === 'object' && !Array.isArray(ex.qos)) ? ex.qos : {};
   const netQos = (net.qos && typeof net.qos === 'object' && !Array.isArray(net.qos)) ? net.qos : {};
-  const qos = Object.assign({}, netQos, exQos);
+
+  const pick = (keys)=>{
+    for(const src of [exQos, netQos, ex, net, ep]){
+      if(!(src && typeof src === 'object' && !Array.isArray(src))) continue;
+      for(const k of keys){
+        if(src[k] != null && String(src[k]).trim() !== '') return src[k];
+      }
+    }
+    return null;
+  };
+
+  const out = {};
+  const bwKbpsRaw = pick(['bandwidth_kbps', 'bandwidth_kbit', 'bandwidth_limit_kbps', 'qos_bandwidth_kbps']);
+  const bwMbpsRaw = pick(['bandwidth_mbps', 'bandwidth_mb', 'bandwidth_limit_mbps', 'qos_bandwidth_mbps']);
+  let bwKbps = parseInt(String(bwKbpsRaw != null ? bwKbpsRaw : ''), 10);
+  if(!(Number.isFinite(bwKbps) && bwKbps > 0)){
+    bwKbps = 0;
+  }
+  if(!(bwKbps > 0)){
+    const bwMbps = parseInt(String(bwMbpsRaw != null ? bwMbpsRaw : ''), 10);
+    if(Number.isFinite(bwMbps) && bwMbps > 0){
+      bwKbps = bwMbps * 1024;
+    }
+  }
+  if(bwKbps > 0){
+    out.bandwidth_kbps = bwKbps;
+  }
+
+  const maxConnsRaw = pick(['max_conns', 'max_connections', 'max_conn', 'qos_max_conns']);
+  const maxConns = parseInt(String(maxConnsRaw != null ? maxConnsRaw : ''), 10);
+  if(Number.isFinite(maxConns) && maxConns > 0){
+    out.max_conns = maxConns;
+  }
+
+  const connRateRaw = pick(['conn_rate', 'new_conn_per_sec', 'conn_per_sec', 'new_connections_per_sec', 'qos_conn_rate']);
+  const connRate = parseInt(String(connRateRaw != null ? connRateRaw : ''), 10);
+  if(Number.isFinite(connRate) && connRate > 0){
+    out.conn_rate = connRate;
+  }
+  return out;
+}
+
+function fillQosFields(e){
+  const qos = collectQosFromEndpoint(e);
+  const bwKbps = parseInt(String(qos.bandwidth_kbps || '0'), 10);
+  const bwMbps = Number.isFinite(bwKbps) && bwKbps > 0 ? Math.max(1, Math.round(bwKbps / 1024)) : '';
+  if(q('f_qos_bandwidth_mbps')) setField('f_qos_bandwidth_mbps', bwMbps);
+
+  const maxConns = parseInt(String(qos.max_conns || '0'), 10);
+  if(q('f_qos_max_conns')) setField('f_qos_max_conns', Number.isFinite(maxConns) && maxConns > 0 ? maxConns : '');
+
+  const connRate = parseInt(String(qos.conn_rate || '0'), 10);
+  if(q('f_qos_conn_rate')) setField('f_qos_conn_rate', Number.isFinite(connRate) && connRate > 0 ? connRate : '');
+}
+
+function readQosFields(){
+  const qos = {};
+  const q1 = readNonnegIntInput('f_qos_bandwidth_mbps', '带宽上限');
+  if(q1.error) return {ok:false, error:q1.error};
+  if(q1.set && q1.value > 0){
+    qos.bandwidth_kbps = q1.value * 1024;
+  }
+
+  const q2 = readNonnegIntInput('f_qos_max_conns', '最大并发连接');
+  if(q2.error) return {ok:false, error:q2.error};
+  if(q2.set && q2.value > 0){
+    qos.max_conns = q2.value;
+  }
+
+  const q3 = readNonnegIntInput('f_qos_conn_rate', '每秒新建连接上限');
+  if(q3.error) return {ok:false, error:q3.error};
+  if(q3.set && q3.value > 0){
+    qos.conn_rate = q3.value;
+  }
+  return {ok:true, qos};
+}
+
+function fillCommonAdvancedFields(e){
+  const ep = e || {};
+  const net = (ep.network && typeof ep.network === 'object' && !Array.isArray(ep.network)) ? ep.network : {};
+  const ex = (ep.extra_config && typeof ep.extra_config === 'object' && !Array.isArray(ep.extra_config)) ? ep.extra_config : {};
 
   if(q('f_through')) setField('f_through', ep.through || '');
   if(q('f_interface')) setField('f_interface', ep.interface || '');
@@ -2324,13 +2413,7 @@ function fillCommonAdvancedFields(e){
     else if(net.ipv6_only === false) q('f_net_ipv6_only').value = '0';
     else q('f_net_ipv6_only').value = '';
   }
-  const bwKbps = parseInt((qos.bandwidth_kbps != null ? qos.bandwidth_kbps : qos.bandwidth_kbit) || '0', 10);
-  const bwMbps = Number.isFinite(bwKbps) && bwKbps > 0 ? Math.max(1, Math.round(bwKbps / 1024)) : '';
-  if(q('f_qos_bandwidth_mbps')) setField('f_qos_bandwidth_mbps', bwMbps);
-  const maxConns = parseInt((qos.max_conns != null ? qos.max_conns : (qos.max_connections != null ? qos.max_connections : qos.max_conn)) || '0', 10);
-  if(q('f_qos_max_conns')) setField('f_qos_max_conns', Number.isFinite(maxConns) && maxConns > 0 ? maxConns : '');
-  const connRate = parseInt((qos.conn_rate != null ? qos.conn_rate : (qos.new_conn_per_sec != null ? qos.new_conn_per_sec : qos.conn_per_sec)) || '0', 10);
-  if(q('f_qos_conn_rate')) setField('f_qos_conn_rate', Number.isFinite(connRate) && connRate > 0 ? connRate : '');
+  fillQosFields(ep);
   if(q('f_adaptive_lb')){
     q('f_adaptive_lb').checked = !(ex && ex.adaptive_lb_enabled === false);
   }
@@ -2417,22 +2500,9 @@ function applyCommonAdvancedToEndpoint(endpoint){
   }
 
   // QoS
-  const qos = {};
-  const q1 = readNonnegIntInput('f_qos_bandwidth_mbps', '带宽上限');
-  if(q1.error) return {ok:false, error:q1.error};
-  if(q1.set && q1.value > 0){
-    qos.bandwidth_kbps = q1.value * 1024;
-  }
-  const q2 = readNonnegIntInput('f_qos_max_conns', '最大并发连接');
-  if(q2.error) return {ok:false, error:q2.error};
-  if(q2.set && q2.value > 0){
-    qos.max_conns = q2.value;
-  }
-  const q3 = readNonnegIntInput('f_qos_conn_rate', '每秒新建连接上限');
-  if(q3.error) return {ok:false, error:q3.error};
-  if(q3.set && q3.value > 0){
-    qos.conn_rate = q3.value;
-  }
+  const qosRead = readQosFields();
+  if(!qosRead.ok) return {ok:false, error:qosRead.error};
+  const qos = qosRead.qos;
 
   if(Object.keys(qos).length > 0){
     ex.qos = qos;
@@ -3118,11 +3188,13 @@ function copyRule(idx){
     fillWssFields(src);
     fillIntranetFields({});
     fillCommonAdvancedFields({});
+    fillQosFields(src);
   }else if(mode === 'intranet'){
     populateIntranetReceiverSelect();
     fillIntranetFields(src);
     fillWssFields({});
     fillCommonAdvancedFields({});
+    fillQosFields(src);
   }else{
     // normal
     fillWssFields({});
@@ -3168,9 +3240,6 @@ function copyRule(idx){
         if(q('f_net_tcp_keepalive') && String(q('f_net_tcp_keepalive').value || '').trim()) openAdv = true;
         if(q('f_net_tcp_keepalive_probe') && String(q('f_net_tcp_keepalive_probe').value || '').trim()) openAdv = true;
         if(q('f_net_ipv6_only') && String(q('f_net_ipv6_only').value || '').trim()) openAdv = true;
-        if(q('f_qos_bandwidth_mbps') && String(q('f_qos_bandwidth_mbps').value || '').trim()) openAdv = true;
-        if(q('f_qos_max_conns') && String(q('f_qos_max_conns').value || '').trim()) openAdv = true;
-        if(q('f_qos_conn_rate') && String(q('f_qos_conn_rate').value || '').trim()) openAdv = true;
         if(q('f_listen_transport') && String(q('f_listen_transport').value || '').trim()) openAdv = true;
         if(q('f_remote_transport') && String(q('f_remote_transport').value || '').trim()) openAdv = true;
       }
@@ -3278,7 +3347,10 @@ function editRule(idx){
 
   // common advanced fields (only meaningful for normal rules)
   if(mode === 'tcp') fillCommonAdvancedFields(e);
-  else fillCommonAdvancedFields({});
+  else{
+    fillCommonAdvancedFields({});
+    fillQosFields(e);
+  }
 
   showWssBox();
   // Close/open advanced panel based on non-default values
@@ -3319,10 +3391,6 @@ function editRule(idx){
         if(q('f_net_tcp_keepalive') && String(q('f_net_tcp_keepalive').value || '').trim()) openAdv = true;
         if(q('f_net_tcp_keepalive_probe') && String(q('f_net_tcp_keepalive_probe').value || '').trim()) openAdv = true;
         if(q('f_net_ipv6_only') && String(q('f_net_ipv6_only').value || '').trim()) openAdv = true;
-        if(q('f_qos_bandwidth_mbps') && String(q('f_qos_bandwidth_mbps').value || '').trim()) openAdv = true;
-        if(q('f_qos_max_conns') && String(q('f_qos_max_conns').value || '').trim()) openAdv = true;
-        if(q('f_qos_conn_rate') && String(q('f_qos_conn_rate').value || '').trim()) openAdv = true;
-
         if(q('f_listen_transport') && String(q('f_listen_transport').value || '').trim()) openAdv = true;
         if(q('f_remote_transport') && String(q('f_remote_transport').value || '').trim()) openAdv = true;
       }
@@ -3348,6 +3416,7 @@ async function toggleRule(idx){
   if(ex && ex.sync_id && ex.sync_role === 'sender' && ex.sync_peer_node_id){
     try{
       setLoading(true);
+      const qos = collectQosFromEndpoint(e);
       const payload = {
         sender_node_id: window.__NODE_ID__,
         receiver_node_id: ex.sync_peer_node_id,
@@ -3368,6 +3437,7 @@ async function toggleRule(idx){
           insecure: ex.remote_tls_insecure === true
         }
       };
+      if(Object.keys(qos).length > 0) payload.qos = qos;
       const res = await fetchJSON('/api/wss_tunnel/save', {method:'POST', body: JSON.stringify(payload)});
       if(res && res.ok){
         CURRENT_POOL = res.sender_pool;
@@ -3377,7 +3447,7 @@ async function toggleRule(idx){
         toast(res && res.error ? res.error : '同步更新失败，请稍后重试', true);
       }
     }catch(err){
-      toast(String(err), true);
+      toast(formatRequestError(err, 'WSS 隧道保存失败'), true);
     }finally{
       setLoading(false);
     }
@@ -3388,6 +3458,7 @@ async function toggleRule(idx){
   if(ex && ex.sync_id && ex.intranet_role === 'server' && ex.intranet_peer_node_id){
     try{
       setLoading(true);
+      const qos = collectQosFromEndpoint(e);
       const payload = {
         sender_node_id: window.__NODE_ID__,
         receiver_node_id: ex.intranet_peer_node_id,
@@ -3401,6 +3472,7 @@ async function toggleRule(idx){
         server_port: ex.intranet_server_port || 18443,
         sync_id: ex.sync_id
       };
+      if(Object.keys(qos).length > 0) payload.qos = qos;
       const res = await fetchJSON('/api/intranet_tunnel/save', {method:'POST', body: JSON.stringify(payload)});
       if(res && res.ok){
         CURRENT_POOL = res.sender_pool;
@@ -3410,7 +3482,7 @@ async function toggleRule(idx){
         toast(res && res.error ? res.error : '同步更新失败，请稍后重试', true);
       }
     }catch(err){
-      toast(String(err), true);
+      toast(formatRequestError(err, '内网穿透保存失败'), true);
     }finally{
       setLoading(false);
     }
@@ -3510,7 +3582,7 @@ async function deleteRule(idx){
         toast(res && res.error ? res.error : '同步删除失败，请稍后重试', true);
       }
     }catch(err){
-      toast(String(err), true);
+      toast(formatRequestError(err, 'WSS 隧道保存失败'), true);
     }finally{
       setLoading(false);
     }
@@ -3532,7 +3604,7 @@ async function deleteRule(idx){
         toast(res && res.error ? res.error : '同步删除失败，请稍后重试', true);
       }
     }catch(err){
-      toast(String(err), true);
+      toast(formatRequestError(err, '内网穿透保存失败'), true);
     }finally{
       setLoading(false);
     }
@@ -3599,6 +3671,7 @@ async function bulkSetDisabled(disabled){
       // WSS sender: update both sides
       if(ex && ex.sync_id && ex.sync_role === 'sender' && ex.sync_peer_node_id){
         try{
+          const qos = collectQosFromEndpoint(e);
           const payload = {
             sender_node_id: window.__NODE_ID__,
             receiver_node_id: ex.sync_peer_node_id,
@@ -3619,6 +3692,7 @@ async function bulkSetDisabled(disabled){
               insecure: ex.remote_tls_insecure === true
             }
           };
+          if(Object.keys(qos).length > 0) payload.qos = qos;
           const res = await fetchJSON('/api/wss_tunnel/save', {method:'POST', body: JSON.stringify(payload)});
           if(res && res.ok){
             CURRENT_POOL = res.sender_pool;
@@ -3635,6 +3709,7 @@ async function bulkSetDisabled(disabled){
       // Intranet server: update both sides
       if(ex && ex.sync_id && ex.intranet_role === 'server' && ex.intranet_peer_node_id){
         try{
+          const qos = collectQosFromEndpoint(e);
           const payload = {
             sender_node_id: window.__NODE_ID__,
             receiver_node_id: ex.intranet_peer_node_id,
@@ -3648,6 +3723,7 @@ async function bulkSetDisabled(disabled){
             server_port: ex.intranet_server_port || 18443,
             sync_id: ex.sync_id
           };
+          if(Object.keys(qos).length > 0) payload.qos = qos;
           const res = await fetchJSON('/api/intranet_tunnel/save', {method:'POST', body: JSON.stringify(payload)});
           if(res && res.ok){
             CURRENT_POOL = res.sender_pool;
@@ -3954,6 +4030,11 @@ async function saveRule(){
     const receiverPortTxt = q('f_wss_receiver_port') ? q('f_wss_receiver_port').value.trim() : '';
     const autoFilled = autoFillWssIfBlank();
     const wss = readWssFields();
+    const qosRead = readQosFields();
+    if(!qosRead.ok){
+      toast(qosRead.error || 'QoS 参数无效', true);
+      return;
+    }
     if(!wss.host || !wss.path){
       toast('WSS Host / Path 不能为空', true);
       return;
@@ -3977,6 +4058,7 @@ async function saveRule(){
       protocol,
       remark,
       favorite,
+      qos: qosRead.qos,
       receiver_port: receiverPortTxt ? parseInt(receiverPortTxt,10) : null,
       sync_id: syncId || undefined,
       wss
@@ -3994,7 +4076,7 @@ async function saveRule(){
         toast((res && res.error) ? res.error : '保存失败，请检查节点是否在线', true);
       }
     }catch(err){
-      toast(String(err), true);
+      toast(formatRequestError(err, 'WSS 隧道保存失败'), true);
     }finally{
       setLoading(false);
     }
@@ -4011,6 +4093,11 @@ async function saveRule(){
     const portTxt = q('f_intranet_server_port') ? q('f_intranet_server_port').value.trim() : '';
     const server_port = portTxt ? parseInt(portTxt,10) : 18443;
     const server_host = q('f_intranet_server_host') ? q('f_intranet_server_host').value.trim() : '';
+    const qosRead = readQosFields();
+    if(!qosRead.ok){
+      toast(qosRead.error || 'QoS 参数无效', true);
+      return;
+    }
     let syncId = '';
     if(CURRENT_EDIT_INDEX >= 0){
       const old = CURRENT_POOL.endpoints[CURRENT_EDIT_INDEX];
@@ -4027,6 +4114,7 @@ async function saveRule(){
       protocol,
       remark,
       favorite,
+      qos: qosRead.qos,
       server_port,
       server_host: server_host || null,
       sync_id: syncId || undefined
@@ -4044,7 +4132,7 @@ async function saveRule(){
         toast((res && res.error) ? res.error : '保存失败，请检查节点是否在线', true);
       }
     }catch(err){
-      toast(String(err), true);
+      toast(formatRequestError(err, '内网穿透保存失败'), true);
     }finally{
       setLoading(false);
     }

@@ -513,6 +513,27 @@
 	            </label>
 	          </div>
 	        </div>
+
+          <div id="qosBox" style="margin-top:14px;">
+            <div class="adv-subtitle">QoS（端口防护，可选）</div>
+            <div class="adv-grid" style="margin-top:6px;">
+              <div class="col" style="max-width:240px;">
+                <label class="label">带宽上限（Mbps）</label>
+                <input class="input" id="f_qos_bandwidth_mbps" type="number" step="1" placeholder="例如 100">
+                <div class="help">限制该监听端口总带宽；留空=不限制。</div>
+              </div>
+              <div class="col" style="max-width:240px;">
+                <label class="label">最大并发连接</label>
+                <input class="input" id="f_qos_max_conns" type="number" step="1" placeholder="例如 2000">
+                <div class="help">超过阈值的新 TCP 连接会被拒绝。</div>
+              </div>
+              <div class="col" style="max-width:260px;">
+                <label class="label">每秒新建连接上限</label>
+                <input class="input" id="f_qos_conn_rate" type="number" step="1" placeholder="例如 300">
+                <div class="help">限制新建连接速率（每秒）。</div>
+              </div>
+            </div>
+          </div>
 	      </div>
 
 	      <details class="advanced-details" id="advancedDetails">
@@ -611,25 +632,6 @@
                           <option value="0">关闭</option>
                         </select>
                         <div class="help">禁用 ipv4-mapped-ipv6（仅在监听 IPv6 时生效）。</div>
-                      </div>
-                    </div>
-
-                    <div class="adv-subtitle">QoS（端口防护，可选）</div>
-                    <div class="adv-grid" style="margin-top:6px;">
-                      <div class="col" style="max-width:240px;">
-                        <label class="label">带宽上限（Mbps）</label>
-                        <input class="input" id="f_qos_bandwidth_mbps" type="number" step="1" placeholder="例如 100">
-                        <div class="help">限制该监听端口总带宽；留空=不限制。</div>
-                      </div>
-                      <div class="col" style="max-width:240px;">
-                        <label class="label">最大并发连接</label>
-                        <input class="input" id="f_qos_max_conns" type="number" step="1" placeholder="例如 2000">
-                        <div class="help">超过阈值的新 TCP 连接会被拒绝。</div>
-                      </div>
-                      <div class="col" style="max-width:260px;">
-                        <label class="label">每秒新建连接上限</label>
-                        <input class="input" id="f_qos_conn_rate" type="number" step="1" placeholder="例如 300">
-                        <div class="help">限制新建连接速率（每秒）。</div>
                       </div>
                     </div>
 
