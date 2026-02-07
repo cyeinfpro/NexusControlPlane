@@ -146,6 +146,21 @@ def _collect_remotes(ep: Dict[str, Any]) -> List[str]:
     return dedup
 
 
+def _adaptive_enabled_for_endpoint(ep: Dict[str, Any]) -> bool:
+    ex = ep.get("extra_config") if isinstance(ep.get("extra_config"), dict) else {}
+    if not isinstance(ex, dict):
+        return True
+    raw = ex.get("adaptive_lb_enabled")
+    if raw is False:
+        return False
+    if raw is True or raw is None:
+        return True
+    s = str(raw or "").strip().lower()
+    if not s:
+        return True
+    return s not in ("0", "false", "off", "no")
+
+
 def _weights_to_pct(weights: List[int]) -> List[float]:
     ws = [max(1, int(x)) for x in weights]
     total = float(sum(ws) or 1.0)
@@ -425,6 +440,10 @@ def suggest_adaptive_pool_patch(
         ex = ep.get("extra_config") if isinstance(ep.get("extra_config"), dict) else {}
         if isinstance(ex, dict) and (ex.get("intranet_role") or ex.get("intranet_token")):
             continue
+        if isinstance(ex, dict) and (ex.get("sync_id") or ex.get("sync_role") or ex.get("sync_lock")):
+            continue
+        if not _adaptive_enabled_for_endpoint(ep):
+            continue
 
         remotes = _collect_remotes(ep)
         if len(remotes) < 2:
@@ -528,4 +547,3 @@ def suggest_adaptive_pool_patch(
     out = dict(best)
     out["pool"] = new_pool
     return out
-

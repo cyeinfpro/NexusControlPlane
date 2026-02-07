@@ -379,6 +379,162 @@ function getAllSearchTargets(e){
   return out;
 }
 
+function isAdaptiveLbEnabled(e){
+  const ex = (e && e.extra_config) ? e.extra_config : {};
+  const raw = ex ? ex.adaptive_lb_enabled : undefined;
+  if(raw === false) return false;
+  if(raw === true || raw == null) return true;
+  const s = String(raw || '').trim().toLowerCase();
+  if(!s) return true;
+  return !['0','false','off','no'].includes(s);
+}
+
+function setAdaptiveLbEnabled(endpoint, enabled){
+  const ep = endpoint || {};
+  const on = !!enabled;
+  let ex = (ep.extra_config && typeof ep.extra_config === 'object' && !Array.isArray(ep.extra_config))
+    ? {...ep.extra_config}
+    : {};
+  if(on){
+    try{ delete ex.adaptive_lb_enabled; }catch(_e){}
+  }else{
+    ex.adaptive_lb_enabled = false;
+  }
+  try{
+    if(Object.keys(ex).length > 0) ep.extra_config = ex;
+    else delete ep.extra_config;
+  }catch(_e){}
+}
+
+function collectRuleRemotes(e){
+  const out = [];
+  const push = (x)=>{
+    const s = String(x || '').trim();
+    if(s) out.push(s);
+  };
+  if(e && typeof e.remote === 'string') push(e.remote);
+  if(e && Array.isArray(e.remotes)) e.remotes.forEach(push);
+  if(e && Array.isArray(e.extra_remotes)) e.extra_remotes.forEach(push);
+
+  const dedup = [];
+  const seen = new Set();
+  for(const r of out){
+    if(seen.has(r)) continue;
+    seen.add(r);
+    dedup.push(r);
+  }
+  return dedup;
+}
+
+function parseRuleBalance(balance, remoteCount){
+  const n = Math.max(0, parseInt(remoteCount || 0, 10));
+  let raw = String(balance || 'roundrobin').trim();
+  if(!raw) raw = 'roundrobin';
+  let algo = raw;
+  let right = '';
+  if(raw.includes(':')){
+    const arr = raw.split(':');
+    algo = String(arr.shift() || '');
+    right = arr.join(':');
+  }
+  let norm = algo.toLowerCase();
+  norm = norm.replace(/[_\-\s]/g, '');
+  if(norm === 'iphash'){
+    return {algo:'iphash', weights:[]};
+  }
+
+  let weights = [];
+  if(right){
+    weights = right
+      .replace(/，/g, ',')
+      .split(',')
+      .map(x=>String(x || '').trim())
+      .filter(Boolean)
+      .map(x=>parseInt(x, 10))
+      .filter(x=>Number.isFinite(x) && x > 0);
+  }
+  if(n > 0 && weights.length !== n){
+    weights = Array(n).fill(1);
+  }
+  return {algo:'roundrobin', weights};
+}
+
+function findHealthByTarget(healthList, target){
+  const t = String(target || '').trim();
+  if(!t) return null;
+  const list = Array.isArray(healthList) ? healthList : [];
+  for(const it of list){
+    if(!it || typeof it !== 'object') continue;
+    const x = String(it.target || '').trim();
+    if(!x) continue;
+    if(x === t) return it;
+    if(x.startsWith('WSS ') && x.slice(4).trim() === t) return it;
+  }
+  return null;
+}
+
+function fmtPct(v){
+  const n = Number(v);
+  if(!Number.isFinite(n)) return '';
+  return (n >= 10 ? n.toFixed(0) : n.toFixed(1)) + '%';
+}
+
+function renderAdaptiveInfo(e, stats, statsError){
+  if(wssMode(e) !== 'tcp') return '';
+  const remotes = collectRuleRemotes(e);
+  if(remotes.length < 2) return '';
+  const enabled = isAdaptiveLbEnabled(e);
+  const b = parseRuleBalance(e && e.balance, remotes.length);
+  const weightsText = (b.algo === 'roundrobin')
+    ? ((Array.isArray(b.weights) && b.weights.length) ? b.weights.join(',') : Array(remotes.length).fill(1).join(','))
+    : 'IP Hash（无权重）';
+  const weightLabel = enabled ? '当前自动权重' : '当前权重';
+
+  let reasonText = '无';
+  if(!enabled){
+    reasonText = '已禁用自动调权';
+  }else if(statsError){
+    reasonText = '探测数据获取失败';
+  }else{
+    const health = (stats && Array.isArray(stats.health)) ? stats.health : [];
+    const reasonLines = [];
+    for(const r of remotes){
+      const it = findHealthByTarget(health, r);
+      if(!it) continue;
+      const reasons = [];
+      if(it.down === true) reasons.push('已触发降级');
+      const cf = Number(it.consecutive_failures);
+      if(Number.isFinite(cf) && cf > 0) reasons.push(`连续失败 ${Math.max(0, Math.round(cf))} 次`);
+      if(it.availability != null){
+        const pct = fmtPct(it.availability);
+        if(pct) reasons.push(`可用率 ${pct}`);
+      }
+      if(it.error_rate != null){
+        const pct = fmtPct(it.error_rate);
+        if(pct) reasons.push(`错误率 ${pct}`);
+      }
+      if((it.ok === false) && it.error){
+        reasons.push(String(it.error).trim());
+      }
+      if(reasons.length > 0){
+        reasonLines.push(`${r}：${reasons.join('，')}`);
+      }
+    }
+    if(reasonLines.length > 0){
+      reasonText = reasonLines.slice(0, 2).join('；');
+      if(reasonLines.length > 2){
+        reasonText += `；等 ${reasonLines.length} 个`;
+      }
+    }
+  }
+
+  return `<div class="adaptive-info">
+    <span class="pill xs ${enabled ? 'ok' : 'warn'}">自适应：${enabled ? '开' : '关'}</span>
+    <span class="pill xs ghost">${escapeHtml(weightLabel)}：${escapeHtml(weightsText)}</span>
+    <span class="adaptive-reason muted sm">降权原因：${escapeHtml(reasonText)}</span>
+  </div>`;
+}
+
 function isLoadBalanceRule(e){
   const targets = getFinalTargets(e);
   return Array.isArray(targets) && targets.length > 1;
@@ -1495,6 +1651,7 @@ function renderRuleCard(e, idx, rowNo, stats, statsError){
   const totalStr = total == null ? '—' : formatBytes(total);
   const trafficTitle = (statsError || total == null) ? '' : `title="↓ ${escapeHtml(formatBytes(rx))}  ↑ ${escapeHtml(formatBytes(tx))}"`;
   const healthHtml = renderHealthMobile(stats.health, statsError, idx);
+  const adaptiveHtml = renderAdaptiveInfo(e, stats, statsError);
   const activeTitle = statsError ? '' : `title="当前已建立连接：${est}"`;
   const lockInfo = getRuleLockInfo(e);
   const key = getRuleKey(e);
@@ -1545,6 +1702,7 @@ function renderRuleCard(e, idx, rowNo, stats, statsError){
     </div>
     <div class="rule-health-block">
       ${healthHtml}
+      ${adaptiveHtml}
     </div>
     ${actionsHtml}
   </div>`;
@@ -1634,6 +1792,7 @@ function renderRules(){
       mobileWrap.appendChild(card.firstElementChild);
     }else{
       const healthHtml = renderHealthExpanded(stats.health, statsLookup.error);
+      const adaptiveHtml = renderAdaptiveInfo(e, stats, statsError);
       const rx = statsError ? null : (stats.rx_bytes || 0);
       const tx = statsError ? null : (stats.tx_bytes || 0);
       const total = (rx == null || tx == null) ? null : rx + tx;
@@ -1660,7 +1819,7 @@ function renderRules(){
           <div class="muted sm">${endpointType(e)}</div>
           ${remark ? `<div class="rule-remark" title="${escapeHtml(remark)}">${escapeHtml(remark)}</div>` : ''}
         </td>
-        <td class="health">${healthHtml}</td>
+        <td class="health">${healthHtml}${adaptiveHtml}</td>
         <td class="stat" title="当前已建立连接：${escapeHtml(est)}">${statsError ? '—' : escapeHtml(connActive)}</td>
         <td class="stat" ${statsError || total == null ? '' : `title="↓ ${escapeHtml(formatBytes(rx))}  ↑ ${escapeHtml(formatBytes(tx))}"`}>${total == null ? '—' : formatBytes(total)}</td>
         <td class="actions">
@@ -2035,6 +2194,7 @@ function readNonnegIntInput(id, label){
 function fillCommonAdvancedFields(e){
   const ep = e || {};
   const net = (ep.network && typeof ep.network === 'object' && !Array.isArray(ep.network)) ? ep.network : {};
+  const ex = (ep.extra_config && typeof ep.extra_config === 'object' && !Array.isArray(ep.extra_config)) ? ep.extra_config : {};
 
   if(q('f_through')) setField('f_through', ep.through || '');
   if(q('f_interface')) setField('f_interface', ep.interface || '');
@@ -2059,6 +2219,9 @@ function fillCommonAdvancedFields(e){
     if(net.ipv6_only === true) q('f_net_ipv6_only').value = '1';
     else if(net.ipv6_only === false) q('f_net_ipv6_only').value = '0';
     else q('f_net_ipv6_only').value = '';
+  }
+  if(q('f_adaptive_lb')){
+    q('f_adaptive_lb').checked = !(ex && ex.adaptive_lb_enabled === false);
   }
 }
 
@@ -2152,6 +2315,10 @@ function applyCommonAdvancedToEndpoint(endpoint){
   }catch(_e){
     // keep as-is
   }
+
+  // adaptive load-balance switch (per-rule)
+  const autoLb = q('f_adaptive_lb') ? !!q('f_adaptive_lb').checked : true;
+  setAdaptiveLbEnabled(ep, autoLb);
 
   return {ok:true};
 }
@@ -2826,6 +2993,7 @@ function copyRule(idx){
       if(q('f_protocol') && String(q('f_protocol').value || '') !== 'tcp+udp') openAdv = true;
       if(q('f_balance') && String(q('f_balance').value || '') !== 'roundrobin') openAdv = true;
       if(q('f_weights') && String(q('f_weights').value || '').trim()) openAdv = true;
+      if(q('f_adaptive_lb') && q('f_adaptive_lb').checked === false) openAdv = true;
 
       const m = q('f_type') ? String(q('f_type').value || 'tcp') : 'tcp';
       if(m === 'intranet'){
@@ -2937,6 +3105,7 @@ function editRule(idx){
       if(q('f_protocol') && String(q('f_protocol').value || '') !== 'tcp+udp') openAdv = true;
       if(q('f_balance') && String(q('f_balance').value || '') !== 'roundrobin') openAdv = true;
       if(q('f_weights') && String(q('f_weights').value || '').trim()) openAdv = true;
+      if(q('f_adaptive_lb') && q('f_adaptive_lb').checked === false) openAdv = true;
 
       const mode = q('f_type') ? String(q('f_type').value || 'tcp') : 'tcp';
       if(mode === 'intranet'){

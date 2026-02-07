@@ -1919,6 +1919,8 @@ details.menu summary::-webkit-details-marker{display:none}
 .health-item{display:inline-flex;gap:6px;align-items:center;max-width:520px}
 .health-target{max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .health-reason{font-size:11px;color:var(--muted)}
+.adaptive-info{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-top:8px}
+.adaptive-reason{flex-basis:100%;line-height:1.4}
 
 /* Inline expand area (+N -> multi-line) */
 .health-extra{flex-basis:100%;display:flex;flex-direction:column;gap:8px;margin-top:6px;padding-left:2px}

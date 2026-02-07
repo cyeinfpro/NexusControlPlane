@@ -484,16 +484,27 @@
 
 	        <div class="help compact" id="baseHelp"></div>
 
-	        <label class="label" id="remoteLabel">
-	          <span id="remoteLabelMain">目标地址</span> <span class="muted sm" id="remoteLabelExtra">（Remote，每行一个 host:port）</span>
-	        </label>
-	        <textarea class="textarea" id="f_remotes" rows="4" placeholder="203.0.113.10:443\n198.51.100.8:443"></textarea>
-	        <div class="help" id="remoteHelp"></div>
+		        <label class="label" id="remoteLabel">
+		          <span id="remoteLabelMain">目标地址</span> <span class="muted sm" id="remoteLabelExtra">（Remote，每行一个 host:port）</span>
+		        </label>
+		        <textarea class="textarea" id="f_remotes" rows="4" placeholder="203.0.113.10:443\n198.51.100.8:443"></textarea>
+		        <div class="help" id="remoteHelp"></div>
 
-	        <div class="row" style="gap:12px; align-items:flex-end;">
-	          <div class="col">
-	            <label class="label">备注 <span class="muted sm">（可选，用于搜索/筛选）</span></label>
-	            <input class="input" id="f_remark" placeholder="例如：客户A / 临时测试 / 走CF">
+		        <div class="row" style="gap:12px; align-items:flex-end;">
+		          <div class="col" style="max-width:360px;">
+		            <label class="label">自适应负载均衡</label>
+		            <label class="help" style="margin:0;">
+		              <input type="checkbox" id="f_adaptive_lb" checked style="transform:translateY(1px);">
+		              启用（按延迟/错误率/可用性自动调权）
+		            </label>
+		            <div class="help">仅多目标转发生效；关闭后保持手动策略/权重。</div>
+		          </div>
+		        </div>
+
+		        <div class="row" style="gap:12px; align-items:flex-end;">
+		          <div class="col">
+		            <label class="label">备注 <span class="muted sm">（可选，用于搜索/筛选）</span></label>
+		            <input class="input" id="f_remark" placeholder="例如：客户A / 临时测试 / 走CF">
 	          </div>
 	          <div class="col" style="max-width:220px;">
 	            <label class="help" style="margin:0;">
@@ -546,7 +557,8 @@
                       <input class="input" id="f_weights" placeholder="1,1,2">
                       <div class="help">仅轮询生效；IP Hash 会忽略权重。权重数量必须与 Remote 行数一致。</div>
                     </div>
-                  </div>
+
+	                  </div>
 
                   <!-- Common advanced params (normal rules only) -->
                   <div id="commonAdvancedBox" style="display:none;">
