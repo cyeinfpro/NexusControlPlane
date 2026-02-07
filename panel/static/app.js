@@ -479,6 +479,28 @@ function fmtPct(v){
   return (n >= 10 ? n.toFixed(0) : n.toFixed(1)) + '%';
 }
 
+function formatHealthAvailability(item){
+  const raw = Number(item && item.availability);
+  if(!Number.isFinite(raw)) return '';
+  const pctRaw = (raw >= 0 && raw <= 1) ? (raw * 100) : raw;
+  const pct = Math.max(0, Math.min(100, pctRaw));
+  const txt = fmtPct(pct);
+  return txt ? `可用率 ${txt}` : '';
+}
+
+function renderHealthTargetMeta(item, mobile){
+  const t = (item && item.target != null) ? String(item.target) : '';
+  const avail = formatHealthAvailability(item);
+  if(mobile){
+    return `<div class="health-target-line">
+      <div class="mono health-target" title="${escapeHtml(t)}">${escapeHtml(t)}</div>
+      ${avail ? `<span class="health-avail">${escapeHtml(avail)}</span>` : ''}
+    </div>`;
+  }
+  return `<span class="mono health-target" title="${escapeHtml(t)}">${escapeHtml(t)}</span>
+    ${avail ? `<span class="health-avail">${escapeHtml(avail)}</span>` : ''}`;
+}
+
 function renderAdaptiveInfo(e, stats, statsError){
   if(wssMode(e) !== 'tcp') return '';
   const remotes = collectRuleRemotes(e);
@@ -497,34 +519,45 @@ function renderAdaptiveInfo(e, stats, statsError){
     reasonText = '探测数据获取失败';
   }else{
     const health = (stats && Array.isArray(stats.health)) ? stats.health : [];
-    const reasonLines = [];
+    const groups = new Map();
+    const addGroup = (kind, label)=>{
+      const k = `${String(kind || '').trim()}|${String(label || '').trim()}`;
+      if(!k || k === '|') return;
+      const old = groups.get(k);
+      if(old) old.count += 1;
+      else groups.set(k, {kind, label, count:1});
+    };
     for(const r of remotes){
       const it = findHealthByTarget(health, r);
       if(!it) continue;
-      const reasons = [];
-      if(it.down === true) reasons.push('已触发降级');
+      if(it.down === true) addGroup('down', '已触发降级');
       const cf = Number(it.consecutive_failures);
-      if(Number.isFinite(cf) && cf > 0) reasons.push(`连续失败 ${Math.max(0, Math.round(cf))} 次`);
+      if(Number.isFinite(cf) && cf > 0) addGroup('cf', `连续失败 ${Math.max(0, Math.round(cf))} 次`);
       if(it.availability != null){
         const pct = fmtPct(it.availability);
-        if(pct) reasons.push(`可用率 ${pct}`);
+        if(pct) addGroup('avail', `可用率 ${pct}`);
       }
       if(it.error_rate != null){
         const pct = fmtPct(it.error_rate);
-        if(pct) reasons.push(`错误率 ${pct}`);
+        if(pct) addGroup('erate', `错误率 ${pct}`);
       }
       if((it.ok === false) && it.error){
-        reasons.push(String(it.error).trim());
-      }
-      if(reasons.length > 0){
-        reasonLines.push(`${r}：${reasons.join('，')}`);
+        const msg = String(it.error).trim();
+        if(msg) addGroup('err', msg);
       }
     }
-    if(reasonLines.length > 0){
-      reasonText = reasonLines.slice(0, 2).join('；');
-      if(reasonLines.length > 2){
-        reasonText += `；等 ${reasonLines.length} 个`;
-      }
+    if(groups.size > 0){
+      const order = {down:0, cf:1, err:2, avail:3, erate:4};
+      const rows = Array.from(groups.values()).sort((a, b)=>{
+        const oa = Object.prototype.hasOwnProperty.call(order, a.kind) ? order[a.kind] : 99;
+        const ob = Object.prototype.hasOwnProperty.call(order, b.kind) ? order[b.kind] : 99;
+        if(oa !== ob) return oa - ob;
+        if(a.count !== b.count) return b.count - a.count;
+        return String(a.label).localeCompare(String(b.label), 'zh');
+      });
+      const parts = rows.slice(0, 3).map((x)=>`${x.label}（${x.count}个）`);
+      if(rows.length > 3) parts.push(`等${rows.length}类`);
+      reasonText = parts.join('；');
     }
   }
 
@@ -846,7 +879,7 @@ function renderHealthExpanded(healthList, statsError){
     const title = !isUnknown && !ok ? `${(item && item.kind === 'handshake') ? '未连接' : '离线'}原因：${String(item.error || item.message || '').trim()}` : '';
     return `<div class="health-item" title="${escapeHtml(title)}">
       <span class="pill ${isUnknown ? 'warn' : (ok ? 'ok' : 'bad')}">${escapeHtml(label)}</span>
-      <span class="mono health-target">${escapeHtml(item.target)}</span>
+      ${renderHealthTargetMeta(item, false)}
       ${reason ? `<span class="health-reason">(${escapeHtml(reason)})</span>` : ''}
     </div>`;
   }).join('');
@@ -1514,7 +1547,7 @@ function renderHealth(healthList, statsError, idx){
     const title = !isUnknown && !ok ? `${(item && item.kind === 'handshake') ? '未连接' : '离线'}原因：${String(item.error || item.message || '').trim()}` : '';
     return `<div class="health-item" title="${escapeHtml(title)}">
       <span class="pill ${isUnknown ? 'warn' : (ok ? 'ok' : 'bad')}">${escapeHtml(label)}</span>
-      <span class="mono health-target">${escapeHtml(item.target)}</span>
+      ${renderHealthTargetMeta(item, false)}
       ${reason ? `<span class="health-reason">(${escapeHtml(reason)})</span>` : ''}
     </div>`;
   }).join('');
@@ -1530,7 +1563,7 @@ function renderHealth(healthList, statsError, idx){
       const title = !isUnknown && !ok ? `${(item && item.kind === 'handshake') ? '未连接' : '离线'}原因：${String(item.error || item.message || '').trim()}` : '';
       return `<div class="health-item" title="${escapeHtml(title)}">
         <span class="pill ${isUnknown ? 'warn' : (ok ? 'ok' : 'bad')}">${escapeHtml(label)}</span>
-        <span class="mono health-target">${escapeHtml(item.target)}</span>
+        ${renderHealthTargetMeta(item, false)}
         ${reason ? `<span class="health-reason">(${escapeHtml(reason)})</span>` : ''}
       </div>`;
     }).join('')}
@@ -1591,7 +1624,7 @@ function renderHealthMobile(healthList, statsError, idx){
     return `<div class="health-item mobile" title="${escapeHtml(title)}">
       <span class="pill ${isUnknown ? 'warn' : (ok ? 'ok' : 'bad')}">${escapeHtml(label)}</span>
       <div class="health-meta">
-        <div class="mono health-target" title="${escapeHtml(item.target)}">${escapeHtml(item.target)}</div>
+        ${renderHealthTargetMeta(item, true)}
         ${reason ? `<div class="health-reason">${escapeHtml(reason)}</div>` : ''}
       </div>
     </div>`;
@@ -1610,7 +1643,7 @@ function renderHealthMobile(healthList, statsError, idx){
       return `<div class="health-item mobile" title="${escapeHtml(title)}">
         <span class="pill ${isUnknown ? 'warn' : (ok ? 'ok' : 'bad')}">${escapeHtml(label)}</span>
         <div class="health-meta">
-          <div class="mono health-target" title="${escapeHtml(item.target)}">${escapeHtml(item.target)}</div>
+          ${renderHealthTargetMeta(item, true)}
           ${reason ? `<div class="health-reason">${escapeHtml(reason)}</div>` : ''}
         </div>
       </div>`;
@@ -1631,10 +1664,11 @@ function showHealthDetail(idx){
       const ok = it && it.ok === true;
       const isUnknown = it && it.ok == null;
       const latency = it && it.latency_ms != null ? `${it.latency_ms} ms` : (it && it.latency != null ? `${it.latency} ms` : '—');
+      const avail = formatHealthAvailability(it);
       const isHandshake = it && it.kind === 'handshake';
       const state = isUnknown ? '不可检测' : (ok ? (isHandshake ? '已连接' : '在线') : (isHandshake ? '未连接' : '离线'));
       const reason = (!isUnknown && !ok) ? (it.error || it.message || '') : '';
-      return `${state}  ${latency}  ${it.target}${reason ? `\n  原因：${reason}` : ''}`;
+      return `${state}  ${latency}  ${it.target}${avail ? `  ${avail}` : ''}${reason ? `\n  原因：${reason}` : ''}`;
     });
     openCommandModal('连通检测详情', lines.join('\n\n'));
   }catch(e){
