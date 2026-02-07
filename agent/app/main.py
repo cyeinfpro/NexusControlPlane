@@ -1843,7 +1843,7 @@ def _wss_probe_entries(rule: Dict[str, Any]) -> List[Dict[str, str]]:
             lp = 0
         if lp > 0:
             # 为 WSS 接收规则补充本机监听探测，便于确认 listen 端口是否真的在跑。
-            entries.append({'key': f"127.0.0.1:{lp}", 'label': f"本机监听 127.0.0.1:{lp}"})
+            entries.append({'key': f"127.0.0.1:{lp}", 'label': f"本机监听 127.0.0.1:{lp}", 'probe': 'tcp'})
 
     return entries
 
@@ -3286,10 +3286,10 @@ def _build_stats_snapshot() -> Dict[str, Any]:
             per_rule_entries.append(entries)
             continue
 
-        protocol = str(e.get('protocol') or 'tcp+udp').lower()
-        if 'tcp' in protocol:
+        pset = _netprobe_proto_set(e.get('protocol'))
+        if 'tcp' in pset:
             default_probe = 'tcp'
-        elif 'udp' in protocol:
+        elif 'udp' in pset:
             default_probe = 'udp'
         else:
             default_probe = 'none'
@@ -3511,8 +3511,15 @@ def _build_stats_snapshot() -> Dict[str, Any]:
                 continue
 
             if probe_mode not in ('tcp', 'udp'):
-                health.append({'target': label, 'ok': None, 'message': '协议不支持探测'})
-                continue
+                # 兼容旧数据：当 entry 缺少 probe 时，按规则协议推断一次。
+                pset = _netprobe_proto_set(e.get('protocol'))
+                if 'tcp' in pset:
+                    probe_mode = 'tcp'
+                elif 'udp' in pset:
+                    probe_mode = 'udp'
+                else:
+                    health.append({'target': label, 'ok': None, 'message': '协议不支持探测'})
+                    continue
 
             rid = f"{probe_mode}|{key}"
             res = probe_results.get(rid)
