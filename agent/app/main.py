@@ -1396,6 +1396,14 @@ def _probe_cache_key(host: str, port: int) -> str:
     return f"{host}:{port}"
 
 
+def _udp_probe_cache_key(host: str, port: int) -> str:
+    return f"udp://{host}:{port}"
+
+
+def _udp_probe_hist_key(host: str, port: int) -> str:
+    return f"udp://{host}:{port}"
+
+
 def _cache_get(key: str) -> Optional[Dict[str, Any]]:
     now = time.monotonic()
     with _PROBE_LOCK:
@@ -1408,7 +1416,7 @@ def _cache_get(key: str) -> Optional[Dict[str, Any]]:
         return dict(item)
 
 
-def _cache_set(key: str, ok: bool, latency_ms: Optional[float], error: Optional[str] = None) -> None:
+def _cache_set(key: str, ok: Optional[bool], latency_ms: Optional[float], error: Optional[str] = None) -> None:
     """Set probe cache entry and opportunistically prune expired entries."""
     global _PROBE_PRUNE_TS
     now = time.monotonic()
@@ -1426,7 +1434,7 @@ def _cache_set(key: str, ok: bool, latency_ms: Optional[float], error: Optional[
 
         _PROBE_CACHE[key] = {
             'ts': now,
-            'ok': bool(ok),
+            'ok': (None if ok is None else bool(ok)),
             'latency_ms': latency_ms,
             'error': error,
         }
@@ -1652,6 +1660,104 @@ def _tcp_probe(host: str, port: int, timeout: float = PROBE_TIMEOUT) -> tuple[bo
     return bool(d.get('ok')), d.get('latency_ms')
 
 
+def _udp_probe_uncached(host: str, port: int, timeout: float = PROBE_TIMEOUT) -> tuple[Optional[bool], Optional[float], Optional[str]]:
+    """Lightweight UDP probe.
+
+    Returns:
+      - (True, latency, None): received a UDP response
+      - (False, None, err): explicit unreachable/refused or hard failure
+      - (None, None, msg): sent but got no response (inconclusive for generic UDP)
+    """
+    try:
+        infos = socket.getaddrinfo(host, port, 0, socket.SOCK_DGRAM)
+    except Exception as exc:
+        return False, None, str(exc)
+    if not infos:
+        return False, None, 'dns_no_result'
+
+    payload = b'REALM-PROBE'
+    last_err: Optional[str] = None
+    for af, sock_type, proto, _canon, sa in infos[:4]:
+        s: Optional[socket.socket] = None
+        try:
+            s = socket.socket(af, sock_type, proto)
+            s.settimeout(max(0.1, float(timeout)))
+            start = time.monotonic()
+            s.connect(sa)
+            s.send(payload)
+            try:
+                _ = s.recv(1)
+                latency_ms = (time.monotonic() - start) * 1000.0
+                return True, round(latency_ms, 2), None
+            except socket.timeout:
+                return None, None, 'udp_no_reply'
+            except ConnectionRefusedError as exc:
+                last_err = str(exc) or 'connection_refused'
+                continue
+            except OSError as exc:
+                msg = str(exc)
+                low = msg.lower()
+                if ('refused' in low) or ('unreachable' in low) or ('no route' in low):
+                    last_err = msg
+                    continue
+                last_err = msg
+                continue
+        except Exception as exc:
+            last_err = str(exc)
+        finally:
+            if s is not None:
+                try:
+                    s.close()
+                except Exception:
+                    pass
+    return False, None, last_err or 'udp_probe_failed'
+
+
+def _udp_probe_detail(host: str, port: int, timeout: float = PROBE_TIMEOUT) -> Dict[str, Any]:
+    """UDP probe detail for /api/v1/stats health view."""
+    key = _udp_probe_cache_key(host, port)
+    hist_key = _udp_probe_hist_key(host, port)
+    cached = _cache_get(key)
+    if cached is not None:
+        ok_cached = cached.get('ok')
+        if ok_cached is None:
+            return {'ok': None, 'message': 'UDP 无响应（可能在线）'}
+        out_cached: Dict[str, Any] = {'ok': bool(ok_cached)}
+        if cached.get('latency_ms') is not None:
+            out_cached['latency_ms'] = cached.get('latency_ms')
+        if out_cached['ok'] is False and cached.get('error'):
+            out_cached['error'] = cached.get('error')
+        return out_cached
+
+    last_state: Optional[bool] = None
+    last_err: Optional[str] = None
+    for i in range(max(1, PROBE_RETRIES)):
+        per_timeout = timeout if i == 0 else min(timeout * 1.4, 1.2)
+        state, latency_ms, err = _udp_probe_uncached(host, port, per_timeout)
+        if state is True:
+            _cache_set(key, True, latency_ms, None)
+            _probe_history_update(hist_key, True, latency_ms, None)
+            out_ok: Dict[str, Any] = {'ok': True}
+            if latency_ms is not None:
+                out_ok['latency_ms'] = latency_ms
+            return out_ok
+        if state is False:
+            last_state = False
+            last_err = err or last_err
+            continue
+        # state is None: no UDP response, inconclusive
+        last_state = None
+        last_err = err or 'udp_no_reply'
+
+    if last_state is None:
+        _cache_set(key, None, None, last_err)
+        return {'ok': None, 'message': 'UDP 无响应（可能在线）'}
+
+    _cache_set(key, False, None, last_err)
+    _probe_history_update(hist_key, False, None, last_err)
+    return {'ok': False, 'error': last_err}
+
+
 def _split_hostport(addr: str) -> tuple[str, int]:
     # addr like 1.2.3.4:443 or [::1]:443
     if addr.startswith('['):
@@ -1722,20 +1828,11 @@ def _parse_transport_host(transport: str) -> Optional[str]:
 def _wss_probe_entries(rule: Dict[str, Any]) -> List[Dict[str, str]]:
     """为 WSS 隧道补充探测目标。
 
-    面板常见困扰：WSS 规则的 remote 目标并不是「真正要连的公网域名/端口」，
-    导致探测永远离线。这里补一个 “WSS Host” 探测，至少能反映隧道外层是否可达。
+    仅补充本机 listen 侧探测，帮助确认接收端监听端口是否真的在跑。
     """
     ex = rule.get('extra_config') or {}
     listen = str(rule.get('listen') or '')
     entries: List[Dict[str, str]] = []
-
-    # remote_transport: ws;host=xxx;path=/ws;tls;...
-    remote_transport = str(rule.get('remote_transport') or ex.get('remote_transport') or '')
-    remote_ws_host = str(ex.get('remote_ws_host') or '').strip() or _parse_transport_host(remote_transport)
-    if remote_ws_host:
-        tls = bool(ex.get('remote_tls_enabled')) or ('tls' in remote_transport)
-        port = 443 if tls else 80
-        entries.append({'key': f"{remote_ws_host}:{port}", 'label': f"WSS {remote_ws_host}:{port}"})
 
     # listen_transport: ws;...  => 探测本机 listen 端口是否在监听（避免显示空白）
     listen_transport = str(rule.get('listen_transport') or ex.get('listen_transport') or '')
@@ -3163,16 +3260,16 @@ def _build_stats_snapshot() -> Dict[str, Any]:
     这里做了：
     - 全部目标并发探测
     - 短缓存复用探测结果
-    - WSS 规则补充探测 WSS Host（显示真实外层延迟）
+    - 按协议选择探测方式（TCP/UDP）
 
     NOTE: 该函数同时被 /api/v1/stats 与面板 push-report 复用。
     """
     full = _load_full_pool()
     eps = full.get('endpoints') or []
 
-    # 收集每条规则要渲染的 health entries（label/key），同时汇总全局需要探测的 key
-    per_rule_entries: List[List[Dict[str, str]]] = []
-    all_probe_keys: List[str] = []
+    # 收集每条规则要渲染的 health entries（label/key/probe），同时汇总全局需要探测的任务
+    per_rule_entries: List[List[Dict[str, Any]]] = []
+    all_probe_tasks: List[Dict[str, str]] = []
     all_probe_set: set[str] = set()
     for e in eps:
         # Intranet tunnel rules are handled by agent (not realm).
@@ -3182,12 +3279,20 @@ def _build_stats_snapshot() -> Dict[str, Any]:
             per_rule_entries.append([])
             continue
 
-        entries: List[Dict[str, str]] = []
+        entries: List[Dict[str, Any]] = []
         if e.get('disabled'):
             # 规则暂停：无需探测，但仍保证面板有可渲染内容
             entries.append({'key': '—', 'label': '—', 'message': '规则已暂停'})
             per_rule_entries.append(entries)
             continue
+
+        protocol = str(e.get('protocol') or 'tcp+udp').lower()
+        if 'tcp' in protocol:
+            default_probe = 'tcp'
+        elif 'udp' in protocol:
+            default_probe = 'udp'
+        else:
+            default_probe = 'none'
 
         remotes: List[str] = []
         if isinstance(e.get('remote'), str) and e.get('remote'):
@@ -3205,58 +3310,85 @@ def _build_stats_snapshot() -> Dict[str, Any]:
             entries.append({'key': '—', 'label': '—', 'message': '未配置目标'})
         else:
             for r in remotes:
-                entries.append({'key': r, 'label': r})
-                if r not in all_probe_set:
-                    all_probe_set.add(r)
-                    all_probe_keys.append(r)
+                entries.append({'key': r, 'label': r, 'probe': default_probe})
+                if default_probe in ('tcp', 'udp'):
+                    probe_id = f"{default_probe}|{r}"
+                    if probe_id not in all_probe_set:
+                        all_probe_set.add(probe_id)
+                        all_probe_tasks.append({'probe': default_probe, 'key': r})
 
-        # WSS 规则补充探测项（WSS Host / LISTEN 本地端口）
+        # WSS 规则补充探测项（LISTEN 本地端口）
         for extra in _wss_probe_entries(e):
-            entries.append(extra)
-            k = extra.get('key')
-            if k and k not in all_probe_set:
-                all_probe_set.add(k)
-                all_probe_keys.append(k)
+            k = str(extra.get('key') or '').strip()
+            if not k:
+                continue
+            label = str(extra.get('label') or k).strip() or k
+            probe_mode = str(extra.get('probe') or 'tcp').strip().lower() or 'tcp'
+            if probe_mode not in ('tcp', 'udp'):
+                probe_mode = 'tcp'
+            entries.append({'key': k, 'label': label, 'probe': probe_mode})
+            probe_id = f"{probe_mode}|{k}"
+            if probe_id not in all_probe_set:
+                all_probe_set.add(probe_id)
+                all_probe_tasks.append({'probe': probe_mode, 'key': k})
 
         per_rule_entries.append(entries)
 
     # 并发探测所有目标（总耗时约等于最慢目标的超时）
     probe_results: Dict[str, Dict[str, Any]] = {}
-    if all_probe_keys:
-        max_workers = max(4, min(PROBE_MAX_WORKERS, len(all_probe_keys)))
+    if all_probe_tasks:
+        max_workers = max(4, min(PROBE_MAX_WORKERS, len(all_probe_tasks)))
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
             fut_map = {}
-            for key in all_probe_keys:
+            for task in all_probe_tasks:
+                mode = str(task.get('probe') or 'tcp').strip().lower() or 'tcp'
+                key = str(task.get('key') or '').strip()
+                rid = f"{mode}|{key}"
                 # key 可能是 "—" 或格式不合法，先做保护
                 try:
                     host, port = _split_hostport(key)
                 except Exception:
-                    probe_results[key] = {'ok': None, 'message': '目标格式无效'}
+                    probe_results[rid] = {'ok': None, 'message': '目标格式无效'}
                     continue
-                fut = ex.submit(_tcp_probe_detail, host, port, PROBE_TIMEOUT)
-                fut_map[fut] = key
+                if mode == 'udp':
+                    fut = ex.submit(_udp_probe_detail, host, port, PROBE_TIMEOUT)
+                else:
+                    fut = ex.submit(_tcp_probe_detail, host, port, PROBE_TIMEOUT)
+                fut_map[fut] = rid
 
             for fut in as_completed(fut_map):
-                key = fut_map[fut]
+                rid = fut_map[fut]
                 try:
                     payload = fut.result(timeout=PROBE_TIMEOUT * max(1, PROBE_RETRIES) + 0.6)
                     if not isinstance(payload, dict):
-                        probe_results[key] = {'ok': None, 'message': '探测返回异常'}
+                        probe_results[rid] = {'ok': None, 'message': '探测返回异常'}
                     else:
-                        probe_results[key] = payload
+                        probe_results[rid] = payload
                 except Exception as exc:
-                    probe_results[key] = {'ok': None, 'message': f'探测异常: {exc}'}
+                    probe_results[rid] = {'ok': None, 'message': f'探测异常: {exc}'}
 
     # 每个 remote 的历史统计（可用率/错误率/连续失败/平滑延迟）
     probe_stats_map: Dict[str, Dict[str, Any]] = {}
     probe_remotes: Dict[str, Dict[str, Any]] = {}
-    for key in all_probe_keys:
-        hist = _probe_history_snapshot(key)
+    for task in all_probe_tasks:
+        mode = str(task.get('probe') or 'tcp').strip().lower() or 'tcp'
+        key = str(task.get('key') or '').strip()
+        rid = f"{mode}|{key}"
+
+        hist: Dict[str, Any] = {}
+        if mode == 'udp':
+            try:
+                h, p = _split_hostport(key)
+                hist = _probe_history_snapshot(_udp_probe_hist_key(h, p))
+            except Exception:
+                hist = {}
+        else:
+            hist = _probe_history_snapshot(key)
         if hist:
-            probe_stats_map[key] = hist
+            probe_stats_map[rid] = hist
 
         item: Dict[str, Any] = {'target': key}
-        res = probe_results.get(key)
+        res = probe_results.get(rid)
         if isinstance(res, dict):
             if res.get('ok') is None:
                 item['ok'] = None
@@ -3270,7 +3402,9 @@ def _build_stats_snapshot() -> Dict[str, Any]:
                     item['error'] = str(res.get('error'))
         if hist:
             item.update(hist)
-        probe_remotes[key] = item
+        # Adaptive LB only consumes TCP remotes keyed by "host:port".
+        if mode == 'tcp':
+            probe_remotes[key] = item
 
     # 连接数/流量：一次性聚合（避免每条规则重复调用 ss）
     listen_ports: set[int] = set()
@@ -3294,8 +3428,8 @@ def _build_stats_snapshot() -> Dict[str, Any]:
     _apply_traffic_baseline(port_sig, conn_traffic_map)
 
     # 组装规则统计
-    def _attach_probe_meta(dst: Dict[str, Any], key: str) -> None:
-        meta = probe_stats_map.get(key)
+    def _attach_probe_meta(dst: Dict[str, Any], rid: str) -> None:
+        meta = probe_stats_map.get(rid)
         if not meta:
             return
         for mk in (
@@ -3329,8 +3463,6 @@ def _build_stats_snapshot() -> Dict[str, Any]:
 
         health: List[Dict[str, Any]] = []
         entries = per_rule_entries[idx] if idx < len(per_rule_entries) else []
-        protocol = str(e.get('protocol') or 'tcp+udp').lower()
-        tcp_probe_enabled = ('tcp' in protocol) and (not bool(e.get('disabled')))
 
         # Intranet tunnel rules: expose "handshake" health instead of probing LAN remotes.
         ex = e.get('extra_config') if isinstance(e, dict) and isinstance(e.get('extra_config'), dict) else {}
@@ -3372,25 +3504,26 @@ def _build_stats_snapshot() -> Dict[str, Any]:
         for it in entries:
             label = it.get('label', '—')
             key = it.get('key', label)
+            probe_mode = str(it.get('probe') or '').strip().lower()
             # 特殊占位项（暂停 / 无目标等）
             if it.get('message'):
                 health.append({'target': label, 'ok': None, 'message': it['message']})
                 continue
 
-            if not tcp_probe_enabled:
-                # UDP-only 或其他协议，不做 TCP 探测
+            if probe_mode not in ('tcp', 'udp'):
                 health.append({'target': label, 'ok': None, 'message': '协议不支持探测'})
                 continue
 
-            res = probe_results.get(key)
+            rid = f"{probe_mode}|{key}"
+            res = probe_results.get(rid)
             if not res:
                 item: Dict[str, Any] = {'target': label, 'ok': None, 'message': '暂无检测数据'}
-                _attach_probe_meta(item, key)
+                _attach_probe_meta(item, rid)
                 health.append(item)
                 continue
             if res.get('ok') is None:
                 item = {'target': label, 'ok': None, 'message': res.get('message', '不可检测')}
-                _attach_probe_meta(item, key)
+                _attach_probe_meta(item, rid)
                 health.append(item)
                 continue
             payload: Dict[str, Any] = {'target': label, 'ok': bool(res.get('ok'))}
@@ -3399,7 +3532,7 @@ def _build_stats_snapshot() -> Dict[str, Any]:
             # 离线原因（面板可展示）
             if payload['ok'] is False and res.get('error'):
                 payload['error'] = res.get('error')
-            _attach_probe_meta(payload, key)
+            _attach_probe_meta(payload, rid)
             health.append(payload)
 
         rules.append({

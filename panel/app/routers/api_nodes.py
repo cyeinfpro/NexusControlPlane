@@ -2578,6 +2578,15 @@ async def api_pool_set(request: Request, node_id: int, payload: Dict[str, Any], 
     if not isinstance(pool, dict):
         return JSONResponse({"ok": False, "error": "请求缺少 pool 字段"}, status_code=400)
 
+    unlock_sync_ids: set[str] = set()
+    if isinstance(payload, dict):
+        raw_unlock = payload.get("unlock_sync_ids")
+        if isinstance(raw_unlock, list):
+            for x in raw_unlock[:256]:
+                sid = str(x or "").strip()
+                if sid:
+                    unlock_sync_ids.add(sid)
+
     sanitize_pool(pool)
 
     # Prevent editing/deleting synced receiver rules from UI
@@ -2633,6 +2642,9 @@ async def api_pool_set(request: Request, node_id: int, payload: Dict[str, Any], 
                 }
 
             for sid, old_ep in locked.items():
+                if str(sid) in unlock_sync_ids:
+                    # 临时解锁：允许本次请求修改/删除该同步规则
+                    continue
                 new_ep = posted.get(sid)
                 if not new_ep:
                     return JSONResponse(
@@ -2679,6 +2691,69 @@ async def api_pool_set(request: Request, node_id: int, payload: Dict[str, Any], 
             "issues": [i.__dict__ for i in precheck_issues],
             "summary": runtime_precheck.get("summary") if isinstance(runtime_precheck.get("summary"), dict) else {},
         },
+    }
+
+
+@router.post("/api/nodes/{node_id}/rule_delete")
+async def api_rule_delete(node_id: int, payload: Dict[str, Any], user: str = Depends(require_login)):
+    """Delete one endpoint by index (best-effort immediate queue).
+
+    This endpoint is intentionally lightweight and does not run full save-time precheck,
+    so UI single-rule delete won't be blocked by unrelated validation/precheck noise.
+    """
+    node = get_node(node_id)
+    if not node:
+        return JSONResponse({"ok": False, "error": "节点不存在"}, status_code=404)
+
+    try:
+        idx = int((payload or {}).get("idx"))
+    except Exception:
+        idx = -1
+    if idx < 0:
+        return JSONResponse({"ok": False, "error": "idx 无效"}, status_code=400)
+
+    unlock_sync_ids: set[str] = set()
+    raw_unlock = (payload or {}).get("unlock_sync_ids")
+    if isinstance(raw_unlock, list):
+        for x in raw_unlock[:256]:
+            sid = str(x or "").strip()
+            if sid:
+                unlock_sync_ids.add(sid)
+
+    pool = await load_pool_for_node(node)
+    eps = pool.get("endpoints")
+    if not isinstance(eps, list):
+        eps = []
+    if idx >= len(eps):
+        return JSONResponse({"ok": False, "error": "规则不存在或已删除"}, status_code=404)
+
+    ep = eps[idx] if isinstance(eps[idx], dict) else {}
+    ex = ep.get("extra_config") if isinstance(ep.get("extra_config"), dict) else {}
+    sid = str(ex.get("sync_id") or "").strip() if isinstance(ex, dict) else ""
+    allow_unlock = bool(sid and sid in unlock_sync_ids)
+    if isinstance(ex, dict):
+        if (ex.get("sync_lock") is True or ex.get("sync_role") == "receiver") and not allow_unlock:
+            return JSONResponse(
+                {"ok": False, "error": "该规则由发送机同步生成，已锁定不可删除，请在发送机节点操作。"},
+                status_code=403,
+            )
+        if ex.get("intranet_lock") is True or ex.get("intranet_role") == "client":
+            return JSONResponse(
+                {"ok": False, "error": "该规则由公网入口同步生成，已锁定不可删除，请在公网入口节点操作。"},
+                status_code=403,
+            )
+
+    del eps[idx]
+    pool["endpoints"] = eps
+
+    desired_ver, _ = set_desired_pool(node_id, pool)
+    schedule_apply_pool(node, pool)
+    return {
+        "ok": True,
+        "pool": pool,
+        "desired_version": desired_ver,
+        "queued": True,
+        "note": "waiting agent report",
     }
 
 
