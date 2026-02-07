@@ -1,6 +1,9 @@
 import os
 import sqlite3
 import json
+import hashlib
+import secrets
+import string
 from contextlib import contextmanager
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -97,6 +100,28 @@ CREATE TABLE IF NOT EXISTS site_checks (
   checked_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_site_checks_site_ts ON site_checks(site_id, checked_at DESC);
+
+CREATE TABLE IF NOT EXISTS site_file_share_revocations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  site_id INTEGER NOT NULL,
+  token_sha256 TEXT NOT NULL,
+  revoked_by TEXT NOT NULL DEFAULT '',
+  reason TEXT NOT NULL DEFAULT '',
+  revoked_at TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE(site_id, token_sha256)
+);
+CREATE INDEX IF NOT EXISTS idx_site_file_share_revocations_site_ts ON site_file_share_revocations(site_id, revoked_at DESC);
+
+CREATE TABLE IF NOT EXISTS site_file_share_short_links (
+  code TEXT PRIMARY KEY,
+  site_id INTEGER NOT NULL,
+  token TEXT NOT NULL,
+  token_sha256 TEXT NOT NULL,
+  created_by TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_site_file_share_short_links_site_ts ON site_file_share_short_links(site_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_site_file_share_short_links_token ON site_file_share_short_links(token_sha256);
 
 CREATE TABLE IF NOT EXISTS certificates (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1684,6 +1709,93 @@ def list_site_checks(site_id: int, limit: int = 60, db_path: str = DEFAULT_DB_PA
             (int(site_id), int(limit)),
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+def revoke_site_file_share_token(
+    site_id: int,
+    token_sha256: str,
+    revoked_by: str = "",
+    reason: str = "",
+    db_path: str = DEFAULT_DB_PATH,
+) -> bool:
+    digest = (token_sha256 or "").strip().lower()
+    if not digest:
+        return False
+    with connect(db_path) as conn:
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO site_file_share_revocations(site_id, token_sha256, revoked_by, reason, revoked_at) "
+            "VALUES(?,?,?,?,datetime('now'))",
+            (int(site_id), digest, (revoked_by or "").strip(), (reason or "").strip()),
+        )
+        conn.commit()
+        return int(cur.rowcount or 0) > 0
+
+
+def is_site_file_share_token_revoked(site_id: int, token_sha256: str, db_path: str = DEFAULT_DB_PATH) -> bool:
+    digest = (token_sha256 or "").strip().lower()
+    if not digest:
+        return False
+    with connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT 1 FROM site_file_share_revocations WHERE site_id=? AND token_sha256=? LIMIT 1",
+            (int(site_id), digest),
+        ).fetchone()
+    return bool(row)
+
+
+def _new_share_short_code(length: int = 8) -> str:
+    n = int(length or 8)
+    if n < 6:
+        n = 6
+    if n > 24:
+        n = 24
+    alphabet = string.ascii_letters + string.digits
+    return "".join(secrets.choice(alphabet) for _ in range(n))
+
+
+def create_site_file_share_short_link(
+    site_id: int,
+    token: str,
+    created_by: str = "",
+    db_path: str = DEFAULT_DB_PATH,
+) -> str:
+    raw_token = (token or "").strip()
+    if not raw_token:
+        raise ValueError("token 不能为空")
+    digest = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+    with connect(db_path) as conn:
+        # Reuse existing short code for the same site+token to keep links stable.
+        row = conn.execute(
+            "SELECT code FROM site_file_share_short_links WHERE site_id=? AND token_sha256=? ORDER BY created_at DESC LIMIT 1",
+            (int(site_id), digest),
+        ).fetchone()
+        if row and row["code"]:
+            return str(row["code"])
+        for _ in range(12):
+            code = _new_share_short_code(8)
+            try:
+                conn.execute(
+                    "INSERT INTO site_file_share_short_links(code, site_id, token, token_sha256, created_by, created_at) "
+                    "VALUES(?,?,?,?,?,datetime('now'))",
+                    (code, int(site_id), raw_token, digest, (created_by or "").strip()),
+                )
+                conn.commit()
+                return code
+            except sqlite3.IntegrityError:
+                continue
+    raise RuntimeError("短链生成失败，请重试")
+
+
+def get_site_file_share_short_link(code: str, db_path: str = DEFAULT_DB_PATH) -> Optional[Dict[str, Any]]:
+    key = str(code or "").strip()
+    if not key:
+        return None
+    with connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT code, site_id, token, token_sha256, created_by, created_at FROM site_file_share_short_links WHERE code=? LIMIT 1",
+            (key,),
+        ).fetchone()
+    return dict(row) if row else None
 
 
 def prune_site_checks(days: int = 7, db_path: str = DEFAULT_DB_PATH) -> int:

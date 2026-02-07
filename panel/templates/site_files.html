@@ -215,6 +215,7 @@
       </div>
       <div class="muted sm" id="fmShareStatus"></div>
       <div class="row" style="justify-content:flex-end;gap:10px;margin-top:6px;">
+        <button class="btn xs ghost fm-act-danger" type="button" id="fmShareRevoke" disabled>取消分享</button>
         <button class="btn xs ghost" type="button" id="fmShareClose">取消</button>
         <button class="btn xs" type="button" id="fmShareGen">生成链接</button>
       </div>
@@ -263,6 +264,7 @@ const fmShareStatus = document.getElementById('fmShareStatus');
 const fmShareClose = document.getElementById('fmShareClose');
 const fmShareCloseTop = document.getElementById('fmShareCloseTop');
 const fmShareGen = document.getElementById('fmShareGen');
+const fmShareRevoke = document.getElementById('fmShareRevoke');
 
 const CHUNK_SIZE = 1024 * 512;
 const UPLOAD_MAX_BYTES = {{ upload_max_bytes }};
@@ -284,6 +286,7 @@ const modalUI = {
 let modalFiles = [];
 let lastUploadMethod = 'chunked';
 let shareItems = [];
+let currentShareUrl = '';
 
 function bytesToHuman(n){
   if(!n) return '0 B';
@@ -430,10 +433,12 @@ function openShareForItems(items){
     return;
   }
   shareItems = picked;
+  currentShareUrl = '';
   resetShareTtl();
   renderShareItems(shareItems);
   if(fmShareLink) fmShareLink.value = '';
   if(fmShareCopy) fmShareCopy.disabled = true;
+  if(fmShareRevoke) fmShareRevoke.disabled = true;
   if(fmShareOpen){
     fmShareOpen.style.display = 'none';
     fmShareOpen.removeAttribute('href');
@@ -1024,8 +1029,10 @@ fmShareGen?.addEventListener('click', async ()=>{
       throw new Error(data.error || '生成分享链接失败');
     }
     const url = String(data.url || '');
+    currentShareUrl = url;
     if(fmShareLink) fmShareLink.value = url;
     if(fmShareCopy) fmShareCopy.disabled = !url;
+    if(fmShareRevoke) fmShareRevoke.disabled = !url;
     if(fmShareOpen){
       if(url){
         fmShareOpen.href = url;
@@ -1038,9 +1045,46 @@ fmShareGen?.addEventListener('click', async ()=>{
     const ttlText = formatDurationLabel(Number(data.ttl_sec || ttlSec));
     setShareStatus(expireText ? `已生成，${ttlText}后过期（${expireText}）` : `已生成，${ttlText}后过期`, false);
   }catch(err){
+    if(fmShareRevoke && !currentShareUrl){
+      fmShareRevoke.disabled = true;
+    }
     setShareStatus(String(err), true);
   }finally{
     if(fmShareGen) fmShareGen.disabled = false;
+  }
+});
+
+fmShareRevoke?.addEventListener('click', async ()=>{
+  const url = String(currentShareUrl || fmShareLink?.value || '');
+  if(!url){
+    return;
+  }
+  if(!confirm('确定取消该分享链接吗？取消后将立即失效。')){
+    return;
+  }
+  if(fmShareRevoke) fmShareRevoke.disabled = true;
+  setShareStatus('正在取消分享…', false);
+  try{
+    const resp = await fetch(`/websites/${SITE_ID}/files/share/revoke`, {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ url })
+    });
+    const data = await resp.json().catch(()=>({ok:false,error:'取消分享失败'}));
+    if(!data.ok){
+      throw new Error(data.error || '取消分享失败');
+    }
+    currentShareUrl = '';
+    if(fmShareLink) fmShareLink.value = '';
+    if(fmShareCopy) fmShareCopy.disabled = true;
+    if(fmShareOpen){
+      fmShareOpen.style.display = 'none';
+      fmShareOpen.removeAttribute('href');
+    }
+    setShareStatus('分享已取消，原链接已失效', false);
+  }catch(err){
+    setShareStatus(String(err), true);
+    if(fmShareRevoke) fmShareRevoke.disabled = !currentShareUrl;
   }
 });
 
@@ -1122,6 +1166,7 @@ if(fmShareTtlHint){
   fmShareTtlHint.textContent = `范围：${formatDurationLabel(FILE_SHARE_MIN_TTL_SEC)} - ${formatDurationLabel(FILE_SHARE_MAX_TTL_SEC)}`;
 }
 resetShareTtl();
+if(fmShareRevoke) fmShareRevoke.disabled = true;
 setShareStatus('', false);
 
 computeTableStats();

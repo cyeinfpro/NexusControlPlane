@@ -4,11 +4,12 @@ import base64
 import datetime
 import hashlib
 import os
+import re
 import tempfile
 import uuid
 import zipfile
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlencode
+from urllib.parse import parse_qs, urlencode, urlparse
 
 from fastapi import APIRouter, Depends, File, Form, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response
@@ -25,6 +26,7 @@ from ..db import (
     add_site_check,
     add_site_event,
     add_task,
+    create_site_file_share_short_link,
     delete_certificates_by_node,
     delete_certificates_by_site,
     delete_site,
@@ -38,6 +40,9 @@ from ..db import (
     list_site_events,
     list_nodes,
     list_sites,
+    get_site_file_share_short_link,
+    is_site_file_share_token_revoked,
+    revoke_site_file_share_token,
     update_node_basic,
     update_certificate,
     update_site,
@@ -91,6 +96,7 @@ if FILE_SHARE_DEFAULT_TTL_SEC < FILE_SHARE_MIN_TTL_SEC:
 if FILE_SHARE_DEFAULT_TTL_SEC > FILE_SHARE_MAX_TTL_SEC:
     FILE_SHARE_DEFAULT_TTL_SEC = FILE_SHARE_MAX_TTL_SEC
 FILE_SHARE_MAX_ITEMS = max(1, _parse_int_env("REALM_WEBSITE_FILE_SHARE_MAX_ITEMS", 200))
+_SHORT_SHARE_CODE_RE = re.compile(r"^[A-Za-z0-9]{6,24}$")
 
 
 def _parse_share_ttl_sec(raw: Any) -> int:
@@ -184,6 +190,70 @@ def _remove_file_quiet(path: str) -> None:
             os.remove(path)
     except Exception:
         pass
+
+
+def _share_token_sha256(token: str) -> str:
+    tok = str(token or "").strip()
+    if not tok:
+        return ""
+    return hashlib.sha256(tok.encode("utf-8")).hexdigest()
+
+
+def _extract_share_token(raw: Any) -> str:
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    if "://" not in text and "?" not in text:
+        return text
+    try:
+        parsed = urlparse(text)
+        q = parse_qs(parsed.query or "")
+        token = ""
+        vals = q.get("t") or []
+        if vals:
+            token = str(vals[0] or "").strip()
+        return token
+    except Exception:
+        return ""
+
+
+def _extract_share_short_code(raw: Any) -> str:
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    if _SHORT_SHARE_CODE_RE.fullmatch(text):
+        return text
+
+    path = ""
+    try:
+        if "://" in text:
+            path = str(urlparse(text).path or "")
+        elif text.startswith("/"):
+            path = text
+    except Exception:
+        path = ""
+
+    marker = "/share/site-files/s/"
+    if marker and marker in path:
+        tail = path.split(marker, 1)[1]
+        code = tail.split("/", 1)[0].strip()
+        if _SHORT_SHARE_CODE_RE.fullmatch(code):
+            return code
+    return ""
+
+
+def _resolve_share_token_input(raw: Any) -> str:
+    tok = _extract_share_token(raw)
+    if tok and verify_share_token(tok):
+        return tok
+    code = _extract_share_short_code(raw)
+    if not code:
+        return tok
+    row = get_site_file_share_short_link(code)
+    if not row:
+        return tok
+    tok2 = str(row.get("token") or "").strip()
+    return tok2 or tok
 
 
 async def _agent_list_files(node: Dict[str, Any], root: str, path: str) -> List[Dict[str, Any]]:
@@ -2259,15 +2329,80 @@ async def website_files_share_link(
     }
     token = make_share_token(token_payload, ttl_sec=ttl_sec)
     base = panel_public_base_url(request)
-    url = f"{base}/share/site-files?t={token}"
+    long_url = f"{base}/share/site-files?t={token}"
+    try:
+        short_code = create_site_file_share_short_link(int(site_id), token, created_by=str(user or ""))
+    except Exception as exc:
+        return {"ok": False, "error": f"生成短链失败：{exc}"}
+    short_url = f"{base}/share/site-files/s/{short_code}"
     expire_at = datetime.datetime.now() + datetime.timedelta(seconds=ttl_sec)
     return {
         "ok": True,
-        "url": url,
+        "url": short_url,
+        "short_url": short_url,
+        "long_url": long_url,
+        "short_code": short_code,
         "ttl_sec": ttl_sec,
         "expire_at": expire_at.strftime("%Y-%m-%d %H:%M:%S"),
         "items": share_items,
     }
+
+
+@router.post("/websites/{site_id}/files/share/revoke")
+async def website_files_share_revoke(
+    request: Request,
+    site_id: int,
+    user: str = Depends(require_login_page),
+):
+    site = get_site(int(site_id))
+    if not site:
+        return {"ok": False, "error": "站点不存在"}
+
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+
+    token = _resolve_share_token_input((data or {}).get("token") or (data or {}).get("url") or "")
+    if not token:
+        return {"ok": False, "error": "缺少分享链接"}
+
+    payload = verify_share_token(token)
+    if not isinstance(payload, dict):
+        return {"ok": False, "error": "分享链接无效或已过期"}
+    if str(payload.get("page") or "") != "site_files_download":
+        return {"ok": False, "error": "分享链接类型不匹配"}
+    try:
+        token_site_id = int(payload.get("site_id") or 0)
+    except Exception:
+        token_site_id = 0
+    if token_site_id != int(site_id):
+        return {"ok": False, "error": "分享链接不属于当前站点"}
+
+    digest = _share_token_sha256(token)
+    if not digest:
+        return {"ok": False, "error": "分享链接无效"}
+    created = revoke_site_file_share_token(
+        int(site_id),
+        digest,
+        revoked_by=str(user or ""),
+        reason=str((data or {}).get("reason") or ""),
+    )
+    return {"ok": True, "revoked": True, "newly_revoked": bool(created)}
+
+
+@router.get("/share/site-files/s/{code}")
+async def website_files_share_download_short(request: Request, code: str):
+    key = str(code or "").strip()
+    if not _SHORT_SHARE_CODE_RE.fullmatch(key):
+        return Response(content="分享链接无效或已过期", media_type="text/plain", status_code=404)
+    row = get_site_file_share_short_link(key)
+    if not row:
+        return Response(content="分享链接无效或已过期", media_type="text/plain", status_code=404)
+    token = str(row.get("token") or "").strip()
+    if not token:
+        return Response(content="分享链接无效或已过期", media_type="text/plain", status_code=404)
+    return await website_files_share_download(request, t=token)
 
 
 @router.get("/share/site-files")
@@ -2283,6 +2418,9 @@ async def website_files_share_download(request: Request, t: str = ""):
         site_id = 0
     if site_id <= 0:
         return Response(content="分享链接无效", media_type="text/plain", status_code=400)
+    digest = _share_token_sha256(t)
+    if digest and is_site_file_share_token_revoked(site_id, digest):
+        return Response(content="分享链接已取消", media_type="text/plain", status_code=403)
 
     try:
         share_items = _parse_share_items(payload.get("items") or payload.get("paths") or [])
