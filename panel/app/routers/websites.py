@@ -4,9 +4,11 @@ import asyncio
 import base64
 import datetime
 import hashlib
+import json
 import os
 import re
 import tempfile
+import threading
 import time
 import uuid
 import zipfile
@@ -14,10 +16,8 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, quote, urlencode, urlparse
 
 from fastapi import APIRouter, Depends, File, Form, Request, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response, StreamingResponse
-from starlette.background import BackgroundTask
-
-from ..clients.agent import AgentError, agent_get, agent_get_raw, agent_get_raw_stream, agent_post
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
+from ..clients.agent import AgentError, agent_get, agent_get_raw_stream, agent_post
 from ..core.deps import require_login_page
 from ..core.flash import flash, set_flash
 from ..core.share import make_share_token, verify_share_token, verify_share_token_allow_expired
@@ -115,6 +115,10 @@ if FILE_SHARE_DEFAULT_TTL_SEC > FILE_SHARE_MAX_TTL_SEC:
     FILE_SHARE_DEFAULT_TTL_SEC = FILE_SHARE_MAX_TTL_SEC
 FILE_SHARE_MAX_ITEMS = max(1, _parse_int_env("REALM_WEBSITE_FILE_SHARE_MAX_ITEMS", 200))
 _SHORT_SHARE_CODE_RE = re.compile(r"^[A-Za-z0-9]{6,24}$")
+_SHARE_ZIP_JOB_TTL_SEC = max(300, _parse_int_env("REALM_WEBSITE_SHARE_ZIP_JOB_TTL_SEC", 3600))
+_SHARE_ZIP_MAX_JOBS = max(20, _parse_int_env("REALM_WEBSITE_SHARE_ZIP_MAX_JOBS", 200))
+_SHARE_ZIP_JOBS: Dict[str, Dict[str, Any]] = {}
+_SHARE_ZIP_JOBS_LOCK = threading.Lock()
 
 
 def _parse_share_ttl_sec(raw: Any) -> int:
@@ -208,6 +212,310 @@ def _remove_file_quiet(path: str) -> None:
             os.remove(path)
     except Exception:
         pass
+
+
+def _share_items_signature(share_items: List[Dict[str, Any]]) -> str:
+    rows: List[str] = []
+    for item in share_items:
+        try:
+            rel = _normalize_rel_path(item.get("path"))
+        except Exception:
+            rel = ""
+        if not rel:
+            continue
+        rows.append(f"{rel}|{1 if bool(item.get('is_dir')) else 0}")
+    rows.sort()
+    if not rows:
+        return ""
+    return hashlib.sha256("\n".join(rows).encode("utf-8")).hexdigest()
+
+
+def _cleanup_share_zip_jobs() -> None:
+    now_ts = time.time()
+    to_remove: List[str] = []
+    with _SHARE_ZIP_JOBS_LOCK:
+        for jid, job in list(_SHARE_ZIP_JOBS.items()):
+            expire_at = float(job.get("expire_at") or 0)
+            if expire_at > 0 and now_ts >= expire_at:
+                to_remove.append(jid)
+
+        if len(_SHARE_ZIP_JOBS) - len(to_remove) > _SHARE_ZIP_MAX_JOBS:
+            kept = [j for j in _SHARE_ZIP_JOBS.items() if j[0] not in to_remove]
+            removable = []
+            for kv in kept:
+                status = str(((kv[1] or {}).get("status") or "")).strip().lower()
+                if status in ("done", "error"):
+                    removable.append(kv)
+            removable.sort(key=lambda kv: float((kv[1] or {}).get("updated_at") or 0))
+            overflow = (len(_SHARE_ZIP_JOBS) - len(to_remove)) - _SHARE_ZIP_MAX_JOBS
+            for idx in range(max(0, overflow)):
+                if idx >= len(removable):
+                    break
+                to_remove.append(str(removable[idx][0]))
+
+        to_remove = list(dict.fromkeys(to_remove))
+        remove_paths = []
+        for jid in to_remove:
+            job = _SHARE_ZIP_JOBS.pop(jid, None)
+            if isinstance(job, dict):
+                remove_paths.append(str(job.get("zip_path") or ""))
+
+    for path in remove_paths:
+        _remove_file_quiet(path)
+
+
+def _get_share_zip_job(job_id: str) -> Optional[Dict[str, Any]]:
+    _cleanup_share_zip_jobs()
+    jid = str(job_id or "").strip()
+    if not jid:
+        return None
+    with _SHARE_ZIP_JOBS_LOCK:
+        row = _SHARE_ZIP_JOBS.get(jid)
+        if not isinstance(row, dict):
+            return None
+        return dict(row)
+
+
+def _upsert_share_zip_job(job: Dict[str, Any]) -> None:
+    if not isinstance(job, dict):
+        return
+    jid = str(job.get("id") or "").strip()
+    if not jid:
+        return
+    with _SHARE_ZIP_JOBS_LOCK:
+        _SHARE_ZIP_JOBS[jid] = dict(job)
+
+
+def _new_share_zip_job(site_id: int, token_sha256: str, items_sig: str, filename: str) -> Dict[str, Any]:
+    now_ts = time.time()
+    return {
+        "id": uuid.uuid4().hex,
+        "site_id": int(site_id),
+        "token_sha256": str(token_sha256 or ""),
+        "items_sig": str(items_sig or ""),
+        "filename": str(filename or "download.zip"),
+        "status": "queued",  # queued -> running -> done|error
+        "error": "",
+        "zip_path": "",
+        "file_count": 0,
+        "created_at": now_ts,
+        "updated_at": now_ts,
+        "expire_at": now_ts + float(_SHARE_ZIP_JOB_TTL_SEC),
+    }
+
+
+def _find_share_zip_job(site_id: int, token_sha256: str, items_sig: str) -> Optional[Dict[str, Any]]:
+    _cleanup_share_zip_jobs()
+    with _SHARE_ZIP_JOBS_LOCK:
+        for row in _SHARE_ZIP_JOBS.values():
+            if not isinstance(row, dict):
+                continue
+            if int(row.get("site_id") or 0) != int(site_id):
+                continue
+            if str(row.get("token_sha256") or "") != str(token_sha256 or ""):
+                continue
+            if str(row.get("items_sig") or "") != str(items_sig or ""):
+                continue
+            status = str(row.get("status") or "")
+            if status in ("queued", "running", "done"):
+                return dict(row)
+    return None
+
+
+def _share_zip_wait_page_html(job_id: str, token: str) -> str:
+    job_js = json.dumps(str(job_id or ""))
+    tok_js = json.dumps(str(token or ""))
+    return (
+        "<!doctype html><html lang='zh'><head><meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+        "<title>准备下载中</title>"
+        "<style>body{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,PingFang SC,Microsoft YaHei,sans-serif;"
+        "background:#0b1220;color:#e5e7eb;padding:32px} .box{max-width:760px;margin:0 auto;padding:20px;border:1px solid #334155;"
+        "border-radius:12px;background:#0f172a} .muted{color:#93a4bf} .mono{font-family:ui-monospace,Menlo,Consolas,monospace}"
+        " .bar{height:8px;border-radius:999px;background:#1e293b;overflow:hidden;margin:14px 0} .fill{height:100%;width:14%;"
+        "background:linear-gradient(90deg,#38bdf8,#22c55e);animation:slide 1.2s ease-in-out infinite} @keyframes slide{0%{margin-left:-35%}"
+        "50%{margin-left:40%}100%{margin-left:100%}}</style></head><body><div class='box'>"
+        "<h2 style='margin:0 0 8px;'>正在打包文件，请稍候…</h2>"
+        "<div class='muted' id='status'>任务已创建，准备开始</div>"
+        "<div class='bar'><div class='fill'></div></div>"
+        "<div class='muted mono' id='hint'></div></div><script>"
+        f"const JOB_ID={job_js}; const TOKEN={tok_js};"
+        "const statusEl=document.getElementById('status'); const hintEl=document.getElementById('hint');"
+        "function dlUrl(){return '/share/site-files/job/download?j='+encodeURIComponent(JOB_ID)+'&t='+encodeURIComponent(TOKEN)}"
+        "async function poll(){"
+        "try{const r=await fetch('/share/site-files/job/status?j='+encodeURIComponent(JOB_ID)+'&t='+encodeURIComponent(TOKEN),{cache:'no-store'});"
+        "const d=await r.json();"
+        "if(!d||!d.ok){statusEl.textContent=String((d&&d.error)||'打包状态获取失败');return;}"
+        "const st=String(d.status||'queued');"
+        "if(st==='done'){statusEl.textContent='打包完成，开始下载…';window.location.href=dlUrl();return;}"
+        "if(st==='error'){statusEl.textContent=String(d.error||'打包失败');return;}"
+        "statusEl.textContent=st==='running'?'正在打包中…':'排队中…';"
+        "const files=parseInt(d.file_count||0,10)||0;"
+        "if(files>0){hintEl.textContent='已处理文件数：'+files;}"
+        "setTimeout(poll,1500);}catch(e){statusEl.textContent='网络波动，正在重试状态查询…';setTimeout(poll,2000);}}"
+        "poll();</script></body></html>"
+    )
+
+
+def _validate_site_files_share_token(t: str) -> Tuple[Optional[Dict[str, Any]], Optional[Response]]:
+    payload = verify_share_token(t)
+    if not isinstance(payload, dict) or str(payload.get("page") or "") != "site_files_download":
+        return None, Response(content="分享链接无效或已过期", media_type="text/plain", status_code=403)
+
+    try:
+        site_id = int(payload.get("site_id") or 0)
+    except Exception:
+        site_id = 0
+    if site_id <= 0:
+        return None, Response(content="分享链接无效", media_type="text/plain", status_code=400)
+    digest = _share_token_sha256(t)
+    if digest and is_site_file_share_token_revoked(site_id, digest):
+        return None, Response(content="分享链接已取消", media_type="text/plain", status_code=403)
+    return {"payload": payload, "site_id": site_id, "token_sha256": digest, "token": str(t or "")}, None
+
+
+async def _run_share_zip_job(
+    job_id: str,
+    node: Dict[str, Any],
+    root: str,
+    share_items: List[Dict[str, Any]],
+) -> None:
+    row = _get_share_zip_job(job_id) or {}
+    if not row:
+        return
+    row["status"] = "running"
+    row["updated_at"] = time.time()
+    _upsert_share_zip_job(row)
+    try:
+        zip_path, file_count = await _build_share_zip(node, root, share_items)
+        if file_count <= 0:
+            _remove_file_quiet(zip_path)
+            raise RuntimeError("没有可下载的文件")
+        row = _get_share_zip_job(job_id) or {}
+        if not row:
+            _remove_file_quiet(zip_path)
+            return
+        row["status"] = "done"
+        row["zip_path"] = zip_path
+        row["file_count"] = int(file_count)
+        row["error"] = ""
+        row["updated_at"] = time.time()
+        row["expire_at"] = max(float(row.get("expire_at") or 0), time.time() + float(_SHARE_ZIP_JOB_TTL_SEC))
+        _upsert_share_zip_job(row)
+    except Exception as exc:
+        row = _get_share_zip_job(job_id) or {}
+        if not row:
+            return
+        row["status"] = "error"
+        row["error"] = str(exc)
+        row["updated_at"] = time.time()
+        _upsert_share_zip_job(row)
+
+
+def _build_stream_zip_filename(site_id: int, site_name: Any) -> str:
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    base = _sanitize_download_name(site_name, f"site-{site_id}")
+    return f"{base}-share-{stamp}.zip"
+
+
+async def _iter_share_zip_stream(
+    node: Dict[str, Any],
+    root: str,
+    share_items: List[Dict[str, Any]],
+):
+    queue: "asyncio.Queue[Optional[bytes]]" = asyncio.Queue()
+    state: Dict[str, Any] = {"error": None, "started": False}
+
+    class _QueueWriter:
+        def __init__(self, out_queue: "asyncio.Queue[Optional[bytes]]") -> None:
+            self._queue = out_queue
+
+        def write(self, data: Any) -> int:
+            if not data:
+                return 0
+            chunk = bytes(data)
+            if not chunk:
+                return 0
+            self._queue.put_nowait(chunk)
+            return len(chunk)
+
+        def flush(self) -> None:
+            return None
+
+    async def _producer() -> None:
+        errors: List[str] = []
+
+        async def _add_entry(zf: zipfile.ZipFile, rel_path: str, arc_path: str, is_dir: bool) -> None:
+            arc = _zip_arcname(arc_path)
+            if not arc:
+                return
+            if is_dir:
+                try:
+                    rows = await _agent_list_files(node, root, rel_path)
+                except Exception as exc:
+                    errors.append(f"{rel_path}: {exc}")
+                    return
+                if not rows:
+                    zf.writestr(f"{arc.rstrip('/')}/", b"")
+                    return
+                for row in rows:
+                    child_arc = _zip_arcname(f"{arc}/{row.get('name') or ''}")
+                    await _add_entry(zf, str(row.get("path") or ""), child_arc, bool(row.get("is_dir")))
+                return
+
+            upstream, status_code, _detail = await _open_agent_file_stream(node, root, rel_path, timeout=600)
+            if upstream is None:
+                errors.append(f"{rel_path}: HTTP {status_code}")
+                return
+            try:
+                with zf.open(arc, mode="w", force_zip64=True) as dst:
+                    async for chunk in upstream.aiter_bytes():
+                        if chunk:
+                            dst.write(chunk)
+            finally:
+                try:
+                    await upstream.aclose()
+                except Exception:
+                    pass
+
+        try:
+            writer = _QueueWriter(queue)
+            with zipfile.ZipFile(writer, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True) as zf:
+                # Emit first bytes immediately to avoid proxy first-byte timeout.
+                zf.writestr(".nexus-share.keep", b"")
+                state["started"] = True
+                for item in share_items:
+                    rel = str(item.get("path") or "")
+                    await _add_entry(zf, rel, rel, bool(item.get("is_dir")))
+                if errors:
+                    zf.writestr(".nexus-share-errors.txt", "\n".join(errors).encode("utf-8"))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            state["error"] = exc
+        finally:
+            await queue.put(None)
+
+    producer_task = asyncio.create_task(_producer())
+    try:
+        while True:
+            chunk = await queue.get()
+            if chunk is None:
+                break
+            if chunk:
+                yield chunk
+        err = state.get("error")
+        if err is not None and not bool(state.get("started")):
+            raise err
+    finally:
+        if not producer_task.done():
+            producer_task.cancel()
+        try:
+            await producer_task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass
 
 
 def _download_content_disposition(filename: str) -> str:
@@ -392,17 +700,19 @@ async def _build_share_zip(
                 await _add_entry(zf, str(row.get("path") or ""), child_arc, bool(row.get("is_dir")))
             return
 
-        r = await agent_get_raw(
-            node.get("base_url", ""),
-            node.get("api_key", ""),
-            "/api/v1/website/files/raw",
-            node_verify_tls(node),
-            params={"root": root, "path": rel_path, "root_base": _node_root_base(node)},
-            timeout=60,
-        )
-        if r.status_code != 200:
-            raise AgentError(f"打包失败：{rel_path}（HTTP {r.status_code}）")
-        zf.writestr(arc, r.content)
+        upstream, status_code, _detail = await _open_agent_file_stream(node, root, rel_path, timeout=600)
+        if upstream is None:
+            raise AgentError(f"打包失败：{rel_path}（HTTP {status_code}）")
+        try:
+            with zf.open(arc, mode="w", force_zip64=True) as dst:
+                async for chunk in upstream.aiter_bytes():
+                    if chunk:
+                        dst.write(chunk)
+        finally:
+            try:
+                await upstream.aclose()
+            except Exception:
+                pass
         file_count += 1
 
     try:
@@ -2613,19 +2923,12 @@ async def website_files_share_download_short(request: Request, code: str):
 @router.get("/share/site-files")
 async def website_files_share_download(request: Request, t: str = ""):
     _ = request
-    payload = verify_share_token(t)
-    if not isinstance(payload, dict) or str(payload.get("page") or "") != "site_files_download":
-        return Response(content="分享链接无效或已过期", media_type="text/plain", status_code=403)
-
-    try:
-        site_id = int(payload.get("site_id") or 0)
-    except Exception:
-        site_id = 0
-    if site_id <= 0:
-        return Response(content="分享链接无效", media_type="text/plain", status_code=400)
-    digest = _share_token_sha256(t)
-    if digest and is_site_file_share_token_revoked(site_id, digest):
-        return Response(content="分享链接已取消", media_type="text/plain", status_code=403)
+    ctx, bad = _validate_site_files_share_token(t)
+    if bad is not None:
+        return bad
+    payload = dict((ctx or {}).get("payload") or {})
+    site_id = int((ctx or {}).get("site_id") or 0)
+    digest = str((ctx or {}).get("token_sha256") or "")
 
     try:
         share_items = _parse_share_items(payload.get("items") or payload.get("paths") or [])
@@ -2657,21 +2960,102 @@ async def website_files_share_download(request: Request, t: str = ""):
         filename = rel_path.split("/")[-1] or "download.bin"
         return _stream_file_download_response(upstream, filename)
 
-    try:
-        zip_path, file_count = await _build_share_zip(node, root, share_items)
-    except Exception as exc:
-        return Response(content=f"打包失败：{exc}", media_type="text/plain", status_code=500)
+    stream_raw = str(request.query_params.get("stream") or "1").strip().lower()
+    stream_enabled = stream_raw not in ("0", "false", "no", "off")
+    if stream_enabled:
+        filename = _build_stream_zip_filename(site_id, site.get("name"))
+        headers = {"Content-Disposition": _download_content_disposition(filename)}
+        return StreamingResponse(
+            _iter_share_zip_stream(node, root, share_items),
+            media_type="application/zip",
+            headers=headers,
+        )
 
-    if file_count <= 0:
-        _remove_file_quiet(zip_path)
-        return Response(content="没有可下载的文件", media_type="text/plain", status_code=404)
+    items_sig = _share_items_signature(share_items)
+    if not items_sig:
+        return Response(content="分享内容为空", media_type="text/plain", status_code=400)
+    filename = _build_stream_zip_filename(site_id, site.get("name"))
 
-    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-    base = _sanitize_download_name(site.get("name"), f"site-{site_id}")
-    filename = f"{base}-share-{stamp}.zip"
-    return FileResponse(
-        path=zip_path,
-        filename=filename,
-        media_type="application/zip",
-        background=BackgroundTask(_remove_file_quiet, zip_path),
-    )
+    job = _find_share_zip_job(site_id, digest, items_sig)
+    if job and str(job.get("status") or "") == "done":
+        zip_path = str(job.get("zip_path") or "")
+        if zip_path and os.path.exists(zip_path):
+            return FileResponse(path=zip_path, filename=str(job.get("filename") or filename), media_type="application/zip")
+
+    if not job:
+        job = _new_share_zip_job(site_id, digest, items_sig, filename=filename)
+        _upsert_share_zip_job(job)
+        asyncio.create_task(_run_share_zip_job(str(job.get("id") or ""), node, root, list(share_items)))
+
+    return HTMLResponse(content=_share_zip_wait_page_html(str(job.get("id") or ""), t), media_type="text/html")
+
+
+@router.get("/share/site-files/job/status")
+async def website_files_share_download_job_status(request: Request, j: str = "", t: str = ""):
+    _ = request
+    ctx, bad = _validate_site_files_share_token(t)
+    if bad is not None:
+        return JSONResponse({"ok": False, "status": "error", "error": "分享链接无效或已过期"}, status_code=403)
+
+    site_id = int((ctx or {}).get("site_id") or 0)
+    digest = str((ctx or {}).get("token_sha256") or "")
+    job_id = str(j or "").strip()
+    if not job_id:
+        return {"ok": False, "status": "error", "error": "缺少任务编号"}
+
+    row = _get_share_zip_job(job_id)
+    if not isinstance(row, dict):
+        return {"ok": False, "status": "error", "error": "任务不存在或已过期"}
+    if int(row.get("site_id") or 0) != int(site_id) or str(row.get("token_sha256") or "") != digest:
+        return {"ok": False, "status": "error", "error": "任务不存在或已过期"}
+
+    status = str(row.get("status") or "queued")
+    zip_path = str(row.get("zip_path") or "")
+    if status == "done" and (not zip_path or not os.path.exists(zip_path)):
+        row["status"] = "error"
+        row["error"] = "打包结果已过期，请刷新链接重试"
+        row["updated_at"] = time.time()
+        _upsert_share_zip_job(row)
+        status = "error"
+
+    out = {
+        "ok": True,
+        "job_id": job_id,
+        "status": status,
+        "file_count": int(row.get("file_count") or 0),
+        "error": str(row.get("error") or ""),
+    }
+    return out
+
+
+@router.get("/share/site-files/job/download")
+async def website_files_share_download_job_download(request: Request, j: str = "", t: str = ""):
+    _ = request
+    ctx, bad = _validate_site_files_share_token(t)
+    if bad is not None:
+        return bad
+
+    site_id = int((ctx or {}).get("site_id") or 0)
+    digest = str((ctx or {}).get("token_sha256") or "")
+    job_id = str(j or "").strip()
+    if not job_id:
+        return Response(content="缺少任务编号", media_type="text/plain", status_code=400)
+
+    row = _get_share_zip_job(job_id)
+    if not isinstance(row, dict):
+        return Response(content="任务不存在或已过期", media_type="text/plain", status_code=404)
+    if int(row.get("site_id") or 0) != int(site_id) or str(row.get("token_sha256") or "") != digest:
+        return Response(content="任务不存在或已过期", media_type="text/plain", status_code=404)
+
+    status = str(row.get("status") or "")
+    if status in ("queued", "running"):
+        return Response(content="仍在打包中，请稍后重试", media_type="text/plain", status_code=409)
+    if status != "done":
+        return Response(content=str(row.get("error") or "打包失败"), media_type="text/plain", status_code=500)
+
+    zip_path = str(row.get("zip_path") or "")
+    if not zip_path or not os.path.exists(zip_path):
+        return Response(content="打包结果已过期，请刷新链接重试", media_type="text/plain", status_code=404)
+
+    filename = str(row.get("filename") or "download.zip")
+    return FileResponse(path=zip_path, filename=filename, media_type="application/zip")
