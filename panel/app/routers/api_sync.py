@@ -534,6 +534,8 @@ async def api_wss_tunnel_save(payload: Dict[str, Any], user: str = Depends(requi
         receiver_warnings = [i.__dict__ for i in validate_pool_inplace(receiver_pool)]
     except PoolValidationError as exc:
         return JSONResponse({"ok": False, "error": str(exc), "issues": [i.__dict__ for i in exc.issues]}, status_code=400)
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": f"WSS 保存失败：规则校验异常（{exc}）"}, status_code=500)
 
     runtime_issues: List[Dict[str, Any]] = []
     if _SYNC_PRECHECK_ENABLED:
@@ -865,6 +867,8 @@ async def api_intranet_tunnel_save(payload: Dict[str, Any], user: str = Depends(
         receiver_warnings = [i.__dict__ for i in validate_pool_inplace(receiver_pool)]
     except PoolValidationError as exc:
         return JSONResponse({"ok": False, "error": str(exc), "issues": [i.__dict__ for i in exc.issues]}, status_code=400)
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": f"内网穿透保存失败：规则校验异常（{exc}）"}, status_code=500)
 
     runtime_issues: List[Dict[str, Any]] = []
     if _SYNC_PRECHECK_ENABLED:

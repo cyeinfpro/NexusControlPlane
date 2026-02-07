@@ -64,7 +64,7 @@ from ..utils.normalize import (
     sanitize_pool,
     split_host_and_port,
 )
-from ..utils.validate import PoolValidationError, validate_pool_inplace
+from ..utils.validate import PoolValidationError, PoolValidationIssue, validate_pool_inplace
 
 router = APIRouter()
 
@@ -2673,6 +2673,8 @@ async def api_pool_set(request: Request, node_id: int, payload: Dict[str, Any], 
         static_warnings = validate_pool_inplace(pool)
     except PoolValidationError as exc:
         return JSONResponse({"ok": False, "error": str(exc), "issues": [i.__dict__ for i in exc.issues]}, status_code=400)
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": f"保存失败：规则校验异常（{exc}）"}, status_code=500)
 
     try:
         runtime_precheck = await _run_pool_save_precheck(node, pool)
