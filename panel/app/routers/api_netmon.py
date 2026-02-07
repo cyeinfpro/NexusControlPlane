@@ -956,7 +956,7 @@ async def api_netmon_probe(request: Request, user: str = Depends(require_login))
     for nid, data in results:
         nid_s = str(nid)
         if not isinstance(data, dict) or data.get("ok") is not True:
-            err = str((data or {}).get("error") or "agent_failed")
+            err = str(data.get("error") or "agent_failed") if isinstance(data, dict) else (str(data or "").strip() or "agent_failed")
             node_errors[nid_s] = err
             for t in targets:
                 matrix[t][nid_s] = {"ok": False, "latency_ms": None, "error": err}

@@ -109,6 +109,14 @@ def _append_issue(
     issues.append(issue)
 
 
+def _safe_error_text(data: Any, default: str = "unknown") -> str:
+    if isinstance(data, dict):
+        msg = str(data.get("error") or "").strip()
+        return msg or default
+    msg = str(data or "").strip()
+    return msg or default
+
+
 def _pool_rules_for_probe(pool: Dict[str, Any]) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     eps = pool.get("endpoints") if isinstance(pool.get("endpoints"), list) else []
@@ -177,7 +185,7 @@ async def _probe_node_rules_precheck(node: Dict[str, Any], pool: Dict[str, Any],
             seen,
             {
                 "path": "endpoints",
-                "message": f"{node_label}预检失败：Agent rules 探测返回异常（{(data or {}).get('error') or 'unknown'}）",
+                "message": f"{node_label}预检失败：Agent rules 探测返回异常（{_safe_error_text(data)}）",
                 "severity": "warning",
                 "code": "precheck_failed",
             },

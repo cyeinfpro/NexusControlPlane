@@ -2363,6 +2363,14 @@ def _append_precheck_issue(
     issues.append(issue)
 
 
+def _safe_error_text(data: Any, default: str = "unknown") -> str:
+    if isinstance(data, dict):
+        msg = str(data.get("error") or "").strip()
+        return msg or default
+    msg = str(data or "").strip()
+    return msg or default
+
+
 async def _run_pool_save_precheck(node: Dict[str, Any], pool: Dict[str, Any]) -> Dict[str, Any]:
     """Save-time runtime precheck via agent /api/v1/netprobe (mode=rules)."""
     out_issues: List[PoolValidationIssue] = []
@@ -2445,7 +2453,7 @@ async def _run_pool_save_precheck(node: Dict[str, Any], pool: Dict[str, Any]) ->
             seen,
             PoolValidationIssue(
                 path="endpoints",
-                message=f"预检失败：Agent rules 探测返回异常（{(data or {}).get('error') or 'unknown'}）",
+                message=f"预检失败：Agent rules 探测返回异常（{_safe_error_text(data)}）",
                 severity="warning",
                 code="precheck_failed",
             ),
@@ -2666,7 +2674,20 @@ async def api_pool_set(request: Request, node_id: int, payload: Dict[str, Any], 
     except PoolValidationError as exc:
         return JSONResponse({"ok": False, "error": str(exc), "issues": [i.__dict__ for i in exc.issues]}, status_code=400)
 
-    runtime_precheck = await _run_pool_save_precheck(node, pool)
+    try:
+        runtime_precheck = await _run_pool_save_precheck(node, pool)
+    except Exception as exc:
+        runtime_precheck = {
+            "issues": [
+                PoolValidationIssue(
+                    path="endpoints",
+                    message=f"预检失败：保存前探测发生异常（{exc}）",
+                    severity="warning",
+                    code="precheck_exception",
+                )
+            ],
+            "summary": {"enabled": True, "source": "save_precheck", "error": "exception"},
+        }
     precheck_issues: List[PoolValidationIssue] = []
     precheck_seen: set[str] = set()
     for i in static_warnings:
@@ -2676,10 +2697,16 @@ async def api_pool_set(request: Request, node_id: int, payload: Dict[str, Any], 
             _append_precheck_issue(precheck_issues, precheck_seen, i, _SAVE_PRECHECK_MAX_ISSUES)
 
     # Store desired pool on panel. Agent will pull it on next report.
-    desired_ver, _ = set_desired_pool(node_id, pool)
+    try:
+        desired_ver, _ = set_desired_pool(node_id, pool)
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": f"保存失败：写入面板配置时异常（{exc}）"}, status_code=500)
 
     # Apply in background: do not block HTTP response
-    schedule_apply_pool(node, pool)
+    try:
+        schedule_apply_pool(node, pool)
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": f"保存失败：下发任务创建失败（{exc}）"}, status_code=500)
 
     return {
         "ok": True,
@@ -2746,8 +2773,14 @@ async def api_rule_delete(node_id: int, payload: Dict[str, Any], user: str = Dep
     del eps[idx]
     pool["endpoints"] = eps
 
-    desired_ver, _ = set_desired_pool(node_id, pool)
-    schedule_apply_pool(node, pool)
+    try:
+        desired_ver, _ = set_desired_pool(node_id, pool)
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": f"删除失败：写入面板配置时异常（{exc}）"}, status_code=500)
+    try:
+        schedule_apply_pool(node, pool)
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": f"删除失败：下发任务创建失败（{exc}）"}, status_code=500)
     return {
         "ok": True,
         "pool": pool,
