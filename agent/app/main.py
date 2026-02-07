@@ -2260,6 +2260,7 @@ def api_apply(_: None = Depends(_api_key_required)) -> Dict[str, Any]:
 # ------------------------ NetProbe (ping/tcping) ------------------------
 
 _NETPROBE_PING_RE = re.compile(r'time[=<]?\s*([0-9.]+)\s*ms', re.IGNORECASE)
+_NETPROBE_TRANSPORT_RE = re.compile(r'(^|;)\s*([a-zA-Z0-9_]+)\s*=\s*([^;]+)')
 
 
 def _parse_tcp_target(target: str, default_port: int) -> tuple[str, int]:
@@ -2394,23 +2395,12 @@ def _tcp_ping_once(host: str, port: int, timeout_sec: float) -> Dict[str, Any]:
         return {'ok': False, 'error': msg}
 
 
-@app.post('/api/v1/netprobe')
-def api_netprobe(payload: Dict[str, Any], _: None = Depends(_api_key_required)) -> Dict[str, Any]:
-    """Batch network probe from this node."""
-    mode = str(payload.get('mode') or 'ping').strip().lower()
-    targets = payload.get('targets') or []
-    tcp_port = payload.get('tcp_port')
-    timeout = payload.get('timeout')
-
-    if mode not in ('ping', 'tcping'):
-        mode = 'ping'
-
-    if not isinstance(targets, list):
-        targets = []
-
+def _netprobe_clean_targets(raw_targets: Any, max_items: int) -> List[str]:
+    if not isinstance(raw_targets, list):
+        return []
     cleaned: List[str] = []
     seen: set[str] = set()
-    for t in targets:
+    for t in raw_targets:
         s = str(t or '').strip()
         if not s:
             continue
@@ -2420,30 +2410,230 @@ def api_netprobe(payload: Dict[str, Any], _: None = Depends(_api_key_required)) 
             continue
         seen.add(s)
         cleaned.append(s)
-    targets = cleaned[:50]
+    return cleaned[:max_items]
 
+
+def _netprobe_default_port(raw_port: Any) -> int:
     try:
-        default_port = int(tcp_port) if tcp_port is not None else 443
+        p = int(raw_port) if raw_port is not None else 443
     except Exception:
-        default_port = 443
-    if default_port < 1 or default_port > 65535:
-        default_port = 443
+        p = 443
+    if p < 1 or p > 65535:
+        p = 443
+    return p
 
+
+def _netprobe_timeout(raw_timeout: Any) -> float:
     try:
-        timeout_f = float(timeout) if timeout is not None else 1.5
+        to = float(raw_timeout) if raw_timeout is not None else 1.5
     except Exception:
-        timeout_f = 1.5
-    if timeout_f < 0.2:
-        timeout_f = 0.2
-    if timeout_f > 10:
-        timeout_f = 10.0
+        to = 1.5
+    if to < 0.2:
+        to = 0.2
+    if to > 10:
+        to = 10.0
+    return to
 
+
+def _netprobe_target_key(host: str, port: int) -> str:
+    h = str(host or '').strip()
+    try:
+        p = int(port)
+    except Exception:
+        p = 0
+    if not h or p < 1 or p > 65535:
+        return ''
+    if ':' in h and not h.startswith('['):
+        h = f'[{h}]'
+    return f'{h}:{p}'
+
+
+def _netprobe_transport_param(transport: Any, key: str) -> str:
+    want = str(key or '').strip().lower()
+    if not want:
+        return ''
+    s = str(transport or '').strip()
+    if not s:
+        return ''
+    for m in _NETPROBE_TRANSPORT_RE.finditer(s):
+        k = str(m.group(2) or '').strip().lower()
+        if k == want:
+            return str(m.group(3) or '').strip()
+    return ''
+
+
+def _netprobe_transport_has_flag(transport: Any, flag: str) -> bool:
+    want = str(flag or '').strip().lower()
+    if not want:
+        return False
+    s = str(transport or '').strip().lower()
+    if not s:
+        return False
+    toks = [x.strip() for x in s.split(';') if x and x.strip()]
+    for t in toks:
+        if '=' in t:
+            continue
+        if t == want:
+            return True
+    return False
+
+
+def _netprobe_is_ws_transport(transport: Any) -> bool:
+    s = str(transport or '').strip().lower()
+    if not s:
+        return False
+    head = s.split(';', 1)[0].strip()
+    return head in ('ws', 'wss')
+
+
+def _netprobe_is_ip_literal(host: str) -> bool:
+    h = str(host or '').strip()
+    if not h:
+        return False
+    core = h.split('%', 1)[0]
+    try:
+        socket.inet_pton(socket.AF_INET, core)
+        return True
+    except Exception:
+        pass
+    try:
+        socket.inet_pton(socket.AF_INET6, core)
+        return True
+    except Exception:
+        return False
+
+
+def _netprobe_collect_remotes(rule: Dict[str, Any]) -> List[str]:
+    remotes: List[str] = []
+    r0 = rule.get('remote')
+    if isinstance(r0, str) and r0.strip():
+        remotes.append(r0.strip())
+    r1 = rule.get('remotes')
+    if isinstance(r1, list):
+        remotes.extend([str(x).strip() for x in r1 if str(x or '').strip()])
+    r2 = rule.get('extra_remotes')
+    if isinstance(r2, list):
+        remotes.extend([str(x).strip() for x in r2 if str(x or '').strip()])
+    out: List[str] = []
+    seen: set[str] = set()
+    for r in remotes:
+        if r in seen:
+            continue
+        seen.add(r)
+        out.append(r)
+    return out[:16]
+
+
+def _netprobe_proto_set(protocol: Any) -> set[str]:
+    p = str(protocol or 'tcp+udp').strip().lower()
+    if p == 'tcp':
+        return {'tcp'}
+    if p == 'udp':
+        return {'udp'}
+    return {'tcp', 'udp'}
+
+
+def _netprobe_read_proc_ports(path: str, tcp: bool) -> set[int]:
+    out: set[int] = set()
+    try:
+        with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+            lines = f.readlines()[1:]
+    except Exception:
+        return out
+
+    for line in lines:
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        local = parts[1]
+        st = parts[3].upper()
+        if tcp:
+            if st != '0A':
+                continue
+        else:
+            # udp sockets are usually "07" (UNCONN)
+            if st not in ('07', '0A'):
+                continue
+        if ':' not in local:
+            continue
+        p_hex = local.rsplit(':', 1)[-1]
+        try:
+            p = int(p_hex, 16)
+        except Exception:
+            continue
+        if p > 0:
+            out.add(p)
+    return out
+
+
+def _netprobe_system_listen_ports() -> Dict[str, set[int]]:
+    tcp_ports = _netprobe_read_proc_ports('/proc/net/tcp', tcp=True) | _netprobe_read_proc_ports('/proc/net/tcp6', tcp=True)
+    udp_ports = _netprobe_read_proc_ports('/proc/net/udp', tcp=False) | _netprobe_read_proc_ports('/proc/net/udp6', tcp=False)
+    return {'tcp': tcp_ports, 'udp': udp_ports}
+
+
+def _netprobe_pool_listen_ports(pool: Dict[str, Any]) -> Dict[str, set[int]]:
+    out: Dict[str, set[int]] = {'tcp': set(), 'udp': set()}
+    eps = pool.get('endpoints') if isinstance(pool, dict) else []
+    if not isinstance(eps, list):
+        return out
+    for ep in eps:
+        if not isinstance(ep, dict):
+            continue
+        if bool(ep.get('disabled')):
+            continue
+        ex = ep.get('extra_config') if isinstance(ep.get('extra_config'), dict) else {}
+        if isinstance(ex, dict) and str(ex.get('intranet_role') or '').strip() == 'client':
+            continue
+        listen = str(ep.get('listen') or '').strip()
+        if not listen:
+            continue
+        try:
+            lp = int(_parse_listen_port(listen))
+        except Exception:
+            continue
+        if lp <= 0:
+            continue
+        for proto in _netprobe_proto_set(ep.get('protocol')):
+            out[proto].add(lp)
+    return out
+
+
+def _netprobe_read_proc_int(path: str) -> Optional[int]:
+    try:
+        raw = Path(path).read_text(encoding='utf-8').strip().split()
+    except Exception:
+        return None
+    if not raw:
+        return None
+    try:
+        return int(raw[0])
+    except Exception:
+        return None
+
+
+def _netprobe_read_port_range(path: str) -> Optional[Tuple[int, int]]:
+    try:
+        raw = Path(path).read_text(encoding='utf-8').strip().split()
+    except Exception:
+        return None
+    if len(raw) < 2:
+        return None
+    try:
+        lo = int(raw[0])
+        hi = int(raw[1])
+    except Exception:
+        return None
+    if lo <= 0 or hi <= lo:
+        return None
+    return lo, hi
+
+
+def _netprobe_run_targets(mode: str, targets: List[str], default_port: int, timeout_f: float) -> Dict[str, Any]:
     if not targets:
-        return {'ok': False, 'error': 'targets_empty'}
-
+        return {}
     results: Dict[str, Any] = {}
-
-    max_workers = max(4, min(32, len(targets)))
+    max_workers = max(4, min(48, len(targets)))
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         fut_map = {}
         for t in targets:
@@ -2464,7 +2654,319 @@ def api_netprobe(payload: Dict[str, Any], _: None = Depends(_api_key_required)) 
                     results[t] = {'ok': False, 'error': 'probe_error'}
             except Exception as exc:
                 results[t] = {'ok': False, 'error': str(exc)}
+    return results
 
+
+def _netprobe_rules(payload: Dict[str, Any], default_port: int, timeout_f: float) -> Dict[str, Any]:
+    raw_rules = payload.get('rules')
+    if not isinstance(raw_rules, list):
+        maybe_pool = payload.get('pool')
+        if isinstance(maybe_pool, dict) and isinstance(maybe_pool.get('endpoints'), list):
+            raw_rules = maybe_pool.get('endpoints') or []
+        else:
+            raw_rules = []
+    raw_rules = raw_rules[:160]
+
+    rules_meta: List[Dict[str, Any]] = []
+    global_targets: List[str] = []
+    global_target_set: set[str] = set()
+    max_probe_targets = 400
+
+    active_rules = 0
+    udp_rules = 0
+
+    for idx, rule in enumerate(raw_rules):
+        if not isinstance(rule, dict):
+            continue
+
+        ex = rule.get('extra_config') if isinstance(rule.get('extra_config'), dict) else {}
+        listen = str(rule.get('listen') or '').strip()
+        protocol = str(rule.get('protocol') or 'tcp+udp').strip().lower()
+        pset = _netprobe_proto_set(protocol)
+        disabled = bool(rule.get('disabled'))
+        rid = str(rule.get('id') or '').strip()
+
+        remotes = _netprobe_collect_remotes(rule)
+        candidate_targets: List[str] = []
+        for r in remotes:
+            host, port = _parse_tcp_target(r, default_port)
+            k = _netprobe_target_key(host, port)
+            if k and k not in candidate_targets:
+                candidate_targets.append(k)
+
+        warnings: List[str] = []
+
+        if 'udp' in pset and 'tcp' in pset and remotes:
+            common_tcp_ports = {21, 22, 25, 53, 80, 110, 143, 443, 465, 587, 993, 995, 3306, 5432, 6379, 8080, 8443}
+            ports: List[int] = []
+            for r in remotes[:16]:
+                _h, p = _parse_tcp_target(r, default_port)
+                if 1 <= int(p) <= 65535:
+                    ports.append(int(p))
+            if ports and all(p in common_tcp_ports for p in ports):
+                warnings.append('已启用 UDP（TCP+UDP），目标端口看起来是典型 TCP 端口，可能存在 UDP 误开')
+
+        remote_transport = str(rule.get('remote_transport') or (ex.get('remote_transport') if isinstance(ex, dict) else '') or '').strip()
+        remote_ws_mode = _netprobe_is_ws_transport(remote_transport) or bool(
+            (ex.get('remote_ws_host') if isinstance(ex, dict) else '') or (ex.get('remote_ws_path') if isinstance(ex, dict) else '')
+        )
+        if remote_ws_mode:
+            ws_host = str((ex.get('remote_ws_host') if isinstance(ex, dict) else '') or _netprobe_transport_param(remote_transport, 'host') or '').strip()
+            ws_path = str((ex.get('remote_ws_path') if isinstance(ex, dict) else '') or _netprobe_transport_param(remote_transport, 'path') or '').strip()
+            tls = bool((ex.get('remote_tls_enabled') if isinstance(ex, dict) else False)) or _netprobe_transport_has_flag(remote_transport, 'tls')
+            insecure = bool((ex.get('remote_tls_insecure') if isinstance(ex, dict) else False)) or _netprobe_transport_has_flag(
+                remote_transport, 'insecure'
+            )
+            sni = str(
+                (ex.get('remote_tls_sni') if isinstance(ex, dict) else '')
+                or _netprobe_transport_param(remote_transport, 'sni')
+                or _netprobe_transport_param(remote_transport, 'servername')
+                or ''
+            ).strip()
+            if not ws_host or not ws_path:
+                miss = []
+                if not ws_host:
+                    miss.append('Host')
+                if not ws_path:
+                    miss.append('Path')
+                warnings.append(f'WSS 参数缺失（remote 侧）：{" / ".join(miss)} 不能为空')
+            if ws_host:
+                ws_port = 443 if tls else 80
+                tk = _netprobe_target_key(ws_host, ws_port)
+                if tk and tk not in candidate_targets:
+                    candidate_targets.append(tk)
+            if tls and insecure:
+                warnings.append('TLS 校验已关闭（remote 侧 insecure=true），存在中间人风险')
+            if tls and ws_host and (not sni) and (not _netprobe_is_ip_literal(ws_host)):
+                warnings.append('TLS 未设置 SNI（remote 侧），证书校验可能失败')
+
+        listen_transport = str(rule.get('listen_transport') or (ex.get('listen_transport') if isinstance(ex, dict) else '') or '').strip()
+        listen_ws_mode = _netprobe_is_ws_transport(listen_transport) or bool(
+            (ex.get('listen_ws_host') if isinstance(ex, dict) else '') or (ex.get('listen_ws_path') if isinstance(ex, dict) else '')
+        )
+        if listen_ws_mode:
+            ws_host = str((ex.get('listen_ws_host') if isinstance(ex, dict) else '') or _netprobe_transport_param(listen_transport, 'host') or '').strip()
+            ws_path = str((ex.get('listen_ws_path') if isinstance(ex, dict) else '') or _netprobe_transport_param(listen_transport, 'path') or '').strip()
+            tls = bool((ex.get('listen_tls_enabled') if isinstance(ex, dict) else False)) or _netprobe_transport_has_flag(listen_transport, 'tls')
+            insecure = bool((ex.get('listen_tls_insecure') if isinstance(ex, dict) else False)) or _netprobe_transport_has_flag(
+                listen_transport, 'insecure'
+            )
+            servername = str(
+                (ex.get('listen_tls_servername') if isinstance(ex, dict) else '')
+                or _netprobe_transport_param(listen_transport, 'servername')
+                or _netprobe_transport_param(listen_transport, 'sni')
+                or ''
+            ).strip()
+            if not ws_host or not ws_path:
+                miss = []
+                if not ws_host:
+                    miss.append('Host')
+                if not ws_path:
+                    miss.append('Path')
+                warnings.append(f'WSS 参数缺失（listen 侧）：{" / ".join(miss)} 不能为空')
+            if tls and insecure:
+                warnings.append('TLS 校验已关闭（listen 侧 insecure=true），存在中间人风险')
+            if tls and ws_host and (not servername) and (not _netprobe_is_ip_literal(ws_host)):
+                warnings.append('TLS 未设置 ServerName（listen 侧），证书校验可能失败')
+
+        probe_targets: List[str] = []
+        if (not disabled) and ('tcp' in pset):
+            for t in candidate_targets:
+                if t not in probe_targets:
+                    probe_targets.append(t)
+        elif (not disabled) and candidate_targets:
+            warnings.append('当前规则未启用 TCP，无法执行 TCP 连通探测')
+
+        listen_port = 0
+        try:
+            listen_port = int(_parse_listen_port(listen))
+        except Exception:
+            listen_port = 0
+
+        if not disabled:
+            active_rules += 1
+            if 'udp' in pset:
+                udp_rules += 1
+
+        scheduled_probe_targets: List[str] = []
+        truncated_count = 0
+        for t in probe_targets:
+            if t in global_target_set:
+                scheduled_probe_targets.append(t)
+                continue
+            if len(global_targets) >= max_probe_targets:
+                truncated_count += 1
+                continue
+            global_target_set.add(t)
+            global_targets.append(t)
+            scheduled_probe_targets.append(t)
+        if truncated_count > 0:
+            warnings.append(f'探测目标过多，已截断（本次最多 {max_probe_targets} 个）')
+
+        rules_meta.append(
+            {
+                'idx': idx,
+                'rule_id': rid,
+                'listen': listen,
+                'protocol': protocol or 'tcp+udp',
+                'disabled': disabled,
+                'proto_set': pset,
+                'listen_port': listen_port,
+                'targets': candidate_targets[:16],
+                'probe_targets': scheduled_probe_targets[:16],
+                'warnings': warnings[:16],
+            }
+        )
+
+    # Check listen port occupancy (new port is already used by other processes).
+    try:
+        running_pool = _load_full_pool()
+    except Exception:
+        running_pool = {'endpoints': []}
+    current_pool_ports = _netprobe_pool_listen_ports(running_pool)
+    system_ports = _netprobe_system_listen_ports()
+
+    for meta in rules_meta:
+        if meta.get('disabled'):
+            continue
+        lp = int(meta.get('listen_port') or 0)
+        if lp <= 0:
+            continue
+        occupied: List[str] = []
+        for proto in sorted(meta.get('proto_set') or []):
+            if proto not in ('tcp', 'udp'):
+                continue
+            if lp in (system_ports.get(proto) or set()) and lp not in (current_pool_ports.get(proto) or set()):
+                occupied.append(f'{proto.upper()}:{lp}')
+        if occupied:
+            msg = f"监听端口可能被占用：{', '.join(occupied)}（当前系统已有监听）"
+            if msg not in meta['warnings']:
+                meta['warnings'].append(msg)
+            meta['port_occupied'] = occupied
+
+    probe_results = _netprobe_run_targets('tcping', global_targets, default_port, timeout_f)
+
+    rules_out: List[Dict[str, Any]] = []
+    unreachable_targets_total = 0
+    unreachable_rules = 0
+    warning_total = 0
+
+    for meta in rules_meta:
+        per_target: Dict[str, Any] = {}
+        unreachable: List[str] = []
+        for t in meta.get('probe_targets') or []:
+            item = probe_results.get(t)
+            if not isinstance(item, dict):
+                item = {'ok': False, 'error': 'no_data'}
+            per_target[t] = item
+            if item.get('ok') is not True:
+                unreachable.append(t)
+
+        if meta.get('disabled'):
+            ok_val = None
+        elif not (meta.get('probe_targets') or []):
+            ok_val = None
+        else:
+            ok_val = len(unreachable) == 0
+
+        if ok_val is False:
+            unreachable_rules += 1
+        unreachable_targets_total += len(unreachable)
+        warning_total += len(meta.get('warnings') or [])
+
+        item = {
+            'idx': int(meta.get('idx') or 0),
+            'rule_id': str(meta.get('rule_id') or ''),
+            'listen': str(meta.get('listen') or ''),
+            'protocol': str(meta.get('protocol') or 'tcp+udp'),
+            'disabled': bool(meta.get('disabled')),
+            'ok': ok_val,
+            'targets': list(meta.get('targets') or []),
+            'checked_targets': list(meta.get('probe_targets') or []),
+            'results': per_target,
+            'unreachable': unreachable,
+            'warnings': list(meta.get('warnings') or []),
+        }
+        if meta.get('port_occupied'):
+            item['port_occupied'] = list(meta.get('port_occupied') or [])
+        rules_out.append(item)
+
+    deps = {
+        'ping': bool(shutil.which('ping') or shutil.which('ping6')),
+        'ss': bool(shutil.which('ss')),
+        'iptables': bool(shutil.which('iptables')),
+        'sysctl': bool(shutil.which('sysctl')),
+    }
+
+    sysctl_snapshot: Dict[str, Any] = {}
+    for k, p in (
+        ('net.core.somaxconn', '/proc/sys/net/core/somaxconn'),
+        ('net.core.rmem_max', '/proc/sys/net/core/rmem_max'),
+        ('net.core.wmem_max', '/proc/sys/net/core/wmem_max'),
+        ('net.core.netdev_max_backlog', '/proc/sys/net/core/netdev_max_backlog'),
+    ):
+        v = _netprobe_read_proc_int(p)
+        if v is not None:
+            sysctl_snapshot[k] = v
+    pr = _netprobe_read_port_range('/proc/sys/net/ipv4/ip_local_port_range')
+    if pr is not None:
+        sysctl_snapshot['net.ipv4.ip_local_port_range'] = [int(pr[0]), int(pr[1])]
+
+    perf_hints: List[str] = []
+    somaxconn = int(sysctl_snapshot.get('net.core.somaxconn') or 0)
+    if active_rules >= 32 and 0 < somaxconn < 1024:
+        perf_hints.append('规则较多且 somaxconn 偏低，建议提升 net.core.somaxconn（例如 >= 2048）')
+    if udp_rules >= 8:
+        rmem_max = int(sysctl_snapshot.get('net.core.rmem_max') or 0)
+        wmem_max = int(sysctl_snapshot.get('net.core.wmem_max') or 0)
+        if 0 < rmem_max < 4 * 1024 * 1024:
+            perf_hints.append('UDP 规则较多，建议提高 net.core.rmem_max（例如 >= 4MB）')
+        if 0 < wmem_max < 4 * 1024 * 1024:
+            perf_hints.append('UDP 规则较多，建议提高 net.core.wmem_max（例如 >= 4MB）')
+    if pr is not None and len(global_targets) >= 120:
+        span = int(pr[1]) - int(pr[0])
+        if span < 20000:
+            perf_hints.append('并发探测目标较多且本机临时端口范围较窄，建议扩大 net.ipv4.ip_local_port_range')
+
+    return {
+        'ok': True,
+        'mode': 'rules',
+        'probe_mode': 'tcping',
+        'tcp_port': default_port,
+        'timeout': timeout_f,
+        'deps': deps,
+        'sysctl': sysctl_snapshot,
+        'perf_hints': perf_hints[:8],
+        'summary': {
+            'rules_total': len(rules_out),
+            'targets_total': len(global_targets),
+            'rules_unreachable': int(unreachable_rules),
+            'targets_unreachable': int(unreachable_targets_total),
+            'warnings': int(warning_total),
+        },
+        'targets': global_targets,
+        'target_results': probe_results,
+        'rules': rules_out,
+    }
+
+
+@app.post('/api/v1/netprobe')
+def api_netprobe(payload: Dict[str, Any], _: None = Depends(_api_key_required)) -> Dict[str, Any]:
+    """Batch network probe from this node."""
+    mode = str(payload.get('mode') or 'ping').strip().lower()
+    default_port = _netprobe_default_port(payload.get('tcp_port'))
+    timeout_f = _netprobe_timeout(payload.get('timeout'))
+
+    if mode == 'rules':
+        return _netprobe_rules(payload, default_port, timeout_f)
+
+    if mode not in ('ping', 'tcping'):
+        mode = 'ping'
+    targets = _netprobe_clean_targets(payload.get('targets') or [], 50)
+    if not targets:
+        return {'ok': False, 'error': 'targets_empty'}
+
+    results = _netprobe_run_targets(mode, targets, default_port, timeout_f)
     return {'ok': True, 'mode': mode, 'tcp_port': default_port, 'timeout': timeout_f, 'results': results}
 
 

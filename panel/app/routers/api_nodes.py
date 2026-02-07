@@ -109,6 +109,43 @@ def _format_bytes(num: int) -> str:
 _FULL_RESTORE_MAX_BYTES = _parse_restore_upload_max_bytes()
 
 
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return bool(default)
+    return str(raw).strip().lower() not in ("0", "false", "off", "no")
+
+
+def _env_float(name: str, default: float, lo: float, hi: float) -> float:
+    try:
+        v = float(str(os.getenv(name, str(default))).strip() or default)
+    except Exception:
+        v = float(default)
+    if v < lo:
+        v = lo
+    if v > hi:
+        v = hi
+    return float(v)
+
+
+def _env_int(name: str, default: int, lo: int, hi: int) -> int:
+    try:
+        v = int(float(str(os.getenv(name, str(default))).strip() or default))
+    except Exception:
+        v = int(default)
+    if v < lo:
+        v = lo
+    if v > hi:
+        v = hi
+    return int(v)
+
+
+_SAVE_PRECHECK_ENABLED = _env_flag("REALM_SAVE_PRECHECK_ENABLED", True)
+_SAVE_PRECHECK_HTTP_TIMEOUT = _env_float("REALM_SAVE_PRECHECK_HTTP_TIMEOUT", 4.5, 2.0, 20.0)
+_SAVE_PRECHECK_PROBE_TIMEOUT = _env_float("REALM_SAVE_PRECHECK_PROBE_TIMEOUT", 1.2, 0.2, 6.0)
+_SAVE_PRECHECK_MAX_ISSUES = _env_int("REALM_SAVE_PRECHECK_MAX_ISSUES", 24, 5, 120)
+
+
 async def _read_full_restore_upload(file: UploadFile) -> tuple[Optional[bytes], Optional[str], int]:
     try:
         await file.seek(0)
@@ -2311,6 +2348,223 @@ async def api_restore(
     return {"ok": True, "desired_version": desired_ver, "queued": True}
 
 
+def _append_precheck_issue(
+    issues: List[PoolValidationIssue],
+    seen: set[str],
+    issue: PoolValidationIssue,
+    limit: int,
+) -> None:
+    key = f"{issue.path}|{issue.code}|{issue.severity}|{issue.message}"
+    if key in seen:
+        return
+    if len(issues) >= limit:
+        return
+    seen.add(key)
+    issues.append(issue)
+
+
+async def _run_pool_save_precheck(node: Dict[str, Any], pool: Dict[str, Any]) -> Dict[str, Any]:
+    """Save-time runtime precheck via agent /api/v1/netprobe (mode=rules)."""
+    out_issues: List[PoolValidationIssue] = []
+    seen: set[str] = set()
+
+    eps = pool.get("endpoints") if isinstance(pool.get("endpoints"), list) else []
+    if not isinstance(eps, list) or not eps:
+        return {
+            "ok": True,
+            "issues": out_issues,
+            "summary": {"enabled": _SAVE_PRECHECK_ENABLED, "rules_total": 0, "issues": 0, "source": "save_precheck"},
+        }
+
+    if not _SAVE_PRECHECK_ENABLED:
+        return {
+            "ok": True,
+            "issues": out_issues,
+            "summary": {"enabled": False, "rules_total": len(eps), "issues": 0, "source": "save_precheck"},
+        }
+
+    rules_payload: List[Dict[str, Any]] = []
+    for ep in eps[:160]:
+        if not isinstance(ep, dict):
+            continue
+        item: Dict[str, Any] = {
+            "id": str(ep.get("id") or ""),
+            "listen": str(ep.get("listen") or ""),
+            "protocol": str(ep.get("protocol") or ""),
+            "disabled": bool(ep.get("disabled")),
+            "remote": ep.get("remote"),
+            "remotes": ep.get("remotes") if isinstance(ep.get("remotes"), list) else [],
+            "extra_remotes": ep.get("extra_remotes") if isinstance(ep.get("extra_remotes"), list) else [],
+        }
+        if ep.get("listen_transport") is not None:
+            item["listen_transport"] = ep.get("listen_transport")
+        if ep.get("remote_transport") is not None:
+            item["remote_transport"] = ep.get("remote_transport")
+        ex = ep.get("extra_config")
+        if isinstance(ex, dict):
+            item["extra_config"] = ex
+        rules_payload.append(item)
+
+    body = {"mode": "rules", "rules": rules_payload, "timeout": _SAVE_PRECHECK_PROBE_TIMEOUT}
+    try:
+        data = await agent_post(
+            node.get("base_url", ""),
+            node.get("api_key", ""),
+            "/api/v1/netprobe",
+            body,
+            node_verify_tls(node),
+            timeout=_SAVE_PRECHECK_HTTP_TIMEOUT,
+        )
+    except Exception as exc:
+        _append_precheck_issue(
+            out_issues,
+            seen,
+            PoolValidationIssue(
+                path="endpoints",
+                message=f"预检失败：无法连接 Agent 执行规则探测（{exc}）",
+                severity="warning",
+                code="precheck_unreachable",
+            ),
+            _SAVE_PRECHECK_MAX_ISSUES,
+        )
+        return {
+            "ok": False,
+            "issues": out_issues,
+            "summary": {
+                "enabled": True,
+                "rules_total": len(rules_payload),
+                "issues": len(out_issues),
+                "source": "agent_netprobe_rules",
+                "error": "agent_unreachable",
+            },
+        }
+
+    if not isinstance(data, dict) or data.get("ok") is not True:
+        _append_precheck_issue(
+            out_issues,
+            seen,
+            PoolValidationIssue(
+                path="endpoints",
+                message=f"预检失败：Agent rules 探测返回异常（{(data or {}).get('error') or 'unknown'}）",
+                severity="warning",
+                code="precheck_failed",
+            ),
+            _SAVE_PRECHECK_MAX_ISSUES,
+        )
+        return {
+            "ok": False,
+            "issues": out_issues,
+            "summary": {
+                "enabled": True,
+                "rules_total": len(rules_payload),
+                "issues": len(out_issues),
+                "source": "agent_netprobe_rules",
+                "error": "probe_failed",
+            },
+        }
+
+    # deps
+    deps = data.get("deps") if isinstance(data.get("deps"), dict) else {}
+    if isinstance(deps, dict):
+        if deps.get("sysctl") is False:
+            _append_precheck_issue(
+                out_issues,
+                seen,
+                PoolValidationIssue(
+                    path="endpoints",
+                    message="依赖提示：节点缺少 sysctl 命令，性能优化提示可能不完整",
+                    severity="warning",
+                    code="dependency_missing",
+                ),
+                _SAVE_PRECHECK_MAX_ISSUES,
+            )
+        if deps.get("ss") is False:
+            _append_precheck_issue(
+                out_issues,
+                seen,
+                PoolValidationIssue(
+                    path="endpoints",
+                    message="依赖提示：节点缺少 ss 命令，端口占用检查可能不完整",
+                    severity="warning",
+                    code="dependency_missing",
+                ),
+                _SAVE_PRECHECK_MAX_ISSUES,
+            )
+
+    # perf hints
+    perf_hints = data.get("perf_hints") if isinstance(data.get("perf_hints"), list) else []
+    for hint in perf_hints[:8]:
+        msg = str(hint or "").strip()
+        if not msg:
+            continue
+        _append_precheck_issue(
+            out_issues,
+            seen,
+            PoolValidationIssue(path="endpoints", message=f"性能风险提示：{msg}", severity="warning", code="sysctl_tuning_recommended"),
+            _SAVE_PRECHECK_MAX_ISSUES,
+        )
+
+    # per-rule warnings / unreachable
+    rules = data.get("rules") if isinstance(data.get("rules"), list) else []
+    for r in rules[:200]:
+        if not isinstance(r, dict):
+            continue
+        try:
+            idx = int(r.get("idx"))
+        except Exception:
+            idx = -1
+        nth = idx + 1 if idx >= 0 else 0
+        path = f"endpoints[{idx}]" if idx >= 0 else "endpoints"
+
+        unreach = r.get("unreachable") if isinstance(r.get("unreachable"), list) else []
+        if unreach:
+            targets = [str(x).strip() for x in unreach if str(x).strip()]
+            if targets:
+                show = ", ".join(targets[:3])
+                if len(targets) > 3:
+                    show += f" 等 {len(targets)} 个"
+                prefix = f"第 {nth} 条规则" if nth > 0 else "规则"
+                _append_precheck_issue(
+                    out_issues,
+                    seen,
+                    PoolValidationIssue(
+                        path=path,
+                        message=f"{prefix}目标不可达：{show}",
+                        severity="warning",
+                        code="target_unreachable",
+                    ),
+                    _SAVE_PRECHECK_MAX_ISSUES,
+                )
+
+        warns = r.get("warnings") if isinstance(r.get("warnings"), list) else []
+        for w in warns[:6]:
+            msg = str(w or "").strip()
+            if not msg:
+                continue
+            prefix = f"第 {nth} 条规则预检提示：" if nth > 0 else "规则预检提示："
+            _append_precheck_issue(
+                out_issues,
+                seen,
+                PoolValidationIssue(path=path, message=f"{prefix}{msg}", severity="warning", code="runtime_warning"),
+                _SAVE_PRECHECK_MAX_ISSUES,
+            )
+
+    summary = data.get("summary") if isinstance(data.get("summary"), dict) else {}
+    return {
+        "ok": True,
+        "issues": out_issues,
+        "summary": {
+            "enabled": True,
+            "source": "agent_netprobe_rules",
+            "rules_total": int(summary.get("rules_total") or len(rules_payload)),
+            "targets_total": int(summary.get("targets_total") or 0),
+            "rules_unreachable": int(summary.get("rules_unreachable") or 0),
+            "targets_unreachable": int(summary.get("targets_unreachable") or 0),
+            "issues": len(out_issues),
+        },
+    }
+
+
 @router.post("/api/nodes/{node_id}/pool")
 async def api_pool_set(request: Request, node_id: int, payload: Dict[str, Any], user: str = Depends(require_login)):
     node = get_node(node_id)
@@ -2393,11 +2647,21 @@ async def api_pool_set(request: Request, node_id: int, payload: Dict[str, Any], 
     except Exception:
         pass
 
-    # Save-time validation: port conflicts / remote format / weights count
+    # Save-time validation: format/conflict errors + static warnings
+    static_warnings: List[PoolValidationIssue] = []
     try:
-        validate_pool_inplace(pool)
+        static_warnings = validate_pool_inplace(pool)
     except PoolValidationError as exc:
         return JSONResponse({"ok": False, "error": str(exc), "issues": [i.__dict__ for i in exc.issues]}, status_code=400)
+
+    runtime_precheck = await _run_pool_save_precheck(node, pool)
+    precheck_issues: List[PoolValidationIssue] = []
+    precheck_seen: set[str] = set()
+    for i in static_warnings:
+        _append_precheck_issue(precheck_issues, precheck_seen, i, _SAVE_PRECHECK_MAX_ISSUES)
+    for i in (runtime_precheck.get("issues") or []):
+        if isinstance(i, PoolValidationIssue):
+            _append_precheck_issue(precheck_issues, precheck_seen, i, _SAVE_PRECHECK_MAX_ISSUES)
 
     # Store desired pool on panel. Agent will pull it on next report.
     desired_ver, _ = set_desired_pool(node_id, pool)
@@ -2411,6 +2675,10 @@ async def api_pool_set(request: Request, node_id: int, payload: Dict[str, Any], 
         "desired_version": desired_ver,
         "queued": True,
         "note": "waiting agent report",
+        "precheck": {
+            "issues": [i.__dict__ for i in precheck_issues],
+            "summary": runtime_precheck.get("summary") if isinstance(runtime_precheck.get("summary"), dict) else {},
+        },
     }
 
 

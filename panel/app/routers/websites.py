@@ -6,6 +6,7 @@ import hashlib
 import os
 import re
 import tempfile
+import time
 import uuid
 import zipfile
 from typing import Any, Dict, List, Optional, Tuple
@@ -18,7 +19,7 @@ from starlette.background import BackgroundTask
 from ..clients.agent import AgentError, agent_get, agent_get_raw, agent_post
 from ..core.deps import require_login_page
 from ..core.flash import flash, set_flash
-from ..core.share import make_share_token, verify_share_token
+from ..core.share import make_share_token, verify_share_token, verify_share_token_allow_expired
 from ..core.templates import templates
 from ..db import (
     add_certificate,
@@ -38,6 +39,7 @@ from ..db import (
     list_certificates,
     list_site_checks,
     list_site_events,
+    list_site_file_share_short_links,
     list_nodes,
     list_sites,
     get_site_file_share_short_link,
@@ -2346,6 +2348,93 @@ async def website_files_share_link(
         "expire_at": expire_at.strftime("%Y-%m-%d %H:%M:%S"),
         "items": share_items,
     }
+
+
+@router.get("/websites/{site_id}/files/share/list")
+async def website_files_share_list(
+    request: Request,
+    site_id: int,
+    limit: int = 50,
+    user: str = Depends(require_login_page),
+):
+    _ = user
+    site = get_site(int(site_id))
+    if not site:
+        return {"ok": False, "error": "站点不存在"}
+
+    rows = list_site_file_share_short_links(int(site_id), limit=max(1, min(int(limit or 50), 200)))
+    base = panel_public_base_url(request)
+    now_ts = int(time.time())
+    out: List[Dict[str, Any]] = []
+
+    for row in rows:
+        code = str(row.get("code") or "").strip()
+        token = str(row.get("token") or "").strip()
+        payload = verify_share_token_allow_expired(token)
+        try:
+            token_site_id = int((payload or {}).get("site_id") or 0) if isinstance(payload, dict) else 0
+        except Exception:
+            token_site_id = 0
+        valid = bool(
+            isinstance(payload, dict)
+            and str(payload.get("page") or "") == "site_files_download"
+            and token_site_id == int(site_id)
+        )
+        exp = 0
+        if isinstance(payload, dict):
+            try:
+                exp = int(payload.get("exp") or 0)
+            except Exception:
+                exp = 0
+        expired = bool(exp and now_ts > exp)
+        revoked = bool(str(row.get("revoked_at") or "").strip())
+
+        status = "invalid"
+        if revoked:
+            status = "revoked"
+        elif valid and expired:
+            status = "expired"
+        elif valid:
+            status = "active"
+
+        share_items: List[Dict[str, Any]] = []
+        if isinstance(payload, dict):
+            try:
+                share_items = _parse_share_items(payload.get("items") or payload.get("paths") or [])
+            except Exception:
+                share_items = []
+        item_count = len(share_items)
+        first_path = str(share_items[0].get("path") or "") if share_items else ""
+        if item_count > 1 and first_path:
+            first_label = f"{first_path} (+{item_count - 1})"
+        else:
+            first_label = first_path
+
+        expire_at = ""
+        if exp > 0:
+            try:
+                expire_at = datetime.datetime.fromtimestamp(exp).strftime("%Y-%m-%d %H:%M:%S")
+            except Exception:
+                expire_at = ""
+
+        out.append(
+            {
+                "code": code,
+                "url": f"{base}/share/site-files/s/{code}" if code else "",
+                "status": status,
+                "can_revoke": status == "active",
+                "is_expired": expired,
+                "is_revoked": revoked,
+                "created_at": str(row.get("created_at") or ""),
+                "expire_at": expire_at,
+                "revoked_at": str(row.get("revoked_at") or ""),
+                "revoked_by": str(row.get("revoked_by") or ""),
+                "item_count": item_count,
+                "first_item": first_label,
+            }
+        )
+
+    return {"ok": True, "items": out}
 
 
 @router.post("/websites/{site_id}/files/share/revoke")

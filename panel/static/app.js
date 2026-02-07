@@ -3019,7 +3019,7 @@ async function toggleRule(idx){
       if(res && res.ok){
         CURRENT_POOL = res.sender_pool;
         renderRules();
-        toast('已同步更新（发送/接收两端）');
+        toastWithPrecheck(res, '已同步更新（发送/接收两端）');
       }else{
         toast(res && res.error ? res.error : '同步更新失败，请稍后重试', true);
       }
@@ -3052,7 +3052,7 @@ async function toggleRule(idx){
       if(res && res.ok){
         CURRENT_POOL = res.sender_pool;
         renderRules();
-        toast('已同步更新（公网入口/内网出口两端）');
+        toastWithPrecheck(res, '已同步更新（公网入口/内网出口两端）');
       }else{
         toast(res && res.error ? res.error : '同步更新失败，请稍后重试', true);
       }
@@ -3555,7 +3555,7 @@ async function saveRule(){
         CURRENT_POOL = res.sender_pool;
         renderRules();
         closeModal();
-        toast('已保存，并自动同步到接收机');
+        toastWithPrecheck(res, '已保存，并自动同步到接收机');
       }else{
         toast((res && res.error) ? res.error : '保存失败，请检查节点是否在线', true);
       }
@@ -3605,7 +3605,7 @@ async function saveRule(){
         CURRENT_POOL = res.sender_pool;
         renderRules();
         closeModal();
-        toast('已保存，并自动下发到内网节点');
+        toastWithPrecheck(res, '已保存，并自动下发到内网节点');
       }else{
         toast((res && res.error) ? res.error : '保存失败，请检查节点是否在线', true);
       }
@@ -3672,6 +3672,26 @@ async function saveRule(){
   }
 }
 
+function precheckWarningMessages(resp){
+  const issues = (resp && resp.precheck && Array.isArray(resp.precheck.issues)) ? resp.precheck.issues : [];
+  return issues
+    .filter((it)=>String((it && it.severity) || 'warning').toLowerCase() !== 'error')
+    .map((it)=>String((it && it.message) || '').trim())
+    .filter(Boolean);
+}
+
+function toastWithPrecheck(resp, okMsg){
+  const lines = precheckWarningMessages(resp);
+  if(lines.length <= 0){
+    if(okMsg) toast(okMsg);
+    return;
+  }
+  const short = lines.slice(0, 2).join('；');
+  const more = lines.length > 2 ? `；等 ${lines.length} 条` : '';
+  const head = okMsg || '已保存';
+  toast(`${head}（预检提示：${short}${more}）`, false, 5600);
+}
+
 async function savePool(msg){
   q('modalMsg') && (q('modalMsg').textContent = '');
   const id = window.__NODE_ID__;
@@ -3683,7 +3703,7 @@ async function savePool(msg){
     if(res && res.ok){
       CURRENT_POOL = res.pool;
       renderRules();
-      if(msg) toast(msg);
+      toastWithPrecheck(res, msg);
       return true;
     }
     const err = (res && res.error) ? res.error : '保存失败';
@@ -3697,9 +3717,10 @@ async function savePool(msg){
   }
 }
 
-function toast(text, isError=false){
+function toast(text, isError=false, durationMs){
   const msg = String(text || '').trim();
   if(!msg) return;
+  const stayMs = Math.max(1200, Number(durationMs) || 1800);
 
   // Prefer a toast bar if present
   const t = q('toast');
@@ -3707,7 +3728,7 @@ function toast(text, isError=false){
     t.textContent = msg;
     t.style.display = 'block';
     t.classList.toggle('error', !!isError);
-    setTimeout(()=>{ t.style.display='none'; }, 1800);
+    setTimeout(()=>{ t.style.display='none'; }, stayMs);
     return;
   }
 

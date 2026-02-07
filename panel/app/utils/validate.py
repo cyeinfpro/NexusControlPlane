@@ -14,6 +14,8 @@ class PoolValidationIssue:
 
     path: str
     message: str
+    severity: str = "error"
+    code: str = ""
 
 
 class PoolValidationError(ValueError):
@@ -188,7 +190,89 @@ def _hosts_overlap(a_host: str, b_host: str) -> bool:
     return str(a_host).strip().lower() == str(b_host).strip().lower()
 
 
-def validate_pool_inplace(pool: Dict[str, Any]) -> None:
+def _transport_tokens(transport: Any) -> List[str]:
+    return [seg.strip() for seg in str(transport or "").split(";") if seg and str(seg).strip()]
+
+
+def _transport_param(transport: Any, key: str) -> str:
+    want = str(key or "").strip().lower()
+    if not want:
+        return ""
+    for seg in _transport_tokens(transport):
+        if "=" not in seg:
+            continue
+        k, v = seg.split("=", 1)
+        if k.strip().lower() == want:
+            return v.strip()
+    return ""
+
+
+def _transport_has_flag(transport: Any, flag: str) -> bool:
+    want = str(flag or "").strip().lower()
+    if not want:
+        return False
+    for seg in _transport_tokens(transport):
+        s = seg.strip().lower()
+        if not s or "=" in s:
+            continue
+        if s == want:
+            return True
+    return False
+
+
+def _is_ws_transport(transport: Any) -> bool:
+    toks = _transport_tokens(transport)
+    if not toks:
+        return False
+    head = toks[0].strip().lower()
+    return head in ("ws", "wss")
+
+
+def _is_ip_literal(host: str) -> bool:
+    h = str(host or "").strip()
+    if not h:
+        return False
+    core = h.split("%", 1)[0]
+    try:
+        ipaddress.ip_address(core)
+        return True
+    except Exception:
+        return False
+
+
+def _looks_like_hostname(host: str) -> bool:
+    h = str(host or "").strip().strip("[]")
+    if not h:
+        return False
+    if _is_ip_literal(h):
+        return False
+    return any(ch.isalpha() for ch in h)
+
+
+def _collect_endpoint_remotes(ep: Dict[str, Any]) -> List[str]:
+    rems: List[str] = []
+    if isinstance(ep.get("remote"), str) and str(ep.get("remote") or "").strip():
+        rems.append(str(ep.get("remote") or "").strip())
+    if isinstance(ep.get("remotes"), list):
+        rems += [str(x).strip() for x in ep.get("remotes") or [] if str(x).strip()]
+    if isinstance(ep.get("extra_remotes"), list):
+        rems += [str(x).strip() for x in ep.get("extra_remotes") or [] if str(x).strip()]
+
+    out: List[str] = []
+    seen: Set[str] = set()
+    for r in rems:
+        if r in seen:
+            continue
+        seen.add(r)
+        out.append(r)
+    return out
+
+
+def _warn(path: str, message: str, code: str) -> PoolValidationIssue:
+    return PoolValidationIssue(path=path, message=message, severity="warning", code=code)
+
+
+def validate_pool_inplace(pool: Dict[str, Any]) -> List[PoolValidationIssue]:
     """Validate a pool dict and normalize obvious formatting issues in-place.
 
     Checks:
@@ -197,7 +281,11 @@ def validate_pool_inplace(pool: Dict[str, Any]) -> None:
       3) weights count vs remotes count (when balance explicitly includes weights)
       4) listen port conflicts across endpoints
 
-    Raises PoolValidationError on failure.
+    Returns:
+      - warning issues when validation passes.
+
+    Raises:
+      - PoolValidationError on blocking errors.
     """
 
     if not isinstance(pool, dict):
@@ -206,13 +294,19 @@ def validate_pool_inplace(pool: Dict[str, Any]) -> None:
     eps = pool.get("endpoints")
     if eps is None:
         pool["endpoints"] = []
-        return
+        return []
     if not isinstance(eps, list):
         raise PoolValidationError("pool.endpoints 必须是数组")
 
     issues: List[PoolValidationIssue] = []
+    warnings: List[PoolValidationIssue] = []
 
     # ---- Per-endpoint validation + normalization ----
+    active_rule_count = 0
+    active_udp_enabled = 0
+    total_remote_count = 0
+    common_tcp_ports = {21, 22, 25, 53, 80, 110, 143, 443, 465, 587, 993, 995, 3306, 5432, 6379, 8080, 8443}
+
     for idx, ep in enumerate(eps):
         if not isinstance(ep, dict):
             continue
@@ -277,18 +371,105 @@ def validate_pool_inplace(pool: Dict[str, Any]) -> None:
                         PoolValidationIssue(
                             path=f"endpoints[{idx}].extra_remotes[{j}]",
                             message=f"目标地址格式错误（第 {idx+1} 条规则，extra_remotes 第 {j+1} 个）：{exc}",
+                            )
                         )
-                    )
             ep["extra_remotes"] = new_list2
 
+        # WSS params / TLS pre-check
+        listen_transport = str(ep.get("listen_transport") or ex.get("listen_transport") or "").strip()
+        listen_ws_enabled = _is_ws_transport(listen_transport) or bool(ex.get("listen_ws_host") or ex.get("listen_ws_path"))
+        if listen_ws_enabled:
+            ws_host = str(ex.get("listen_ws_host") or _transport_param(listen_transport, "host") or "").strip()
+            ws_path = str(ex.get("listen_ws_path") or _transport_param(listen_transport, "path") or "").strip()
+            tls = bool(ex.get("listen_tls_enabled")) or _transport_has_flag(listen_transport, "tls") or str(
+                listen_transport
+            ).strip().lower().startswith("wss")
+            insecure = bool(ex.get("listen_tls_insecure")) or _transport_has_flag(listen_transport, "insecure")
+            sni = str(
+                ex.get("listen_tls_servername")
+                or _transport_param(listen_transport, "servername")
+                or _transport_param(listen_transport, "sni")
+                or ""
+            ).strip()
+
+            if not ws_host or not ws_path:
+                miss: List[str] = []
+                if not ws_host:
+                    miss.append("Host")
+                if not ws_path:
+                    miss.append("Path")
+                issues.append(
+                    PoolValidationIssue(
+                        path=f"endpoints[{idx}].extra_config",
+                        message=f"WSS 参数缺失（第 {idx+1} 条规则，listen 侧）：{' / '.join(miss)} 不能为空",
+                        code="wss_param_missing",
+                    )
+                )
+            if tls and insecure:
+                warnings.append(
+                    _warn(
+                        f"endpoints[{idx}].extra_config",
+                        f"TLS 校验已关闭（第 {idx+1} 条规则，listen 侧 insecure=true），存在中间人风险",
+                        "tls_insecure",
+                    )
+                )
+            if tls and not sni and _looks_like_hostname(ws_host):
+                warnings.append(
+                    _warn(
+                        f"endpoints[{idx}].extra_config",
+                        f"TLS 未设置 ServerName（第 {idx+1} 条规则，listen 侧），证书校验可能失败",
+                        "tls_sni_missing",
+                    )
+                )
+
+        remote_transport = str(ep.get("remote_transport") or ex.get("remote_transport") or "").strip()
+        remote_ws_enabled = _is_ws_transport(remote_transport) or bool(ex.get("remote_ws_host") or ex.get("remote_ws_path"))
+        if remote_ws_enabled:
+            ws_host = str(ex.get("remote_ws_host") or _transport_param(remote_transport, "host") or "").strip()
+            ws_path = str(ex.get("remote_ws_path") or _transport_param(remote_transport, "path") or "").strip()
+            tls = bool(ex.get("remote_tls_enabled")) or _transport_has_flag(remote_transport, "tls") or str(
+                remote_transport
+            ).strip().lower().startswith("wss")
+            insecure = bool(ex.get("remote_tls_insecure")) or _transport_has_flag(remote_transport, "insecure")
+            sni = str(
+                ex.get("remote_tls_sni")
+                or _transport_param(remote_transport, "sni")
+                or _transport_param(remote_transport, "servername")
+                or ""
+            ).strip()
+
+            if not ws_host or not ws_path:
+                miss = []
+                if not ws_host:
+                    miss.append("Host")
+                if not ws_path:
+                    miss.append("Path")
+                issues.append(
+                    PoolValidationIssue(
+                        path=f"endpoints[{idx}].extra_config",
+                        message=f"WSS 参数缺失（第 {idx+1} 条规则，remote 侧）：{' / '.join(miss)} 不能为空",
+                        code="wss_param_missing",
+                    )
+                )
+            if tls and insecure:
+                warnings.append(
+                    _warn(
+                        f"endpoints[{idx}].extra_config",
+                        f"TLS 校验已关闭（第 {idx+1} 条规则，remote 侧 insecure=true），存在中间人风险",
+                        "tls_insecure",
+                    )
+                )
+            if tls and not sni and _looks_like_hostname(ws_host):
+                warnings.append(
+                    _warn(
+                        f"endpoints[{idx}].extra_config",
+                        f"TLS 未设置 SNI（第 {idx+1} 条规则，remote 侧），证书校验可能失败",
+                        "tls_sni_missing",
+                    )
+                )
+
         # weights count check (only when balance explicitly provides weights)
-        rems: List[str] = []
-        if isinstance(ep.get("remote"), str) and str(ep.get("remote") or "").strip():
-            rems.append(str(ep.get("remote") or "").strip())
-        if isinstance(ep.get("remotes"), list):
-            rems += [str(x).strip() for x in ep.get("remotes") or [] if str(x).strip()]
-        if isinstance(ep.get("extra_remotes"), list):
-            rems += [str(x).strip() for x in ep.get("extra_remotes") or [] if str(x).strip()]
+        rems = _collect_endpoint_remotes(ep)
         n = len(rems)
         if n > 1:
             algo, weights = _parse_balance_weights(ep.get("balance"))
@@ -309,6 +490,29 @@ def validate_pool_inplace(pool: Dict[str, Any]) -> None:
                                 message=f"权重必须是正整数（非法：{', '.join(bad[:5])}{'…' if len(bad) > 5 else ''}）",
                             )
                         )
+
+        # UDP mis-open hint
+        proto = _proto_set(ep.get("protocol"))
+        if "udp" in proto and "tcp" in proto:
+            ports: List[int] = []
+            for r in rems[:16]:
+                _h, p = split_host_port(r)
+                if p is not None and int(p) > 0:
+                    ports.append(int(p))
+            if ports and all(p in common_tcp_ports for p in ports):
+                warnings.append(
+                    _warn(
+                        f"endpoints[{idx}].protocol",
+                        f"第 {idx+1} 条规则启用了 UDP（TCP+UDP），但目标端口看起来是典型 TCP 端口，可能误开 UDP",
+                        "udp_maybe_unintended",
+                    )
+                )
+
+        if not bool(ep.get("disabled")) and intranet_role != "client":
+            active_rule_count += 1
+            total_remote_count += n
+            if "udp" in proto:
+                active_udp_enabled += 1
 
     if issues:
         raise PoolValidationError(issues[0].message, issues)
@@ -374,3 +578,37 @@ def validate_pool_inplace(pool: Dict[str, Any]) -> None:
 
     if conflict_issues:
         raise PoolValidationError(conflict_issues[0].message, conflict_issues)
+
+    # ---- Performance risk hints ----
+    if active_rule_count >= 80:
+        warnings.append(
+            _warn(
+                "endpoints",
+                (
+                    f"性能风险提示：当前启用规则 {active_rule_count} 条，建议在节点上调优 "
+                    "sysctl（net.core.somaxconn、net.ipv4.ip_local_port_range、net.core.rmem_max、net.core.wmem_max）"
+                ),
+                "sysctl_tuning_recommended",
+            )
+        )
+    if total_remote_count >= 240:
+        warnings.append(
+            _warn(
+                "endpoints",
+                f"性能风险提示：总目标地址 {total_remote_count} 个，建议适当拆分规则并检查连接跟踪与端口范围配置",
+                "too_many_remotes",
+            )
+        )
+    if active_udp_enabled >= 16:
+        warnings.append(
+            _warn(
+                "endpoints",
+                (
+                    "性能风险提示：启用 UDP 的规则较多，建议提高 net.core.rmem_max/net.core.wmem_max，"
+                    "并检查 net.core.netdev_max_backlog"
+                ),
+                "udp_sysctl_recommended",
+            )
+        )
+
+    return warnings

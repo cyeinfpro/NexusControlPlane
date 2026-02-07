@@ -73,7 +73,7 @@ def make_share_token(payload: Dict[str, Any], ttl_sec: Optional[int] = None) -> 
     return f"{_b64url_encode(raw)}.{sig}"
 
 
-def verify_share_token(token: str) -> Optional[Dict[str, Any]]:
+def _verify_share_token(token: str, check_expire: bool = True) -> Optional[Dict[str, Any]]:
     try:
         tok = str(token or "").strip()
         if not tok or "." not in tok:
@@ -89,11 +89,19 @@ def verify_share_token(token: str) -> Optional[Dict[str, Any]]:
         if not isinstance(obj, dict):
             return None
         exp = int(obj.get("exp") or 0)
-        if exp and int(time.time()) > exp:
+        if check_expire and exp and int(time.time()) > exp:
             return None
         return obj
     except Exception:
         return None
+
+
+def verify_share_token(token: str) -> Optional[Dict[str, Any]]:
+    return _verify_share_token(token, check_expire=True)
+
+
+def verify_share_token_allow_expired(token: str) -> Optional[Dict[str, Any]]:
+    return _verify_share_token(token, check_expire=False)
 
 
 def require_login_or_share_page(request: Request, allow_page: str) -> str:

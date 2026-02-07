@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import os
 import secrets
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Depends
 from fastapi.responses import JSONResponse
@@ -25,6 +26,31 @@ from ..utils.normalize import format_addr, normalize_host_input, split_host_port
 from ..utils.validate import PoolValidationError, validate_pool_inplace
 
 router = APIRouter()
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return bool(default)
+    return str(raw).strip().lower() not in ("0", "false", "off", "no")
+
+
+def _env_float(name: str, default: float, lo: float, hi: float) -> float:
+    try:
+        v = float(str(os.getenv(name, str(default))).strip() or default)
+    except Exception:
+        v = float(default)
+    if v < lo:
+        v = lo
+    if v > hi:
+        v = hi
+    return float(v)
+
+
+_SYNC_PRECHECK_ENABLED = _env_flag("REALM_SYNC_SAVE_PRECHECK_ENABLED", True)
+_SYNC_PRECHECK_HTTP_TIMEOUT = _env_float("REALM_SYNC_SAVE_PRECHECK_HTTP_TIMEOUT", 4.5, 2.0, 20.0)
+_SYNC_PRECHECK_PROBE_TIMEOUT = _env_float("REALM_SYNC_SAVE_PRECHECK_PROBE_TIMEOUT", 1.2, 0.2, 6.0)
+_SYNC_PRECHECK_MAX_ISSUES = 24
 
 
 def random_wss_params() -> Tuple[str, str, str]:
@@ -59,6 +85,192 @@ def random_wss_params() -> Tuple[str, str, str]:
         path = "/" + path
     sni = host
     return host, path, sni
+
+
+def _issue_key(issue: Dict[str, Any]) -> str:
+    return (
+        f"{issue.get('path') or ''}|{issue.get('code') or ''}|"
+        f"{issue.get('severity') or ''}|{issue.get('message') or ''}"
+    )
+
+
+def _append_issue(
+    issues: List[Dict[str, Any]],
+    seen: set[str],
+    issue: Dict[str, Any],
+    limit: int = _SYNC_PRECHECK_MAX_ISSUES,
+) -> None:
+    k = _issue_key(issue)
+    if k in seen:
+        return
+    if len(issues) >= limit:
+        return
+    seen.add(k)
+    issues.append(issue)
+
+
+def _pool_rules_for_probe(pool: Dict[str, Any]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    eps = pool.get("endpoints") if isinstance(pool.get("endpoints"), list) else []
+    if not isinstance(eps, list):
+        return out
+    for ep in eps[:160]:
+        if not isinstance(ep, dict):
+            continue
+        item: Dict[str, Any] = {
+            "id": str(ep.get("id") or ""),
+            "listen": str(ep.get("listen") or ""),
+            "protocol": str(ep.get("protocol") or ""),
+            "disabled": bool(ep.get("disabled")),
+            "remote": ep.get("remote"),
+            "remotes": ep.get("remotes") if isinstance(ep.get("remotes"), list) else [],
+            "extra_remotes": ep.get("extra_remotes") if isinstance(ep.get("extra_remotes"), list) else [],
+        }
+        if ep.get("listen_transport") is not None:
+            item["listen_transport"] = ep.get("listen_transport")
+        if ep.get("remote_transport") is not None:
+            item["remote_transport"] = ep.get("remote_transport")
+        ex = ep.get("extra_config")
+        if isinstance(ex, dict):
+            item["extra_config"] = ex
+        out.append(item)
+    return out
+
+
+async def _probe_node_rules_precheck(node: Dict[str, Any], pool: Dict[str, Any], node_label: str) -> List[Dict[str, Any]]:
+    if not _SYNC_PRECHECK_ENABLED:
+        return []
+
+    rules_payload = _pool_rules_for_probe(pool)
+    if not rules_payload:
+        return []
+
+    issues: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    body = {"mode": "rules", "rules": rules_payload, "timeout": _SYNC_PRECHECK_PROBE_TIMEOUT}
+
+    try:
+        data = await agent_post(
+            node.get("base_url", ""),
+            node.get("api_key", ""),
+            "/api/v1/netprobe",
+            body,
+            node_verify_tls(node),
+            timeout=_SYNC_PRECHECK_HTTP_TIMEOUT,
+        )
+    except Exception as exc:
+        _append_issue(
+            issues,
+            seen,
+            {
+                "path": "endpoints",
+                "message": f"{node_label}预检失败：无法连接 Agent 执行规则探测（{exc}）",
+                "severity": "warning",
+                "code": "precheck_unreachable",
+            },
+        )
+        return issues
+
+    if not isinstance(data, dict) or data.get("ok") is not True:
+        _append_issue(
+            issues,
+            seen,
+            {
+                "path": "endpoints",
+                "message": f"{node_label}预检失败：Agent rules 探测返回异常（{(data or {}).get('error') or 'unknown'}）",
+                "severity": "warning",
+                "code": "precheck_failed",
+            },
+        )
+        return issues
+
+    deps = data.get("deps") if isinstance(data.get("deps"), dict) else {}
+    if isinstance(deps, dict):
+        if deps.get("sysctl") is False:
+            _append_issue(
+                issues,
+                seen,
+                {
+                    "path": "endpoints",
+                    "message": f"{node_label}依赖提示：节点缺少 sysctl 命令，性能优化提示可能不完整",
+                    "severity": "warning",
+                    "code": "dependency_missing",
+                },
+            )
+        if deps.get("ss") is False:
+            _append_issue(
+                issues,
+                seen,
+                {
+                    "path": "endpoints",
+                    "message": f"{node_label}依赖提示：节点缺少 ss 命令，端口占用检查可能不完整",
+                    "severity": "warning",
+                    "code": "dependency_missing",
+                },
+            )
+
+    perf_hints = data.get("perf_hints") if isinstance(data.get("perf_hints"), list) else []
+    for hint in perf_hints[:8]:
+        msg = str(hint or "").strip()
+        if not msg:
+            continue
+        _append_issue(
+            issues,
+            seen,
+            {
+                "path": "endpoints",
+                "message": f"{node_label}性能风险提示：{msg}",
+                "severity": "warning",
+                "code": "sysctl_tuning_recommended",
+            },
+        )
+
+    rules = data.get("rules") if isinstance(data.get("rules"), list) else []
+    for r in rules[:200]:
+        if not isinstance(r, dict):
+            continue
+        try:
+            idx = int(r.get("idx"))
+        except Exception:
+            idx = -1
+        nth = idx + 1 if idx >= 0 else 0
+        path = f"endpoints[{idx}]" if idx >= 0 else "endpoints"
+
+        unreach = r.get("unreachable") if isinstance(r.get("unreachable"), list) else []
+        if unreach:
+            targets = [str(x).strip() for x in unreach if str(x).strip()]
+            if targets:
+                show = ", ".join(targets[:3])
+                if len(targets) > 3:
+                    show += f" 等 {len(targets)} 个"
+                _append_issue(
+                    issues,
+                    seen,
+                    {
+                        "path": path,
+                        "message": f"{node_label}第 {nth} 条规则目标不可达：{show}" if nth > 0 else f"{node_label}规则目标不可达：{show}",
+                        "severity": "warning",
+                        "code": "target_unreachable",
+                    },
+                )
+
+        warns = r.get("warnings") if isinstance(r.get("warnings"), list) else []
+        for w in warns[:6]:
+            msg = str(w or "").strip()
+            if not msg:
+                continue
+            _append_issue(
+                issues,
+                seen,
+                {
+                    "path": path,
+                    "message": f"{node_label}第 {nth} 条规则预检提示：{msg}" if nth > 0 else f"{node_label}规则预检提示：{msg}",
+                    "severity": "warning",
+                    "code": "runtime_warning",
+                },
+            )
+
+    return issues
 
 
 @router.post("/api/wss_tunnel/save")
@@ -306,12 +518,31 @@ async def api_wss_tunnel_save(payload: Dict[str, Any], user: str = Depends(requi
     upsert_endpoint_by_sync_id(sender_pool, sync_id, sender_ep)
     upsert_endpoint_by_sync_id(receiver_pool, sync_id, receiver_ep)
 
-    # Save-time validation (sender+receiver): port conflicts / remote format / weights count
+    # Save-time validation (sender+receiver): blocking errors + warning hints
+    sender_warnings: List[Dict[str, Any]] = []
+    receiver_warnings: List[Dict[str, Any]] = []
     try:
-        validate_pool_inplace(sender_pool)
-        validate_pool_inplace(receiver_pool)
+        sender_warnings = [i.__dict__ for i in validate_pool_inplace(sender_pool)]
+        receiver_warnings = [i.__dict__ for i in validate_pool_inplace(receiver_pool)]
     except PoolValidationError as exc:
         return JSONResponse({"ok": False, "error": str(exc), "issues": [i.__dict__ for i in exc.issues]}, status_code=400)
+
+    runtime_issues: List[Dict[str, Any]] = []
+    if _SYNC_PRECHECK_ENABLED:
+        runtime_issues += await _probe_node_rules_precheck(sender, sender_pool, "发送机")
+        runtime_issues += await _probe_node_rules_precheck(receiver, receiver_pool, "接收机")
+
+    precheck_issues: List[Dict[str, Any]] = []
+    precheck_seen: set[str] = set()
+    for it in sender_warnings + receiver_warnings + runtime_issues:
+        if isinstance(it, dict):
+            _append_issue(precheck_issues, precheck_seen, it)
+
+    precheck_summary = {
+        "enabled": bool(_SYNC_PRECHECK_ENABLED),
+        "source": "static_validate+agent_netprobe_rules" if _SYNC_PRECHECK_ENABLED else "static_validate",
+        "issues": len(precheck_issues),
+    }
 
     s_ver, _ = set_desired_pool(sender_id, sender_pool)
     r_ver, _ = set_desired_pool(receiver_id, receiver_pool)
@@ -344,6 +575,10 @@ async def api_wss_tunnel_save(payload: Dict[str, Any], user: str = Depends(requi
         "receiver_pool": receiver_pool,
         "sender_desired_version": s_ver,
         "receiver_desired_version": r_ver,
+        "precheck": {
+            "issues": precheck_issues,
+            "summary": precheck_summary,
+        },
     }
 
 
@@ -614,12 +849,31 @@ async def api_intranet_tunnel_save(payload: Dict[str, Any], user: str = Depends(
     upsert_endpoint_by_sync_id(sender_pool, sync_id, sender_ep)
     upsert_endpoint_by_sync_id(receiver_pool, sync_id, receiver_ep)
 
-    # Save-time validation (sender+receiver): port conflicts / remote format / weights count
+    # Save-time validation (sender+receiver): blocking errors + warning hints
+    sender_warnings: List[Dict[str, Any]] = []
+    receiver_warnings: List[Dict[str, Any]] = []
     try:
-        validate_pool_inplace(sender_pool)
-        validate_pool_inplace(receiver_pool)
+        sender_warnings = [i.__dict__ for i in validate_pool_inplace(sender_pool)]
+        receiver_warnings = [i.__dict__ for i in validate_pool_inplace(receiver_pool)]
     except PoolValidationError as exc:
         return JSONResponse({"ok": False, "error": str(exc), "issues": [i.__dict__ for i in exc.issues]}, status_code=400)
+
+    runtime_issues: List[Dict[str, Any]] = []
+    if _SYNC_PRECHECK_ENABLED:
+        runtime_issues += await _probe_node_rules_precheck(sender, sender_pool, "公网入口")
+        runtime_issues += await _probe_node_rules_precheck(receiver, receiver_pool, "内网出口")
+
+    precheck_issues: List[Dict[str, Any]] = []
+    precheck_seen: set[str] = set()
+    for it in sender_warnings + receiver_warnings + runtime_issues:
+        if isinstance(it, dict):
+            _append_issue(precheck_issues, precheck_seen, it)
+
+    precheck_summary = {
+        "enabled": bool(_SYNC_PRECHECK_ENABLED),
+        "source": "static_validate+agent_netprobe_rules" if _SYNC_PRECHECK_ENABLED else "static_validate",
+        "issues": len(precheck_issues),
+    }
 
     s_ver, _ = set_desired_pool(sender_id, sender_pool)
     r_ver, _ = set_desired_pool(receiver_id, receiver_pool)
@@ -651,6 +905,10 @@ async def api_intranet_tunnel_save(payload: Dict[str, Any], user: str = Depends(
         "receiver_pool": receiver_pool,
         "sender_desired_version": s_ver,
         "receiver_desired_version": r_ver,
+        "precheck": {
+            "issues": precheck_issues,
+            "summary": precheck_summary,
+        },
     }
 
 

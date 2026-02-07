@@ -214,6 +214,10 @@
         <a class="btn xs ghost" id="fmShareOpen" href="#" target="_blank" rel="noopener" style="display:none;">打开</a>
       </div>
       <div class="muted sm" id="fmShareStatus"></div>
+      <div class="fm-share-history-wrap">
+        <div class="muted sm">历史链接</div>
+        <div class="fm-share-history" id="fmShareHistory">加载中…</div>
+      </div>
       <div class="row" style="justify-content:flex-end;gap:10px;margin-top:6px;">
         <button class="btn xs ghost fm-act-danger" type="button" id="fmShareRevoke" disabled>取消分享</button>
         <button class="btn xs ghost" type="button" id="fmShareClose">取消</button>
@@ -261,6 +265,7 @@ const fmShareLink = document.getElementById('fmShareLink');
 const fmShareCopy = document.getElementById('fmShareCopy');
 const fmShareOpen = document.getElementById('fmShareOpen');
 const fmShareStatus = document.getElementById('fmShareStatus');
+const fmShareHistory = document.getElementById('fmShareHistory');
 const fmShareClose = document.getElementById('fmShareClose');
 const fmShareCloseTop = document.getElementById('fmShareCloseTop');
 const fmShareGen = document.getElementById('fmShareGen');
@@ -287,6 +292,7 @@ let modalFiles = [];
 let lastUploadMethod = 'chunked';
 let shareItems = [];
 let currentShareUrl = '';
+let shareHistoryLoading = false;
 
 function bytesToHuman(n){
   if(!n) return '0 B';
@@ -408,6 +414,196 @@ function setShareStatus(text, isError){
   fmShareStatus.style.color = isError ? 'rgba(248,113,113,0.95)' : '';
 }
 
+function clearCurrentShareLink(){
+  currentShareUrl = '';
+  if(fmShareLink) fmShareLink.value = '';
+  if(fmShareCopy) fmShareCopy.disabled = true;
+  if(fmShareRevoke) fmShareRevoke.disabled = true;
+  if(fmShareOpen){
+    fmShareOpen.style.display = 'none';
+    fmShareOpen.removeAttribute('href');
+  }
+}
+
+function shareStatusText(status){
+  const s = String(status || '').toLowerCase();
+  if(s === 'active') return '有效';
+  if(s === 'expired') return '已过期';
+  if(s === 'revoked') return '已取消';
+  return '异常';
+}
+
+async function copyText(text){
+  const val = String(text || '');
+  if(!val) return false;
+  try{
+    if(navigator.clipboard && navigator.clipboard.writeText){
+      await navigator.clipboard.writeText(val);
+      return true;
+    }
+  }catch(_err){
+    // fallback below
+  }
+  if(!fmShareLink) return false;
+  const old = fmShareLink.value;
+  fmShareLink.value = val;
+  fmShareLink.focus();
+  fmShareLink.select();
+  let ok = false;
+  try{
+    ok = document.execCommand('copy');
+  }catch(_err){
+    ok = false;
+  }
+  fmShareLink.value = old;
+  return ok;
+}
+
+async function revokeShareByUrl(url){
+  const target = String(url || '').trim();
+  if(!target) throw new Error('缺少分享链接');
+  const resp = await fetch(`/websites/${SITE_ID}/files/share/revoke`, {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ url: target })
+  });
+  const data = await resp.json().catch(()=>({ok:false,error:'取消分享失败'}));
+  if(!data.ok){
+    throw new Error(data.error || '取消分享失败');
+  }
+  return data;
+}
+
+function renderShareHistory(items){
+  if(!fmShareHistory) return;
+  const rows = Array.isArray(items) ? items : [];
+  fmShareHistory.innerHTML = '';
+  if(!rows.length){
+    const empty = document.createElement('div');
+    empty.className = 'muted sm';
+    empty.textContent = '暂无历史分享链接';
+    fmShareHistory.appendChild(empty);
+    return;
+  }
+  rows.forEach((it)=>{
+    const row = document.createElement('div');
+    row.className = 'fm-share-history-row';
+
+    const info = document.createElement('div');
+    info.className = 'fm-share-history-info';
+
+    const top = document.createElement('div');
+    top.className = 'fm-share-history-top';
+    const url = document.createElement('span');
+    url.className = 'mono fm-share-history-url';
+    const rowUrl = String(it?.url || '');
+    url.textContent = rowUrl || `(短链丢失: ${String(it?.code || '-')})`;
+    const badge = document.createElement('span');
+    const status = String(it?.status || 'invalid');
+    badge.className = `fm-share-status ${status}`;
+    badge.textContent = shareStatusText(status);
+    top.appendChild(url);
+    top.appendChild(badge);
+
+    const meta = document.createElement('div');
+    meta.className = 'muted sm';
+    const parts = [];
+    const firstItem = String(it?.first_item || '');
+    const itemCount = parseInt(it?.item_count || 0, 10) || 0;
+    if(firstItem) parts.push(firstItem);
+    if(itemCount > 0) parts.push(`共 ${itemCount} 项`);
+    const createdAt = String(it?.created_at || '');
+    if(createdAt) parts.push(`创建 ${createdAt}`);
+    const expireAt = String(it?.expire_at || '');
+    if(expireAt) parts.push(`过期 ${expireAt}`);
+    const revokedAt = String(it?.revoked_at || '');
+    if(revokedAt) parts.push(`取消 ${revokedAt}`);
+    meta.textContent = parts.join(' · ') || '-';
+
+    info.appendChild(top);
+    info.appendChild(meta);
+
+    const actions = document.createElement('div');
+    actions.className = 'fm-share-history-actions';
+    const copyBtn = document.createElement('button');
+    copyBtn.className = 'btn xs ghost';
+    copyBtn.type = 'button';
+    copyBtn.textContent = '复制';
+    copyBtn.disabled = !rowUrl;
+    copyBtn.addEventListener('click', async ()=>{
+      const ok = await copyText(rowUrl);
+      setShareStatus(ok ? '链接已复制' : '复制失败，请手动复制', !ok);
+    });
+    actions.appendChild(copyBtn);
+
+    const openBtn = document.createElement('a');
+    openBtn.className = 'btn xs ghost';
+    openBtn.textContent = '打开';
+    openBtn.target = '_blank';
+    openBtn.rel = 'noopener';
+    if(rowUrl){
+      openBtn.href = rowUrl;
+    }else{
+      openBtn.href = '#';
+      openBtn.setAttribute('disabled', 'disabled');
+      openBtn.classList.add('disabled');
+    }
+    actions.appendChild(openBtn);
+
+    if(Boolean(it?.can_revoke) && rowUrl){
+      const revokeBtn = document.createElement('button');
+      revokeBtn.className = 'btn xs ghost fm-act-danger';
+      revokeBtn.type = 'button';
+      revokeBtn.textContent = '取消';
+      revokeBtn.addEventListener('click', async ()=>{
+        if(!confirm('确定取消该分享链接吗？取消后将立即失效。')){
+          return;
+        }
+        revokeBtn.disabled = true;
+        try{
+          await revokeShareByUrl(rowUrl);
+          if(currentShareUrl === rowUrl){
+            clearCurrentShareLink();
+          }
+          setShareStatus('分享已取消，原链接已失效', false);
+          await loadShareHistory();
+        }catch(err){
+          setShareStatus(String(err), true);
+          revokeBtn.disabled = false;
+        }
+      });
+      actions.appendChild(revokeBtn);
+    }
+
+    row.appendChild(info);
+    row.appendChild(actions);
+    fmShareHistory.appendChild(row);
+  });
+}
+
+async function loadShareHistory(){
+  if(!fmShareHistory || shareHistoryLoading) return;
+  shareHistoryLoading = true;
+  fmShareHistory.innerHTML = '<div class="muted sm">加载中…</div>';
+  try{
+    const resp = await fetch(`/websites/${SITE_ID}/files/share/list?limit=50`);
+    const data = await resp.json().catch(()=>({ok:false,error:'加载历史链接失败'}));
+    if(!data.ok){
+      throw new Error(data.error || '加载历史链接失败');
+    }
+    renderShareHistory(data.items || []);
+  }catch(err){
+    fmShareHistory.innerHTML = '';
+    const fail = document.createElement('div');
+    fail.className = 'muted sm';
+    fail.style.color = 'rgba(248,113,113,0.95)';
+    fail.textContent = String(err);
+    fmShareHistory.appendChild(fail);
+  }finally{
+    shareHistoryLoading = false;
+  }
+}
+
 function resetShareTtl(){
   let sec = FILE_SHARE_DEFAULT_TTL_SEC || 86400;
   let unit = 'hour';
@@ -433,18 +629,12 @@ function openShareForItems(items){
     return;
   }
   shareItems = picked;
-  currentShareUrl = '';
   resetShareTtl();
   renderShareItems(shareItems);
-  if(fmShareLink) fmShareLink.value = '';
-  if(fmShareCopy) fmShareCopy.disabled = true;
-  if(fmShareRevoke) fmShareRevoke.disabled = true;
-  if(fmShareOpen){
-    fmShareOpen.style.display = 'none';
-    fmShareOpen.removeAttribute('href');
-  }
+  clearCurrentShareLink();
   setShareStatus(`已选择 ${shareItems.length} 项`, false);
   openShareModal();
+  loadShareHistory();
 }
 
 function collectCheckedShareItems(){
@@ -1044,6 +1234,7 @@ fmShareGen?.addEventListener('click', async ()=>{
     const expireText = String(data.expire_at || '');
     const ttlText = formatDurationLabel(Number(data.ttl_sec || ttlSec));
     setShareStatus(expireText ? `已生成，${ttlText}后过期（${expireText}）` : `已生成，${ttlText}后过期`, false);
+    await loadShareHistory();
   }catch(err){
     if(fmShareRevoke && !currentShareUrl){
       fmShareRevoke.disabled = true;
@@ -1065,23 +1256,10 @@ fmShareRevoke?.addEventListener('click', async ()=>{
   if(fmShareRevoke) fmShareRevoke.disabled = true;
   setShareStatus('正在取消分享…', false);
   try{
-    const resp = await fetch(`/websites/${SITE_ID}/files/share/revoke`, {
-      method: 'POST',
-      headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({ url })
-    });
-    const data = await resp.json().catch(()=>({ok:false,error:'取消分享失败'}));
-    if(!data.ok){
-      throw new Error(data.error || '取消分享失败');
-    }
-    currentShareUrl = '';
-    if(fmShareLink) fmShareLink.value = '';
-    if(fmShareCopy) fmShareCopy.disabled = true;
-    if(fmShareOpen){
-      fmShareOpen.style.display = 'none';
-      fmShareOpen.removeAttribute('href');
-    }
+    await revokeShareByUrl(url);
+    clearCurrentShareLink();
     setShareStatus('分享已取消，原链接已失效', false);
+    await loadShareHistory();
   }catch(err){
     setShareStatus(String(err), true);
     if(fmShareRevoke) fmShareRevoke.disabled = !currentShareUrl;
@@ -1091,24 +1269,7 @@ fmShareRevoke?.addEventListener('click', async ()=>{
 fmShareCopy?.addEventListener('click', async ()=>{
   const text = String(fmShareLink?.value || '');
   if(!text) return;
-  let copied = false;
-  try{
-    if(navigator.clipboard && navigator.clipboard.writeText){
-      await navigator.clipboard.writeText(text);
-      copied = true;
-    }
-  }catch(_err){
-    copied = false;
-  }
-  if(!copied && fmShareLink){
-    fmShareLink.focus();
-    fmShareLink.select();
-    try{
-      copied = document.execCommand('copy');
-    }catch(_err){
-      copied = false;
-    }
-  }
+  const copied = await copyText(text);
   setShareStatus(copied ? '链接已复制' : '复制失败，请手动复制', !copied);
 });
 

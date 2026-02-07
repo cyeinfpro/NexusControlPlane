@@ -1798,6 +1798,31 @@ def get_site_file_share_short_link(code: str, db_path: str = DEFAULT_DB_PATH) ->
     return dict(row) if row else None
 
 
+def list_site_file_share_short_links(
+    site_id: int,
+    limit: int = 100,
+    db_path: str = DEFAULT_DB_PATH,
+) -> List[Dict[str, Any]]:
+    n = int(limit or 100)
+    if n < 1:
+        n = 1
+    if n > 500:
+        n = 500
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT s.code, s.site_id, s.token, s.token_sha256, s.created_by, s.created_at, "
+            "r.revoked_at, r.revoked_by, r.reason "
+            "FROM site_file_share_short_links s "
+            "LEFT JOIN site_file_share_revocations r "
+            "ON r.site_id=s.site_id AND r.token_sha256=s.token_sha256 "
+            "WHERE s.site_id=? "
+            "ORDER BY s.created_at DESC "
+            "LIMIT ?",
+            (int(site_id), int(n)),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
 def prune_site_checks(days: int = 7, db_path: str = DEFAULT_DB_PATH) -> int:
     try:
         d = int(days)
