@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import OrderedDict
 import hashlib
 import hmac
 import json
@@ -12,7 +13,7 @@ import threading
 import time
 import weakref
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
@@ -28,6 +29,36 @@ def _env_bool(name: str, default: bool = False) -> bool:
     if s in ('0', 'false', 'no', 'n', 'off'):
         return False
     return bool(default)
+
+
+def _env_int(name: str, default: int, lo: int, hi: int) -> int:
+    try:
+        v = int(str(os.getenv(name, str(default))).strip() or default)
+    except Exception:
+        v = int(default)
+    if v < lo:
+        v = lo
+    if v > hi:
+        v = hi
+    return int(v)
+
+
+def _env_float(name: str, default: float, lo: float, hi: float) -> float:
+    try:
+        v = float(str(os.getenv(name, str(default))).strip() or default)
+    except Exception:
+        v = float(default)
+    if v < lo:
+        v = lo
+    if v > hi:
+        v = hi
+    return float(v)
+
+
+def _truthy(v: Any) -> bool:
+    if isinstance(v, bool):
+        return v
+    return str(v or '').strip().lower() in ('1', 'true', 'yes', 'y', 'on')
 
 # -----------------------------
 # Intranet tunnel (A<->B)
@@ -49,6 +80,15 @@ OPEN_TIMEOUT = float(os.getenv('REALM_INTRANET_OPEN_TIMEOUT', '8.0'))
 TCP_BACKLOG = int(os.getenv('REALM_INTRANET_TCP_BACKLOG', '256'))
 UDP_SESSION_TTL = float(os.getenv('REALM_INTRANET_UDP_TTL', '60.0'))
 MAX_FRAME = int(os.getenv('REALM_INTRANET_MAX_UDP_FRAME', '65535'))
+FIRST_PACKET_TIMEOUT = _env_float('REALM_INTRANET_FIRST_PACKET_TIMEOUT', 5.0, 1.0, 30.0)
+FIRST_PACKET_MAX = _env_int('REALM_INTRANET_FIRST_PACKET_MAX', 65536, 256, 1024 * 1024)
+MAX_ACCEPT_WORKERS = _env_int('REALM_INTRANET_MAX_ACCEPT_WORKERS', 512, 8, 8192)
+MAX_ACTIVE_FLOWS = _env_int('REALM_INTRANET_MAX_ACTIVE_FLOWS', 1024, 8, 65535)
+MAX_CLIENT_OPEN_WORKERS = _env_int('REALM_INTRANET_MAX_CLIENT_OPEN_WORKERS', 512, 8, 8192)
+NONCE_TTL_SEC = _env_int('REALM_INTRANET_NONCE_TTL_SEC', 600, 60, 3600)
+NONCE_LRU_PER_TOKEN = _env_int('REALM_INTRANET_NONCE_LRU_PER_TOKEN', 2048, 64, 65535)
+LOG_ROTATE_BYTES = _env_int('REALM_INTRANET_LOG_ROTATE_BYTES', 10 * 1024 * 1024, 0, 1024 * 1024 * 1024)
+LOG_ROTATE_KEEP = _env_int('REALM_INTRANET_LOG_ROTATE_KEEP', 5, 1, 20)
 
 # Handshake/heartbeat
 INTRANET_MAGIC = os.getenv('REALM_INTRANET_MAGIC', 'realm-intranet')
@@ -59,9 +99,10 @@ PONG_TIMEOUT = float(os.getenv('REALM_INTRANET_PONG_TIMEOUT', '45.0'))
 SESSION_STALE = float(os.getenv('REALM_INTRANET_SESSION_STALE', '65.0'))
 TS_SKEW_SEC = int(os.getenv('REALM_INTRANET_TS_SKEW_SEC', '300'))
 
-# Fallback to plaintext only when the server side has no TLS (e.g. openssl missing on A).
-# Keep it enabled by default to maximize connectivity; set REALM_INTRANET_ALLOW_PLAINTEXT=0 to force TLS-only.
-ALLOW_PLAINTEXT_FALLBACK = _env_bool('REALM_INTRANET_ALLOW_PLAINTEXT', True)
+# Keep TLS as secure default.
+# Set REALM_INTRANET_ALLOW_PLAINTEXT=1 only for break-glass compatibility.
+ALLOW_PLAINTEXT_FALLBACK = _env_bool('REALM_INTRANET_ALLOW_PLAINTEXT', False)
+REQUIRE_TLS_SERVER = _env_bool('REALM_INTRANET_REQUIRE_TLS', True)
 
 # Log can be disabled in extreme IO constrained env
 ENABLE_LOG = _env_bool('REALM_INTRANET_LOG', True)
@@ -78,6 +119,37 @@ def _now_ms() -> int:
 _LOG_LOCK = threading.Lock()
 
 
+def _rotate_logs_locked() -> None:
+    if LOG_ROTATE_BYTES <= 0:
+        return
+    try:
+        if (not LOG_FILE.exists()) or LOG_FILE.stat().st_size < LOG_ROTATE_BYTES:
+            return
+    except Exception:
+        return
+
+    try:
+        oldest = INTRA_DIR / f'{LOG_FILE.name}.{LOG_ROTATE_KEEP}'
+        if oldest.exists():
+            oldest.unlink()
+    except Exception:
+        pass
+
+    for i in range(LOG_ROTATE_KEEP - 1, 0, -1):
+        src = INTRA_DIR / f'{LOG_FILE.name}.{i}'
+        dst = INTRA_DIR / f'{LOG_FILE.name}.{i + 1}'
+        try:
+            if src.exists():
+                src.replace(dst)
+        except Exception:
+            pass
+
+    try:
+        LOG_FILE.replace(INTRA_DIR / f'{LOG_FILE.name}.1')
+    except Exception:
+        pass
+
+
 def _log(event: str, **fields: Any) -> None:
     if not ENABLE_LOG:
         return
@@ -87,6 +159,7 @@ def _log(event: str, **fields: Any) -> None:
         payload.update(fields)
         line = (json.dumps(payload, ensure_ascii=False, separators=(',', ':')) + '\n').encode('utf-8')
         with _LOG_LOCK:
+            _rotate_logs_locked()
             with open(LOG_FILE, 'ab', buffering=0) as f:
                 f.write(line)
     except Exception:
@@ -173,8 +246,8 @@ def shutil_which(cmd: str) -> Optional[str]:
 def ensure_server_cert() -> None:
     """Ensure we have a self-signed cert for intranet tunnel server.
 
-    We intentionally avoid extra Python dependencies (cryptography). If openssl is not available,
-    the tunnel can still run in plaintext TCP (not recommended), but we try hard to generate.
+    We intentionally avoid extra Python dependencies (cryptography).
+    If openssl is unavailable and no pre-provisioned cert/key exist, TLS cannot be enabled.
     """
     try:
         INTRA_DIR.mkdir(parents=True, exist_ok=True)
@@ -221,6 +294,13 @@ def load_server_cert_pem() -> str:
         return ''
 
 
+def server_tls_ready() -> bool:
+    try:
+        return _mk_server_ssl_context() is not None
+    except Exception:
+        return False
+
+
 def _mk_server_ssl_context() -> Optional[ssl.SSLContext]:
     ensure_server_cert()
     if not SERVER_CERT.exists() or not SERVER_KEY.exists():
@@ -241,7 +321,7 @@ _RECV_LINE_BUFS = weakref.WeakKeyDictionary()  # sock -> bytearray
 _RECV_LINE_BUFS_LOCK = threading.Lock()
 
 
-def _mk_client_ssl_context(server_cert_pem: Optional[str]) -> ssl.SSLContext:
+def _mk_client_ssl_context(server_cert_pem: Optional[str], require_verify: bool = False) -> ssl.SSLContext:
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     ctx.options |= ssl.OP_NO_SSLv2
     ctx.options |= ssl.OP_NO_SSLv3
@@ -251,9 +331,11 @@ def _mk_client_ssl_context(server_cert_pem: Optional[str]) -> ssl.SSLContext:
         ctx.verify_mode = ssl.CERT_REQUIRED
         try:
             ctx.load_verify_locations(cadata=server_cert_pem)
-        except Exception:
-            ctx.verify_mode = ssl.CERT_NONE
+        except Exception as exc:
+            raise ValueError(f'invalid_server_cert_pem: {exc}') from exc
     else:
+        if require_verify:
+            raise ValueError('server_cert_missing')
         ctx.verify_mode = ssl.CERT_NONE
     return ctx
 
@@ -293,6 +375,8 @@ class IntranetRule:
     peer_host: str
     tunnel_port: int
     server_cert_pem: str = ''  # for client verification
+    tokens: List[str] = field(default_factory=list)
+    tls_verify: bool = False
 
 
 class _ControlSession:
@@ -345,7 +429,9 @@ class _TunnelServer:
         self._th: Optional[threading.Thread] = None
         self._janitor_th: Optional[threading.Thread] = None
         self._sock: Optional[socket.socket] = None
+        self._tls_required = bool(REQUIRE_TLS_SERVER)
         self._ssl_ctx = _mk_server_ssl_context()
+        self._startup_error = ''
 
         self._allowed_tokens_lock = threading.Lock()
         self._allowed_tokens: set[str] = set()
@@ -356,6 +442,36 @@ class _TunnelServer:
         self._pending_lock = threading.Lock()
         self._pending: Dict[Tuple[str, str], Dict[str, Any]] = {}  # (token, conn_id) -> {event, client_sock, proto, udp_sender}
 
+        self._accept_sem = threading.BoundedSemaphore(MAX_ACCEPT_WORKERS)
+        self._flow_sem = threading.BoundedSemaphore(MAX_ACTIVE_FLOWS)
+
+        self._nonce_lock = threading.Lock()
+        self._recent_nonces: Dict[str, OrderedDict[str, float]] = {}
+
+        self._stats_lock = threading.Lock()
+        self._accept_active = 0
+        self._accept_peak = 0
+        self._flow_active = 0
+        self._flow_peak = 0
+        self._tcp_active = 0
+        self._tcp_peak = 0
+        self._udp_active = 0
+        self._udp_peak = 0
+        self._open_total = 0
+        self._open_success = 0
+        self._open_fail = 0
+        self._open_timeout = 0
+        self._reject_overload = 0
+        self._first_packet_timeout = 0
+        self._nonce_replay = 0
+        self._open_latency_buckets: Dict[str, int] = {
+            'le_50ms': 0,
+            'le_100ms': 0,
+            'le_300ms': 0,
+            'le_1000ms': 0,
+            'gt_1000ms': 0,
+        }
+
     def set_allowed_tokens(self, tokens: set[str]) -> None:
         with self._allowed_tokens_lock:
             self._allowed_tokens = set(tokens)
@@ -365,6 +481,10 @@ class _TunnelServer:
                 if t not in tokens:
                     self._sessions[t].close('token_removed')
                     self._sessions.pop(t, None)
+        with self._nonce_lock:
+            for t in list(self._recent_nonces.keys()):
+                if t not in tokens:
+                    self._recent_nonces.pop(t, None)
 
     def get_session(self, token: str) -> Optional[_ControlSession]:
         with self._sessions_lock:
@@ -380,10 +500,125 @@ class _TunnelServer:
             return s
         return None
 
+    def _record_open_result(self, started_at: float, ok: bool, timeout: bool = False) -> None:
+        elapsed_ms = int(max(0.0, (_now() - started_at) * 1000.0))
+        with self._stats_lock:
+            if ok:
+                self._open_success += 1
+            else:
+                self._open_fail += 1
+                if timeout:
+                    self._open_timeout += 1
+
+            if elapsed_ms <= 50:
+                self._open_latency_buckets['le_50ms'] += 1
+            elif elapsed_ms <= 100:
+                self._open_latency_buckets['le_100ms'] += 1
+            elif elapsed_ms <= 300:
+                self._open_latency_buckets['le_300ms'] += 1
+            elif elapsed_ms <= 1000:
+                self._open_latency_buckets['le_1000ms'] += 1
+            else:
+                self._open_latency_buckets['gt_1000ms'] += 1
+
+    def open_started(self) -> float:
+        with self._stats_lock:
+            self._open_total += 1
+        return _now()
+
+    def open_finished(self, started_at: float, ok: bool, timeout: bool = False) -> None:
+        self._record_open_result(started_at, ok=ok, timeout=timeout)
+
+    def acquire_flow_slot(self, proto: str) -> bool:
+        if not self._flow_sem.acquire(blocking=False):
+            with self._stats_lock:
+                self._reject_overload += 1
+            return False
+        with self._stats_lock:
+            self._flow_active += 1
+            if self._flow_active > self._flow_peak:
+                self._flow_peak = self._flow_active
+            if proto == 'udp':
+                self._udp_active += 1
+                if self._udp_active > self._udp_peak:
+                    self._udp_peak = self._udp_active
+            else:
+                self._tcp_active += 1
+                if self._tcp_active > self._tcp_peak:
+                    self._tcp_peak = self._tcp_active
+        return True
+
+    def release_flow_slot(self, proto: str) -> None:
+        with self._stats_lock:
+            self._flow_active = max(0, self._flow_active - 1)
+            if proto == 'udp':
+                self._udp_active = max(0, self._udp_active - 1)
+            else:
+                self._tcp_active = max(0, self._tcp_active - 1)
+        try:
+            self._flow_sem.release()
+        except Exception:
+            pass
+
+    def stats_snapshot(self) -> Dict[str, Any]:
+        with self._pending_lock:
+            pending = len(self._pending)
+        with self._stats_lock:
+            return {
+                'limits': {
+                    'max_accept_workers': int(MAX_ACCEPT_WORKERS),
+                    'max_active_flows': int(MAX_ACTIVE_FLOWS),
+                },
+                'accept_workers_active': int(self._accept_active),
+                'accept_workers_peak': int(self._accept_peak),
+                'flows_active': int(self._flow_active),
+                'flows_peak': int(self._flow_peak),
+                'tcp_relays_active': int(self._tcp_active),
+                'tcp_relays_peak': int(self._tcp_peak),
+                'udp_sessions_active': int(self._udp_active),
+                'udp_sessions_peak': int(self._udp_peak),
+                'open_total': int(self._open_total),
+                'open_success': int(self._open_success),
+                'open_fail': int(self._open_fail),
+                'open_timeout': int(self._open_timeout),
+                'open_latency': dict(self._open_latency_buckets),
+                'reject_overload': int(self._reject_overload),
+                'first_packet_timeout': int(self._first_packet_timeout),
+                'nonce_replay_rejected': int(self._nonce_replay),
+                'pending_opens': int(pending),
+                'tls_required': bool(self._tls_required),
+                'tls_enabled': bool(self._ssl_ctx is not None),
+                'startup_error': str(self._startup_error or ''),
+            }
+
+    def _remember_nonce(self, token: str, nonce: str) -> bool:
+        now = _now()
+        cutoff = now - float(NONCE_TTL_SEC)
+        with self._nonce_lock:
+            by_token = self._recent_nonces.get(token)
+            if by_token is None:
+                by_token = OrderedDict()
+                self._recent_nonces[token] = by_token
+
+            while by_token:
+                _nk, seen_at = next(iter(by_token.items()))
+                if seen_at >= cutoff:
+                    break
+                by_token.popitem(last=False)
+
+            if nonce in by_token:
+                return False
+
+            by_token[nonce] = now
+            while len(by_token) > NONCE_LRU_PER_TOKEN:
+                by_token.popitem(last=False)
+            return True
+
     def start(self) -> None:
         if self._th and self._th.is_alive():
             return
         self._stop.clear()
+        self._startup_error = ''
         th = threading.Thread(target=self._serve, name=f'intranet-tunnel:{self.port}', daemon=True)
         th.start()
         self._th = th
@@ -392,6 +627,9 @@ class _TunnelServer:
         jt.start()
         self._janitor_th = jt
 
+    def is_running(self) -> bool:
+        return bool(self._th and self._th.is_alive() and (not self._startup_error))
+
     def stop(self) -> None:
         self._stop.set()
         try:
@@ -399,14 +637,20 @@ class _TunnelServer:
                 self._sock.close()
         except Exception:
             pass
+        self._sock = None
         with self._sessions_lock:
             for s in self._sessions.values():
                 s.close('server_stop')
             self._sessions.clear()
+        with self._nonce_lock:
+            self._recent_nonces.clear()
 
     def _wrap(self, conn: socket.socket) -> Tuple[Optional[Any], str]:
         # Returns (socket_like, dial_mode)
         if self._ssl_ctx is None:
+            if self._tls_required:
+                _safe_close(conn)
+                return None, 'tls'
             try:
                 conn.settimeout(None)
                 _set_keepalive(conn)
@@ -425,10 +669,15 @@ class _TunnelServer:
             return None, 'tls'
 
     def _serve(self) -> None:
+        if self._tls_required and self._ssl_ctx is None:
+            self._startup_error = 'tls_context_unavailable'
+            _log('server_tls_unavailable', port=int(self.port))
+            return
         try:
             s = _bind_socket('', int(self.port), socket.SOCK_STREAM)
             s.listen(TCP_BACKLOG)
         except Exception as exc:
+            self._startup_error = f'listen_failed: {exc}'
             _log('server_listen_failed', port=int(self.port), error=str(exc))
             return
         s.settimeout(1.0)
@@ -441,8 +690,28 @@ class _TunnelServer:
                 continue
             except Exception:
                 continue
-            th = threading.Thread(target=self._handle_conn, args=(conn, addr), daemon=True)
+            if not self._accept_sem.acquire(blocking=False):
+                with self._stats_lock:
+                    self._reject_overload += 1
+                _safe_close(conn)
+                continue
+            with self._stats_lock:
+                self._accept_active += 1
+                if self._accept_active > self._accept_peak:
+                    self._accept_peak = self._accept_active
+            th = threading.Thread(target=self._handle_conn_guarded, args=(conn, addr), daemon=True)
             th.start()
+
+    def _handle_conn_guarded(self, conn: socket.socket, addr: Any) -> None:
+        try:
+            self._handle_conn(conn, addr)
+        finally:
+            with self._stats_lock:
+                self._accept_active = max(0, self._accept_active - 1)
+            try:
+                self._accept_sem.release()
+            except Exception:
+                pass
 
     def _handle_conn(self, conn: socket.socket, addr: Any) -> None:
         ss, dial_mode = self._wrap(conn)
@@ -451,7 +720,15 @@ class _TunnelServer:
 
         # Read first line
         try:
-            line = _recv_line(ss)
+            try:
+                ss.settimeout(FIRST_PACKET_TIMEOUT)
+            except Exception:
+                pass
+            line = _recv_line(ss, max_len=FIRST_PACKET_MAX)
+            try:
+                ss.settimeout(None)
+            except Exception:
+                pass
             if not line:
                 _safe_close(ss)
                 return
@@ -461,6 +738,11 @@ class _TunnelServer:
                 _safe_close(ss)
                 return
             msg = json.loads(line)
+        except socket.timeout:
+            with self._stats_lock:
+                self._first_packet_timeout += 1
+            _safe_close(ss)
+            return
         except Exception:
             _safe_close(ss)
             return
@@ -534,6 +816,12 @@ class _TunnelServer:
                 self._send_hello_err(ss, 'sig_invalid')
                 _safe_close(ss)
                 return
+            if not self._remember_nonce(token, nonce):
+                with self._stats_lock:
+                    self._nonce_replay += 1
+                self._send_hello_err(ss, 'nonce_replay')
+                _safe_close(ss)
+                return
 
         sess = _ControlSession(token=token, node_id=node_id, sock=ss, dial_mode=dial_mode, legacy=legacy)
         with self._sessions_lock:
@@ -542,7 +830,12 @@ class _TunnelServer:
                 old.close('replaced')
             self._sessions[token] = sess
 
-        sess.send({'type': 'hello_ok', 'ver': INTRANET_PROTO_VER, 'server_ts': int(_now())})
+        if not sess.send({'type': 'hello_ok', 'ver': INTRANET_PROTO_VER, 'server_ts': int(_now())}):
+            sess.close('hello_ok_send_failed')
+            with self._sessions_lock:
+                if self._sessions.get(token) is sess:
+                    self._sessions.pop(token, None)
+            return
         _log('control_connected', port=self.port, token=_mask_token(token), node_id=node_id, dial_mode=dial_mode, legacy=legacy, from_addr=str(addr))
 
         # Keep reading to detect disconnect; also handle ping.
@@ -631,6 +924,17 @@ class _TunnelServer:
                     created = float(pend.get('created_at') or 0.0)
                     if created and (now - created) > max(OPEN_TIMEOUT * 3.0, 30.0):
                         self._pending.pop(key, None)
+            # cleanup replay nonce cache
+            cutoff = now - float(NONCE_TTL_SEC)
+            with self._nonce_lock:
+                for tok, by_token in list(self._recent_nonces.items()):
+                    while by_token:
+                        _nonce, seen_at = next(iter(by_token.items()))
+                        if seen_at >= cutoff:
+                            break
+                        by_token.popitem(last=False)
+                    if not by_token:
+                        self._recent_nonces.pop(tok, None)
 
 
 class _TCPListener:
@@ -689,38 +993,64 @@ class _TCPListener:
             th.start()
 
     def _handle_client(self, client: socket.socket) -> None:
+        if not self.tunnel.acquire_flow_slot('tcp'):
+            _safe_close(client)
+            return
+
+        opened_at = self.tunnel.open_started()
+        open_recorded = False
         token = self.rule.token
-        sess = self.tunnel.get_session(token)
-        if not sess:
-            _safe_close(client)
-            return
-        target = self._choose_target()
-        if not target:
-            _safe_close(client)
-            return
+        try:
+            sess = self.tunnel.get_session(token)
+            if not sess:
+                self.tunnel.open_finished(opened_at, ok=False)
+                open_recorded = True
+                _safe_close(client)
+                return
+            target = self._choose_target()
+            if not target:
+                self.tunnel.open_finished(opened_at, ok=False)
+                open_recorded = True
+                _safe_close(client)
+                return
 
-        conn_id = uuid.uuid4().hex
-        ev = threading.Event()
-        pend = {'event': ev, 'client_sock': client, 'proto': 'tcp', 'created_at': _now()}
-        self.tunnel.register_pending(token, conn_id, pend)
+            conn_id = uuid.uuid4().hex
+            ev = threading.Event()
+            pend = {'event': ev, 'client_sock': client, 'proto': 'tcp', 'created_at': _now()}
+            self.tunnel.register_pending(token, conn_id, pend)
 
-        # ask B to open
-        sess.send({'type': 'open', 'conn_id': conn_id, 'proto': 'tcp', 'target': target})
+            # ask B to open
+            if not sess.send({'type': 'open', 'conn_id': conn_id, 'proto': 'tcp', 'target': target}):
+                self.tunnel.pop_pending(token, conn_id)
+                self.tunnel.open_finished(opened_at, ok=False)
+                open_recorded = True
+                _safe_close(client)
+                return
 
-        if not ev.wait(timeout=OPEN_TIMEOUT):
-            self.tunnel.pop_pending(token, conn_id)
-            _safe_close(client)
-            return
+            if not ev.wait(timeout=OPEN_TIMEOUT):
+                self.tunnel.pop_pending(token, conn_id)
+                self.tunnel.open_finished(opened_at, ok=False, timeout=True)
+                open_recorded = True
+                _safe_close(client)
+                return
 
-        pend2 = self.tunnel.pop_pending(token, conn_id) or pend
-        data_sock = pend2.get('data_sock')
-        ok = bool(pend2.get('ok', True))
-        if not ok or not data_sock:
-            _safe_close(client)
-            _safe_close(data_sock)
-            return
+            pend2 = self.tunnel.pop_pending(token, conn_id) or pend
+            data_sock = pend2.get('data_sock')
+            ok = bool(pend2.get('ok', True))
+            if not ok or not data_sock:
+                self.tunnel.open_finished(opened_at, ok=False)
+                open_recorded = True
+                _safe_close(client)
+                _safe_close(data_sock)
+                return
 
-        _relay_tcp(client, data_sock)
+            self.tunnel.open_finished(opened_at, ok=True)
+            open_recorded = True
+            _relay_tcp(client, data_sock)
+        finally:
+            if not open_recorded:
+                self.tunnel.open_finished(opened_at, ok=False)
+            self.tunnel.release_flow_slot('tcp')
 
 
 class _UDPSession:
@@ -736,30 +1066,58 @@ class _UDPSession:
         self.last_seen = _now()
         self._send_lock = threading.Lock()
         self._rx_th: Optional[threading.Thread] = None
+        self._flow_slot_acquired = False
 
     def open(self) -> bool:
-        sess = self.tunnel.get_session(self.token)
-        if not sess:
+        if not self.tunnel.acquire_flow_slot('udp'):
             return False
-        ev = threading.Event()
-        pend = {'event': ev, 'proto': 'udp', 'created_at': _now()}
-        self.tunnel.register_pending(self.token, self.conn_id, pend)
-        sess.send({'type': 'open', 'conn_id': self.conn_id, 'proto': 'udp', 'target': self.target})
-        if not ev.wait(timeout=OPEN_TIMEOUT):
-            self.tunnel.pop_pending(self.token, self.conn_id)
-            return False
-        pend2 = self.tunnel.pop_pending(self.token, self.conn_id) or pend
-        self.data_sock = pend2.get('data_sock')
-        self.ok = bool(pend2.get('ok', True)) and self.data_sock is not None
-        if not self.ok:
-            _safe_close(self.data_sock)
-            self.data_sock = None
-            return False
+        self._flow_slot_acquired = True
+        opened_at = self.tunnel.open_started()
+        open_recorded = False
+        try:
+            sess = self.tunnel.get_session(self.token)
+            if not sess:
+                self.tunnel.open_finished(opened_at, ok=False)
+                open_recorded = True
+                self.close()
+                return False
+            ev = threading.Event()
+            pend = {'event': ev, 'proto': 'udp', 'created_at': _now()}
+            self.tunnel.register_pending(self.token, self.conn_id, pend)
+            if not sess.send({'type': 'open', 'conn_id': self.conn_id, 'proto': 'udp', 'target': self.target}):
+                self.tunnel.pop_pending(self.token, self.conn_id)
+                self.tunnel.open_finished(opened_at, ok=False)
+                open_recorded = True
+                self.close()
+                return False
+            if not ev.wait(timeout=OPEN_TIMEOUT):
+                self.tunnel.pop_pending(self.token, self.conn_id)
+                self.tunnel.open_finished(opened_at, ok=False, timeout=True)
+                open_recorded = True
+                self.close()
+                return False
+            pend2 = self.tunnel.pop_pending(self.token, self.conn_id) or pend
+            self.data_sock = pend2.get('data_sock')
+            self.ok = bool(pend2.get('ok', True)) and self.data_sock is not None
+            if not self.ok:
+                self.tunnel.open_finished(opened_at, ok=False)
+                open_recorded = True
+                _safe_close(self.data_sock)
+                self.data_sock = None
+                self.close()
+                return False
 
-        th = threading.Thread(target=self._rx_loop, name='intranet-udp-rx', daemon=True)
-        th.start()
-        self._rx_th = th
-        return True
+            self.tunnel.open_finished(opened_at, ok=True)
+            open_recorded = True
+            th = threading.Thread(target=self._rx_loop, name='intranet-udp-rx', daemon=True)
+            th.start()
+            self._rx_th = th
+            return True
+        except Exception:
+            if not open_recorded:
+                self.tunnel.open_finished(opened_at, ok=False)
+            self.close()
+            return False
 
     def send_datagram(self, payload: bytes) -> None:
         self.last_seen = _now()
@@ -772,8 +1130,7 @@ class _UDPSession:
             with self._send_lock:
                 self.data_sock.sendall(frame)
         except Exception:
-            _safe_close(self.data_sock)
-            self.data_sock = None
+            self.close()
 
     def _rx_loop(self) -> None:
         ds = self.data_sock
@@ -795,10 +1152,20 @@ class _UDPSession:
             pass
         _safe_close(ds)
         self.data_sock = None
+        self.ok = False
+        self._release_flow_slot()
 
     def close(self) -> None:
         _safe_close(self.data_sock)
         self.data_sock = None
+        self.ok = False
+        self._release_flow_slot()
+
+    def _release_flow_slot(self) -> None:
+        if not self._flow_slot_acquired:
+            return
+        self._flow_slot_acquired = False
+        self.tunnel.release_flow_slot('udp')
 
 
 class _UDPListener:
@@ -868,10 +1235,15 @@ class _UDPListener:
                 target = self._choose_target()
                 if not target:
                     continue
+                old_sess = sess
                 sess = _UDPSession(udp_sock=s, client_addr=addr, token=self.rule.token, tunnel=self.tunnel, target=target)
                 if not sess.open():
+                    if old_sess:
+                        old_sess.close()
                     continue
                 with self._lock:
+                    if old_sess:
+                        old_sess.close()
                     self._sessions[addr] = sess
             sess.send_datagram(data)
 
@@ -910,17 +1282,30 @@ class _ClientState:
 class _TunnelClient:
     """B-side client maintaining control connection to A, and opening data connections on demand."""
 
-    def __init__(self, peer_host: str, peer_port: int, token: str, node_id: int, server_cert_pem: str = ''):
+    def __init__(
+        self,
+        peer_host: str,
+        peer_port: int,
+        token: str,
+        node_id: int,
+        server_cert_pem: str = '',
+        tls_verify: bool = False,
+    ):
         self.peer_host = peer_host
         self.peer_port = int(peer_port)
         self.token = token
         self.node_id = int(node_id)
         self.server_cert_pem = server_cert_pem or ''
+        self.tls_verify = bool(tls_verify)
         self._stop = threading.Event()
         self._th: Optional[threading.Thread] = None
 
         self._state_lock = threading.Lock()
         self._state = _ClientState(peer_host=self.peer_host, peer_port=self.peer_port, token=self.token, node_id=self.node_id)
+        self._tls_ctx: Optional[ssl.SSLContext] = None
+        self._tls_ctx_err = ''
+        self._open_sem = threading.BoundedSemaphore(MAX_CLIENT_OPEN_WORKERS)
+        self._build_tls_context()
 
     def start(self) -> None:
         if self._th and self._th.is_alive():
@@ -949,6 +1334,7 @@ class _TunnelClient:
                 'rtt_ms': st.rtt_ms,
                 'handshake_ms': st.handshake_ms,
                 'last_error': st.last_error,
+                'tls_verify': bool(self.tls_verify),
             }
 
     def _set_state(self, **kwargs: Any) -> None:
@@ -957,13 +1343,25 @@ class _TunnelClient:
                 if hasattr(self._state, k):
                     setattr(self._state, k, v)
 
+    def matches_config(self, server_cert_pem: str, tls_verify: bool) -> bool:
+        return (self.server_cert_pem == (server_cert_pem or '')) and (self.tls_verify == bool(tls_verify))
+
+    def _build_tls_context(self) -> None:
+        try:
+            self._tls_ctx = _mk_client_ssl_context(
+                self.server_cert_pem or None,
+                require_verify=bool(self.tls_verify),
+            )
+            self._tls_ctx_err = ''
+        except Exception as exc:
+            self._tls_ctx = None
+            self._tls_ctx_err = f'tls_context_failed: {exc}'
+
     def _dial(self) -> Tuple[Optional[Any], str, str]:
         """Dial A-side tunnel port.
 
-        Prefer TLS. If A cannot enable TLS (e.g. missing openssl and no cert provisioned),
-        the TLS handshake usually fails with WRONG_VERSION_NUMBER/UNKNOWN_PROTOCOL.
-        In that case, and only when verification is not required, we fall back to plaintext
-        to keep connectivity (still authenticated by token).
+        Use TLS by default. Plaintext fallback is disabled unless explicitly enabled
+        via REALM_INTRANET_ALLOW_PLAINTEXT=1 for break-glass compatibility.
 
         Returns: (socket_like, dial_mode, error)
         """
@@ -974,9 +1372,13 @@ class _TunnelClient:
         except Exception as exc:
             return None, '', f'dial_failed: {exc}'
 
+        if self._tls_ctx is None:
+            _safe_close(raw)
+            return None, '', (self._tls_ctx_err or 'tls_context_unavailable')
+
         # TLS first
         try:
-            ctx = _mk_client_ssl_context(self.server_cert_pem or None)
+            ctx = self._tls_ctx
             ss = ctx.wrap_socket(raw, server_hostname=None)
             ss.settimeout(None)
             return ss, 'tls', ''
@@ -986,7 +1388,7 @@ class _TunnelClient:
         except ssl.SSLError as exc:
             msg = str(exc).upper()
             # Only fall back when TLS is not required and error indicates server is plaintext/HTTP.
-            if (not self.server_cert_pem) and ALLOW_PLAINTEXT_FALLBACK and (
+            if (not self.server_cert_pem) and (not self.tls_verify) and ALLOW_PLAINTEXT_FALLBACK and (
                 'WRONG_VERSION_NUMBER' in msg or 'UNKNOWN_PROTOCOL' in msg or 'HTTP_REQUEST' in msg
             ):
                 # Re-dial plaintext
@@ -1004,7 +1406,7 @@ class _TunnelClient:
             # which can surface as ConnectionResetError (instead of an ssl.SSLError).
             # When we are allowed to fall back to plaintext (i.e. TLS verification is not
             # required), treat this as a strong signal that the peer is running without TLS.
-            if (not self.server_cert_pem) and ALLOW_PLAINTEXT_FALLBACK and isinstance(exc, ConnectionResetError):
+            if (not self.server_cert_pem) and (not self.tls_verify) and ALLOW_PLAINTEXT_FALLBACK and isinstance(exc, ConnectionResetError):
                 _safe_close(raw)
                 try:
                     raw2 = socket.create_connection((self.peer_host, self.peer_port), timeout=6)
@@ -1171,7 +1573,10 @@ class _TunnelClient:
                     continue
 
                 if t == 'open':
-                    threading.Thread(target=self._handle_open, args=(msg,), daemon=True).start()
+                    if not self._open_sem.acquire(blocking=False):
+                        _log('client_open_overload', peer=f'{self.peer_host}:{self.peer_port}', token=_mask_token(self.token))
+                        continue
+                    threading.Thread(target=self._handle_open_guarded, args=(msg,), daemon=True).start()
                     continue
 
             # disconnected
@@ -1195,6 +1600,15 @@ class _TunnelClient:
             self._handle_udp(conn_id, target)
         else:
             self._handle_tcp(conn_id, target)
+
+    def _handle_open_guarded(self, msg: Dict[str, Any]) -> None:
+        try:
+            self._handle_open(msg)
+        finally:
+            try:
+                self._open_sem.release()
+            except Exception:
+                pass
 
     def _handle_tcp(self, conn_id: str, target: str) -> None:
         try:
@@ -1453,6 +1867,7 @@ class IntranetManager:
             servers = []
             for p, s in self._servers.items():
                 tls_on = bool(getattr(s, '_ssl_ctx', None) is not None)
+                srv_stats = s.stats_snapshot()
                 sessions = []
                 with getattr(s, '_sessions_lock'):
                     for tok, sess in list(getattr(s, '_sessions', {}).items()):
@@ -1465,7 +1880,7 @@ class IntranetManager:
                             'last_seen_at': int(sess.last_seen),
                             'rtt_ms': sess.rtt_ms,
                         })
-                servers.append({'port': int(p), 'tls': tls_on, 'sessions': sessions})
+                servers.append({'port': int(p), 'tls': tls_on, 'sessions': sessions, 'stats': srv_stats})
 
             clients = []
             for key, c in self._clients.items():
@@ -1483,6 +1898,8 @@ class IntranetManager:
                     'peer_host': r.peer_host,
                     'port': r.tunnel_port,
                     'token': _mask_token(r.token),
+                    'token_count': len(r.tokens or [r.token]),
+                    'tls_verify': bool(r.tls_verify),
                     'handshake': self.handshake_health(r.sync_id, {
                         'intranet_role': r.role,
                         'intranet_token': r.token,
@@ -1491,12 +1908,23 @@ class IntranetManager:
                     }),
                 })
 
+            summary = {
+                'servers': len(servers),
+                'clients': len(clients),
+                'rules': len(rules),
+                'active_tcp_relays': sum(int((s.get('stats') or {}).get('tcp_relays_active') or 0) for s in servers),
+                'active_udp_sessions': sum(int((s.get('stats') or {}).get('udp_sessions_active') or 0) for s in servers),
+                'open_fail': sum(int((s.get('stats') or {}).get('open_fail') or 0) for s in servers),
+                'reject_overload': sum(int((s.get('stats') or {}).get('reject_overload') or 0) for s in servers),
+            }
+
             return {
                 'servers': servers,
                 'tcp_rules': list(self._tcp_listeners.keys()),
                 'udp_rules': list(self._udp_listeners.keys()),
                 'clients': clients,
                 'rules': rules,
+                'summary': summary,
             }
 
     def handshake_health(self, sync_id: str, ex: Dict[str, Any]) -> Dict[str, Any]:
@@ -1572,6 +2000,41 @@ class IntranetManager:
             elif isinstance(e.get('remote'), str) and e.get('remote'):
                 remotes = [str(e.get('remote')).strip()]
             token = str(ex.get('intranet_token') or '').strip()
+            tokens: List[str] = []
+            if token:
+                tokens.append(token)
+            raw_tokens = ex.get('intranet_tokens')
+            if isinstance(raw_tokens, list):
+                for tk in raw_tokens:
+                    st = str(tk or '').strip()
+                    if st:
+                        tokens.append(st)
+            now_ts = int(_now())
+            raw_grace = ex.get('intranet_token_grace')
+            if isinstance(raw_grace, list):
+                for it in raw_grace:
+                    if not isinstance(it, dict):
+                        continue
+                    st = str(it.get('token') or '').strip()
+                    if not st:
+                        continue
+                    try:
+                        exp = int(it.get('expires_at') or 0)
+                    except Exception:
+                        exp = 0
+                    if exp > now_ts:
+                        tokens.append(st)
+            seen_tokens: set[str] = set()
+            uniq_tokens: List[str] = []
+            for tk in tokens:
+                if tk in seen_tokens:
+                    continue
+                seen_tokens.add(tk)
+                uniq_tokens.append(tk)
+            if not token and uniq_tokens:
+                token = uniq_tokens[0]
+            if not uniq_tokens and token:
+                uniq_tokens = [token]
             try:
                 peer_node_id = int(ex.get('intranet_peer_node_id') or 0)
             except Exception:
@@ -1582,6 +2045,7 @@ class IntranetManager:
             except Exception:
                 tunnel_port = DEFAULT_TUNNEL_PORT
             server_cert_pem = str(ex.get('intranet_server_cert_pem') or '').strip()
+            tls_verify = _truthy(ex.get('intranet_tls_verify'))
 
             if not token:
                 continue
@@ -1602,6 +2066,8 @@ class IntranetManager:
                 peer_host=peer_host,
                 tunnel_port=tunnel_port,
                 server_cert_pem=server_cert_pem,
+                tokens=uniq_tokens,
+                tls_verify=tls_verify,
             )
         return out
 
@@ -1609,11 +2075,18 @@ class IntranetManager:
         tokens_by_port: Dict[int, set[str]] = {}
         for r in rules.values():
             if r.role == 'server':
-                tokens_by_port.setdefault(r.tunnel_port, set()).add(r.token)
+                tokens_by_port.setdefault(r.tunnel_port, set()).update(r.tokens or [r.token])
 
         # start/stop servers
         for port, tokens in tokens_by_port.items():
             srv = self._servers.get(port)
+            if srv and (not srv.is_running()):
+                try:
+                    srv.stop()
+                except Exception:
+                    pass
+                self._servers.pop(port, None)
+                srv = None
             if not srv:
                 srv = _TunnelServer(port)
                 srv.start()
@@ -1710,6 +2183,10 @@ class IntranetManager:
             desired_keys.add(key)
 
             c = self._clients.get(key)
+            if c and (not c.matches_config(r.server_cert_pem, r.tls_verify)):
+                c.stop()
+                self._clients.pop(key, None)
+                c = None
             if not c:
                 c = _TunnelClient(
                     peer_host=r.peer_host,
@@ -1717,6 +2194,7 @@ class IntranetManager:
                     token=r.token,
                     node_id=self.node_id,
                     server_cert_pem=r.server_cert_pem,
+                    tls_verify=r.tls_verify,
                 )
                 c.start()
                 # ✅ 关键修复：新建的 client 必须写入 self._clients，否则状态检测会一直显示“客户端未启动”

@@ -26,7 +26,7 @@ from fastapi.responses import FileResponse
 import requests
 
 from .config import CFG
-from .intranet_tunnel import IntranetManager, load_server_cert_pem
+from .intranet_tunnel import IntranetManager, load_server_cert_pem, server_tls_ready
 from .qos import apply_qos_from_pool
 
 API_KEY_FILE = Path('/etc/realm-agent/api.key')
@@ -2540,7 +2540,11 @@ def api_intranet_cert(_: None = Depends(_api_key_required)) -> Dict[str, Any]:
 
     面板可从公网节点(A)拉取证书 PEM 并下发给内网节点(B)，用于 TLS 校验（更严格）。
     """
-    pem = load_server_cert_pem()
+    pem = str(load_server_cert_pem() or '').strip()
+    if not pem:
+        return {'ok': False, 'error': 'tls_cert_missing', 'cert_pem': ''}
+    if not server_tls_ready():
+        return {'ok': False, 'error': 'tls_context_unavailable', 'cert_pem': ''}
     return {'ok': True, 'cert_pem': pem}
 
 

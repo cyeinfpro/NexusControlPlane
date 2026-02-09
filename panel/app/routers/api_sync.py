@@ -48,11 +48,26 @@ def _env_float(name: str, default: float, lo: float, hi: float) -> float:
     return float(v)
 
 
+def _env_int(name: str, default: int, lo: int, hi: int) -> int:
+    try:
+        v = int(str(os.getenv(name, str(default))).strip() or default)
+    except Exception:
+        v = int(default)
+    if v < lo:
+        v = lo
+    if v > hi:
+        v = hi
+    return int(v)
+
+
 _SYNC_PRECHECK_ENABLED = _env_flag("REALM_SYNC_SAVE_PRECHECK_ENABLED", True)
 _SYNC_PRECHECK_HTTP_TIMEOUT = _env_float("REALM_SYNC_SAVE_PRECHECK_HTTP_TIMEOUT", 4.5, 2.0, 20.0)
 _SYNC_PRECHECK_PROBE_TIMEOUT = _env_float("REALM_SYNC_SAVE_PRECHECK_PROBE_TIMEOUT", 1.2, 0.2, 6.0)
 _SYNC_APPLY_TIMEOUT = _env_float("REALM_SYNC_SAVE_APPLY_TIMEOUT", 3.0, 0.5, 20.0)
 _SYNC_PRECHECK_MAX_ISSUES = 24
+_INTRANET_FORCE_TLS_VERIFY = _env_flag("REALM_INTRANET_FORCE_TLS_VERIFY", True)
+_INTRANET_TOKEN_GRACE_SEC = _env_int("REALM_INTRANET_TOKEN_GRACE_SEC", 900, 0, 7 * 24 * 3600)
+_INTRANET_TOKEN_GRACE_MAX = _env_int("REALM_INTRANET_TOKEN_GRACE_MAX", 4, 1, 16)
 
 
 def random_wss_params() -> Tuple[str, str, str]:
@@ -207,6 +222,84 @@ def _find_sync_qos(pool: Dict[str, Any], sync_id: str) -> Dict[str, int]:
     except Exception:
         return {}
     return {}
+
+
+def _normalize_intranet_token_grace(raw: Any, now_ts: int) -> List[Dict[str, int]]:
+    rows = raw if isinstance(raw, list) else []
+    latest: Dict[str, int] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        tok = str(row.get("token") or "").strip()
+        if not tok:
+            continue
+        try:
+            exp = int(row.get("expires_at") or 0)
+        except Exception:
+            exp = 0
+        if exp <= now_ts:
+            continue
+        old = int(latest.get(tok) or 0)
+        if exp > old:
+            latest[tok] = int(exp)
+
+    ordered = sorted(latest.items(), key=lambda it: int(it[1]), reverse=True)
+    out: List[Dict[str, int]] = []
+    for tok, exp in ordered[: _INTRANET_TOKEN_GRACE_MAX]:
+        out.append({"token": tok, "expires_at": int(exp)})
+    return out
+
+
+def _extract_intranet_token_meta(pool: Dict[str, Any], sync_id: str, now_ts: int) -> Tuple[str, List[Dict[str, int]]]:
+    sid = str(sync_id or "").strip()
+    if not sid:
+        return "", []
+
+    candidate_ex: List[Dict[str, Any]] = []
+    try:
+        for ep in (pool or {}).get("endpoints") or []:
+            if not isinstance(ep, dict):
+                continue
+            ex0 = ep.get("extra_config") or {}
+            if not isinstance(ex0, dict):
+                continue
+            if str(ex0.get("sync_id") or "") != sid:
+                continue
+            candidate_ex.append(ex0)
+    except Exception:
+        return "", []
+
+    # Prefer server side metadata when available.
+    candidate_ex.sort(key=lambda ex: 0 if str(ex.get("intranet_role") or "") == "server" else 1)
+    for ex in candidate_ex:
+        primary = str(ex.get("intranet_token") or "").strip()
+        grace = _normalize_intranet_token_grace(ex.get("intranet_token_grace"), now_ts)
+        if primary or grace:
+            return primary, grace
+    return "", []
+
+
+def _build_intranet_tokens(
+    primary_token: str,
+    previous_primary: str,
+    previous_grace: List[Dict[str, int]],
+    now_ts: int,
+) -> Tuple[List[str], List[Dict[str, int]]]:
+    grace = _normalize_intranet_token_grace(previous_grace, now_ts)
+    prev = str(previous_primary or "").strip()
+    cur = str(primary_token or "").strip()
+    if prev and cur and prev != cur and _INTRANET_TOKEN_GRACE_SEC > 0:
+        grace.append({"token": prev, "expires_at": int(now_ts + _INTRANET_TOKEN_GRACE_SEC)})
+        grace = _normalize_intranet_token_grace(grace, now_ts)
+
+    tokens: List[str] = []
+    seen: set[str] = set()
+    for tok in [cur] + [str(it.get("token") or "").strip() for it in grace]:
+        if not tok or tok in seen:
+            continue
+        seen.add(tok)
+        tokens.append(tok)
+    return tokens, grace
 
 
 def _issue_key(issue: Dict[str, Any]) -> str:
@@ -843,9 +936,12 @@ async def api_intranet_tunnel_save(payload: Dict[str, Any], user: str = Depends(
         return JSONResponse({"ok": False, "error": "目标地址不能为空"}, status_code=400)
 
     sync_id = str(payload.get("sync_id") or "").strip() or uuid.uuid4().hex
-    token = str(payload.get("token") or "").strip() or uuid.uuid4().hex
 
     sender_pool = await load_pool_for_node(sender)
+    now_ts = int(datetime.now(timezone.utc).timestamp())
+    existing_token, existing_token_grace = _extract_intranet_token_meta(sender_pool, sync_id, now_ts)
+    req_token = str(payload.get("token") or "").strip()
+    token = req_token or existing_token or uuid.uuid4().hex
     old_receiver_id: int = 0
     try:
         for ep in sender_pool.get("endpoints") or []:
@@ -887,8 +983,9 @@ async def api_intranet_tunnel_save(payload: Dict[str, Any], user: str = Depends(
             status_code=400,
         )
 
-    # Best-effort: fetch A-side tunnel server cert and embed into B config for TLS verification.
+    # Fetch A-side tunnel cert and embed into B config for TLS verification (strict by default).
     server_cert_pem = ""
+    cert_fetch_err = ""
     try:
         cert = await agent_get(
             sender.get("base_url", ""),
@@ -898,8 +995,11 @@ async def api_intranet_tunnel_save(payload: Dict[str, Any], user: str = Depends(
         )
         if isinstance(cert, dict) and cert.get("ok") is True:
             server_cert_pem = str(cert.get("cert_pem") or "").strip()
+        else:
+            cert_fetch_err = _safe_error_text(cert, "cert_unavailable")
     except Exception:
         server_cert_pem = ""
+        cert_fetch_err = "cert_fetch_failed"
 
     receiver_pool = await load_pool_for_node(receiver)
 
@@ -914,6 +1014,28 @@ async def api_intranet_tunnel_save(payload: Dict[str, Any], user: str = Depends(
             return v
         s = str(v or "").strip().lower()
         return s in ("1", "true", "yes", "y", "on")
+
+    payload_tls_verify: Optional[bool] = None
+    if "intranet_tls_verify" in payload:
+        payload_tls_verify = _coerce_bool(payload.get("intranet_tls_verify"))
+    tls_verify_required = bool(_INTRANET_FORCE_TLS_VERIFY or (payload_tls_verify is True))
+    if tls_verify_required and (not server_cert_pem):
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": "已启用强制 TLS 证书校验，但无法获取公网入口证书，请检查 A 节点在线状态后重试。",
+                "detail": cert_fetch_err or "cert_empty",
+            },
+            status_code=400,
+        )
+    tls_verify_enabled = bool(server_cert_pem) or tls_verify_required
+
+    token_candidates, token_grace = _build_intranet_tokens(
+        primary_token=token,
+        previous_primary=existing_token,
+        previous_grace=existing_token_grace,
+        now_ts=now_ts,
+    )
 
     def _find_meta(pool: Dict[str, Any]) -> Tuple[str, Optional[bool]]:
         try:
@@ -968,10 +1090,13 @@ async def api_intranet_tunnel_save(payload: Dict[str, Any], user: str = Depends(
         "intranet_public_host": sender_host,
         "intranet_server_port": server_port,
         "intranet_token": token,
+        "intranet_tokens": token_candidates,
         "intranet_original_remotes": remotes,
         "sync_id": sync_id,
         "intranet_updated_at": now_iso,
     }
+    if token_grace:
+        sender_extra["intranet_token_grace"] = token_grace
     if qos:
         sender_extra["qos"] = dict(qos)
 
@@ -999,13 +1124,16 @@ async def api_intranet_tunnel_save(payload: Dict[str, Any], user: str = Depends(
         "intranet_peer_host": sender_host,
         "intranet_server_port": server_port,
         "intranet_token": token,
+        "intranet_tokens": token_candidates,
         "intranet_server_cert_pem": server_cert_pem,
-        "intranet_tls_verify": bool(server_cert_pem),
+        "intranet_tls_verify": bool(tls_verify_enabled),
         "intranet_sender_listen": listen,
         "intranet_original_remotes": remotes,
         "sync_id": sync_id,
         "intranet_updated_at": now_iso,
     }
+    if token_grace:
+        receiver_extra["intranet_token_grace"] = token_grace
     if qos:
         receiver_extra["qos"] = dict(qos)
 

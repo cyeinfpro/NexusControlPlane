@@ -918,6 +918,9 @@ function renderHealthExpanded(healthList, statsError){
     if(t === 'client_not_running') return '客户端未启动';
     if(t === 'server_not_running') return '入口未启动';
     if(t === 'client_not_running') return '客户端未启动';
+    if(t === 'token_invalid') return '令牌无效';
+    if(t === 'nonce_replay') return '握手重放被拒绝';
+    if(t === 'server_cert_missing') return '缺少服务端证书';
     if(t === 'peer_is_http_proxy') return '走了HTTP反代/代理';
     if(t === 'sig_invalid') return '签名校验失败';
     if(t === 'magic_mismatch') return '协议不匹配';
@@ -927,6 +930,7 @@ function renderHealthExpanded(healthList, statsError){
     if(t === 'control_closed') return '连接断开';
     if(t.startsWith('dial_failed')) return '连接失败';
     if(t.startsWith('dial_tls_failed')) return 'TLS握手失败';
+    if(t.startsWith('tls_context_failed')) return 'TLS配置错误';
     if(t.startsWith('tls_verify_failed')) return '证书校验失败';
     if(t.startsWith('hello_timeout')) return '握手超时';
     if(t.startsWith('hello_')) return '握手失败';
@@ -1582,6 +1586,9 @@ function renderHealth(healthList, statsError, idx){
     if(t === 'client_not_running') return '客户端未启动';
     if(t === 'server_not_running') return '入口未启动';
     if(t === 'client_not_running') return '客户端未启动';
+    if(t === 'token_invalid') return '令牌无效';
+    if(t === 'nonce_replay') return '握手重放被拒绝';
+    if(t === 'server_cert_missing') return '缺少服务端证书';
     if(t === 'peer_is_http_proxy') return '走了HTTP反代/代理';
     if(t === 'sig_invalid') return '签名校验失败';
     if(t === 'magic_mismatch') return '协议不匹配';
@@ -1591,6 +1598,7 @@ function renderHealth(healthList, statsError, idx){
     if(t === 'control_closed') return '连接断开';
     if(t.startsWith('dial_failed')) return '连接失败';
     if(t.startsWith('dial_tls_failed')) return 'TLS握手失败';
+    if(t.startsWith('tls_context_failed')) return 'TLS配置错误';
     if(t.startsWith('tls_verify_failed')) return '证书校验失败';
     if(t.startsWith('hello_timeout')) return '握手超时';
     if(t.startsWith('hello_')) return '握手失败';
@@ -1658,6 +1666,9 @@ function renderHealthMobile(healthList, statsError, idx){
     if(t === 'client_not_running') return '客户端未启动';
     if(t === 'server_not_running') return '入口未启动';
     if(t === 'client_not_running') return '客户端未启动';
+    if(t === 'token_invalid') return '令牌无效';
+    if(t === 'nonce_replay') return '握手重放被拒绝';
+    if(t === 'server_cert_missing') return '缺少服务端证书';
     if(t === 'peer_is_http_proxy') return '走了HTTP反代/代理';
     if(t === 'sig_invalid') return '签名校验失败';
     if(t === 'magic_mismatch') return '协议不匹配';
@@ -1667,6 +1678,7 @@ function renderHealthMobile(healthList, statsError, idx){
     if(t === 'control_closed') return '连接断开';
     if(t.startsWith('dial_failed')) return '连接失败';
     if(t.startsWith('dial_tls_failed')) return 'TLS握手失败';
+    if(t.startsWith('tls_context_failed')) return 'TLS配置错误';
     if(t.startsWith('tls_verify_failed')) return '证书校验失败';
     if(t.startsWith('hello_timeout')) return '握手超时';
     if(t.startsWith('hello_')) return '握手失败';
