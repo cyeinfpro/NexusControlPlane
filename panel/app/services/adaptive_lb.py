@@ -38,15 +38,17 @@ def _env_float(name: str, default: float, lo: float, hi: float) -> float:
 
 _AUTO_LB_ENABLED = _env_flag("REALM_ADAPTIVE_LB_ENABLED", "1")
 _AUTO_LB_COOLDOWN_SEC = _env_float("REALM_ADAPTIVE_LB_COOLDOWN_SEC", 18.0, 1.0, 600.0)
-_AUTO_LB_MIN_DIFF_PCT = _env_float("REALM_ADAPTIVE_LB_MIN_DIFF_PCT", 8.0, 0.5, 80.0)
-_AUTO_LB_MIN_SAMPLES = _env_int("REALM_ADAPTIVE_LB_MIN_SAMPLES", 3, 1, 120)
-_AUTO_LB_DOWN_CONSEC_FAIL = _env_int("REALM_ADAPTIVE_LB_DOWN_CONSEC_FAIL", 3, 1, 30)
-_AUTO_LB_DOWN_AVAIL_PCT = _env_float("REALM_ADAPTIVE_LB_DOWN_AVAIL_PCT", 35.0, 0.0, 95.0)
+_AUTO_LB_MIN_DIFF_PCT = _env_float("REALM_ADAPTIVE_LB_MIN_DIFF_PCT", 3.0, 0.5, 80.0)
+_AUTO_LB_MIN_SAMPLES = _env_int("REALM_ADAPTIVE_LB_MIN_SAMPLES", 2, 1, 120)
+_AUTO_LB_DOWN_CONSEC_FAIL = _env_int("REALM_ADAPTIVE_LB_DOWN_CONSEC_FAIL", 2, 1, 30)
+_AUTO_LB_DOWN_AVAIL_PCT = _env_float("REALM_ADAPTIVE_LB_DOWN_AVAIL_PCT", 60.0, 0.0, 99.0)
 _AUTO_LB_LATENCY_REF_MS = _env_float("REALM_ADAPTIVE_LB_LATENCY_REF_MS", 120.0, 10.0, 5000.0)
 _AUTO_LB_WEIGHT_SCALE = _env_int("REALM_ADAPTIVE_LB_WEIGHT_SCALE", 100, 20, 10000)
 _AUTO_LB_MAX_WEIGHT = _env_int("REALM_ADAPTIVE_LB_MAX_WEIGHT", 1000, 10, 100000)
 _AUTO_LB_MIN_WEIGHT = _env_int("REALM_ADAPTIVE_LB_MIN_WEIGHT", 2, 1, 1000)
 _AUTO_LB_MIN_DOWN_WEIGHT = _env_int("REALM_ADAPTIVE_LB_MIN_DOWN_WEIGHT", 1, 1, 1000)
+_AUTO_LB_FAIL_SCORE_MULT = _env_float("REALM_ADAPTIVE_LB_FAIL_SCORE_MULT", 0.55, 0.05, 1.0)
+_AUTO_LB_TIMEOUT_SCORE_MULT = _env_float("REALM_ADAPTIVE_LB_TIMEOUT_SCORE_MULT", 0.65, 0.05, 1.0)
 _AUTO_LB_RULE_TTL_SEC = max(180.0, float(_AUTO_LB_COOLDOWN_SEC) * 12.0)
 
 
@@ -257,6 +259,13 @@ def _derive_remote(remote: str, metric: Dict[str, Any]) -> Dict[str, Any]:
     stability = 1.0 - min(1.0, float(consec_fail) / float(max(1, _AUTO_LB_DOWN_CONSEC_FAIL * 2)))
     score = (availability * 0.62) + ((1.0 - err_ratio) * 0.18) + (lat_factor * 0.15) + (stability * 0.05)
     score = _clamp(score, 0.01, 1.0)
+    # More sensitive fail handling: one timeout/refusal should quickly reduce traffic share.
+    if ok is False:
+        score = _clamp(score * float(_AUTO_LB_FAIL_SCORE_MULT), 0.01, 1.0)
+        err_text = str(metric.get("error") or metric.get("last_error") or "").strip().lower()
+        if err_text:
+            if ("timeout" in err_text) or ("timed out" in err_text) or ("超时" in err_text):
+                score = _clamp(score * float(_AUTO_LB_TIMEOUT_SCORE_MULT), 0.01, 1.0)
     if ok is False and samples < _AUTO_LB_MIN_SAMPLES:
         score = _clamp(score * 0.7, 0.01, 1.0)
 
