@@ -4,6 +4,7 @@ agent/app/__init__.py
 agent/app/auth.py
 agent/app/config.py
 agent/app/intranet_tunnel.py
+agent/app/overlay_tunnel.py
 agent/app/iptables_cmd.py
 agent/app/ipt_forward.py
 agent/app/main.py
