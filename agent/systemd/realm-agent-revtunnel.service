@@ -1,0 +1,37 @@
+[Unit]
+Description=Realm Agent Reverse SSH Tunnel (Agent -> Panel)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment="PANEL_SSH_HOST=REPLACE_ME"
+Environment="PANEL_SSH_PORT=22"
+Environment="PANEL_SSH_USER=nexus-tunnel"
+Environment="REMOTE_BIND=127.0.0.1"
+Environment="REMOTE_PORT=28700"
+Environment="LOCAL_HOST=127.0.0.1"
+Environment="LOCAL_PORT=18700"
+Environment="SSH_KEY_FILE=/etc/realm-agent/tunnel/id_ed25519"
+Environment="KNOWN_HOSTS_FILE=/etc/realm-agent/tunnel/known_hosts"
+Environment="STRICT_HOST_KEY_CHECKING=yes"
+EnvironmentFile=-/etc/realm-agent/revtunnel.env
+ExecStartPre=/usr/bin/test -n ${PANEL_SSH_HOST}
+ExecStartPre=/usr/bin/test -r ${SSH_KEY_FILE}
+ExecStart=/usr/bin/ssh -NT \
+  -o BatchMode=yes \
+  -o ExitOnForwardFailure=yes \
+  -o ServerAliveInterval=15 \
+  -o ServerAliveCountMax=3 \
+  -o StrictHostKeyChecking=${STRICT_HOST_KEY_CHECKING} \
+  -o UserKnownHostsFile=${KNOWN_HOSTS_FILE} \
+  -i ${SSH_KEY_FILE} \
+  -p ${PANEL_SSH_PORT} \
+  -R ${REMOTE_BIND}:${REMOTE_PORT}:${LOCAL_HOST}:${LOCAL_PORT} \
+  ${PANEL_SSH_USER}@${PANEL_SSH_HOST}
+Restart=always
+RestartSec=3
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target

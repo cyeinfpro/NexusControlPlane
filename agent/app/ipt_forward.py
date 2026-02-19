@@ -19,6 +19,17 @@ IPTABLES_TIMEOUT = float(str(os.getenv("REALM_IPTABLES_FWD_TIMEOUT", "2.0")).str
 NAT_CHAIN = str(os.getenv("REALM_IPTABLES_FWD_NAT_CHAIN", "REALMFWD_PREROUTE") or "REALMFWD_PREROUTE").strip()
 FILTER_CHAIN = str(os.getenv("REALM_IPTABLES_FWD_FILTER_CHAIN", "REALMFWD_FORWARD") or "REALMFWD_FORWARD").strip()
 
+_BALANCE_ALGO_MAP = {
+    "roundrobin": "roundrobin",
+    "iphash": "iphash",
+    "leastconn": "least_conn",
+    "leastlatency": "least_latency",
+    "consistenthash": "consistent_hash",
+    "randomweight": "random_weight",
+}
+_WEIGHTED_BALANCE_ALGOS = {"roundrobin", "random_weight"}
+_IPTABLES_DIRECT_BALANCE_ALGOS = {"roundrobin", "random_weight"}
+
 
 def _run_iptables(args: List[str]) -> Tuple[int, str, str]:
     return run_iptables(args, timeout=max(0.2, IPTABLES_TIMEOUT))
@@ -41,7 +52,7 @@ def _normalize_algo(raw: Any) -> str:
     a = str(raw or "roundrobin").strip().lower()
     for ch in ("_", "-", " "):
         a = a.replace(ch, "")
-    return "iphash" if a == "iphash" else "roundrobin"
+    return str(_BALANCE_ALGO_MAP.get(a) or "roundrobin")
 
 
 def _parse_balance(balance: Any, remotes_count: int) -> Tuple[str, List[int]]:
@@ -53,6 +64,8 @@ def _parse_balance(balance: Any, remotes_count: int) -> Tuple[str, List[int]]:
 
     left, right = txt.split(":", 1)
     algo = _normalize_algo(left)
+    if algo not in _WEIGHTED_BALANCE_ALGOS:
+        return algo, [1] * max(0, remotes_count)
     raw = [x.strip() for x in right.replace("，", ",").split(",") if x.strip()]
     ws: List[int] = []
     for it in raw:
@@ -80,9 +93,12 @@ def _split_hostport(addr: str) -> Tuple[str, int]:
         raise ValueError("empty address")
 
     if "://" in s:
-        u = urlparse(s)
-        host = (u.hostname or "").strip()
-        port = int(u.port or 0)
+        try:
+            u = urlparse(s)
+            host = (u.hostname or "").strip()
+            port = int(u.port or 0)
+        except Exception:
+            raise ValueError("address must include host and valid port")
         if not host or port <= 0 or port > 65535:
             raise ValueError("address must include host and valid port")
         return host, port
@@ -450,10 +466,11 @@ class IptablesForwardManager:
 
         # nat/PREROUTING DNAT rules with weighted random dispatch
         algo = rule.balance_algo
-        if algo == "iphash":
+        if algo not in _IPTABLES_DIRECT_BALANCE_ALGOS:
+            old_algo = str(algo or "unknown")
             algo = "roundrobin"
             self._warnings.append(
-                f"{rule.listen}: iphash is not natively supported by iptables DNAT; fallback to weighted random"
+                f"{rule.listen}: {old_algo} is not natively supported by iptables DNAT; fallback to weighted random"
             )
 
         weights = list(rule.weights or [])

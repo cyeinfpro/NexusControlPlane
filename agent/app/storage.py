@@ -1,5 +1,6 @@
 import json
 import os
+import tempfile
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, List
@@ -54,11 +55,32 @@ def load_json(path: str) -> Dict[str, Any]:
 
 
 def save_json_atomic(path: str, obj: Dict[str, Any]) -> None:
-    ensure_dir(os.path.dirname(path))
-    tmp = f"{path}.tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(obj, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, path)
+    parent = os.path.dirname(path)
+    ensure_dir(parent)
+
+    tmp_path = ""
+    fd = -1
+    try:
+        fd, tmp_path = tempfile.mkstemp(
+            prefix=f"{os.path.basename(path)}.tmp.",
+            dir=parent or ".",
+            text=True,
+        )
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            fd = -1
+            json.dump(obj, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, path)
+    finally:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except Exception:
+                pass
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
 
 
 def ensure_pool_full(paths: Paths) -> Dict[str, Any]:

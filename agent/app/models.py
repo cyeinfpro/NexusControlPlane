@@ -6,7 +6,14 @@ from pydantic import BaseModel, Field
 
 
 RuleType = Literal["tcp_udp", "wss_client", "wss_server"]
-BalanceAlgo = Literal["roundrobin", "iphash"]
+BalanceAlgo = Literal[
+    "roundrobin",
+    "iphash",
+    "least_conn",
+    "least_latency",
+    "consistent_hash",
+    "random_weight",
+]
 
 
 class Target(BaseModel):

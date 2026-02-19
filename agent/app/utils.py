@@ -51,7 +51,10 @@ def parse_pair_code(code: str) -> Dict[str, Any]:
 
 
 def ensure_dir(path: str) -> None:
-    os.makedirs(path, exist_ok=True)
+    p = str(path or "").strip()
+    if not p:
+        return
+    os.makedirs(p, exist_ok=True)
 
 
 def gen_api_key() -> str:

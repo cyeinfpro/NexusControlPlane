@@ -6,6 +6,7 @@ import hmac
 import ipaddress
 import json
 import os
+import random
 import socket
 import ssl
 import struct
@@ -81,6 +82,14 @@ OPEN_TIMEOUT = float(os.getenv('REALM_INTRANET_OPEN_TIMEOUT', '8.0'))
 TCP_BACKLOG = int(os.getenv('REALM_INTRANET_TCP_BACKLOG', '256'))
 UDP_SESSION_TTL = float(os.getenv('REALM_INTRANET_UDP_TTL', '60.0'))
 MAX_FRAME = int(os.getenv('REALM_INTRANET_MAX_UDP_FRAME', '65535'))
+SOCKET_RCVBUF = _env_int('REALM_INTRANET_SOCKET_RCVBUF', 1024 * 1024, 0, 32 * 1024 * 1024)
+SOCKET_SNDBUF = _env_int('REALM_INTRANET_SOCKET_SNDBUF', 1024 * 1024, 0, 32 * 1024 * 1024)
+TCP_NODELAY = _env_bool('REALM_INTRANET_TCP_NODELAY', True)
+TCP_QUICKACK = _env_bool('REALM_INTRANET_TCP_QUICKACK', False)
+TCP_RELAY_CHUNK = _env_int('REALM_INTRANET_TCP_RELAY_CHUNK', 128 * 1024, 8 * 1024, 1024 * 1024)
+TCP_RELAY_STOP_WAIT = _env_float('REALM_INTRANET_TCP_RELAY_STOP_WAIT', 0.05, 0.01, 1.0)
+TCP_RELAY_DRAIN_TIMEOUT = _env_float('REALM_INTRANET_TCP_RELAY_DRAIN_TIMEOUT', 15.0, 1.0, 120.0)
+UDP_BRIDGE_STOP_WAIT = _env_float('REALM_INTRANET_UDP_BRIDGE_STOP_WAIT', 0.2, 0.02, 2.0)
 DIAL_CONNECT_TIMEOUT = _env_float('REALM_INTRANET_DIAL_CONNECT_TIMEOUT', 6.0, 1.0, 60.0)
 DIAL_TLS_TIMEOUT = _env_float('REALM_INTRANET_DIAL_TLS_TIMEOUT', 8.0, 1.0, 60.0)
 SERVER_TLS_HANDSHAKE_TIMEOUT = _env_float('REALM_INTRANET_SERVER_TLS_HANDSHAKE_TIMEOUT', 8.0, 1.0, 60.0)
@@ -89,6 +98,13 @@ FIRST_PACKET_MAX = _env_int('REALM_INTRANET_FIRST_PACKET_MAX', 65536, 256, 1024 
 MAX_ACCEPT_WORKERS = _env_int('REALM_INTRANET_MAX_ACCEPT_WORKERS', 512, 8, 8192)
 MAX_ACTIVE_FLOWS = _env_int('REALM_INTRANET_MAX_ACTIVE_FLOWS', 1024, 8, 65535)
 MAX_CLIENT_OPEN_WORKERS = _env_int('REALM_INTRANET_MAX_CLIENT_OPEN_WORKERS', 512, 8, 8192)
+MAX_TCP_LISTENER_WORKERS = _env_int(
+    'REALM_INTRANET_MAX_TCP_LISTENER_WORKERS',
+    max(256, MAX_ACTIVE_FLOWS * 2),
+    32,
+    16384,
+)
+CONTROL_RECV_TIMEOUT = _env_float('REALM_INTRANET_CONTROL_RECV_TIMEOUT', 2.0, 0.2, 10.0)
 NONCE_TTL_SEC = _env_int('REALM_INTRANET_NONCE_TTL_SEC', 600, 60, 3600)
 NONCE_LRU_PER_TOKEN = _env_int('REALM_INTRANET_NONCE_LRU_PER_TOKEN', 2048, 64, 65535)
 LOG_ROTATE_BYTES = _env_int('REALM_INTRANET_LOG_ROTATE_BYTES', 10 * 1024 * 1024, 0, 1024 * 1024 * 1024)
@@ -111,6 +127,29 @@ REQUIRE_TLS_SERVER = _env_bool('REALM_INTRANET_REQUIRE_TLS', True)
 # Log can be disabled in extreme IO constrained env
 ENABLE_LOG = _env_bool('REALM_INTRANET_LOG', True)
 
+_BALANCE_ALGO_MAP = {
+    'roundrobin': 'roundrobin',
+    'iphash': 'iphash',
+    'leastconn': 'least_conn',
+    'leastlatency': 'least_latency',
+    'consistenthash': 'consistent_hash',
+    'randomweight': 'random_weight',
+}
+_WEIGHTED_BALANCE_ALGOS = {'roundrobin', 'random_weight'}
+LB_LATENCY_EMA_ALPHA = _env_float('REALM_INTRANET_LB_LATENCY_EMA_ALPHA', 0.28, 0.05, 0.95)
+LB_LATENCY_FAIL_PENALTY_MS = _env_int('REALM_INTRANET_LB_LATENCY_FAIL_MS', 2000, 200, 15000)
+LB_LATENCY_TIMEOUT_PENALTY_MS = _env_int('REALM_INTRANET_LB_LATENCY_TIMEOUT_MS', 4000, 500, 30000)
+DIAL_HAPPY_EYEBALLS = _env_bool('REALM_INTRANET_HAPPY_EYEBALLS', True)
+DIAL_HAPPY_EYEBALLS_STAGGER_MS = _env_int('REALM_INTRANET_HAPPY_EYEBALLS_STAGGER_MS', 220, 20, 1000)
+DIAL_HAPPY_EYEBALLS_MAX_ADDRS = _env_int('REALM_INTRANET_HAPPY_EYEBALLS_MAX_ADDRS', 8, 2, 32)
+LB_ROUTE_RTT_REF_MS = _env_int('REALM_INTRANET_ROUTE_RTT_REF_MS', 180, 20, 5000)
+LB_ROUTE_JITTER_REF_MS = _env_int('REALM_INTRANET_ROUTE_JITTER_REF_MS', 60, 5, 2000)
+LB_ROUTE_MIN_SAMPLES = _env_int('REALM_INTRANET_ROUTE_MIN_SAMPLES', 4, 1, 100)
+LB_ROUTE_EXPLORE_EVERY = _env_int('REALM_INTRANET_ROUTE_EXPLORE_EVERY', 12, 1, 200)
+LB_ROUTE_RTT_WEIGHT = _env_float('REALM_INTRANET_ROUTE_RTT_WEIGHT', 0.58, 0.05, 0.95)
+LB_ROUTE_JITTER_WEIGHT = _env_float('REALM_INTRANET_ROUTE_JITTER_WEIGHT', 0.17, 0.01, 0.95)
+LB_ROUTE_LOSS_WEIGHT = _env_float('REALM_INTRANET_ROUTE_LOSS_WEIGHT', 0.25, 0.01, 0.95)
+
 
 def _now() -> float:
     return time.time()
@@ -121,6 +160,443 @@ def _now_ms() -> int:
 
 
 _LOG_LOCK = threading.Lock()
+
+
+def _normalize_balance_algo(raw: Any) -> str:
+    s = str(raw or '').strip().lower()
+    for ch in ('_', '-', ' '):
+        s = s.replace(ch, '')
+    return str(_BALANCE_ALGO_MAP.get(s) or 'roundrobin')
+
+
+def _parse_balance(balance: Any, remote_count: int) -> Tuple[str, List[int]]:
+    n = max(0, int(remote_count))
+    if n <= 0:
+        return 'roundrobin', []
+    txt = str(balance or 'roundrobin').strip()
+    if not txt:
+        txt = 'roundrobin'
+    if ':' not in txt:
+        algo = _normalize_balance_algo(txt)
+        return algo, [1] * n
+
+    left, right = txt.split(':', 1)
+    algo = _normalize_balance_algo(left)
+    if algo not in _WEIGHTED_BALANCE_ALGOS:
+        return algo, [1] * n
+    raw = [x.strip() for x in right.replace('，', ',').split(',') if x.strip()]
+    ws: List[int] = []
+    for item in raw:
+        if not item.isdigit():
+            return algo, [1] * n
+        v = int(item)
+        if v <= 0:
+            return algo, [1] * n
+        ws.append(v)
+    if len(ws) != n:
+        ws = [1] * n
+    return algo, ws
+
+
+def _addr_source_key(addr: Any) -> str:
+    try:
+        if isinstance(addr, tuple) and addr:
+            return str(addr[0] or '').strip()
+    except Exception:
+        return ''
+    return ''
+
+
+def _pick_weighted_random_index(weights: List[int]) -> int:
+    if not weights:
+        return 0
+    total = 0
+    safe: List[int] = []
+    for w in weights:
+        v = max(1, int(w))
+        safe.append(v)
+        total += v
+    if total <= 0:
+        return 0
+    point = random.uniform(0.0, float(total))
+    acc = 0.0
+    for idx, w in enumerate(safe):
+        acc += float(w)
+        if point <= acc:
+            return int(idx)
+    return max(0, len(safe) - 1)
+
+
+def _pick_weighted_rr_index(weights: List[int], current: List[int]) -> int:
+    if not weights:
+        return 0
+    n = len(weights)
+    if len(current) != n:
+        current[:] = [0] * n
+    total = 0
+    best_idx = 0
+    best_val = None
+    for i in range(n):
+        w = max(1, int(weights[i]))
+        total += w
+        current[i] = int(current[i]) + w
+        val = int(current[i])
+        if best_val is None or val > int(best_val):
+            best_val = val
+            best_idx = i
+    current[best_idx] = int(current[best_idx]) - int(total)
+    return int(best_idx)
+
+
+def _pick_consistent_hash_index(remotes: List[str], key: str, fallback_idx: int = 0) -> int:
+    n = len(remotes)
+    if n <= 0:
+        return 0
+    if not key:
+        return int(max(0, fallback_idx) % n)
+    best_idx = 0
+    best_score = -1
+    for idx, remote in enumerate(remotes):
+        payload = f'{key}|{remote}'.encode('utf-8', errors='ignore')
+        digest = hashlib.sha1(payload).digest()
+        score = int.from_bytes(digest[:8], byteorder='big', signed=False)
+        if score > best_score:
+            best_score = score
+            best_idx = idx
+    return int(best_idx)
+
+
+def _latency_sample_ms(started_at: float, *, ok: bool, timeout: bool = False) -> float:
+    elapsed = float(max(1, int(max(0.0, (_now() - float(started_at))) * 1000.0)))
+    if ok:
+        return elapsed
+    penalty = float(LB_LATENCY_TIMEOUT_PENALTY_MS if timeout else LB_LATENCY_FAIL_PENALTY_MS)
+    return max(elapsed, penalty)
+
+
+def _update_latency_ema(store: Dict[str, float], target: str, sample_ms: float) -> None:
+    t = str(target or '').strip()
+    if not t:
+        return
+    cur = float(max(1.0, sample_ms))
+    prev = store.get(t)
+    if prev is None:
+        store[t] = cur
+        return
+    alpha = float(LB_LATENCY_EMA_ALPHA)
+    store[t] = (float(prev) * (1.0 - alpha)) + (cur * alpha)
+
+
+def _normalize_route_weights() -> Tuple[float, float, float]:
+    rw = max(0.0, float(LB_ROUTE_RTT_WEIGHT))
+    jw = max(0.0, float(LB_ROUTE_JITTER_WEIGHT))
+    lw = max(0.0, float(LB_ROUTE_LOSS_WEIGHT))
+    total = rw + jw + lw
+    if total <= 0.0:
+        return 0.58, 0.17, 0.25
+    return rw / total, jw / total, lw / total
+
+
+LB_ROUTE_RTT_WEIGHT_N, LB_ROUTE_JITTER_WEIGHT_N, LB_ROUTE_LOSS_WEIGHT_N = _normalize_route_weights()
+
+
+def _route_quality_score(rtt_ms: Optional[float], jitter_ms: Optional[float], loss_ratio: Optional[float], samples: int) -> Optional[float]:
+    if rtt_ms is None:
+        return None
+    rtt_v = max(1.0, float(rtt_ms))
+    jitter_v = float(jitter_ms) if jitter_ms is not None else (rtt_v * 0.08)
+    jitter_v = max(0.0, jitter_v)
+    if loss_ratio is None:
+        loss_v = 0.0
+    else:
+        loss_v = max(0.0, min(1.0, float(loss_ratio)))
+
+    rtt_factor = float(LB_ROUTE_RTT_REF_MS) / (float(LB_ROUTE_RTT_REF_MS) + rtt_v)
+    jitter_factor = float(LB_ROUTE_JITTER_REF_MS) / (float(LB_ROUTE_JITTER_REF_MS) + jitter_v)
+    loss_factor = 1.0 - loss_v
+
+    score = (
+        (rtt_factor * float(LB_ROUTE_RTT_WEIGHT_N))
+        + (jitter_factor * float(LB_ROUTE_JITTER_WEIGHT_N))
+        + (loss_factor * float(LB_ROUTE_LOSS_WEIGHT_N))
+    )
+    conf = min(1.0, float(max(0, int(samples))) / float(max(1, int(LB_ROUTE_MIN_SAMPLES))))
+    score = score * (0.6 + 0.4 * conf)
+    return max(0.0, min(1.0, float(score)))
+
+
+def _update_loss_ema(store: Dict[str, float], target: str, ok: bool) -> None:
+    t = str(target or '').strip()
+    if not t:
+        return
+    sample = 0.0 if bool(ok) else 1.0
+    prev = store.get(t)
+    if prev is None:
+        store[t] = sample
+        return
+    alpha = float(LB_LATENCY_EMA_ALPHA)
+    out = (float(prev) * (1.0 - alpha)) + (sample * alpha)
+    store[t] = max(0.0, min(1.0, out))
+
+
+def _update_target_quality(
+    latency_store: Dict[str, float],
+    jitter_store: Dict[str, float],
+    loss_store: Dict[str, float],
+    last_sample_store: Dict[str, float],
+    sample_count_store: Dict[str, int],
+    target: str,
+    sample_ms: float,
+    *,
+    ok: bool,
+) -> None:
+    t = str(target or '').strip()
+    if not t:
+        return
+    _update_latency_ema(latency_store, t, sample_ms)
+    prev = last_sample_store.get(t)
+    if prev is not None:
+        _update_latency_ema(jitter_store, t, abs(float(sample_ms) - float(prev)))
+    elif t not in jitter_store:
+        jitter_store[t] = max(1.0, float(sample_ms) * 0.05)
+    last_sample_store[t] = float(max(1.0, sample_ms))
+    _update_loss_ema(loss_store, t, bool(ok))
+    sample_count_store[t] = int(sample_count_store.get(t, 0)) + 1
+
+
+def _family_label(family: int) -> str:
+    if int(family) == int(getattr(socket, 'AF_INET6', 10)):
+        return 'ipv6'
+    if int(family) == int(getattr(socket, 'AF_INET', 2)):
+        return 'ipv4'
+    return str(int(family))
+
+
+def _sockaddr_label(sockaddr: Any) -> str:
+    try:
+        if isinstance(sockaddr, tuple):
+            if len(sockaddr) >= 2:
+                host = str(sockaddr[0] or '').strip()
+                port = int(sockaddr[1] or 0)
+                if (':' in host) and (not host.startswith('[')):
+                    return f'[{host}]:{port}'
+                return f'{host}:{port}'
+    except Exception:
+        pass
+    return str(sockaddr)
+
+
+def _resolve_addrinfos(host: str, port: int, sock_type: int, *, max_addrs: int = 0) -> List[Tuple[int, int, int, Any]]:
+    infos = socket.getaddrinfo(host, int(port), socket.AF_UNSPEC, sock_type)
+    seen: set[Tuple[int, int, int, Any]] = set()
+    ordered: List[Tuple[int, int, int, Any]] = []
+    for family, stype, proto, _canon, sockaddr in infos:
+        key = (int(family), int(stype), int(proto), sockaddr)
+        if key in seen:
+            continue
+        seen.add(key)
+        ordered.append((int(family), int(stype), int(proto), sockaddr))
+
+    ipv6: List[Tuple[int, int, int, Any]] = []
+    ipv4: List[Tuple[int, int, int, Any]] = []
+    other: List[Tuple[int, int, int, Any]] = []
+    for item in ordered:
+        if item[0] == socket.AF_INET6:
+            ipv6.append(item)
+        elif item[0] == socket.AF_INET:
+            ipv4.append(item)
+        else:
+            other.append(item)
+
+    out: List[Tuple[int, int, int, Any]] = []
+    for idx in range(max(len(ipv6), len(ipv4))):
+        if idx < len(ipv6):
+            out.append(ipv6[idx])
+        if idx < len(ipv4):
+            out.append(ipv4[idx])
+    out.extend(other)
+
+    limit = int(max_addrs or 0)
+    if limit > 0 and len(out) > limit:
+        out = out[:limit]
+    return out
+
+
+def _dial_tcp_seq(infos: List[Tuple[int, int, int, Any]], timeout: float) -> Tuple[Optional[socket.socket], str, Dict[str, Any]]:
+    info: Dict[str, Any] = {
+        'race_mode': 'sequential',
+        'happy_eyeballs_enabled': False,
+        'resolved': int(len(infos)),
+        'attempts': 0,
+    }
+    t0 = time.monotonic()
+    last_err = 'dial_failed'
+    for family, stype, proto, sockaddr in infos:
+        info['attempts'] = int(info.get('attempts', 0)) + 1
+        s: Optional[socket.socket] = None
+        try:
+            s = socket.socket(family, stype, proto)
+            _set_socket_buffers(s)
+            s.settimeout(float(timeout))
+            s.connect(sockaddr)
+            s.settimeout(None)
+            info['winner_family'] = _family_label(family)
+            info['winner_addr'] = _sockaddr_label(sockaddr)
+            info['duration_ms'] = int(max(0.0, (time.monotonic() - t0) * 1000.0))
+            return s, '', info
+        except Exception as exc:
+            last_err = str(exc)
+            _safe_close(s)
+    info['duration_ms'] = int(max(0.0, (time.monotonic() - t0) * 1000.0))
+    return None, last_err, info
+
+
+def _dial_tcp_happy_eyeballs(infos: List[Tuple[int, int, int, Any]], timeout: float) -> Tuple[Optional[socket.socket], str, Dict[str, Any]]:
+    base_info: Dict[str, Any] = {
+        'race_mode': 'happy_eyeballs',
+        'happy_eyeballs_enabled': True,
+        'resolved': int(len(infos)),
+        'attempts': 0,
+    }
+    t0 = time.monotonic()
+    if len(infos) <= 1:
+        s, err, info = _dial_tcp_seq(infos, timeout)
+        info['race_mode'] = 'sequential'
+        info['happy_eyeballs_enabled'] = False
+        return s, err, info
+
+    stop = threading.Event()
+    lock = threading.Lock()
+    winner: List[Tuple[socket.socket, str, str]] = []
+    errors: List[str] = []
+    stagger_s = max(0.02, float(DIAL_HAPPY_EYEBALLS_STAGGER_MS) / 1000.0)
+
+    def _attempt(idx: int, item: Tuple[int, int, int, Any]) -> None:
+        delay = float(idx) * stagger_s
+        if delay > 0.0 and stop.wait(delay):
+            return
+        if stop.is_set():
+            return
+        family, stype, proto, sockaddr = item
+        s: Optional[socket.socket] = None
+        try:
+            with lock:
+                base_info['attempts'] = int(base_info.get('attempts', 0)) + 1
+            s = socket.socket(family, stype, proto)
+            _set_socket_buffers(s)
+            s.settimeout(float(timeout))
+            s.connect(sockaddr)
+            s.settimeout(None)
+            with lock:
+                if (not winner) and (not stop.is_set()):
+                    winner.append((s, _family_label(family), _sockaddr_label(sockaddr)))
+                    stop.set()
+                    return
+        except Exception as exc:
+            with lock:
+                errors.append(str(exc))
+        _safe_close(s)
+
+    workers: List[threading.Thread] = []
+    for idx, info in enumerate(infos):
+        th = threading.Thread(target=_attempt, args=(idx, info), daemon=True)
+        th.start()
+        workers.append(th)
+
+    deadline = time.monotonic() + float(timeout) + (stagger_s * float(max(0, len(infos) - 1))) + 0.25
+    while time.monotonic() < deadline:
+        if stop.wait(0.02):
+            break
+        if not any(th.is_alive() for th in workers):
+            break
+
+    if winner:
+        ws, wf, wa = winner[0]
+        base_info['winner_family'] = wf
+        base_info['winner_addr'] = wa
+        base_info['duration_ms'] = int(max(0.0, (time.monotonic() - t0) * 1000.0))
+        for th in workers:
+            try:
+                th.join(timeout=0.01)
+            except Exception:
+                pass
+        return ws, '', base_info
+
+    stop.set()
+    for th in workers:
+        try:
+            th.join(timeout=0.02)
+        except Exception:
+            pass
+    if errors:
+        base_info['duration_ms'] = int(max(0.0, (time.monotonic() - t0) * 1000.0))
+        return None, errors[0], base_info
+    base_info['duration_ms'] = int(max(0.0, (time.monotonic() - t0) * 1000.0))
+    return None, 'dial_failed', base_info
+
+
+def _dial_tcp_target(host: str, port: int, timeout: float) -> Tuple[Optional[socket.socket], str, Dict[str, Any]]:
+    base: Dict[str, Any] = {
+        'host': str(host or ''),
+        'port': int(port),
+        'happy_eyeballs_enabled': bool(DIAL_HAPPY_EYEBALLS),
+        'race_mode': ('happy_eyeballs' if DIAL_HAPPY_EYEBALLS else 'sequential'),
+        'attempts': 0,
+        'resolved': 0,
+    }
+    try:
+        infos = _resolve_addrinfos(host, int(port), socket.SOCK_STREAM, max_addrs=DIAL_HAPPY_EYEBALLS_MAX_ADDRS)
+    except Exception as exc:
+        base['error'] = f'resolve_failed: {exc}'
+        return None, str(base.get('error') or 'resolve_failed'), base
+    if not infos:
+        base['error'] = 'resolve_no_addr'
+        return None, 'resolve_no_addr', base
+    base['resolved'] = int(len(infos))
+    if DIAL_HAPPY_EYEBALLS and len(infos) > 1:
+        s, err, info = _dial_tcp_happy_eyeballs(infos, timeout)
+    else:
+        s, err, info = _dial_tcp_seq(infos, timeout)
+    if isinstance(info, dict):
+        base.update(info)
+    return s, err, base
+
+
+def _dial_udp_target(host: str, port: int, timeout: float) -> Tuple[Optional[socket.socket], str, Dict[str, Any]]:
+    base: Dict[str, Any] = {
+        'host': str(host or ''),
+        'port': int(port),
+        'attempts': 0,
+        'resolved': 0,
+    }
+    try:
+        infos = _resolve_addrinfos(host, int(port), socket.SOCK_DGRAM, max_addrs=DIAL_HAPPY_EYEBALLS_MAX_ADDRS)
+    except Exception as exc:
+        base['error'] = f'resolve_failed: {exc}'
+        return None, str(base.get('error') or 'resolve_failed'), base
+    if not infos:
+        base['error'] = 'resolve_no_addr'
+        return None, 'resolve_no_addr', base
+    base['resolved'] = int(len(infos))
+
+    last_err = 'dial_failed'
+    for family, stype, proto, sockaddr in infos:
+        s: Optional[socket.socket] = None
+        try:
+            base['attempts'] = int(base.get('attempts', 0)) + 1
+            s = socket.socket(family, stype, proto)
+            _set_socket_buffers(s)
+            s.settimeout(float(timeout))
+            s.connect(sockaddr)
+            s.settimeout(None)
+            base['winner_family'] = _family_label(family)
+            base['winner_addr'] = _sockaddr_label(sockaddr)
+            return s, '', base
+        except Exception as exc:
+            last_err = str(exc)
+            _safe_close(s)
+    base['error'] = last_err
+    return None, last_err, base
 
 
 def _rotate_logs_locked() -> None:
@@ -382,15 +858,46 @@ def _mk_client_ssl_context(server_cert_pem: Optional[str], require_verify: bool 
     return ctx
 
 
-def _set_keepalive(sock_obj: socket.socket) -> None:
+def _set_socket_buffers(sock_obj: Any) -> None:
+    if SOCKET_RCVBUF > 0:
+        try:
+            sock_obj.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, int(SOCKET_RCVBUF))
+        except Exception:
+            pass
+    if SOCKET_SNDBUF > 0:
+        try:
+            sock_obj.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, int(SOCKET_SNDBUF))
+        except Exception:
+            pass
+
+
+def _set_tcp_low_latency(sock_obj: Any) -> None:
+    if TCP_NODELAY:
+        try:
+            sock_obj.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except Exception:
+            pass
+    if TCP_QUICKACK and hasattr(socket, 'TCP_QUICKACK'):
+        try:
+            sock_obj.setsockopt(socket.IPPROTO_TCP, socket.TCP_QUICKACK, 1)
+        except Exception:
+            pass
+
+
+def _set_keepalive(sock_obj: Any) -> None:
+    _set_socket_buffers(sock_obj)
+    _set_tcp_low_latency(sock_obj)
     try:
         sock_obj.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
     except Exception:
-        return
-    # Best effort for Linux. Ignore failures.
+        pass
+    # Best effort for Linux/macOS. Ignore failures.
     try:
         if hasattr(socket, 'TCP_KEEPIDLE'):
             sock_obj.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 30)
+        elif hasattr(socket, 'TCP_KEEPALIVE'):
+            # macOS/BSD use TCP_KEEPALIVE as idle time option.
+            sock_obj.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPALIVE, 30)
         if hasattr(socket, 'TCP_KEEPINTVL'):
             sock_obj.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)
         if hasattr(socket, 'TCP_KEEPCNT'):
@@ -852,6 +1359,16 @@ class _TunnelServer:
                     'max_accept_workers': int(MAX_ACCEPT_WORKERS),
                     'max_active_flows': int(MAX_ACTIVE_FLOWS),
                 },
+                'transport': {
+                    'socket_rcvbuf': int(SOCKET_RCVBUF),
+                    'socket_sndbuf': int(SOCKET_SNDBUF),
+                    'tcp_nodelay': bool(TCP_NODELAY),
+                    'tcp_relay_chunk': int(TCP_RELAY_CHUNK),
+                    'tcp_relay_drain_timeout': float(TCP_RELAY_DRAIN_TIMEOUT),
+                    'control_recv_timeout': float(CONTROL_RECV_TIMEOUT),
+                    'udp_bridge_stop_wait': float(UDP_BRIDGE_STOP_WAIT),
+                    'max_tcp_listener_workers': int(MAX_TCP_LISTENER_WORKERS),
+                },
                 'accept_workers_active': int(self._accept_active),
                 'accept_workers_peak': int(self._accept_peak),
                 'flows_active': int(self._flow_active),
@@ -948,6 +1465,7 @@ class _TunnelServer:
             conn.settimeout(SERVER_TLS_HANDSHAKE_TIMEOUT)
             _set_keepalive(conn)
             ss = self._ssl_ctx.wrap_socket(conn, server_side=True)
+            _set_tcp_low_latency(ss)
             ss.settimeout(None)
             return ss, 'tls'
         except socket.timeout as exc:
@@ -1042,7 +1560,7 @@ class _TunnelServer:
         if mtype == 'hello':
             self._handle_control(ss, dial_mode, msg, addr)
             return
-        if mtype in ('data', 'data_udp'):
+        if mtype in ('data', 'data_udp', 'data_rev'):
             self._handle_data(ss, msg)
             return
         _safe_close(ss)
@@ -1184,6 +1702,10 @@ class _TunnelServer:
             t = str(msg.get('type') or '')
             sess.last_seen = _now()
 
+            if t == 'open_rev':
+                self._handle_open_reverse(sess, msg)
+                continue
+
             if t == 'ping':
                 sess.last_ping_at = sess.last_seen
                 # client may report last measured rtt
@@ -1209,6 +1731,73 @@ class _TunnelServer:
                 if sv is sess:
                     self._sessions.pop(tk, None)
 
+    def _handle_open_reverse(self, sess: _ControlSession, msg: Dict[str, Any]) -> None:
+        conn_id = str(msg.get('conn_id') or '').strip()
+        target = str(msg.get('target') or '').strip()
+        token = str(msg.get('token') or sess.token).strip() or sess.token
+        proto = str(msg.get('proto') or 'tcp').strip().lower() or 'tcp'
+
+        if proto not in ('tcp', 'udp'):
+            sess.send({'type': 'open_rev_err', 'conn_id': conn_id, 'error': 'proto_unsupported'})
+            return
+        if (not conn_id) or (not target):
+            sess.send({'type': 'open_rev_err', 'conn_id': conn_id, 'error': 'open_rev_invalid'})
+            return
+        if token not in getattr(sess, 'tokens', {sess.token}):
+            sess.send({'type': 'open_rev_err', 'conn_id': conn_id, 'error': 'token_mismatch'})
+            return
+        if not self.acquire_flow_slot(proto):
+            sess.send({'type': 'open_rev_err', 'conn_id': conn_id, 'error': 'server_overload'})
+            return
+
+        opened_at = self.open_started()
+        out: Optional[socket.socket] = None
+        try:
+            host, port = _split_hostport(target)
+            if proto == 'udp':
+                out, dial_err, _dial_info = _dial_udp_target(host, int(port), 6.0)
+            else:
+                out, dial_err, _dial_info = _dial_tcp_target(host, int(port), 6.0)
+            if not out:
+                self.release_flow_slot(proto)
+                self.open_finished(opened_at, ok=False)
+                sess.send({'type': 'open_rev_err', 'conn_id': conn_id, 'error': str(dial_err or 'dial_failed')})
+                return
+            out.settimeout(None)
+            if proto == 'tcp':
+                _set_keepalive(out)
+        except Exception as exc:
+            _safe_close(out)
+            self.release_flow_slot(proto)
+            self.open_finished(opened_at, ok=False)
+            sess.send({'type': 'open_rev_err', 'conn_id': conn_id, 'error': f'dial_failed: {exc}'})
+            return
+
+        key = (token, conn_id)
+        with self._pending_lock:
+            old = self._pending.pop(key, None)
+            self._pending[key] = {
+                'created_at': _now(),
+                'proto': proto,
+                'reverse': True,
+                'server_sock': out,
+                'flow_proto': proto,
+            }
+        if isinstance(old, dict):
+            _safe_close(old.get('server_sock'))
+            if old.get('flow_proto') in ('tcp', 'udp'):
+                try:
+                    self.release_flow_slot(str(old.get('flow_proto')))
+                except Exception:
+                    pass
+
+        self.open_finished(opened_at, ok=True)
+        if not sess.send({'type': 'open_rev_ok', 'conn_id': conn_id}):
+            with self._pending_lock:
+                self._pending.pop(key, None)
+            _safe_close(out)
+            self.release_flow_slot(proto)
+
     def _handle_data(self, ss: Any, msg: Dict[str, Any]) -> None:
         token = str(msg.get('token') or '')
         conn_id = str(msg.get('conn_id') or '')
@@ -1220,6 +1809,35 @@ class _TunnelServer:
             pend = self._pending.get(key)
         if not pend:
             _safe_close(ss)
+            return
+
+        # Reverse mode: server side already opened target and waits for client data channel.
+        if bool(pend.get('reverse')):
+            with self._pending_lock:
+                pend2 = self._pending.pop(key, None) or pend
+            out = pend2.get('server_sock')
+            flow_proto = str(pend2.get('flow_proto') or 'tcp')
+            rev_proto = str(pend2.get('proto') or flow_proto or 'tcp').strip().lower() or 'tcp'
+            if (not ok) or (out is None):
+                _safe_close(out)
+                _safe_close(ss)
+                if flow_proto in ('tcp', 'udp'):
+                    try:
+                        self.release_flow_slot(flow_proto)
+                    except Exception:
+                        pass
+                return
+            try:
+                if rev_proto == 'udp':
+                    _relay_udp_stream(ss, out)
+                else:
+                    _relay_tcp(out, ss)
+            finally:
+                if flow_proto in ('tcp', 'udp'):
+                    try:
+                        self.release_flow_slot(flow_proto)
+                    except Exception:
+                        pass
             return
 
         pend['data_sock'] = ss
@@ -1255,7 +1873,15 @@ class _TunnelServer:
                 for key, pend in list(self._pending.items()):
                     created = float(pend.get('created_at') or 0.0)
                     if created and (now - created) > max(OPEN_TIMEOUT * 3.0, 30.0):
-                        self._pending.pop(key, None)
+                        dead = self._pending.pop(key, None)
+                        if isinstance(dead, dict):
+                            _safe_close(dead.get('server_sock'))
+                            flow_proto = str(dead.get('flow_proto') or '')
+                            if flow_proto in ('tcp', 'udp'):
+                                try:
+                                    self.release_flow_slot(flow_proto)
+                                except Exception:
+                                    pass
             # cleanup replay nonce cache
             cutoff = now - float(NONCE_TTL_SEC)
             with self._nonce_lock:
@@ -1277,8 +1903,22 @@ class _TCPListener:
         self._th: Optional[threading.Thread] = None
         self._sock: Optional[socket.socket] = None
         self._rr = 0
+        self._balance_algo, self._balance_weights = _parse_balance(rule.balance, len(rule.remotes or []))
+        if len(self._balance_weights) != len(rule.remotes or []):
+            self._balance_weights = [1] * len(rule.remotes or [])
+        self._wrr_current: List[int] = [0] * len(rule.remotes or [])
+        self._latency_ema_ms: Dict[str, float] = {}
+        self._jitter_ema_ms: Dict[str, float] = {}
+        self._loss_ema: Dict[str, float] = {}
+        self._last_latency_sample_ms: Dict[str, float] = {}
+        self._latency_samples: Dict[str, int] = {}
+        self._route_pick_seq = 0
+        self._last_selected_target = ''
+        self._last_selected_at = 0.0
         self._rule_lock = threading.Lock()
         self._active_local_conns = 0
+        self._active_target_conns: Dict[str, int] = {}
+        self._client_sem = threading.BoundedSemaphore(MAX_TCP_LISTENER_WORKERS)
 
         self._acl_allow_nets = _compile_ip_networks(rule.acl_allow_sources)
         self._acl_deny_nets = _compile_ip_networks(rule.acl_deny_sources)
@@ -1305,14 +1945,162 @@ class _TCPListener:
         except Exception:
             pass
 
-    def _choose_target(self) -> str:
+    def _next_rr_index_locked(self, n: int) -> int:
+        if n <= 0:
+            return 0
+        idx = int(self._rr % n)
+        self._rr = (self._rr + 1) % n
+        return idx
+
+    def _pick_least_conn_index_locked(self, remotes: List[str]) -> int:
+        n = len(remotes)
+        if n <= 0:
+            return 0
+        start = self._next_rr_index_locked(n)
+        best_idx = 0
+        best_load = None
+        for ofs in range(n):
+            idx = (start + ofs) % n
+            target = remotes[idx]
+            load = int(max(0, int(self._active_target_conns.get(target, 0))))
+            if best_load is None or load < int(best_load):
+                best_load = load
+                best_idx = idx
+        return int(best_idx)
+
+    def _pick_least_latency_index_locked(self, remotes: List[str]) -> int:
+        n = len(remotes)
+        if n <= 0:
+            return 0
+        start = self._next_rr_index_locked(n)
+        unknown: List[int] = []
+        best_idx = -1
+        best_score = None
+        for ofs in range(n):
+            idx = (start + ofs) % n
+            target = remotes[idx]
+            score = _route_quality_score(
+                self._latency_ema_ms.get(target),
+                self._jitter_ema_ms.get(target),
+                self._loss_ema.get(target),
+                int(self._latency_samples.get(target, 0)),
+            )
+            if score is None:
+                unknown.append(idx)
+                continue
+            if best_score is None or float(score) > float(best_score):
+                best_score = score
+                best_idx = idx
+        self._route_pick_seq = (int(self._route_pick_seq) + 1) % 1000000000
+        if unknown and (
+            best_idx < 0 or (int(self._route_pick_seq) % max(1, int(LB_ROUTE_EXPLORE_EVERY))) == 0
+        ):
+            return int(unknown[0])
+        if best_idx >= 0:
+            return int(best_idx)
+        if unknown:
+            return int(unknown[0])
+        return int(start)
+
+    def _mark_target_active(self, target: str, delta: int) -> None:
+        t = str(target or '').strip()
+        if not t:
+            return
+        with self._rule_lock:
+            cur = int(self._active_target_conns.get(t, 0)) + int(delta)
+            if cur > 0:
+                self._active_target_conns[t] = cur
+            else:
+                self._active_target_conns.pop(t, None)
+
+    def _record_target_open(self, target: str, started_at: float, *, ok: bool, timeout: bool = False) -> None:
+        t = str(target or '').strip()
+        if not t:
+            return
+        sample = _latency_sample_ms(started_at, ok=bool(ok), timeout=bool(timeout))
+        with self._rule_lock:
+            _update_target_quality(
+                self._latency_ema_ms,
+                self._jitter_ema_ms,
+                self._loss_ema,
+                self._last_latency_sample_ms,
+                self._latency_samples,
+                t,
+                sample,
+                ok=bool(ok),
+            )
+
+    def _snapshot_route_info_locked(self) -> Dict[str, Any]:
+        remotes = [str(x).strip() for x in (self.rule.remotes or []) if str(x).strip()]
+        rows: List[Dict[str, Any]] = []
+        for target in remotes:
+            lat = self._latency_ema_ms.get(target)
+            jit = self._jitter_ema_ms.get(target)
+            loss = self._loss_ema.get(target)
+            samples = int(self._latency_samples.get(target, 0))
+            score = _route_quality_score(lat, jit, loss, samples)
+            rows.append(
+                {
+                    'target': target,
+                    'score': (round(float(score), 4) if score is not None else None),
+                    'latency_ms': (round(float(lat), 2) if lat is not None else None),
+                    'jitter_ms': (round(float(jit), 2) if jit is not None else None),
+                    'loss_pct': (round(float(loss) * 100.0, 2) if loss is not None else None),
+                    'samples': samples,
+                    'active': int(max(0, int(self._active_target_conns.get(target, 0)))),
+                    'selected': (target == self._last_selected_target),
+                }
+            )
+        return {
+            'proto': 'tcp',
+            'algo': str(self._balance_algo or 'roundrobin'),
+            'last_selected_target': str(self._last_selected_target or ''),
+            'last_selected_at': int(self._last_selected_at) if self._last_selected_at else 0,
+            'remotes': rows,
+        }
+
+    def snapshot_route_info(self) -> Dict[str, Any]:
+        with self._rule_lock:
+            return self._snapshot_route_info_locked()
+
+    def _choose_target(self, addr: Any) -> str:
         rs = self.rule.remotes or []
         if not rs:
             return ''
-        # round-robin (fix off-by-one)
-        target = rs[self._rr % len(rs)]
-        self._rr = (self._rr + 1) % len(rs)
-        return target
+        if len(rs) == 1:
+            chosen = str(rs[0])
+            with self._rule_lock:
+                self._last_selected_target = chosen
+                self._last_selected_at = _now()
+            return chosen
+        with self._rule_lock:
+            algo = str(self._balance_algo or 'roundrobin')
+            n = len(rs)
+            if algo == 'least_conn':
+                idx = self._pick_least_conn_index_locked(rs)
+            elif algo == 'least_latency':
+                idx = self._pick_least_latency_index_locked(rs)
+            elif algo in ('iphash', 'consistent_hash'):
+                source_key = _addr_source_key(addr)
+                if source_key:
+                    idx = _pick_consistent_hash_index(rs, source_key, fallback_idx=0)
+                else:
+                    idx = self._next_rr_index_locked(n)
+            elif algo == 'random_weight':
+                idx = _pick_weighted_random_index(self._balance_weights)
+            elif algo == 'roundrobin':
+                if any(int(x) > 1 for x in (self._balance_weights or [])):
+                    idx = _pick_weighted_rr_index(self._balance_weights, self._wrr_current)
+                else:
+                    idx = self._next_rr_index_locked(n)
+            else:
+                idx = self._next_rr_index_locked(n)
+            if idx < 0 or idx >= n:
+                idx = self._next_rr_index_locked(n)
+            chosen = str(rs[idx])
+            self._last_selected_target = chosen
+            self._last_selected_at = _now()
+            return chosen
 
     def _serve(self) -> None:
         try:
@@ -1332,8 +2120,21 @@ class _TCPListener:
                 continue
             except Exception:
                 continue
-            th = threading.Thread(target=self._handle_client, args=(c, addr), daemon=True)
+            if not self._client_sem.acquire(blocking=False):
+                _log('tcp_listener_overload', listen=self.rule.listen, from_addr=str(addr), max_workers=int(MAX_TCP_LISTENER_WORKERS))
+                _safe_close(c)
+                continue
+            th = threading.Thread(target=self._handle_client_guarded, args=(c, addr), daemon=True)
             th.start()
+
+    def _handle_client_guarded(self, client: socket.socket, addr: Any) -> None:
+        try:
+            self._handle_client(client, addr)
+        finally:
+            try:
+                self._client_sem.release()
+            except Exception:
+                pass
 
     def _allow_client(self, addr: Any) -> Tuple[bool, str]:
         ip_txt = ''
@@ -1393,6 +2194,8 @@ class _TCPListener:
 
         opened_at = self.tunnel.open_started()
         open_recorded = False
+        target = ''
+        target_marked = False
         token = self.rule.token
         try:
             sess = self.tunnel.get_session(token)
@@ -1401,12 +2204,14 @@ class _TCPListener:
                 open_recorded = True
                 _safe_close(client)
                 return
-            target = self._choose_target()
+            target = self._choose_target(addr)
             if not target:
                 self.tunnel.open_finished(opened_at, ok=False)
                 open_recorded = True
                 _safe_close(client)
                 return
+            self._mark_target_active(target, +1)
+            target_marked = True
 
             conn_id = uuid.uuid4().hex
             ev = threading.Event()
@@ -1417,6 +2222,7 @@ class _TCPListener:
             if not sess.send({'type': 'open', 'conn_id': conn_id, 'proto': 'tcp', 'target': target, 'token': token}):
                 self.tunnel.pop_pending(token, conn_id)
                 self.tunnel.open_finished(opened_at, ok=False)
+                self._record_target_open(target, opened_at, ok=False)
                 open_recorded = True
                 _safe_close(client)
                 return
@@ -1424,6 +2230,7 @@ class _TCPListener:
             if not ev.wait(timeout=OPEN_TIMEOUT):
                 self.tunnel.pop_pending(token, conn_id)
                 self.tunnel.open_finished(opened_at, ok=False, timeout=True)
+                self._record_target_open(target, opened_at, ok=False, timeout=True)
                 open_recorded = True
                 _safe_close(client)
                 return
@@ -1433,20 +2240,189 @@ class _TCPListener:
             ok = bool(pend2.get('ok', True))
             if not ok or not data_sock:
                 self.tunnel.open_finished(opened_at, ok=False)
+                self._record_target_open(target, opened_at, ok=False)
                 open_recorded = True
                 _safe_close(client)
                 _safe_close(data_sock)
                 return
 
             self.tunnel.open_finished(opened_at, ok=True)
+            self._record_target_open(target, opened_at, ok=True)
             open_recorded = True
             _relay_tcp(client, data_sock, limiter=self._bw_limiter)
         finally:
             if not open_recorded:
                 self.tunnel.open_finished(opened_at, ok=False)
+                self._record_target_open(target, opened_at, ok=False)
             self.tunnel.release_flow_slot('tcp')
             if local_conn_slot:
                 self._release_local_conn_slot()
+            if target_marked:
+                self._mark_target_active(target, -1)
+
+
+class _NoopTunnelServer:
+    def mark_acl_reject(self) -> None:
+        return
+
+    def mark_qos_reject(self, _kind: str) -> None:
+        return
+
+    def acquire_flow_slot(self, _proto: str) -> bool:
+        return True
+
+    def release_flow_slot(self, _proto: str) -> None:
+        return
+
+    def open_started(self) -> float:
+        return _now()
+
+    def open_finished(self, _started_at: float, ok: bool, timeout: bool = False) -> None:
+        return
+
+
+_NOOP_TUNNEL_SERVER = _NoopTunnelServer()
+
+
+class _ClientTCPListener(_TCPListener):
+    """Client-side listener for reverse tunnel mode.
+
+    Local listener accepts traffic, asks peer server to open target on server side,
+    then bridges payload over `data_rev` channel.
+    """
+
+    def __init__(self, rule: IntranetRule, client: _TunnelClient):
+        super().__init__(rule=rule, tunnel=_NOOP_TUNNEL_SERVER)  # type: ignore[arg-type]
+        self.client = client
+
+    def _handle_client(self, client_sock: socket.socket, addr: Any) -> None:
+        local_conn_slot = False
+        allowed, deny_reason = self._allow_client(addr)
+        if not allowed:
+            _log('reverse_tcp_acl_reject', listen=self.rule.listen, from_addr=str(addr), reason=deny_reason)
+            _safe_close(client_sock)
+            return
+        if self._conn_rate and (not self._conn_rate.allow()):
+            _log('reverse_tcp_qos_reject', listen=self.rule.listen, from_addr=str(addr), reason='conn_rate')
+            _safe_close(client_sock)
+            return
+        if not self._take_local_conn_slot():
+            _log('reverse_tcp_qos_reject', listen=self.rule.listen, from_addr=str(addr), reason='max_conns')
+            _safe_close(client_sock)
+            return
+        local_conn_slot = True
+
+        opened_at = _now()
+        open_recorded = False
+        target = ''
+        target_marked = False
+        token = self.rule.token
+        try:
+            target = self._choose_target(addr)
+            if not target:
+                self._record_target_open(target, opened_at, ok=False)
+                open_recorded = True
+                _safe_close(client_sock)
+                return
+            self._mark_target_active(target, +1)
+            target_marked = True
+
+            data_sock, err = self.client.open_reverse_stream(target, token)
+            if not data_sock:
+                is_timeout = str(err or '').startswith('open_rev_timeout')
+                self._record_target_open(target, opened_at, ok=False, timeout=is_timeout)
+                open_recorded = True
+                _safe_close(client_sock)
+                return
+
+            self._record_target_open(target, opened_at, ok=True)
+            open_recorded = True
+            _relay_tcp(client_sock, data_sock, limiter=self._bw_limiter)
+        finally:
+            if (not open_recorded) and target:
+                self._record_target_open(target, opened_at, ok=False)
+            if local_conn_slot:
+                self._release_local_conn_slot()
+            if target_marked:
+                self._mark_target_active(target, -1)
+
+
+class _ClientUDPSession:
+    def __init__(
+        self,
+        udp_sock: socket.socket,
+        client_addr: Tuple[str, int],
+        client: _TunnelClient,
+        target: str,
+        token: str,
+        limiter: Optional[_ByteRateLimiter] = None,
+    ):
+        self.udp_sock = udp_sock
+        self.client_addr = client_addr
+        self.client = client
+        self.target = target
+        self.token = token
+        self.data_sock: Optional[Any] = None
+        self.ok = False
+        self.last_seen = _now()
+        self._send_lock = threading.Lock()
+        self._rx_th: Optional[threading.Thread] = None
+        self._limiter = limiter
+
+    def open(self) -> bool:
+        ds, err = self.client.open_reverse_stream(self.target, self.token, proto='udp')
+        if not ds:
+            return False
+        self.data_sock = ds
+        self.ok = True
+        th = threading.Thread(target=self._rx_loop, name='intranet-reverse-udp-rx', daemon=True)
+        th.start()
+        self._rx_th = th
+        return True
+
+    def send_datagram(self, payload: bytes) -> None:
+        self.last_seen = _now()
+        if not self.data_sock:
+            return
+        if len(payload) > MAX_FRAME:
+            payload = payload[:MAX_FRAME]
+        frame = struct.pack('!I', len(payload)) + payload
+        try:
+            with self._send_lock:
+                if self._limiter is not None:
+                    self._limiter.consume(len(frame))
+                self.data_sock.sendall(frame)
+        except Exception:
+            self.close()
+
+    def _rx_loop(self) -> None:
+        ds = self.data_sock
+        if not ds:
+            return
+        try:
+            while True:
+                hdr = _recv_exact(ds, 4)
+                if not hdr:
+                    break
+                (n,) = struct.unpack('!I', hdr)
+                if n <= 0 or n > MAX_FRAME:
+                    break
+                data = _recv_exact(ds, n)
+                if not data:
+                    break
+                if self._limiter is not None:
+                    self._limiter.consume(len(data))
+                self.udp_sock.sendto(data, self.client_addr)
+        except Exception:
+            pass
+        _safe_close(ds)
+        self.data_sock = None
+        self.ok = False
+
+    def close(self) -> None:
+        _safe_close(self.data_sock)
+        self.data_sock = None
+        self.ok = False
 
 
 class _UDPSession:
@@ -1587,6 +2563,18 @@ class _UDPListener:
         self._sessions: Dict[Tuple[str, int], _UDPSession] = {}
         self._lock = threading.Lock()
         self._rr = 0
+        self._balance_algo, self._balance_weights = _parse_balance(rule.balance, len(rule.remotes or []))
+        if len(self._balance_weights) != len(rule.remotes or []):
+            self._balance_weights = [1] * len(rule.remotes or [])
+        self._wrr_current: List[int] = [0] * len(rule.remotes or [])
+        self._latency_ema_ms: Dict[str, float] = {}
+        self._jitter_ema_ms: Dict[str, float] = {}
+        self._loss_ema: Dict[str, float] = {}
+        self._last_latency_sample_ms: Dict[str, float] = {}
+        self._latency_samples: Dict[str, int] = {}
+        self._route_pick_seq = 0
+        self._last_selected_target = ''
+        self._last_selected_at = 0.0
         self._acl_allow_nets = _compile_ip_networks(rule.acl_allow_sources)
         self._acl_deny_nets = _compile_ip_networks(rule.acl_deny_sources)
         self._acl_hours = _compile_hour_windows(rule.acl_allow_hours)
@@ -1616,13 +2604,164 @@ class _UDPListener:
                 s.close()
             self._sessions.clear()
 
-    def _choose_target(self) -> str:
+    def _next_rr_index_locked(self, n: int) -> int:
+        if n <= 0:
+            return 0
+        idx = int(self._rr % n)
+        self._rr = (self._rr + 1) % n
+        return idx
+
+    def _active_session_counts_locked(self, remotes: List[str]) -> Dict[str, int]:
+        counts: Dict[str, int] = {str(r): 0 for r in remotes}
+        for sess in self._sessions.values():
+            t = str(getattr(sess, 'target', '') or '').strip()
+            if not t:
+                continue
+            if not bool(getattr(sess, 'ok', False)):
+                continue
+            counts[t] = int(counts.get(t, 0)) + 1
+        return counts
+
+    def _pick_least_conn_index_locked(self, remotes: List[str]) -> int:
+        n = len(remotes)
+        if n <= 0:
+            return 0
+        counts = self._active_session_counts_locked(remotes)
+        start = self._next_rr_index_locked(n)
+        best_idx = 0
+        best_load = None
+        for ofs in range(n):
+            idx = (start + ofs) % n
+            target = remotes[idx]
+            load = int(max(0, int(counts.get(target, 0))))
+            if best_load is None or load < int(best_load):
+                best_load = load
+                best_idx = idx
+        return int(best_idx)
+
+    def _pick_least_latency_index_locked(self, remotes: List[str]) -> int:
+        n = len(remotes)
+        if n <= 0:
+            return 0
+        start = self._next_rr_index_locked(n)
+        unknown: List[int] = []
+        best_idx = -1
+        best_score = None
+        for ofs in range(n):
+            idx = (start + ofs) % n
+            target = remotes[idx]
+            score = _route_quality_score(
+                self._latency_ema_ms.get(target),
+                self._jitter_ema_ms.get(target),
+                self._loss_ema.get(target),
+                int(self._latency_samples.get(target, 0)),
+            )
+            if score is None:
+                unknown.append(idx)
+                continue
+            if best_score is None or float(score) > float(best_score):
+                best_score = score
+                best_idx = idx
+        self._route_pick_seq = (int(self._route_pick_seq) + 1) % 1000000000
+        if unknown and (
+            best_idx < 0 or (int(self._route_pick_seq) % max(1, int(LB_ROUTE_EXPLORE_EVERY))) == 0
+        ):
+            return int(unknown[0])
+        if best_idx >= 0:
+            return int(best_idx)
+        if unknown:
+            return int(unknown[0])
+        return int(start)
+
+    def _record_target_open(self, target: str, started_at: float, *, ok: bool, timeout: bool = False) -> None:
+        t = str(target or '').strip()
+        if not t:
+            return
+        sample = _latency_sample_ms(started_at, ok=bool(ok), timeout=bool(timeout))
+        with self._lock:
+            _update_target_quality(
+                self._latency_ema_ms,
+                self._jitter_ema_ms,
+                self._loss_ema,
+                self._last_latency_sample_ms,
+                self._latency_samples,
+                t,
+                sample,
+                ok=bool(ok),
+            )
+
+    def _snapshot_route_info_locked(self) -> Dict[str, Any]:
+        remotes = [str(x).strip() for x in (self.rule.remotes or []) if str(x).strip()]
+        counts = self._active_session_counts_locked(remotes)
+        rows: List[Dict[str, Any]] = []
+        for target in remotes:
+            lat = self._latency_ema_ms.get(target)
+            jit = self._jitter_ema_ms.get(target)
+            loss = self._loss_ema.get(target)
+            samples = int(self._latency_samples.get(target, 0))
+            score = _route_quality_score(lat, jit, loss, samples)
+            rows.append(
+                {
+                    'target': target,
+                    'score': (round(float(score), 4) if score is not None else None),
+                    'latency_ms': (round(float(lat), 2) if lat is not None else None),
+                    'jitter_ms': (round(float(jit), 2) if jit is not None else None),
+                    'loss_pct': (round(float(loss) * 100.0, 2) if loss is not None else None),
+                    'samples': samples,
+                    'active': int(max(0, int(counts.get(target, 0)))),
+                    'selected': (target == self._last_selected_target),
+                }
+            )
+        return {
+            'proto': 'udp',
+            'algo': str(self._balance_algo or 'roundrobin'),
+            'last_selected_target': str(self._last_selected_target or ''),
+            'last_selected_at': int(self._last_selected_at) if self._last_selected_at else 0,
+            'remotes': rows,
+        }
+
+    def snapshot_route_info(self) -> Dict[str, Any]:
+        with self._lock:
+            return self._snapshot_route_info_locked()
+
+    def _choose_target(self, addr: Any) -> str:
         rs = self.rule.remotes or []
         if not rs:
             return ''
-        target = rs[self._rr % len(rs)]
-        self._rr = (self._rr + 1) % len(rs)
-        return target
+        if len(rs) == 1:
+            chosen = str(rs[0])
+            with self._lock:
+                self._last_selected_target = chosen
+                self._last_selected_at = _now()
+            return chosen
+        with self._lock:
+            algo = str(self._balance_algo or 'roundrobin')
+            n = len(rs)
+            if algo == 'least_conn':
+                idx = self._pick_least_conn_index_locked(rs)
+            elif algo == 'least_latency':
+                idx = self._pick_least_latency_index_locked(rs)
+            elif algo in ('iphash', 'consistent_hash'):
+                source_key = _addr_source_key(addr)
+                if source_key:
+                    idx = _pick_consistent_hash_index(rs, source_key, fallback_idx=0)
+                else:
+                    idx = self._next_rr_index_locked(n)
+            elif algo == 'random_weight':
+                idx = _pick_weighted_random_index(self._balance_weights)
+            elif algo == 'roundrobin':
+                if any(int(x) > 1 for x in (self._balance_weights or [])):
+                    idx = _pick_weighted_rr_index(self._balance_weights, self._wrr_current)
+                else:
+                    idx = self._next_rr_index_locked(n)
+            else:
+                idx = self._next_rr_index_locked(n)
+            if idx < 0 or idx >= n:
+                idx = self._next_rr_index_locked(n)
+            chosen = str(rs[idx])
+            self._last_selected_target = chosen
+            self._last_selected_at = _now()
+            return chosen
 
     def _allow_client(self, addr: Any) -> Tuple[bool, str]:
         ip_txt = ''
@@ -1681,7 +2820,7 @@ class _UDPListener:
                         self.tunnel.mark_qos_reject('max_conns')
                         _log('udp_qos_reject', listen=self.rule.listen, from_addr=str(addr), reason='max_conns')
                         continue
-                target = self._choose_target()
+                target = self._choose_target(addr)
                 if not target:
                     continue
                 old_sess = sess
@@ -1693,10 +2832,14 @@ class _UDPListener:
                     target=target,
                     limiter=self._bw_limiter,
                 )
+                opened_at = _now()
                 if not sess.open():
+                    is_timeout = (_now() - opened_at) >= max(0.5, float(OPEN_TIMEOUT) - 0.05)
+                    self._record_target_open(target, opened_at, ok=False, timeout=is_timeout)
                     if old_sess:
                         old_sess.close()
                     continue
+                self._record_target_open(target, opened_at, ok=True)
                 with self._lock:
                     if old_sess:
                         old_sess.close()
@@ -1716,6 +2859,78 @@ class _UDPListener:
                     s = self._sessions.pop(addr, None)
                     if s:
                         s.close()
+
+
+class _ClientUDPListener(_UDPListener):
+    """Client-side UDP listener for reverse tunnel mode."""
+
+    def __init__(self, rule: IntranetRule, client: "_TunnelClient"):
+        super().__init__(rule=rule, tunnel=_NOOP_TUNNEL_SERVER)  # type: ignore[arg-type]
+        self.client = client
+
+    def _serve(self) -> None:
+        try:
+            host, port = _split_hostport(self.rule.listen)
+            s = _bind_socket(host, port, socket.SOCK_DGRAM)
+        except Exception as exc:
+            _log('reverse_udp_listen_failed', listen=self.rule.listen, error=str(exc))
+            return
+        s.settimeout(1.0)
+        self._sock = s
+
+        threading.Thread(target=self._cleanup_loop, daemon=True).start()
+
+        while not self._stop.is_set():
+            try:
+                data, addr = s.recvfrom(MAX_FRAME)
+            except socket.timeout:
+                continue
+            except Exception:
+                continue
+
+            if not data:
+                continue
+            allowed, deny_reason = self._allow_client(addr)
+            if not allowed:
+                _log('reverse_udp_acl_reject', listen=self.rule.listen, from_addr=str(addr), reason=deny_reason)
+                continue
+            with self._lock:
+                sess = self._sessions.get(addr)
+            if not sess or not sess.ok or sess.data_sock is None:
+                if self._conn_rate and (not self._conn_rate.allow()):
+                    _log('reverse_udp_qos_reject', listen=self.rule.listen, from_addr=str(addr), reason='conn_rate')
+                    continue
+                if self._max_conns > 0:
+                    with self._lock:
+                        cur_sessions = len(self._sessions)
+                    if cur_sessions >= self._max_conns:
+                        _log('reverse_udp_qos_reject', listen=self.rule.listen, from_addr=str(addr), reason='max_conns')
+                        continue
+                target = self._choose_target(addr)
+                if not target:
+                    continue
+                old_sess = sess
+                sess = _ClientUDPSession(
+                    udp_sock=s,
+                    client_addr=addr,
+                    client=self.client,
+                    target=target,
+                    token=self.rule.token,
+                    limiter=self._bw_limiter,
+                )
+                opened_at = _now()
+                if not sess.open():
+                    is_timeout = (_now() - opened_at) >= max(0.5, float(OPEN_TIMEOUT) - 0.05)
+                    self._record_target_open(target, opened_at, ok=False, timeout=is_timeout)
+                    if old_sess:
+                        old_sess.close()
+                    continue
+                self._record_target_open(target, opened_at, ok=True)
+                with self._lock:
+                    if old_sess:
+                        old_sess.close()
+                    self._sessions[addr] = sess
+            sess.send_datagram(data)
 
 
 @dataclass
@@ -1738,6 +2953,12 @@ class _ClientState:
     pong_recv: int = 0
     loss_pct: float = 0.0
     jitter_ms: int = 0
+    he_enabled: bool = False
+    he_mode: str = ''
+    he_family: str = ''
+    he_addr: str = ''
+    he_attempts: int = 0
+    he_last_at: float = 0.0
 
 
 class _TunnelClient:
@@ -1779,6 +3000,10 @@ class _TunnelClient:
         self._tls_ctx: Optional[ssl.SSLContext] = None
         self._tls_ctx_err = ''
         self._open_sem = threading.BoundedSemaphore(MAX_CLIENT_OPEN_WORKERS)
+        self._ctrl_lock = threading.Lock()
+        self._ctrl_sock: Optional[Any] = None
+        self._rev_open_lock = threading.Lock()
+        self._rev_open_wait: Dict[str, Dict[str, Any]] = {}
         self._had_connected = False
         self._reconnects = 0
         self._build_tls_context()
@@ -1793,6 +3018,12 @@ class _TunnelClient:
 
     def stop(self) -> None:
         self._stop.set()
+        ss: Optional[Any] = None
+        with self._ctrl_lock:
+            ss = self._ctrl_sock
+            self._ctrl_sock = None
+        self._fail_rev_open_waiters('client_stopped')
+        _safe_close(ss)
 
     def get_state(self) -> Dict[str, Any]:
         with self._state_lock:
@@ -1817,6 +3048,12 @@ class _TunnelClient:
                 'pong_recv': int(st.pong_recv),
                 'loss_pct': float(st.loss_pct),
                 'jitter_ms': int(st.jitter_ms),
+                'he_enabled': bool(st.he_enabled),
+                'he_mode': str(st.he_mode or ''),
+                'he_family': str(st.he_family or ''),
+                'he_addr': str(st.he_addr or ''),
+                'he_attempts': int(st.he_attempts),
+                'he_last_at': int(st.he_last_at) if st.he_last_at else 0,
             }
 
     def _set_state(self, **kwargs: Any) -> None:
@@ -1824,6 +3061,22 @@ class _TunnelClient:
             for k, v in kwargs.items():
                 if hasattr(self._state, k):
                     setattr(self._state, k, v)
+
+    def _set_happy_eyeballs_state(self, info: Dict[str, Any]) -> None:
+        if not isinstance(info, dict):
+            return
+        try:
+            attempts = int(info.get('attempts') or 0)
+        except Exception:
+            attempts = 0
+        self._set_state(
+            he_enabled=bool(info.get('happy_eyeballs_enabled', DIAL_HAPPY_EYEBALLS)),
+            he_mode=str(info.get('race_mode') or ('happy_eyeballs' if DIAL_HAPPY_EYEBALLS else 'sequential')),
+            he_family=str(info.get('winner_family') or ''),
+            he_addr=str(info.get('winner_addr') or '')[:160],
+            he_attempts=max(0, attempts),
+            he_last_at=_now(),
+        )
 
     def matches_config(self, server_cert_pem: str, tls_verify: bool, tokens: Optional[List[str]] = None) -> bool:
         cfg_tokens = _normalize_str_list(tokens or [], max_items=256, item_max_len=128)
@@ -1837,6 +3090,91 @@ class _TunnelClient:
 
     def owns_token(self, token: str) -> bool:
         return str(token or '').strip() in self._token_set
+
+    def _set_ctrl_sock(self, ss: Optional[Any]) -> None:
+        with self._ctrl_lock:
+            self._ctrl_sock = ss
+
+    def _send_control(self, msg: Dict[str, Any]) -> bool:
+        with self._ctrl_lock:
+            ss = self._ctrl_sock
+            if ss is None:
+                return False
+            try:
+                ss.sendall(_json_line(msg))
+                return True
+            except Exception:
+                return False
+
+    def _fail_rev_open_waiters(self, error: str) -> None:
+        rows: List[Dict[str, Any]] = []
+        with self._rev_open_lock:
+            if self._rev_open_wait:
+                rows = list(self._rev_open_wait.values())
+                self._rev_open_wait.clear()
+        for row in rows:
+            try:
+                row['ok'] = False
+                row['error'] = str(error or 'control_closed')
+                ev = row.get('event')
+                if isinstance(ev, threading.Event):
+                    ev.set()
+            except Exception:
+                pass
+
+    def _request_open_reverse(self, target: str, req_token: str, *, proto: str = 'tcp') -> Tuple[str, str]:
+        tgt = str(target or '').strip()
+        tok = str(req_token or '').strip() or self.token
+        p = str(proto or 'tcp').strip().lower() or 'tcp'
+        if not tgt:
+            return '', 'target_empty'
+        if not tok:
+            return '', 'token_empty'
+        if not self.owns_token(tok):
+            return '', 'token_invalid'
+        if p not in ('tcp', 'udp'):
+            return '', 'proto_unsupported'
+        conn_id = uuid.uuid4().hex
+        ev = threading.Event()
+        row: Dict[str, Any] = {'event': ev, 'ok': None, 'error': ''}
+        with self._rev_open_lock:
+            self._rev_open_wait[conn_id] = row
+
+        sent = self._send_control({'type': 'open_rev', 'conn_id': conn_id, 'proto': p, 'target': tgt, 'token': tok})
+        if not sent:
+            with self._rev_open_lock:
+                self._rev_open_wait.pop(conn_id, None)
+            return '', 'control_send_failed'
+
+        if not ev.wait(timeout=OPEN_TIMEOUT):
+            with self._rev_open_lock:
+                self._rev_open_wait.pop(conn_id, None)
+            return '', 'open_rev_timeout'
+
+        with self._rev_open_lock:
+            out = self._rev_open_wait.pop(conn_id, None)
+        if not isinstance(out, dict):
+            return '', 'open_rev_state_missing'
+        if not bool(out.get('ok')):
+            return '', str(out.get('error') or 'open_rev_failed')
+        return conn_id, ''
+
+    def open_reverse_stream(self, target: str, req_token: str, *, proto: str = 'tcp') -> Tuple[Optional[Any], str]:
+        p = str(proto or 'tcp').strip().lower() or 'tcp'
+        token = str(req_token or '').strip() or self.token
+        conn_id, err = self._request_open_reverse(target, token, proto=p)
+        if not conn_id:
+            return None, err
+
+        ds, derr = self._open_data()
+        if not ds:
+            return None, derr
+        try:
+            ds.sendall(_json_line({'type': 'data_rev', 'proto': p, 'token': token, 'conn_id': conn_id, 'ok': True}))
+        except Exception as exc:
+            _safe_close(ds)
+            return None, f'data_rev_send_failed: {exc}'
+        return ds, ''
 
     def _build_tls_context(self) -> None:
         try:
@@ -1857,11 +3195,15 @@ class _TunnelClient:
 
         Returns: (socket_like, dial_mode, error)
         """
+        raw, dial_err, dial_info = _dial_tcp_target(self.peer_host, self.peer_port, DIAL_CONNECT_TIMEOUT)
+        self._set_happy_eyeballs_state(dial_info)
+        if not raw:
+            return None, '', f'dial_failed: {dial_err}'
         try:
-            raw = socket.create_connection((self.peer_host, self.peer_port), timeout=DIAL_CONNECT_TIMEOUT)
             raw.settimeout(DIAL_TLS_TIMEOUT)
             _set_keepalive(raw)
         except Exception as exc:
+            _safe_close(raw)
             return None, '', f'dial_failed: {exc}'
 
         if self._tls_ctx is None:
@@ -1872,6 +3214,7 @@ class _TunnelClient:
         try:
             ctx = self._tls_ctx
             ss = ctx.wrap_socket(raw, server_hostname=None)
+            _set_tcp_low_latency(ss)
             ss.settimeout(None)
             return ss, 'tls', ''
         except socket.timeout as exc:
@@ -1887,12 +3230,16 @@ class _TunnelClient:
                 'WRONG_VERSION_NUMBER' in msg or 'UNKNOWN_PROTOCOL' in msg or 'HTTP_REQUEST' in msg
             ):
                 # Re-dial plaintext
+                raw2, err2, dial_info2 = _dial_tcp_target(self.peer_host, self.peer_port, DIAL_CONNECT_TIMEOUT)
+                self._set_happy_eyeballs_state(dial_info2)
+                if not raw2:
+                    return None, '', f'dial_failed: {err2}'
                 try:
-                    raw2 = socket.create_connection((self.peer_host, self.peer_port), timeout=DIAL_CONNECT_TIMEOUT)
                     raw2.settimeout(None)
                     _set_keepalive(raw2)
                     return raw2, 'plain', ''
                 except Exception as exc2:
+                    _safe_close(raw2)
                     return None, '', f'dial_failed: {exc2}'
             _safe_close(raw)
             return None, '', f'dial_tls_failed: {exc}'
@@ -1903,12 +3250,16 @@ class _TunnelClient:
             # required), treat this as a strong signal that the peer is running without TLS.
             if (not self.server_cert_pem) and (not self.tls_verify) and ALLOW_PLAINTEXT_FALLBACK and isinstance(exc, ConnectionResetError):
                 _safe_close(raw)
+                raw2, err2, dial_info2 = _dial_tcp_target(self.peer_host, self.peer_port, DIAL_CONNECT_TIMEOUT)
+                self._set_happy_eyeballs_state(dial_info2)
+                if not raw2:
+                    return None, '', f'dial_failed: {err2}'
                 try:
-                    raw2 = socket.create_connection((self.peer_host, self.peer_port), timeout=DIAL_CONNECT_TIMEOUT)
                     raw2.settimeout(None)
                     _set_keepalive(raw2)
                     return raw2, 'plain', ''
                 except Exception as exc2:
+                    _safe_close(raw2)
                     return None, '', f'dial_failed: {exc2}'
 
             _safe_close(raw)
@@ -2018,6 +3369,7 @@ class _TunnelClient:
                 loss_pct=0.0,
                 jitter_ms=0,
             )
+            self._set_ctrl_sock(ss)
             _log('client_connected', peer=f'{self.peer_host}:{self.peer_port}', token=_mask_token(self.token), dial_mode=dial_mode, handshake_ms=hs_ms)
 
             last_ping = 0.0
@@ -2028,10 +3380,8 @@ class _TunnelClient:
                     ping = {'type': 'ping', 'seq': seq, 'ts': _now_ms()}
                     if last_rtt is not None:
                         ping['rtt_ms'] = int(last_rtt)
-                    try:
-                        ss.sendall(_json_line(ping))
-                    except Exception as exc:
-                        self._set_state(last_error=f'control_send_failed: {exc}')
+                    if not self._send_control(ping):
+                        self._set_state(last_error='control_send_failed')
                         break
                     with self._state_lock:
                         self._state.ping_sent = int(self._state.ping_sent) + 1
@@ -2044,15 +3394,20 @@ class _TunnelClient:
                     self._set_state(last_error='pong_timeout')
                     break
 
+                line = ''
                 try:
-                    ss.settimeout(2.0)
+                    ss.settimeout(CONTROL_RECV_TIMEOUT)
                     line = _recv_line(ss)
-                    ss.settimeout(None)
                 except socket.timeout:
                     continue
                 except Exception as exc:
                     self._set_state(last_error=f'control_recv_failed: {exc}')
                     break
+                finally:
+                    try:
+                        ss.settimeout(None)
+                    except Exception:
+                        pass
 
                 if not line:
                     self._set_state(last_error='control_closed')
@@ -2100,8 +3455,24 @@ class _TunnelClient:
                     threading.Thread(target=self._handle_open_guarded, args=(msg,), daemon=True).start()
                     continue
 
+                if t in ('open_rev_ok', 'open_rev_err'):
+                    conn_id = str(msg.get('conn_id') or '').strip()
+                    if not conn_id:
+                        continue
+                    with self._rev_open_lock:
+                        row = self._rev_open_wait.get(conn_id)
+                        if isinstance(row, dict):
+                            row['ok'] = (t == 'open_rev_ok')
+                            row['error'] = str(msg.get('error') or '')
+                            ev = row.get('event')
+                            if isinstance(ev, threading.Event):
+                                ev.set()
+                    continue
+
             # disconnected
             self._set_state(connected=False)
+            self._set_ctrl_sock(None)
+            self._fail_rev_open_waiters('control_closed')
             _safe_close(ss)
             # next loop with backoff
 
@@ -2138,7 +3509,9 @@ class _TunnelClient:
     def _handle_tcp(self, conn_id: str, target: str, req_token: str) -> None:
         try:
             host, port = _split_hostport(target)
-            out = socket.create_connection((host, port), timeout=6)
+            out, dial_err, _dial_info = _dial_tcp_target(host, int(port), 6.0)
+            if not out:
+                raise OSError(str(dial_err or 'dial_failed'))
             out.settimeout(None)
             _set_keepalive(out)
         except Exception as exc:
@@ -2167,13 +3540,29 @@ class _TunnelClient:
         _relay_tcp(out, ds)
 
     def _handle_udp(self, conn_id: str, target: str, req_token: str) -> None:
+        us: Optional[socket.socket] = None
         try:
             host, port = _split_hostport(target)
-            infos = socket.getaddrinfo(host, int(port), socket.AF_UNSPEC, socket.SOCK_DGRAM)
-            family, stype, proto, _canon, sockaddr = infos[0]
-            us = socket.socket(family, stype, proto)
-            us.connect(sockaddr)
-            us.settimeout(1.0)
+            infos = _resolve_addrinfos(host, int(port), socket.SOCK_DGRAM, max_addrs=DIAL_HAPPY_EYEBALLS_MAX_ADDRS)
+            if not infos:
+                raise OSError('resolve_no_addr')
+            last_exc: Optional[Exception] = None
+            for family, stype, proto, sockaddr in infos:
+                cand: Optional[socket.socket] = None
+                try:
+                    cand = socket.socket(family, stype, proto)
+                    _set_socket_buffers(cand)
+                    cand.connect(sockaddr)
+                    cand.settimeout(1.0)
+                    us = cand
+                    break
+                except Exception as exc2:
+                    last_exc = exc2
+                    _safe_close(cand)
+            if us is None:
+                if last_exc is not None:
+                    raise last_exc
+                raise OSError('udp_connect_failed')
         except Exception as exc:
             ds, err = self._open_data()
             if ds:
@@ -2201,50 +3590,111 @@ class _TunnelClient:
         stop = threading.Event()
         threading.Thread(target=_udp_from_data_to_target, args=(ds, us, stop), daemon=True).start()
         threading.Thread(target=_udp_from_target_to_data, args=(ds, us, stop), daemon=True).start()
-        while not stop.is_set():
-            time.sleep(0.5)
+        while not stop.wait(UDP_BRIDGE_STOP_WAIT):
+            pass
         _safe_close(ds)
         _safe_close(us)
 
 
 def _recv_exact(sock: Any, n: int) -> bytes:
-    buf = b''
-    while len(buf) < n:
+    need = int(n)
+    if need <= 0:
+        return b''
+    buf = bytearray(need)
+    view = memoryview(buf)
+    got = 0
+    while got < need:
         try:
-            chunk = sock.recv(n - len(buf))
+            if hasattr(sock, 'recv_into'):
+                cnt = sock.recv_into(view[got:], need - got)
+                if not cnt:
+                    return b''
+                got += int(cnt)
+                continue
+            chunk = sock.recv(need - got)
         except Exception:
             return b''
         if not chunk:
             return b''
-        buf += chunk
-    return buf
+        ln = len(chunk)
+        view[got: got + ln] = chunk
+        got += ln
+    return bytes(buf)
 
 
 def _relay_tcp(a: socket.socket, b: Any, limiter: Optional[_ByteRateLimiter] = None) -> None:
-    """Bidirectional relay between a plain TCP socket and a (TLS/plain) tunnel socket."""
-    stop = threading.Event()
+    """Bidirectional relay between a plain TCP socket and a (TLS/plain) tunnel socket.
 
-    def _pump(src, dst):
+    Keep half-close semantics: EOF on one direction only shuts down peer write side
+    and allows the opposite direction to drain pending response bytes.
+    """
+    stop = threading.Event()
+    done_ab = threading.Event()
+    done_ba = threading.Event()
+    chunk_size = int(TCP_RELAY_CHUNK)
+    drain_timeout = float(TCP_RELAY_DRAIN_TIMEOUT)
+
+    def _shutdown_write(sock_obj: Any) -> None:
+        try:
+            sock_obj.shutdown(socket.SHUT_WR)
+        except Exception:
+            pass
+
+    def _pump(src, dst, done_ev: threading.Event):
+        use_recv_into = hasattr(src, 'recv_into')
+        buf = bytearray(chunk_size) if use_recv_into else None
+        view = memoryview(buf) if buf is not None else None
         try:
             while not stop.is_set():
-                data = src.recv(65536)
+                if view is not None:
+                    n = src.recv_into(view)
+                    if not n:
+                        break
+                    if limiter is not None:
+                        limiter.consume(int(n))
+                    dst.sendall(view[: int(n)])
+                    continue
+                data = src.recv(chunk_size)
                 if not data:
                     break
                 if limiter is not None:
                     limiter.consume(len(data))
                 dst.sendall(data)
         except Exception:
-            pass
-        stop.set()
+            stop.set()
+        finally:
+            _shutdown_write(dst)
+            done_ev.set()
 
-    t1 = threading.Thread(target=_pump, args=(a, b), daemon=True)
-    t2 = threading.Thread(target=_pump, args=(b, a), daemon=True)
+    t1 = threading.Thread(target=_pump, args=(a, b, done_ab), daemon=True)
+    t2 = threading.Thread(target=_pump, args=(b, a, done_ba), daemon=True)
     t1.start()
     t2.start()
-    while not stop.is_set():
-        time.sleep(0.2)
+    first_done_at = 0.0
+    while True:
+        if done_ab.is_set() and done_ba.is_set():
+            break
+        if stop.wait(TCP_RELAY_STOP_WAIT):
+            break
+        if done_ab.is_set() or done_ba.is_set():
+            if first_done_at <= 0.0:
+                first_done_at = _now()
+            elif (_now() - first_done_at) >= drain_timeout:
+                break
     _safe_close(a)
     _safe_close(b)
+    t1.join(timeout=0.2)
+    t2.join(timeout=0.2)
+
+
+def _relay_udp_stream(data_sock: Any, udp_sock: socket.socket) -> None:
+    stop = threading.Event()
+    threading.Thread(target=_udp_from_data_to_target, args=(data_sock, udp_sock, stop), daemon=True).start()
+    threading.Thread(target=_udp_from_target_to_data, args=(data_sock, udp_sock, stop), daemon=True).start()
+    while not stop.wait(UDP_BRIDGE_STOP_WAIT):
+        pass
+    _safe_close(data_sock)
+    _safe_close(udp_sock)
 
 
 def _udp_from_data_to_target(data_sock: Any, udp_sock: socket.socket, stop: threading.Event) -> None:
@@ -2293,9 +3743,12 @@ def _split_hostport(addr: str) -> Tuple[str, int]:
 
     # URL form
     if '://' in s:
-        u = urlparse(s)
-        host = (u.hostname or '').strip()
-        port = int(u.port or 0)
+        try:
+            u = urlparse(s)
+            host = (u.hostname or '').strip()
+            port = int(u.port or 0)
+        except Exception:
+            raise ValueError('address must include host and valid port')
         if not host or port <= 0 or port > 65535:
             raise ValueError('address must include host and valid port')
         return host, port
@@ -2332,6 +3785,61 @@ def _split_hostport(addr: str) -> Tuple[str, int]:
     raise ValueError('missing port (expected host:port)')
 
 
+def _split_hostport_allow_zero(addr: str) -> Tuple[str, int]:
+    """Parse host:port while allowing port 0 for placeholder listen addresses."""
+    s = (addr or '').strip()
+    if not s:
+        raise ValueError('empty address')
+
+    if '://' in s:
+        try:
+            u = urlparse(s)
+            host = (u.hostname or '').strip()
+            port = int(u.port or 0)
+        except Exception:
+            raise ValueError('address must include host and valid port')
+        if not host or port < 0 or port > 65535:
+            raise ValueError('address must include host and valid port')
+        return host, port
+
+    if s.startswith('['):
+        if ']' not in s:
+            raise ValueError('invalid IPv6 bracket address')
+        host = s.split(']')[0][1:].strip()
+        rest = s.split(']')[1]
+        if not rest.startswith(':'):
+            raise ValueError('missing port')
+        p = rest[1:]
+        if not p.isdigit():
+            raise ValueError('invalid port')
+        port = int(p)
+        if port < 0 or port > 65535:
+            raise ValueError('invalid port')
+        return host, port
+
+    if s.count(':') > 1:
+        raise ValueError('IPv6 must use [addr]:port')
+
+    if ':' in s:
+        host, p = s.rsplit(':', 1)
+        if not p.isdigit():
+            raise ValueError('invalid port')
+        port = int(p)
+        if port < 0 or port > 65535:
+            raise ValueError('invalid port')
+        return host.strip(), port
+
+    raise ValueError('missing port (expected host:port)')
+
+
+def _listen_port_or_neg1(addr: str) -> int:
+    try:
+        _host, port = _split_hostport_allow_zero(addr)
+        return int(port)
+    except Exception:
+        return -1
+
+
 
 def _bind_socket(host: str, port: int, socktype: int) -> socket.socket:
     """Bind a socket (TCP/UDP) with IPv4/IPv6 support."""
@@ -2345,6 +3853,7 @@ def _bind_socket(host: str, port: int, socktype: int) -> socket.socket:
         s: Optional[socket.socket] = None
         try:
             s = socket.socket(family, stype, proto)
+            _set_socket_buffers(s)
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:
                 s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)  # type: ignore[attr-defined]
@@ -2381,6 +3890,8 @@ class IntranetManager:
         self._servers: Dict[int, _TunnelServer] = {}
         self._tcp_listeners: Dict[str, _TCPListener] = {}  # sync_id -> listener
         self._udp_listeners: Dict[str, _UDPListener] = {}
+        self._client_tcp_listeners: Dict[str, _ClientTCPListener] = {}
+        self._client_udp_listeners: Dict[str, _ClientUDPListener] = {}
         self._clients: Dict[str, _TunnelClient] = {}  # key -> client
         self._client_token_index: Dict[str, str] = {}  # token -> client key
         self._rule_client_key: Dict[str, str] = {}  # sync_id -> client key
@@ -2484,10 +3995,55 @@ class IntranetManager:
                 'servers': servers,
                 'tcp_rules': list(self._tcp_listeners.keys()),
                 'udp_rules': list(self._udp_listeners.keys()),
+                'client_tcp_rules': list(self._client_tcp_listeners.keys()),
+                'client_udp_rules': list(self._client_udp_listeners.keys()),
                 'clients': clients,
                 'rules': rules,
                 'summary': summary,
             }
+
+    def _route_cards(self, sync_id: str) -> List[Dict[str, Any]]:
+        sid = str(sync_id or '').strip()
+        if not sid:
+            return []
+        out: List[Dict[str, Any]] = []
+        tl = self._tcp_listeners.get(sid)
+        if tl is not None:
+            try:
+                x = tl.snapshot_route_info()
+                if isinstance(x, dict):
+                    out.append(x)
+            except Exception:
+                pass
+        ul = self._udp_listeners.get(sid)
+        if ul is not None:
+            try:
+                x = ul.snapshot_route_info()
+                if isinstance(x, dict):
+                    out.append(x)
+            except Exception:
+                pass
+        ctl = self._client_tcp_listeners.get(sid)
+        if ctl is not None:
+            try:
+                x = ctl.snapshot_route_info()
+                if isinstance(x, dict):
+                    row = dict(x)
+                    row['mode'] = 'reverse_open'
+                    out.append(row)
+            except Exception:
+                pass
+        cul = self._client_udp_listeners.get(sid)
+        if cul is not None:
+            try:
+                x = cul.snapshot_route_info()
+                if isinstance(x, dict):
+                    row = dict(x)
+                    row['mode'] = 'reverse_open'
+                    out.append(row)
+            except Exception:
+                pass
+        return out
 
     def handshake_health(self, sync_id: str, ex: Dict[str, Any]) -> Dict[str, Any]:
         """Return health payload for panel handshake check.
@@ -2501,15 +4057,16 @@ class IntranetManager:
             port = int(ex.get('intranet_server_port') or DEFAULT_TUNNEL_PORT)
         except Exception:
             port = DEFAULT_TUNNEL_PORT
+        route_cards = self._route_cards(sync_id)
 
         # Server side: check control session presence
         if role == 'server':
             srv = self._servers.get(port)
             if not srv:
-                return {'ok': False, 'error': 'server_not_running'}
+                return {'ok': False, 'error': 'server_not_running', 'route_cards': route_cards}
             sess = srv.get_session(token)
             if not sess:
-                return {'ok': False, 'error': 'no_client_connected'}
+                return {'ok': False, 'error': 'no_client_connected', 'route_cards': route_cards}
             latency = sess.rtt_ms
             if latency is None:
                 latency = int(max(0.0, (_now() - sess.last_seen) * 1000.0))
@@ -2519,6 +4076,7 @@ class IntranetManager:
                 'dial_mode': str(sess.dial_mode or ''),
                 'reconnects': int(srv.token_reconnects(token)),
                 'token_count': len(getattr(sess, 'tokens', set()) or {token}),
+                'route_cards': route_cards,
             }
             if sess.legacy:
                 payload['message'] = 'legacy_client'
@@ -2555,8 +4113,16 @@ class IntranetManager:
                     break
             c = self._clients.get(key) if key else None
             if not c:
-                return {'ok': False, 'error': 'client_not_running'}
+                return {'ok': False, 'error': 'client_not_running', 'route_cards': route_cards}
             st = c.get_state()
+            he = {
+                'enabled': bool(st.get('he_enabled')),
+                'mode': str(st.get('he_mode') or ''),
+                'winner_family': str(st.get('he_family') or ''),
+                'winner_addr': str(st.get('he_addr') or ''),
+                'attempts': int(st.get('he_attempts') or 0),
+                'last_at': int(st.get('he_last_at') or 0),
+            }
             if st.get('connected'):
                 payload2: Dict[str, Any] = {
                     'ok': True,
@@ -2569,6 +4135,8 @@ class IntranetManager:
                     'pong_recv': int(st.get('pong_recv') or 0),
                     'last_attempt_at': int(st.get('last_attempt_at') or 0),
                     'last_connected_at': int(st.get('last_connected_at') or 0),
+                    'happy_eyeballs': he,
+                    'route_cards': route_cards,
                 }
                 if st.get('rtt_ms') is not None:
                     payload2['latency_ms'] = int(st.get('rtt_ms') or 0)
@@ -2590,6 +4158,8 @@ class IntranetManager:
                 'pong_recv': int(st.get('pong_recv') or 0),
                 'last_attempt_at': int(st.get('last_attempt_at') or 0),
                 'last_connected_at': int(st.get('last_connected_at') or 0),
+                'happy_eyeballs': he,
+                'route_cards': route_cards,
             }
 
         return {'ok': None, 'message': 'unknown_role'}
@@ -2605,18 +4175,57 @@ class IntranetManager:
             ex = e.get('extra_config')
             if not isinstance(ex, dict):
                 continue
-            role = str(ex.get('intranet_role') or '').strip()
+            role = str(ex.get('intranet_runtime_role') or ex.get('intranet_role') or '').strip()
             if role not in ('server', 'client'):
                 continue
             sync_id = str(ex.get('sync_id') or '').strip() or uuid.uuid4().hex
             listen = str(e.get('listen') or '').strip()
+            if role == 'client' and _listen_port_or_neg1(listen) <= 0:
+                sender_listen = str(ex.get('sync_sender_listen') or ex.get('intranet_sender_listen') or '').strip()
+                if sender_listen:
+                    listen = sender_listen
             protocol = str(e.get('protocol') or 'tcp+udp').strip().lower() or 'tcp+udp'
+            relay_mode = str(ex.get('sync_tunnel_mode') or ex.get('sync_tunnel_type') or '').strip().lower()
+            if role == 'client' and relay_mode in ('relay', 'wss_relay') and protocol == 'tcp':
+                # Backward compatibility: old relay rules were persisted as TCP-only.
+                protocol = 'tcp+udp'
             balance = str(e.get('balance') or 'roundrobin').strip() or 'roundrobin'
-            remotes: List[str] = []
+            remotes_raw: List[str] = []
+            if isinstance(e.get('remote'), str) and str(e.get('remote') or '').strip():
+                remotes_raw.append(str(e.get('remote') or '').strip())
             if isinstance(e.get('remotes'), list):
-                remotes = [str(x).strip() for x in e.get('remotes') if str(x).strip()]
-            elif isinstance(e.get('remote'), str) and e.get('remote'):
-                remotes = [str(e.get('remote')).strip()]
+                remotes_raw += [str(x).strip() for x in e.get('remotes') if str(x).strip()]
+            if isinstance(e.get('extra_remotes'), list):
+                remotes_raw += [str(x).strip() for x in e.get('extra_remotes') if str(x).strip()]
+            seen_remotes: set[str] = set()
+            remotes: List[str] = []
+            for r in remotes_raw:
+                if r in seen_remotes:
+                    continue
+                seen_remotes.add(r)
+                remotes.append(r)
+            if remotes:
+                algo_bal, ws_bal = _parse_balance(balance, len(remotes))
+                has_explicit_weights = ":" in str(balance)
+                used_weight_override = False
+                if (
+                    algo_bal in _WEIGHTED_BALANCE_ALGOS
+                    and (not has_explicit_weights)
+                    and isinstance(e.get('weights'), list)
+                ):
+                    raw_ws = [str(x).strip() for x in (e.get('weights') or []) if str(x).strip()]
+                    if len(raw_ws) == len(remotes) and all(x.isdigit() and int(x) > 0 for x in raw_ws):
+                        ws_bal = [int(x) for x in raw_ws]
+                        used_weight_override = True
+                if (
+                    len(remotes) > 1
+                    and algo_bal in _WEIGHTED_BALANCE_ALGOS
+                    and ws_bal
+                    and (has_explicit_weights or used_weight_override)
+                ):
+                    balance = f"{algo_bal}: " + ", ".join(str(int(max(1, w))) for w in ws_bal)
+                else:
+                    balance = str(algo_bal)
             token = str(ex.get('intranet_token') or '').strip()
             tokens: List[str] = []
             if token:
@@ -2784,9 +4393,11 @@ class IntranetManager:
             srv = self._servers.get(r.tunnel_port)
             if not srv:
                 continue
+            listen_port = _listen_port_or_neg1(r.listen)
+            listen_enabled = bool(listen_port > 0)
 
             # TCP
-            if 'tcp' in r.protocol:
+            if ('tcp' in r.protocol) and listen_enabled:
                 if sync_id not in self._tcp_listeners:
                     lis = _TCPListener(r, srv)
                     lis.start()
@@ -2830,7 +4441,7 @@ class IntranetManager:
                     self._tcp_listeners.pop(sync_id, None)
 
             # UDP
-            if 'udp' in r.protocol:
+            if ('udp' in r.protocol) and listen_enabled:
                 if sync_id not in self._udp_listeners:
                     ul = _UDPListener(r, srv)
                     ul.start()
@@ -2874,11 +4485,21 @@ class IntranetManager:
 
         # stop removed listeners
         for sync_id in list(self._tcp_listeners.keys()):
-            if sync_id not in rules or rules[sync_id].role != 'server' or ('tcp' not in rules[sync_id].protocol):
+            if (
+                sync_id not in rules
+                or rules[sync_id].role != 'server'
+                or ('tcp' not in rules[sync_id].protocol)
+                or _listen_port_or_neg1(rules[sync_id].listen) <= 0
+            ):
                 self._tcp_listeners[sync_id].stop()
                 self._tcp_listeners.pop(sync_id, None)
         for sync_id in list(self._udp_listeners.keys()):
-            if sync_id not in rules or rules[sync_id].role != 'server' or ('udp' not in rules[sync_id].protocol):
+            if (
+                sync_id not in rules
+                or rules[sync_id].role != 'server'
+                or ('udp' not in rules[sync_id].protocol)
+                or _listen_port_or_neg1(rules[sync_id].listen) <= 0
+            ):
                 self._udp_listeners[sync_id].stop()
                 self._udp_listeners.pop(sync_id, None)
 
@@ -2941,6 +4562,159 @@ class IntranetManager:
             if key not in desired_keys:
                 self._clients[key].stop()
                 self._clients.pop(key, None)
+
+        # client-side local listeners (reverse-open mode)
+        for sync_id, r in rules.items():
+            if r.role != 'client':
+                if sync_id in self._client_tcp_listeners:
+                    self._client_tcp_listeners[sync_id].stop()
+                    self._client_tcp_listeners.pop(sync_id, None)
+                if sync_id in self._client_udp_listeners:
+                    self._client_udp_listeners[sync_id].stop()
+                    self._client_udp_listeners.pop(sync_id, None)
+                continue
+
+            ckey = str(rule_client_key.get(sync_id) or '')
+            c = self._clients.get(ckey) if ckey else None
+            listen_port = _listen_port_or_neg1(r.listen)
+            enabled_tcp = bool(
+                c is not None
+                and listen_port > 0
+                and ('tcp' in r.protocol)
+                and bool(r.remotes)
+            )
+            enabled_udp = bool(
+                c is not None
+                and listen_port > 0
+                and ('udp' in r.protocol)
+                and bool(r.remotes)
+            )
+
+            if not enabled_tcp:
+                if sync_id in self._client_tcp_listeners:
+                    self._client_tcp_listeners[sync_id].stop()
+                    self._client_tcp_listeners.pop(sync_id, None)
+            else:
+                cur = self._client_tcp_listeners.get(sync_id)
+                if cur is None:
+                    lis = _ClientTCPListener(r, c)  # type: ignore[arg-type]
+                    lis.start()
+                    self._client_tcp_listeners[sync_id] = lis
+                else:
+                    old_rule = getattr(cur, 'rule', None)
+                    need_restart = bool(getattr(cur, 'client', None) is not c)
+                    if old_rule is not None:
+                        if getattr(old_rule, 'listen', '') != r.listen:
+                            need_restart = True
+                        if getattr(old_rule, 'balance', '') != r.balance:
+                            need_restart = True
+                        if getattr(old_rule, 'protocol', '') != r.protocol:
+                            need_restart = True
+                        if list(getattr(old_rule, 'remotes', []) or []) != list(r.remotes or []):
+                            need_restart = True
+                        if int(getattr(old_rule, 'qos_bandwidth_kbps', 0) or 0) != int(r.qos_bandwidth_kbps or 0):
+                            need_restart = True
+                        if int(getattr(old_rule, 'qos_max_conns', 0) or 0) != int(r.qos_max_conns or 0):
+                            need_restart = True
+                        if int(getattr(old_rule, 'qos_conn_rate', 0) or 0) != int(r.qos_conn_rate or 0):
+                            need_restart = True
+                        if list(getattr(old_rule, 'acl_allow_sources', []) or []) != list(r.acl_allow_sources or []):
+                            need_restart = True
+                        if list(getattr(old_rule, 'acl_deny_sources', []) or []) != list(r.acl_deny_sources or []):
+                            need_restart = True
+                        if list(getattr(old_rule, 'acl_allow_hours', []) or []) != list(r.acl_allow_hours or []):
+                            need_restart = True
+                        if list(getattr(old_rule, 'acl_allow_tokens', []) or []) != list(r.acl_allow_tokens or []):
+                            need_restart = True
+
+                    if need_restart:
+                        try:
+                            cur.stop()
+                        except Exception:
+                            pass
+                        lis = _ClientTCPListener(r, c)  # type: ignore[arg-type]
+                        lis.start()
+                        self._client_tcp_listeners[sync_id] = lis
+                    else:
+                        cur.rule = r
+                        cur.client = c  # type: ignore[assignment]
+
+            if not enabled_udp:
+                if sync_id in self._client_udp_listeners:
+                    self._client_udp_listeners[sync_id].stop()
+                    self._client_udp_listeners.pop(sync_id, None)
+            else:
+                curu = self._client_udp_listeners.get(sync_id)
+                if curu is None:
+                    ul = _ClientUDPListener(r, c)  # type: ignore[arg-type]
+                    ul.start()
+                    self._client_udp_listeners[sync_id] = ul
+                else:
+                    old_rule = getattr(curu, 'rule', None)
+                    need_restart = bool(getattr(curu, 'client', None) is not c)
+                    if old_rule is not None:
+                        if getattr(old_rule, 'listen', '') != r.listen:
+                            need_restart = True
+                        if getattr(old_rule, 'balance', '') != r.balance:
+                            need_restart = True
+                        if getattr(old_rule, 'protocol', '') != r.protocol:
+                            need_restart = True
+                        if list(getattr(old_rule, 'remotes', []) or []) != list(r.remotes or []):
+                            need_restart = True
+                        if int(getattr(old_rule, 'qos_bandwidth_kbps', 0) or 0) != int(r.qos_bandwidth_kbps or 0):
+                            need_restart = True
+                        if int(getattr(old_rule, 'qos_max_conns', 0) or 0) != int(r.qos_max_conns or 0):
+                            need_restart = True
+                        if int(getattr(old_rule, 'qos_conn_rate', 0) or 0) != int(r.qos_conn_rate or 0):
+                            need_restart = True
+                        if list(getattr(old_rule, 'acl_allow_sources', []) or []) != list(r.acl_allow_sources or []):
+                            need_restart = True
+                        if list(getattr(old_rule, 'acl_deny_sources', []) or []) != list(r.acl_deny_sources or []):
+                            need_restart = True
+                        if list(getattr(old_rule, 'acl_allow_hours', []) or []) != list(r.acl_allow_hours or []):
+                            need_restart = True
+                        if list(getattr(old_rule, 'acl_allow_tokens', []) or []) != list(r.acl_allow_tokens or []):
+                            need_restart = True
+                    if need_restart:
+                        try:
+                            curu.stop()
+                        except Exception:
+                            pass
+                        ul = _ClientUDPListener(r, c)  # type: ignore[arg-type]
+                        ul.start()
+                        self._client_udp_listeners[sync_id] = ul
+                    else:
+                        curu.rule = r
+                        curu.client = c  # type: ignore[assignment]
+
+        for sync_id in list(self._client_tcp_listeners.keys()):
+            r = rules.get(sync_id)
+            ckey = str(rule_client_key.get(sync_id) or '') if r else ''
+            c = self._clients.get(ckey) if ckey else None
+            if (
+                (r is None)
+                or (r.role != 'client')
+                or ('tcp' not in r.protocol)
+                or (_listen_port_or_neg1(r.listen) <= 0)
+                or (not bool(r.remotes))
+                or (c is None)
+            ):
+                self._client_tcp_listeners[sync_id].stop()
+                self._client_tcp_listeners.pop(sync_id, None)
+        for sync_id in list(self._client_udp_listeners.keys()):
+            r = rules.get(sync_id)
+            ckey = str(rule_client_key.get(sync_id) or '') if r else ''
+            c = self._clients.get(ckey) if ckey else None
+            if (
+                (r is None)
+                or (r.role != 'client')
+                or ('udp' not in r.protocol)
+                or (_listen_port_or_neg1(r.listen) <= 0)
+                or (not bool(r.remotes))
+                or (c is None)
+            ):
+                self._client_udp_listeners[sync_id].stop()
+                self._client_udp_listeners.pop(sync_id, None)
 
         self._client_token_index = token_index
         self._rule_client_key = rule_client_key

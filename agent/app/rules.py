@@ -2,7 +2,7 @@ import time
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
-from .storage import Paths, ensure_pool_full, load_json, save_json_atomic
+from .storage import Paths, ensure_pool_full, save_json_atomic
 
 
 def _now() -> int:

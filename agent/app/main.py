@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import calendar
+import copy
 import gzip
 import json
 import re
@@ -11,6 +12,7 @@ import socket
 import subprocess
 import time
 import os
+import tempfile
 import threading
 import math
 import hashlib
@@ -18,22 +20,35 @@ import hmac
 import ipaddress
 import ssl
 import http.client
-import glob
 import uuid
+import platform
+try:
+    import pwd
+except Exception:
+    pwd = None
+try:
+    import grp
+except Exception:
+    grp = None
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 
 from fastapi import Body, Depends, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse
 import requests
+try:
+    import dns.resolver as _dns_resolver
+except Exception:
+    _dns_resolver = None
 
 from .config import CFG
 from .intranet_tunnel import IntranetManager, load_server_cert_pem, server_tls_ready
 from .ipt_forward import IptablesForwardManager
+from .overlay_tunnel import OverlayManager
 from .iptables_cmd import iptables_available, run_iptables
 from .qos import apply_qos_from_pool, policies_from_pool
 
@@ -64,6 +79,35 @@ def _env_float(name: str, default: float, min_v: float, max_v: float) -> float:
     return float(v)
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return bool(default)
+    s = str(raw).strip().lower()
+    if s in ("1", "true", "yes", "y", "on"):
+        return True
+    if s in ("0", "false", "no", "n", "off"):
+        return False
+    return bool(default)
+
+
+UNZIP_MAX_ENTRIES = _env_int("REALM_AGENT_UNZIP_MAX_ENTRIES", 20000, 100, 1000000)
+UNZIP_MAX_TOTAL_BYTES = _env_int(
+    "REALM_AGENT_UNZIP_MAX_TOTAL_BYTES",
+    5 * 1024 * 1024 * 1024,
+    10 * 1024 * 1024,
+    1024 * 1024 * 1024 * 1024,
+)
+UNZIP_MAX_FILE_BYTES = _env_int(
+    "REALM_AGENT_UNZIP_MAX_FILE_BYTES",
+    2 * 1024 * 1024 * 1024,
+    1024 * 1024,
+    1024 * 1024 * 1024 * 1024,
+)
+UNZIP_MAX_RATIO = _env_float("REALM_AGENT_UNZIP_MAX_RATIO", 200.0, 5.0, 5000.0)
+UPLOAD_ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
+
+
 API_KEY_FILE = Path('/etc/realm-agent/api.key')
 ACK_VER_FILE = Path('/etc/realm-agent/panel_ack.version')
 UPDATE_STATE_FILE = Path('/etc/realm-agent/agent_update.json')
@@ -72,6 +116,7 @@ TRAFFIC_RESET_ACK_FILE = Path('/etc/realm-agent/traffic_reset_ack.version')
 AUTO_RESTART_STATE_FILE = Path('/etc/realm-agent/auto_restart_state.json')
 AUTO_RESTART_POLICY_FILE = Path('/etc/realm-agent/auto_restart_policy.json')
 AUTO_RESTART_ACK_FILE = Path('/etc/realm-agent/auto_restart_ack.version')
+TIME_SYNC_ACK_FILE = Path('/etc/realm-agent/time_sync_ack.version')
 POOL_FULL = Path('/etc/realm/pool_full.json')
 POOL_ACTIVE = Path('/etc/realm/pool.json')
 POOL_RUN_FILTER = Path('/etc/realm/pool_to_run.jq')
@@ -174,6 +219,15 @@ _TRACE_TOOL_INSTALL_LOCK = threading.Lock()
 _TRACE_TOOL_INSTALL_ATTEMPTED = False
 _TRACE_TOOL_INSTALL_LAST: Dict[str, Any] = {}
 
+# ---------------- Dynamic DNS/SRV Remotes ----------------
+DNS_DYNAMIC_ENABLE = _env_bool("REALM_AGENT_DNS_DYNAMIC_ENABLE", True)
+DNS_REFRESH_INTERVAL = _env_float("REALM_AGENT_DNS_REFRESH_INTERVAL", 60.0, 5.0, 86400.0)
+DNS_REFRESH_BOOT_DELAY = _env_float("REALM_AGENT_DNS_REFRESH_BOOT_DELAY", 5.0, 0.2, 300.0)
+DNS_LOOKUP_TIMEOUT = _env_float("REALM_AGENT_DNS_LOOKUP_TIMEOUT", 3.0, 0.2, 30.0)
+DNS_MAX_ADDRS_PER_REMOTE = _env_int("REALM_AGENT_DNS_MAX_ADDRS_PER_REMOTE", 8, 1, 64)
+DNS_ENABLE_SRV = _env_bool("REALM_AGENT_DNS_ENABLE_SRV", True)
+DNS_SRV_AUTO_HOST = _env_bool("REALM_AGENT_DNS_SRV_AUTO_HOST", True)
+
 # ---------------- System Snapshot (CPU/Mem/Disk/Net) ----------------
 # 说明：不依赖 psutil，纯 /proc + shutil.disk_usage 实现。
 # 用于面板节点详情展示（CPU/内存/硬盘/交换/在线时长/流量/实时速率），默认 3s 上报一次。
@@ -181,8 +235,8 @@ _SYS_LOCK = threading.Lock()
 _SYS_CPU_LAST: Optional[dict] = None  # {total:int, idle:int, ts:float}
 _SYS_NET_LAST: Optional[dict] = None  # {rx:int, tx:int, ts:float}
 
-# ---------------- Auto Daily Restart (per-node low-impact window) ----------------
-# 基于本机实时吞吐学习“每小时负载画像”（EMA），每天自动选择影响最小小时重启 realm + agent。
+# ---------------- Auto Smart Restart (per-node low-impact window) ----------------
+# 基于本机实时吞吐学习“每小时负载画像”（EMA），在策略周期日自动选择影响最小小时重启 realm + agent。
 AUTO_RESTART_ENABLED = str(os.getenv('REALM_AGENT_AUTO_DAILY_RESTART', '1')).strip().lower() not in (
     '0',
     'false',
@@ -369,6 +423,17 @@ def _read_cpu_model() -> str:
                     return line.split(':', 1)[-1].strip()
     except Exception:
         pass
+    # macOS fallback
+    if platform.system().lower() == 'darwin':
+        for cmd in (['sysctl', '-n', 'machdep.cpu.brand_string'], ['sysctl', '-n', 'hw.model']):
+            try:
+                r = subprocess.run(cmd, capture_output=True, text=True, timeout=2)
+                if r.returncode == 0:
+                    s = str(r.stdout or '').strip()
+                    if s:
+                        return s
+            except Exception:
+                continue
     return ''
 
 def _read_cpu_times() -> tuple[int, int]:
@@ -389,7 +454,23 @@ def _read_cpu_times() -> tuple[int, int]:
         total = sum(nums)
         return (total, idle)
     except Exception:
-        return (0, 0)
+        pass
+    # macOS fallback: sysctl kern.cp_time -> user nice sys idle intr
+    if platform.system().lower() == 'darwin':
+        for oid in ('kern.cp_time',):
+            try:
+                r = subprocess.run(['sysctl', '-n', oid], capture_output=True, text=True, timeout=2)
+                if r.returncode != 0:
+                    continue
+                raw = str(r.stdout or '').strip()
+                nums = [int(x) for x in re.findall(r'[0-9]+', raw)]
+                if nums:
+                    total = int(sum(nums))
+                    idle = int(nums[3] if len(nums) >= 4 else 0)
+                    return (total, idle)
+            except Exception:
+                continue
+    return (0, 0)
 
 def _read_meminfo() -> dict:
     out = {}
@@ -409,6 +490,120 @@ def _read_meminfo() -> dict:
                     pass
     except Exception:
         pass
+
+    # macOS fallback
+    if (not out) and platform.system().lower() == 'darwin':
+        try:
+            r_mem = subprocess.run(['sysctl', '-n', 'hw.memsize'], capture_output=True, text=True, timeout=2)
+            if r_mem.returncode == 0:
+                mem_total = int(float(str(r_mem.stdout or '0').strip() or '0'))
+            else:
+                mem_total = 0
+        except Exception:
+            mem_total = 0
+
+        page_size = 4096
+        free_pages = 0
+        inactive_pages = 0
+        speculative_pages = 0
+        have_vm_pages = False
+        try:
+            r_vm = subprocess.run(['vm_stat'], capture_output=True, text=True, timeout=3)
+            if r_vm.returncode == 0:
+                lines = str(r_vm.stdout or '').splitlines()
+                for ln in lines:
+                    s = str(ln or '').strip()
+                    if not s:
+                        continue
+                    if 'page size of' in s and 'bytes' in s:
+                        try:
+                            m = re.search(r'page size of\s+(\d+)\s+bytes', s, re.IGNORECASE)
+                            if m:
+                                page_size = int(m.group(1))
+                        except Exception:
+                            pass
+                        continue
+                    if ':' not in s:
+                        continue
+                    k, v = s.split(':', 1)
+                    key = str(k or '').strip().lower()
+                    raw_num = str(v or '').strip().rstrip('.')
+                    try:
+                        n = int(raw_num.replace('.', '').replace(',', ''))
+                    except Exception:
+                        continue
+                    if key.startswith('pages free'):
+                        free_pages = n
+                    elif key.startswith('pages inactive'):
+                        inactive_pages = n
+                    elif key.startswith('pages speculative'):
+                        speculative_pages = n
+                have_vm_pages = (free_pages + inactive_pages + speculative_pages) > 0
+        except Exception:
+            pass
+
+        if mem_total > 0:
+            if have_vm_pages:
+                mem_avail = int((free_pages + inactive_pages + speculative_pages) * page_size)
+            else:
+                # vm_stat unavailable: avoid reporting a fake 100% memory usage.
+                mem_avail = int(mem_total)
+            if mem_avail < 0:
+                mem_avail = 0
+            if mem_avail > mem_total:
+                mem_avail = mem_total
+            out['MemTotal'] = int(mem_total)
+            out['MemAvailable'] = int(mem_avail)
+        else:
+            try:
+                phys_pages = int(os.sysconf('SC_PHYS_PAGES'))
+                page_sz = int(os.sysconf('SC_PAGE_SIZE'))
+                if phys_pages > 0 and page_sz > 0:
+                    mem_total = int(phys_pages * page_sz)
+            except Exception:
+                mem_total = 0
+            if mem_total > 0:
+                if have_vm_pages:
+                    mem_avail = int((free_pages + inactive_pages + speculative_pages) * page_size)
+                else:
+                    mem_avail = int(mem_total)
+                if mem_avail < 0:
+                    mem_avail = 0
+                if mem_avail > mem_total:
+                    mem_avail = mem_total
+                out['MemTotal'] = int(mem_total)
+                out['MemAvailable'] = int(mem_avail)
+
+        try:
+            r_swap = subprocess.run(['sysctl', '-n', 'vm.swapusage'], capture_output=True, text=True, timeout=2)
+            txt = str(r_swap.stdout or '').strip()
+            if txt:
+                # total = 1024.00M  used = 12.34M  free = 1011.66M
+                def _to_bytes(num: str, unit: str) -> int:
+                    try:
+                        v = float(num)
+                    except Exception:
+                        return 0
+                    u = str(unit or '').upper()
+                    mul = 1
+                    if u == 'K':
+                        mul = 1024
+                    elif u == 'M':
+                        mul = 1024 * 1024
+                    elif u == 'G':
+                        mul = 1024 * 1024 * 1024
+                    elif u == 'T':
+                        mul = 1024 * 1024 * 1024 * 1024
+                    return int(v * mul)
+
+                m_total = re.search(r'total\s*=\s*([0-9.]+)\s*([KMGTP])', txt, re.IGNORECASE)
+                m_free = re.search(r'free\s*=\s*([0-9.]+)\s*([KMGTP])', txt, re.IGNORECASE)
+                if m_total:
+                    out['SwapTotal'] = _to_bytes(m_total.group(1), m_total.group(2))
+                if m_free:
+                    out['SwapFree'] = _to_bytes(m_free.group(1), m_free.group(2))
+        except Exception:
+            pass
     return out
 
 def _read_net_bytes() -> tuple[int, int]:
@@ -432,8 +627,55 @@ def _read_net_bytes() -> tuple[int, int]:
             rx += int(fields[0])
             tx += int(fields[8])
     except Exception:
-        return (0, 0)
-    return (rx, tx)
+        rx = 0
+        tx = 0
+
+    if rx > 0 or tx > 0:
+        return (rx, tx)
+
+    # macOS fallback: netstat -ibn (sum per iface using max counter snapshot)
+    if platform.system().lower() == 'darwin':
+        try:
+            r = subprocess.run(['netstat', '-ibn'], capture_output=True, text=True, timeout=3)
+            if r.returncode == 0:
+                name_idx = ibytes_idx = obytes_idx = -1
+                iface_max: Dict[str, Tuple[int, int]] = {}
+                for ln in str(r.stdout or '').splitlines():
+                    cols = [c for c in ln.split() if c]
+                    if not cols:
+                        continue
+                    if cols[0] == 'Name':
+                        try:
+                            name_idx = cols.index('Name')
+                            ibytes_idx = cols.index('Ibytes')
+                            obytes_idx = cols.index('Obytes')
+                        except Exception:
+                            name_idx = ibytes_idx = obytes_idx = -1
+                        continue
+                    if min(name_idx, ibytes_idx, obytes_idx) < 0:
+                        continue
+                    need_len = max(name_idx, ibytes_idx, obytes_idx) + 1
+                    if len(cols) < need_len:
+                        continue
+                    iface = str(cols[name_idx] or '').strip()
+                    if not iface or iface.startswith('lo'):
+                        continue
+                    try:
+                        irx = int(cols[ibytes_idx])
+                        itx = int(cols[obytes_idx])
+                    except Exception:
+                        continue
+                    cur = iface_max.get(iface)
+                    if not cur:
+                        iface_max[iface] = (irx, itx)
+                    else:
+                        iface_max[iface] = (max(cur[0], irx), max(cur[1], itx))
+                if iface_max:
+                    rx = sum(v[0] for v in iface_max.values())
+                    tx = sum(v[1] for v in iface_max.values())
+        except Exception:
+            pass
+    return (int(rx), int(tx))
 
 def _build_sys_snapshot() -> dict:
     now = time.time()
@@ -461,6 +703,18 @@ def _build_sys_snapshot() -> dict:
         uptime_sec = float((up.split() or ['0'])[0])
     except Exception:
         uptime_sec = 0.0
+    if uptime_sec <= 0.0 and platform.system().lower() == 'darwin':
+        try:
+            rb = subprocess.run(['sysctl', '-n', 'kern.boottime'], capture_output=True, text=True, timeout=2)
+            if rb.returncode == 0:
+                s = str(rb.stdout or '').strip()
+                m = re.search(r'sec\s*=\s*([0-9]+)', s)
+                if m:
+                    boot_ts = int(m.group(1))
+                    if boot_ts > 0:
+                        uptime_sec = max(0.0, float(now - boot_ts))
+        except Exception:
+            pass
 
     cpu_pct = 0.0
     rx_bps = 0.0
@@ -481,6 +735,15 @@ def _build_sys_snapshot() -> dict:
             rx_bps = max(0.0, drx / dt)
             tx_bps = max(0.0, dtx / dt)
         _SYS_NET_LAST = {'rx': int(rx), 'tx': int(tx), 'ts': float(now)}
+
+    # Fallback when CPU tick counters are unavailable on current OS/runtime.
+    if cpu_pct <= 0.0:
+        try:
+            load1 = float((os.getloadavg() or (0.0, 0.0, 0.0))[0])
+            if cores > 0:
+                cpu_pct = max(0.0, min(100.0, (load1 * 100.0) / float(cores)))
+        except Exception:
+            pass
 
     def pct(used: int, total: int) -> float:
         if total <= 0:
@@ -792,7 +1055,20 @@ def _auto_restart_ingest_sample_locked(now_dt: datetime, load_bps: float) -> Non
     st['last_load_bps'] = round(max(0.0, float(load_bps)), 2)
 
 
-def _auto_restart_plan_locked(now_dt: datetime) -> tuple[int, int, str]:
+def _auto_restart_plan_minute_for_hour(plan_hour: int, base_minute: int) -> int:
+    minute = max(0, min(59, int(base_minute)))
+    if int(AUTO_RESTART_MINUTE_JITTER) > 0:
+        # 节点级固定抖动：避免多节点在同一分钟同时重启。
+        seed = f"{socket.gethostname()}:{int(plan_hour)}"
+        try:
+            hv = int(hashlib.sha256(seed.encode('utf-8')).hexdigest()[:8], 16)
+            minute = int((minute + (hv % (int(AUTO_RESTART_MINUTE_JITTER) + 1))) % 60)
+        except Exception:
+            minute = max(0, min(59, int(base_minute)))
+    return int(minute)
+
+
+def _auto_restart_plan_locked(now_dt: datetime, default_hour: int, base_minute: int) -> tuple[int, int, str]:
     st = _AUTO_RESTART_STATE
     profile = st.get('profile')
     if not isinstance(profile, dict):
@@ -817,22 +1093,24 @@ def _auto_restart_plan_locked(now_dt: datetime) -> tuple[int, int, str]:
         if samples >= int(AUTO_RESTART_MIN_PROFILE_SAMPLES):
             candidates.append((max(0.0, ema_bps), int(hour)))
 
-    plan_hour = int(AUTO_RESTART_DEFAULT_HOUR)
+    plan_hour = max(0, min(23, int(default_hour)))
     plan_reason = 'fallback_default'
     if observed_hours >= int(AUTO_RESTART_MIN_PROFILE_HOURS) and candidates:
-        candidates.sort(key=lambda x: (x[0], x[1]))
-        plan_hour = int(candidates[0][1])
+        ranked: List[Tuple[int, float, int]] = []
+        for ema_bps, hour in candidates:
+            cand_hour = max(0, min(23, int(hour)))
+            cand_minute = _auto_restart_plan_minute_for_hour(cand_hour, int(base_minute))
+            window_end = min(59, int(cand_minute) + int(AUTO_RESTART_WINDOW_MINUTES) - 1)
+            due_today = (
+                cand_hour > int(now_dt.hour)
+                or (cand_hour == int(now_dt.hour) and int(now_dt.minute) <= int(window_end))
+            )
+            ranked.append((0 if due_today else 1, max(0.0, float(ema_bps)), cand_hour))
+        ranked.sort(key=lambda x: (x[0], x[1], x[2]))
+        plan_hour = int(ranked[0][2])
         plan_reason = 'profile_ema'
 
-    minute = int(AUTO_RESTART_BASE_MINUTE)
-    if int(AUTO_RESTART_MINUTE_JITTER) > 0:
-        # 节点级固定抖动：避免多节点在同一分钟同时重启。
-        seed = f"{socket.gethostname()}:{plan_hour}"
-        try:
-            hv = int(hashlib.sha256(seed.encode('utf-8')).hexdigest()[:8], 16)
-            minute = int((minute + (hv % (int(AUTO_RESTART_MINUTE_JITTER) + 1))) % 60)
-        except Exception:
-            minute = int(AUTO_RESTART_BASE_MINUTE)
+    minute = _auto_restart_plan_minute_for_hour(int(plan_hour), int(base_minute))
 
     st['plan_date'] = now_dt.strftime('%Y-%m-%d')
     st['plan_hour'] = int(plan_hour)
@@ -863,13 +1141,14 @@ def _auto_restart_match_monthday(now_dt: datetime, monthdays: List[int]) -> bool
 
 
 def _auto_restart_schedule_due(policy: Dict[str, Any], now_dt: datetime, last_restart_ts: int) -> tuple[bool, str]:
-    mode = str(policy.get("schedule_type") or "daily").strip().lower()
-    interval = int(policy.get("interval") or 1)
+    policy_n = _normalize_auto_restart_policy(policy)
+    mode = str(policy_n.get("schedule_type") or "daily").strip().lower()
+    interval = int(policy_n.get("interval") or 1)
     if interval < 1:
         interval = 1
 
     if mode == "weekly":
-        wd = set(int(x) for x in (policy.get("weekdays") or []) if isinstance(x, int) and 1 <= int(x) <= 7)
+        wd = set(int(x) for x in (policy_n.get("weekdays") or []) if isinstance(x, int) and 1 <= int(x) <= 7)
         if not wd:
             wd = {1, 2, 3, 4, 5, 6, 7}
         if int(now_dt.isoweekday()) not in wd:
@@ -891,7 +1170,7 @@ def _auto_restart_schedule_due(policy: Dict[str, Any], now_dt: datetime, last_re
         return True, ""
 
     if mode == "monthly":
-        if not _auto_restart_match_monthday(now_dt, list(policy.get("monthdays") or [])):
+        if not _auto_restart_match_monthday(now_dt, list(policy_n.get("monthdays") or [])):
             return False, ""
         if last_restart_ts > 0:
             try:
@@ -938,16 +1217,16 @@ def _auto_restart_policy_time(policy: Dict[str, Any]) -> tuple[int, int]:
 def _auto_restart_status_snapshot() -> Dict[str, Any]:
     now_dt = datetime.now()
     with _AUTO_RESTART_POLICY_LOCK:
-        policy = _auto_restart_load_policy_locked()
+        policy = _normalize_auto_restart_policy(_auto_restart_load_policy_locked())
     with _AUTO_RESTART_LOCK:
         _auto_restart_load_state_locked()
         st = _AUTO_RESTART_STATE
-        plan_hour, plan_minute = _auto_restart_policy_time(policy)
-        plan_reason = f"policy_{str(policy.get('schedule_type') or 'daily')}"
-        st['plan_date'] = now_dt.strftime('%Y-%m-%d')
-        st['plan_hour'] = int(plan_hour)
-        st['plan_minute'] = int(plan_minute)
-        st['plan_reason'] = str(plan_reason)
+        fixed_hour, fixed_minute = _auto_restart_policy_time(policy)
+        plan_hour, plan_minute, plan_reason = _auto_restart_plan_locked(
+            now_dt,
+            int(fixed_hour),
+            int(fixed_minute),
+        )
         return {
             'enabled': bool(policy.get("enabled", False)),
             'schedule_type': str(policy.get("schedule_type") or "daily"),
@@ -997,19 +1276,19 @@ def _auto_restart_tick(report: Optional[Dict[str, Any]]) -> None:
         uptime_sec = 0.0
 
     with _AUTO_RESTART_POLICY_LOCK:
-        policy = _auto_restart_load_policy_locked()
+        policy = _normalize_auto_restart_policy(_auto_restart_load_policy_locked())
 
     restart_due = False
-    plan_hour, plan_minute = _auto_restart_policy_time(policy)
-    plan_reason = f"policy_{str(policy.get('schedule_type') or 'daily')}"
+    fixed_hour, fixed_minute = _auto_restart_policy_time(policy)
     with _AUTO_RESTART_LOCK:
         _auto_restart_load_state_locked()
         _auto_restart_ingest_sample_locked(now_dt, load_bps)
         st = _AUTO_RESTART_STATE
-        st['plan_date'] = now_dt.strftime('%Y-%m-%d')
-        st['plan_hour'] = int(plan_hour)
-        st['plan_minute'] = int(plan_minute)
-        st['plan_reason'] = str(plan_reason)
+        plan_hour, plan_minute, plan_reason = _auto_restart_plan_locked(
+            now_dt,
+            int(fixed_hour),
+            int(fixed_minute),
+        )
         today = now_dt.strftime('%Y-%m-%d')
         window_end = min(59, int(plan_minute) + int(AUTO_RESTART_WINDOW_MINUTES) - 1)
         last_attempt_ts = float(st.get('last_attempt_ts') or 0.0)
@@ -1067,6 +1346,15 @@ def _auto_restart_tick(report: Optional[Dict[str, Any]]) -> None:
     if not restart_due:
         return
 
+    restart_date = now_dt.strftime('%Y-%m-%d')
+    restart_ts = int(now_ts)
+    prev_restart_marker: Dict[str, Any] = {
+        'date': '',
+        'ts': 0,
+        'hour': -1,
+        'minute': -1,
+    }
+
     try:
         _restart_realm()
     except Exception as exc:
@@ -1078,12 +1366,35 @@ def _auto_restart_tick(report: Optional[Dict[str, Any]]) -> None:
             _auto_restart_save_state_locked(force=True)
         return
 
+    # Persist dispatch result before restarting agent itself. On macOS launchctl
+    # restart, current process may be terminated immediately after command starts.
+    with _AUTO_RESTART_LOCK:
+        _auto_restart_load_state_locked()
+        st = _AUTO_RESTART_STATE
+        prev_restart_marker = {
+            'date': str(st.get('last_restart_date') or ''),
+            'ts': int(st.get('last_restart_ts') or 0),
+            'hour': int(st.get('last_restart_hour') or -1),
+            'minute': int(st.get('last_restart_minute') or -1),
+        }
+        st['last_restart_date'] = restart_date
+        st['last_restart_ts'] = restart_ts
+        st['last_restart_hour'] = int(plan_hour)
+        st['last_restart_minute'] = int(plan_minute)
+        st['last_restart_result'] = 'dispatched'
+        st['last_error'] = ''
+        _auto_restart_save_state_locked(force=True)
+
     try:
         _restart_agent_service()
     except Exception as exc:
         with _AUTO_RESTART_LOCK:
             _auto_restart_load_state_locked()
             st = _AUTO_RESTART_STATE
+            st['last_restart_date'] = str(prev_restart_marker.get('date') or '')
+            st['last_restart_ts'] = int(prev_restart_marker.get('ts') or 0)
+            st['last_restart_hour'] = int(prev_restart_marker.get('hour') or -1)
+            st['last_restart_minute'] = int(prev_restart_marker.get('minute') or -1)
             st['last_restart_result'] = 'failed_agent'
             st['last_error'] = str(exc)[:500]
             _auto_restart_save_state_locked(force=True)
@@ -1092,8 +1403,8 @@ def _auto_restart_tick(report: Optional[Dict[str, Any]]) -> None:
     with _AUTO_RESTART_LOCK:
         _auto_restart_load_state_locked()
         st = _AUTO_RESTART_STATE
-        st['last_restart_date'] = now_dt.strftime('%Y-%m-%d')
-        st['last_restart_ts'] = int(now_ts)
+        st['last_restart_date'] = restart_date
+        st['last_restart_ts'] = restart_ts
         st['last_restart_hour'] = int(plan_hour)
         st['last_restart_minute'] = int(plan_minute)
         st['last_restart_result'] = 'dispatched'
@@ -1217,6 +1528,16 @@ def _write_json(p: Path, data: Any) -> None:
     _write_text(p, json.dumps(data, ensure_ascii=False, indent=2))
 
 
+def _json_clone(data: Any) -> Any:
+    try:
+        return json.loads(json.dumps(data, ensure_ascii=False))
+    except Exception:
+        try:
+            return copy.deepcopy(data)
+        except Exception:
+            return data
+
+
 def _api_key_required(req: Request) -> None:
     api_key = req.headers.get('x-api-key', '')
     try:
@@ -1225,6 +1546,322 @@ def _api_key_required(req: Request) -> None:
         raise HTTPException(status_code=401, detail='Agent未初始化API Key')
     if not expected or api_key != expected:
         raise HTTPException(status_code=401, detail='API Key 无效')
+
+
+def _service_base_name(name: str) -> str:
+    n = str(name or '').strip()
+    if n.endswith('.service'):
+        n = n[:-8]
+    return n
+
+
+def _launchctl_targets(label: str) -> List[str]:
+    lbl = str(label or '').strip()
+    if not lbl:
+        return []
+    raw = [f"system/{lbl}", f"gui/{os.getuid()}/{lbl}", lbl]
+    out: List[str] = []
+    seen: set[str] = set()
+    for it in raw:
+        if it in seen:
+            continue
+        seen.add(it)
+        out.append(it)
+    return out
+
+
+def _launchd_label_candidates(name: str) -> List[str]:
+    base = _service_base_name(name).lower()
+    out: List[str] = []
+    seen: set[str] = set()
+
+    def _add(v: Any) -> None:
+        s = str(v or '').strip()
+        if (not s) or (s in seen):
+            return
+        seen.add(s)
+        out.append(s)
+
+    if base in ('realm-agent', 'realm-agent-https'):
+        _add(os.getenv('REALM_AGENT_LAUNCHD_LABEL'))
+        _add('com.realm.agent')
+    elif base == 'realm':
+        _add(os.getenv('REALM_REALM_LAUNCHD_LABEL'))
+        _add('com.realm.realm')
+    elif base == 'nginx':
+        _add(os.getenv('REALM_NGINX_LAUNCHD_LABEL'))
+        _add('homebrew.mxcl.nginx')
+    elif base in ('apache2', 'httpd'):
+        _add('homebrew.mxcl.httpd')
+    elif base.startswith('php'):
+        _add(os.getenv('REALM_PHP_FPM_LAUNCHD_LABEL'))
+        _add('homebrew.mxcl.php')
+        for v in ('8.4', '8.3', '8.2', '8.1', '8.0', '7.4'):
+            _add(f'homebrew.mxcl.php@{v}')
+
+    _add(base)
+    return out
+
+
+def _launchctl_status(name: str) -> Tuple[Optional[bool], str]:
+    if shutil.which('launchctl') is None:
+        return None, ''
+
+    labels = _launchd_label_candidates(name)
+    if not labels:
+        return None, ''
+
+    loaded = False
+    errors: List[str] = []
+    inactive_msg = ''
+    for label in labels:
+        for target in _launchctl_targets(label):
+            try:
+                r = subprocess.run(['launchctl', 'print', target], capture_output=True, text=True, timeout=6)
+            except Exception as exc:
+                errors.append(str(exc))
+                continue
+            out = ((r.stdout or '') + (r.stderr or '')).strip()
+            low = out.lower()
+            if r.returncode == 0:
+                loaded = True
+                if ('state = running' in low) or ('pid = ' in low):
+                    return True, out or target
+                if ('state = exited' in low) or ('state = waiting' in low) or ('last exit code' in low):
+                    inactive_msg = out or target
+                    continue
+                return True, out or target
+            not_found = ('could not find service' in low) or ('service could not be found' in low) or ('not found' in low)
+            if not not_found:
+                errors.append(out or target)
+
+    if loaded:
+        return False, inactive_msg or 'launchd service inactive'
+    if errors:
+        return None, '; '.join([e for e in errors if e])[:1200]
+    return None, ''
+
+
+def _launchd_plist_paths(label: str) -> List[Path]:
+    lbl = str(label or '').strip()
+    if not lbl:
+        return []
+    out = [Path('/Library/LaunchDaemons') / f'{lbl}.plist']
+    try:
+        home = Path.home()
+        out.append(home / 'Library' / 'LaunchAgents' / f'{lbl}.plist')
+    except Exception:
+        pass
+    seen: set[str] = set()
+    uniq: List[Path] = []
+    for p in out:
+        s = str(p)
+        if s in seen:
+            continue
+        seen.add(s)
+        uniq.append(p)
+    return uniq
+
+
+def _launchctl_action(name: str, action: str) -> Tuple[bool, str]:
+    if shutil.which('launchctl') is None:
+        return False, 'launchctl 不存在'
+
+    labels = _launchd_label_candidates(name)
+    if not labels:
+        return False, 'launchd label 未配置'
+
+    action_l = str(action or '').strip().lower()
+    errs: List[str] = []
+    for label in labels:
+        for target in _launchctl_targets(label):
+            if action_l in ('restart', 'start'):
+                cmd = ['launchctl', 'kickstart']
+                if action_l == 'restart':
+                    cmd.append('-k')
+                cmd.append(target)
+            elif action_l == 'stop':
+                cmd = ['launchctl', 'bootout', target]
+            else:
+                return False, f'unsupported action: {action_l}'
+            try:
+                r = subprocess.run(cmd, capture_output=True, text=True, timeout=12)
+            except Exception as exc:
+                errs.append(str(exc))
+                continue
+            out = ((r.stdout or '') + (r.stderr or '')).strip()
+            if r.returncode == 0:
+                return True, out or target
+            low = out.lower()
+            not_found = ('could not find service' in low) or ('service could not be found' in low) or ('not found' in low)
+            if action_l == 'stop' and not_found:
+                return True, out or target
+            errs.append(out or target)
+
+        # start/restart fallback: if plist exists but service not loaded, bootstrap then kickstart
+        if action_l in ('start', 'restart'):
+            for plist in _launchd_plist_paths(label):
+                if not plist.exists():
+                    continue
+                target = f"system/{label}"
+                try:
+                    subprocess.run(['launchctl', 'bootout', target], capture_output=True, text=True, timeout=10)
+                except Exception:
+                    pass
+                try:
+                    r_boot = subprocess.run(
+                        ['launchctl', 'bootstrap', 'system', str(plist)],
+                        capture_output=True,
+                        text=True,
+                        timeout=12,
+                    )
+                except Exception as exc:
+                    errs.append(str(exc))
+                    continue
+                out_boot = ((r_boot.stdout or '') + (r_boot.stderr or '')).strip()
+                if r_boot.returncode != 0:
+                    errs.append(out_boot or f'bootstrap {plist}')
+                    continue
+                try:
+                    subprocess.run(['launchctl', 'enable', target], capture_output=True, text=True, timeout=8)
+                except Exception:
+                    pass
+                cmd = ['launchctl', 'kickstart']
+                if action_l == 'restart':
+                    cmd.append('-k')
+                cmd.append(target)
+                try:
+                    r_run = subprocess.run(cmd, capture_output=True, text=True, timeout=12)
+                except Exception as exc:
+                    errs.append(str(exc))
+                    continue
+                out_run = ((r_run.stdout or '') + (r_run.stderr or '')).strip()
+                if r_run.returncode == 0:
+                    return True, out_run or target
+                errs.append(out_run or target)
+
+    return False, '; '.join([e for e in errs if e])[:1600]
+
+
+def _brew_service_formula_candidates(name: str) -> List[str]:
+    base = _service_base_name(name).lower()
+    out: List[str] = []
+    seen: set[str] = set()
+
+    def _add(v: str) -> None:
+        s = str(v or '').strip()
+        if (not s) or (s in seen):
+            return
+        seen.add(s)
+        out.append(s)
+
+    if base == 'nginx':
+        _add('nginx')
+    elif base in ('apache2', 'httpd'):
+        _add('httpd')
+    elif base.startswith('php'):
+        _add('php')
+        for v in ('8.4', '8.3', '8.2', '8.1', '8.0', '7.4'):
+            _add(f'php@{v}')
+    return out
+
+
+def _brew_binary() -> Optional[str]:
+    cand = shutil.which('brew')
+    if cand:
+        return cand
+    for p in ('/opt/homebrew/bin/brew', '/usr/local/bin/brew'):
+        try:
+            if Path(p).exists():
+                return p
+        except Exception:
+            continue
+    return None
+
+
+def _brew_run(args: List[str], timeout: int = 600, env: Optional[Dict[str, str]] = None) -> Tuple[int, str]:
+    brew = _brew_binary()
+    if not brew:
+        return 127, 'brew 不存在'
+
+    run_env = os.environ.copy()
+    if env:
+        run_env.update(env)
+    run_env.setdefault('HOMEBREW_NO_AUTO_UPDATE', '1')
+
+    cmd = [brew, *args]
+
+    # Agent runs as root under launchd/systemd in many deployments.
+    # Homebrew rejects root execution, so best-effort switch to brew owner.
+    if os.geteuid() == 0:
+        brew_user = str(os.getenv('REALM_BREW_USER') or os.getenv('SUDO_USER') or '').strip()
+        if not brew_user:
+            try:
+                st = os.stat(brew)
+                if int(st.st_uid) != 0:
+                    import pwd
+
+                    brew_user = str(pwd.getpwuid(int(st.st_uid)).pw_name or '').strip()
+            except Exception:
+                brew_user = ''
+        if brew_user and brew_user != 'root':
+            if shutil.which('sudo'):
+                cmd = ['sudo', '-u', brew_user, '-H', brew, *args]
+            elif shutil.which('su'):
+                quoted = ' '.join(shlex.quote(x) for x in ([brew, *args]))
+                cmd = ['su', '-l', brew_user, '-c', quoted]
+            else:
+                return 126, '当前为 root，且缺少 sudo/su，无法以普通用户执行 brew'
+        else:
+            return 126, '当前为 root，无法确定可用的 brew 用户（可设置 REALM_BREW_USER）'
+
+    code, out = _run_cmd(cmd, timeout=timeout, env=run_env)
+    return code, out
+
+
+def _brew_service_action(name: str, action: str) -> Tuple[bool, str]:
+    if _brew_binary() is None:
+        return False, 'brew 不存在'
+    formulas = _brew_service_formula_candidates(name)
+    if not formulas:
+        return False, ''
+    errs: List[str] = []
+    for formula in formulas:
+        code, out = _brew_run(['services', action, formula], timeout=120)
+        if code == 0:
+            return True, out or formula
+        errs.append(out or formula)
+    return False, '; '.join([e for e in errs if e])[:1600]
+
+
+def _brew_service_status(name: str) -> Tuple[Optional[bool], str]:
+    if _brew_binary() is None:
+        return None, ''
+    formulas = _brew_service_formula_candidates(name)
+    if not formulas:
+        return None, ''
+    code, out = _brew_run(['services', 'list'], timeout=120)
+    if code != 0:
+        return None, out
+
+    lines = [ln.strip() for ln in str(out or '').splitlines() if ln.strip()]
+    # brew services list format:
+    # Name Status User File
+    # nginx started foo ~/Library/LaunchAgents/homebrew.mxcl.nginx.plist
+    for formula in formulas:
+        for ln in lines:
+            parts = ln.split()
+            if len(parts) < 2:
+                continue
+            if parts[0] != formula:
+                continue
+            st = str(parts[1] or '').strip().lower()
+            if st in ('started', 'running'):
+                return True, ln
+            if st in ('none', 'stopped', 'error', 'unknown'):
+                return False, ln
+            return None, ln
+    return None, ''
 
 
 def _service_is_active(name: str) -> bool:
@@ -1254,6 +1891,13 @@ def _service_is_active(name: str) -> bool:
             return r.returncode == 0
         except Exception:
             return False
+
+    st, _msg = _launchctl_status(name)
+    if st is not None:
+        return bool(st)
+    st2, _msg2 = _brew_service_status(name)
+    if st2 is not None:
+        return bool(st2)
     return False
 
 
@@ -1266,6 +1910,66 @@ def _stop_service(name: str) -> None:
             return
         except Exception:
             continue
+    ok, _msg = _launchctl_action(name, 'stop')
+    if ok:
+        return
+    _brew_service_action(name, 'stop')
+
+
+def _systemctl_bus_unavailable(msg: str) -> bool:
+    low = str(msg or '').strip().lower()
+    if not low:
+        return False
+    return (
+        'system has not been booted with systemd' in low
+        or 'failed to connect to bus' in low
+        or 'no such file or directory' in low and '/run/systemd/' in low
+    )
+
+
+def _systemctl_unit_not_found(msg: str) -> bool:
+    low = str(msg or '').strip().lower()
+    if not low:
+        return False
+    return (
+        ('unit' in low and 'not found' in low)
+        or 'could not be found' in low
+    )
+
+
+def _systemctl_diag(unit: str) -> str:
+    if shutil.which('systemctl') is None:
+        return ''
+    u = str(unit or '').strip()
+    if not u:
+        return ''
+    parts: List[str] = []
+    try:
+        r = subprocess.run(
+            ['systemctl', 'status', u, '--no-pager', '--lines=20'],
+            capture_output=True,
+            text=True,
+            timeout=8,
+        )
+        txt = ((r.stdout or '') + (r.stderr or '')).strip()
+        if txt:
+            parts.append(f"status[{u}]: {txt[:2200]}")
+    except Exception:
+        pass
+    if shutil.which('journalctl'):
+        try:
+            r2 = subprocess.run(
+                ['journalctl', '-u', u, '-n', '30', '--no-pager'],
+                capture_output=True,
+                text=True,
+                timeout=8,
+            )
+            txt2 = ((r2.stdout or '') + (r2.stderr or '')).strip()
+            if txt2:
+                parts.append(f"journal[{u}]: {txt2[:2200]}")
+        except Exception:
+            pass
+    return ' | '.join(parts)
 
 
 def _restart_realm() -> None:
@@ -1274,21 +1978,67 @@ def _restart_realm() -> None:
         candidates.append(CFG.realm_service)
     candidates.extend(['realm.service', 'realm'])
     seen = set()
-    services = [s for s in candidates if s and not (s in seen or seen.add(s))]
+    services = [str(s).strip() for s in candidates if str(s or '').strip() and not (str(s).strip() in seen or seen.add(str(s).strip()))]
     errors = []
 
+    systemctl_units: List[str] = []
+    service_names: List[str] = []
+    seen_units: set[str] = set()
+    seen_svcs: set[str] = set()
+    for svc in services:
+        base = _service_base_name(svc)
+        if base and base not in seen_svcs:
+            seen_svcs.add(base)
+            service_names.append(base)
+
+        if svc.endswith('.service'):
+            if svc not in seen_units:
+                seen_units.add(svc)
+                systemctl_units.append(svc)
+            if base and base not in seen_units:
+                seen_units.add(base)
+                systemctl_units.append(base)
+        else:
+            if svc not in seen_units:
+                seen_units.add(svc)
+                systemctl_units.append(svc)
+            unit = f'{base}.service' if base else ''
+            if unit and unit not in seen_units:
+                seen_units.add(unit)
+                systemctl_units.append(unit)
+
+    linux_like = platform.system().lower() == 'linux'
+
     if shutil.which('systemctl'):
-        for svc in services:
+        systemctl_errors: List[str] = []
+        bus_unavailable = False
+        units_not_found = True
+        for svc in systemctl_units:
             try:
                 r = subprocess.run(['systemctl', 'restart', svc], capture_output=True, text=True)
                 if r.returncode == 0:
                     return
-                errors.append(f"systemctl {svc}: {r.stderr.strip() or r.stdout.strip()}")
+                msg = r.stderr.strip() or r.stdout.strip()
+                systemctl_errors.append(f"systemctl {svc}: {msg}")
+                if _systemctl_bus_unavailable(msg):
+                    bus_unavailable = True
+                    break
+                if not _systemctl_unit_not_found(msg):
+                    units_not_found = False
             except Exception as exc:
-                errors.append(f"systemctl {svc}: {exc}")
+                systemctl_errors.append(f"systemctl {svc}: {exc}")
+                units_not_found = False
+
+        if (not bus_unavailable) and (not units_not_found):
+            diag_txt = _systemctl_diag(systemctl_units[0] if systemctl_units else (services[0] if services else 'realm.service'))
+            detail = '; '.join([e for e in systemctl_errors if e]) or '未知错误'
+            if diag_txt:
+                detail = f"{detail}; {diag_txt}"
+            raise RuntimeError(f'无法重启 realm 服务（systemctl）：{detail}')
+        errors.extend(systemctl_errors)
 
     if shutil.which('service'):
-        for svc in services:
+        for svc in service_names:
             try:
                 r = subprocess.run(['service', svc, 'restart'], capture_output=True, text=True)
                 if r.returncode == 0:
@@ -1298,7 +2048,7 @@ def _restart_realm() -> None:
                 errors.append(f"service {svc}: {exc}")
 
     if shutil.which('rc-service'):
-        for svc in services:
+        for svc in service_names:
             try:
                 r = subprocess.run(['rc-service', svc, 'restart'], capture_output=True, text=True)
                 if r.returncode == 0:
@@ -1307,8 +2057,33 @@ def _restart_realm() -> None:
             except Exception as exc:
                 errors.append(f"rc-service {svc}: {exc}")
 
+    if linux_like:
+        detail = '; '.join([e for e in errors if e]) or '未知错误'
+        raise RuntimeError(f'无法重启 realm 服务（尝试 {", ".join(service_names or services)} 失败）：{detail}')
+
+    for svc in service_names:
+        ok, msg = _launchctl_action(svc, 'restart')
+        if ok:
+            return
+        if msg:
+            errors.append(f"launchctl {svc}: {msg}")
+
+    for svc in service_names:
+        ok, msg = _brew_service_action(svc, 'restart')
+        if ok:
+            return
+        if msg:
+            errors.append(f"brew services {svc}: {msg}")
+
+    non_linux = platform.system().lower() != 'linux'
+    strict_non_linux = str(os.getenv('REALM_AGENT_STRICT_REALM_RESTART', '0')).strip().lower() in ('1', 'true', 'yes', 'on')
+    if non_linux and (not strict_non_linux) and shutil.which('realm') is None:
+        # macOS/non-Linux can run agent intranet features without realm service.
+        # Keep this non-fatal by default to avoid blocking pool apply/ack cycle.
+        return
+
     detail = '; '.join([e for e in errors if e]) or '未知错误'
-    raise RuntimeError(f'无法重启 realm 服务（尝试 {", ".join(services)} 失败）：{detail}')
+    raise RuntimeError(f'无法重启 realm 服务（尝试 {", ".join(service_names or services)} 失败）：{detail}')
 
 
 def _restart_agent_service() -> None:
@@ -1359,6 +2134,13 @@ def _restart_agent_service() -> None:
             except Exception as exc:
                 errors.append(f"systemctl {unit}: {exc}")
 
+    for svc in services:
+        ok, msg = _launchctl_action(svc, 'restart')
+        if ok:
+            return
+        if msg:
+            errors.append(f"launchctl {svc}: {msg}")
+
     legacy_names = []
     for svc in services:
         base = svc[:-8] if svc.endswith('.service') else svc
@@ -1385,31 +2167,149 @@ def _restart_agent_service() -> None:
             except Exception as exc:
                 errors.append(f"rc-service {svc}: {exc}")
 
+    for svc in legacy_names:
+        ok, msg = _brew_service_action(svc, 'restart')
+        if ok:
+            return
+        if msg:
+            errors.append(f"brew services {svc}: {msg}")
+
     detail = '; '.join([e for e in errors if e]) or '未知错误'
     raise RuntimeError(f'无法重启 agent 服务（尝试 {", ".join(services)} 失败）：{detail}')
 
 
-def _apply_pool_to_config() -> None:
+def _normalize_balance_key(raw: Any) -> str:
+    s = str(raw or '').strip().lower()
+    if not s:
+        return ''
+    return ''.join(ch for ch in s if ch not in ('_', '-', ' '))
+
+
+def _sanitize_realm_balance_value(raw: Any) -> Any:
+    if not isinstance(raw, str):
+        return raw
+    txt = str(raw or '').strip()
+    if not txt:
+        return raw
+    if ':' in txt:
+        left, right = txt.split(':', 1)
+        if _normalize_balance_key(left) == 'randomweight':
+            rhs = right.strip()
+            return (f'roundrobin: {rhs}' if rhs else 'roundrobin')
+        return raw
+    if _normalize_balance_key(txt) == 'randomweight':
+        return 'roundrobin'
+    return raw
+
+
+def _sanitize_realm_config_balance(cfg: Any) -> int:
+    if not isinstance(cfg, dict):
+        return 0
+    eps = cfg.get('endpoints')
+    if not isinstance(eps, list):
+        return 0
+    changed = 0
+    for ep in eps:
+        if not isinstance(ep, dict):
+            continue
+        if 'balance' not in ep:
+            continue
+        old = ep.get('balance')
+        new = _sanitize_realm_balance_value(old)
+        if new != old:
+            ep['balance'] = new
+            changed += 1
+    return int(changed)
+
+
+def _apply_pool_to_config(pool_override: Optional[Dict[str, Any]] = None) -> None:
     if not shutil.which('jq'):
         raise RuntimeError('缺少 jq 命令，无法生成 realm 配置')
-    if not POOL_RUN_FILTER.exists():
-        if FALLBACK_RUN_FILTER.exists():
-            _write_text(POOL_RUN_FILTER, FALLBACK_RUN_FILTER.read_text(encoding='utf-8').strip() + '\n')
+    run_filter = POOL_RUN_FILTER
+    if FALLBACK_RUN_FILTER.exists():
+        fallback_filter = FALLBACK_RUN_FILTER.read_text(encoding='utf-8').strip() + '\n'
+        # Prefer bundled filter so code updates take effect immediately.
+        run_filter = FALLBACK_RUN_FILTER
+        if not POOL_RUN_FILTER.exists():
+            _write_text(POOL_RUN_FILTER, fallback_filter)
         else:
-            raise RuntimeError(f'缺少JQ过滤器: {POOL_RUN_FILTER}')
-    if not POOL_FULL.exists():
+            try:
+                cur_filter = POOL_RUN_FILTER.read_text(encoding='utf-8')
+            except Exception:
+                cur_filter = ''
+            cur_low = cur_filter.lower()
+            cur_norm = ''.join(cur_low.split())
+            # Auto-refresh only legacy bundled filter (avoid overriding customized filter files).
+            refresh_old_filter = ('if.=="iphash"then"iphash"else"roundrobin"end;' in cur_norm)
+            if refresh_old_filter:
+                _write_text(POOL_RUN_FILTER, fallback_filter)
+    elif not POOL_RUN_FILTER.exists():
+        raise RuntimeError(f'缺少JQ过滤器: {POOL_RUN_FILTER}')
+    if (pool_override is None) and (not POOL_FULL.exists()):
         active = _read_json(POOL_ACTIVE, {'endpoints': []})
         eps = active.get('endpoints') or []
         for e in eps:
             e.setdefault('disabled', False)
         _write_json(POOL_FULL, {'endpoints': eps})
 
-    # jq -c -f filter pool_full.json > /etc/realm/config.json
-    cmd = ['jq', '-c', '-f', str(POOL_RUN_FILTER), str(POOL_FULL)]
-    r = subprocess.run(cmd, capture_output=True, text=True)
-    if r.returncode != 0:
-        raise RuntimeError(f'JQ生成config失败: {r.stderr.strip()}')
-    _write_text(REALM_CONFIG, r.stdout.strip() + '\n')
+    pool_src = POOL_FULL
+    tmp_pool_src: Optional[Path] = None
+    try:
+        raw_pool_for_run: Optional[Dict[str, Any]] = None
+        if isinstance(pool_override, dict):
+            maybe_pool = _json_clone(pool_override)
+            if isinstance(maybe_pool, dict):
+                raw_pool_for_run = maybe_pool
+            else:
+                raw_pool_for_run = {'endpoints': []}
+
+        # On non-Linux platforms there is no iptables backend.
+        # Coerce iptables-only forward rules to realm so forwarding still works.
+        if platform.system().lower() != 'linux' and (not _iptables_available()):
+            raw_pool = raw_pool_for_run if isinstance(raw_pool_for_run, dict) else _read_json(POOL_FULL, {'endpoints': []})
+            eps = raw_pool.get('endpoints') if isinstance(raw_pool, dict) else []
+            changed = 0
+            if isinstance(eps, list):
+                for ep in eps:
+                    if not isinstance(ep, dict):
+                        continue
+                    ex = ep.get('extra_config')
+                    if not isinstance(ex, dict):
+                        ex = {}
+                        ep['extra_config'] = ex
+                    raw_tool = str(ex.get('forward_tool') or ep.get('forward_tool') or '').strip().lower()
+                    if raw_tool in ('ipt', 'iptables'):
+                        ex['forward_tool'] = 'realm'
+                        changed += 1
+            if changed > 0 or isinstance(pool_override, dict):
+                raw_pool_for_run = raw_pool
+
+        if isinstance(raw_pool_for_run, dict):
+            tmp_pool_src = Path(f"/tmp/realm-pool-run-{os.getpid()}-{int(time.time() * 1000)}.json")
+            _write_json(tmp_pool_src, raw_pool_for_run)
+            pool_src = tmp_pool_src
+
+        # jq -c -f filter pool_full.json > /etc/realm/config.json
+        cmd = ['jq', '-c', '-f', str(run_filter), str(pool_src)]
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode != 0:
+            raise RuntimeError(f'JQ生成config失败: {r.stderr.strip()}')
+        cfg_txt = r.stdout.strip()
+        if cfg_txt:
+            try:
+                cfg_obj = json.loads(cfg_txt)
+                if _sanitize_realm_config_balance(cfg_obj) > 0:
+                    cfg_txt = json.dumps(cfg_obj, ensure_ascii=False, separators=(',', ':'))
+            except Exception:
+                cfg_txt = re.sub(r'(?i)random_weight', 'roundrobin', cfg_txt)
+        _write_text(REALM_CONFIG, cfg_txt + '\n')
+    finally:
+        if tmp_pool_src is not None:
+            try:
+                if tmp_pool_src.exists():
+                    tmp_pool_src.unlink()
+            except Exception:
+                pass
 
 
 def _sync_active_pool() -> None:
@@ -2472,7 +3372,7 @@ def _cache_set(key: str, ok: Optional[bool], latency_ms: Optional[float], error:
             cutoff = now - float(PROBE_CACHE_TTL)
             for k, item in list(_PROBE_CACHE.items()):
                 try:
-                    if now - float(item.get('ts', 0)) > PROBE_CACHE_TTL:
+                    if float(item.get('ts', 0)) < cutoff:
                         _PROBE_CACHE.pop(k, None)
                 except Exception:
                     _PROBE_CACHE.pop(k, None)
@@ -2842,6 +3742,340 @@ def _split_hostport(addr: str) -> tuple[str, int]:
     return host.strip(), int(p)
 
 
+_BALANCE_ALGO_MAP = {
+    "roundrobin": "roundrobin",
+    "iphash": "iphash",
+    "leastconn": "least_conn",
+    "leastlatency": "least_latency",
+    "consistenthash": "consistent_hash",
+    "randomweight": "random_weight",
+}
+_WEIGHTED_BALANCE_ALGOS = {"roundrobin", "random_weight"}
+_SRV_HOST_RE = re.compile(r"^_[A-Za-z0-9-]+\._(?:tcp|udp)\..+")
+
+
+def _normalize_balance_algo(raw: Any) -> str:
+    s = str(raw or "roundrobin").strip().lower()
+    for ch in ("_", "-", " "):
+        s = s.replace(ch, "")
+    return str(_BALANCE_ALGO_MAP.get(s) or "roundrobin")
+
+
+def _parse_balance_for_dns(balance: Any, remote_count: int) -> Tuple[str, List[int]]:
+    n = max(0, int(remote_count))
+    if n <= 0:
+        return "roundrobin", []
+    txt = str(balance or "roundrobin").strip()
+    if not txt:
+        txt = "roundrobin"
+    if ":" not in txt:
+        algo = _normalize_balance_algo(txt)
+        return algo, [1] * n
+
+    left, right = txt.split(":", 1)
+    algo = _normalize_balance_algo(left)
+    if algo not in _WEIGHTED_BALANCE_ALGOS:
+        return algo, [1] * n
+
+    raw_ws = [x.strip() for x in right.replace("，", ",").split(",") if x.strip()]
+    ws: List[int] = []
+    for item in raw_ws:
+        if not item.isdigit():
+            return algo, [1] * n
+        val = int(item)
+        if val <= 0:
+            return algo, [1] * n
+        ws.append(val)
+    if len(ws) != n:
+        return algo, [1] * n
+    return algo, ws
+
+
+def _is_ws_transport(raw: Any) -> bool:
+    s = str(raw or "").strip().lower()
+    return bool(s in ("ws", "wss") or s.startswith("ws;") or s.startswith("wss;"))
+
+
+def _collect_rule_remotes(ep: Dict[str, Any]) -> List[str]:
+    remotes: List[str] = []
+    if isinstance(ep.get("remote"), str) and str(ep.get("remote") or "").strip():
+        remotes.append(str(ep.get("remote") or "").strip())
+    if isinstance(ep.get("remotes"), list):
+        remotes.extend([str(x).strip() for x in ep.get("remotes") if str(x).strip()])
+    if isinstance(ep.get("extra_remotes"), list):
+        remotes.extend([str(x).strip() for x in ep.get("extra_remotes") if str(x).strip()])
+
+    out: List[str] = []
+    seen: set[str] = set()
+    for r in remotes:
+        if r in seen:
+            continue
+        seen.add(r)
+        out.append(r)
+    return out
+
+
+def _format_hostport(host: str, port: int) -> str:
+    h = str(host or "").strip()
+    if (":" in h) and (not h.startswith("[")):
+        return f"[{h}]:{int(port)}"
+    return f"{h}:{int(port)}"
+
+
+def _is_ip_literal(host: str) -> bool:
+    h = str(host or "").strip()
+    if not h:
+        return False
+    core = h.split("%", 1)[0]
+    try:
+        ipaddress.ip_address(core)
+        return True
+    except Exception:
+        return False
+
+
+def _interleave_addrinfos(infos: List[Tuple[int, int, int, Any]]) -> List[Tuple[int, int, int, Any]]:
+    ipv6: List[Tuple[int, int, int, Any]] = []
+    ipv4: List[Tuple[int, int, int, Any]] = []
+    other: List[Tuple[int, int, int, Any]] = []
+    for item in infos:
+        fam = int(item[0])
+        if fam == int(socket.AF_INET6):
+            ipv6.append(item)
+        elif fam == int(socket.AF_INET):
+            ipv4.append(item)
+        else:
+            other.append(item)
+
+    out: List[Tuple[int, int, int, Any]] = []
+    for i in range(max(len(ipv6), len(ipv4))):
+        if i < len(ipv6):
+            out.append(ipv6[i])
+        if i < len(ipv4):
+            out.append(ipv4[i])
+    out.extend(other)
+    return out
+
+
+def _resolve_host_targets(host: str, port: int, max_addrs: int = DNS_MAX_ADDRS_PER_REMOTE) -> List[str]:
+    infos = socket.getaddrinfo(host, int(port), socket.AF_UNSPEC, socket.SOCK_STREAM)
+    packed: List[Tuple[int, int, int, Any]] = []
+    seen: set[Tuple[int, int, int, Any]] = set()
+    for family, stype, proto, _canon, sockaddr in infos:
+        key = (int(family), int(stype), int(proto), sockaddr)
+        if key in seen:
+            continue
+        seen.add(key)
+        packed.append((int(family), int(stype), int(proto), sockaddr))
+    ordered = _interleave_addrinfos(packed)
+
+    out: List[str] = []
+    seen_remote: set[str] = set()
+    limit = max(1, int(max_addrs or 1))
+    for family, _stype, _proto, sockaddr in ordered:
+        try:
+            if family == socket.AF_INET6:
+                host_txt = str(sockaddr[0] or "").strip()
+                port_txt = int(sockaddr[1] or 0)
+            else:
+                host_txt = str(sockaddr[0] or "").strip()
+                port_txt = int(sockaddr[1] or 0)
+        except Exception:
+            continue
+        if not host_txt or port_txt <= 0:
+            continue
+        remote = _format_hostport(host_txt, port_txt)
+        if remote in seen_remote:
+            continue
+        seen_remote.add(remote)
+        out.append(remote)
+    out = sorted(out, key=lambda x: str(x))
+    if len(out) > limit:
+        out = out[:limit]
+    return out
+
+
+def _lookup_srv_records(host: str) -> List[Tuple[int, int, str, int]]:
+    if (not DNS_ENABLE_SRV) or (_dns_resolver is None):
+        return []
+    name = str(host or "").strip().rstrip(".")
+    if not name:
+        return []
+    try:
+        answers = _dns_resolver.resolve(name, "SRV", lifetime=float(DNS_LOOKUP_TIMEOUT))
+    except Exception:
+        return []
+
+    rows: List[Tuple[int, int, str, int]] = []
+    for rec in answers:
+        try:
+            priority = int(getattr(rec, "priority", 0) or 0)
+            weight = int(getattr(rec, "weight", 0) or 0)
+            target = str(getattr(rec, "target", "") or "").strip().rstrip(".")
+            port = int(getattr(rec, "port", 0) or 0)
+        except Exception:
+            continue
+        if (not target) or port <= 0:
+            continue
+        rows.append((priority, max(1, weight), target, int(port)))
+    rows.sort(key=lambda x: (int(x[0]), -int(x[1]), str(x[2]), int(x[3])))
+    return rows
+
+
+def _resolve_remote_dynamic(remote: str) -> Tuple[List[str], List[int], bool]:
+    txt = str(remote or "").strip()
+    if not txt:
+        return [], [], False
+    try:
+        host, port = _split_hostport(txt)
+    except Exception:
+        return [txt], [1], False
+
+    host = str(host or "").strip()
+    if (not host) or int(port) <= 0:
+        return [txt], [1], False
+    if _is_ip_literal(host):
+        return [_format_hostport(host, int(port))], [1], False
+
+    if DNS_SRV_AUTO_HOST and bool(_SRV_HOST_RE.match(host)):
+        rows = _lookup_srv_records(host)
+        if rows:
+            resolved: List[str] = []
+            weights: List[int] = []
+            seen: set[str] = set()
+            limit = max(1, int(DNS_MAX_ADDRS_PER_REMOTE))
+            for _pri, srv_w, srv_target, srv_port in rows:
+                try:
+                    targets = _resolve_host_targets(srv_target, int(srv_port), max_addrs=limit)
+                except Exception:
+                    targets = []
+                for t in targets:
+                    if t in seen:
+                        continue
+                    seen.add(t)
+                    resolved.append(t)
+                    weights.append(max(1, int(srv_w)))
+                    if len(resolved) >= limit:
+                        break
+                if len(resolved) >= limit:
+                    break
+            if resolved:
+                return resolved, weights, True
+
+    try:
+        targets = _resolve_host_targets(host, int(port), max_addrs=DNS_MAX_ADDRS_PER_REMOTE)
+    except Exception:
+        targets = []
+    if targets:
+        return targets, [1] * len(targets), True
+    return [_format_hostport(host, int(port))], [1], True
+
+
+def _expand_pool_remotes_for_runtime(pool: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    runtime = _json_clone(pool if isinstance(pool, dict) else {"endpoints": []})
+    if not isinstance(runtime, dict):
+        runtime = {"endpoints": []}
+    eps = runtime.get("endpoints")
+    if not isinstance(eps, list):
+        eps = []
+        runtime["endpoints"] = eps
+
+    dynamic_rules = 0
+    changed_rules = 0
+    for ep in eps:
+        if not isinstance(ep, dict):
+            continue
+        if bool(ep.get("disabled")):
+            continue
+        ex = ep.get("extra_config") if isinstance(ep.get("extra_config"), dict) else {}
+        if bool(ex.get("intranet_role") or ex.get("intranet_token")):
+            continue
+
+        listen_transport = str(ep.get("listen_transport") or ex.get("listen_transport") or "")
+        remote_transport = str(ep.get("remote_transport") or ex.get("remote_transport") or "")
+        if _is_ws_transport(listen_transport) or _is_ws_transport(remote_transport):
+            continue
+
+        remotes = _collect_rule_remotes(ep)
+        if not remotes:
+            continue
+
+        has_dynamic = False
+        for r in remotes:
+            try:
+                h, _p = _split_hostport(r)
+                if not _is_ip_literal(h):
+                    has_dynamic = True
+                    break
+            except Exception:
+                continue
+        if not has_dynamic:
+            continue
+        dynamic_rules += 1
+
+        algo, base_weights = _parse_balance_for_dns(ep.get("balance"), len(remotes))
+        expanded: List[str] = []
+        expanded_weights: List[int] = []
+        idx_map: Dict[str, int] = {}
+        limit = max(1, int(DNS_MAX_ADDRS_PER_REMOTE))
+        for ridx, r in enumerate(remotes):
+            base_w = int(base_weights[ridx]) if ridx < len(base_weights) else 1
+            resolved, resolved_ws, _dynamic = _resolve_remote_dynamic(r)
+            if not resolved:
+                resolved = [r]
+                resolved_ws = [1]
+            for i, target in enumerate(resolved):
+                t = str(target or "").strip()
+                if not t:
+                    continue
+                w = max(1, int(base_w) * int(resolved_ws[i] if i < len(resolved_ws) else 1))
+                pos = idx_map.get(t)
+                if pos is None:
+                    if len(expanded) >= limit:
+                        continue
+                    idx_map[t] = len(expanded)
+                    expanded.append(t)
+                    expanded_weights.append(w)
+                else:
+                    expanded_weights[pos] = max(1, int(expanded_weights[pos]) + int(w))
+
+        if not expanded:
+            continue
+        if expanded != remotes:
+            changed_rules += 1
+
+        ep["remote"] = expanded[0]
+        ep.pop("remotes", None)
+        if len(expanded) > 1:
+            ep["extra_remotes"] = expanded[1:]
+        else:
+            ep.pop("extra_remotes", None)
+
+        if len(expanded) > 1:
+            if algo in _WEIGHTED_BALANCE_ALGOS:
+                ws = [max(1, int(x)) for x in expanded_weights[: len(expanded)]]
+                if len(ws) < len(expanded):
+                    ws.extend([1] * (len(expanded) - len(ws)))
+                ep["balance"] = f"{algo}: " + ", ".join(str(int(w)) for w in ws)
+            else:
+                ep["balance"] = str(algo or "roundrobin")
+
+    meta = {
+        "dynamic_rules": int(dynamic_rules),
+        "changed_rules": int(changed_rules),
+        "has_dynamic_remotes": bool(dynamic_rules > 0),
+    }
+    return runtime, meta
+
+
+def _pool_signature(pool: Dict[str, Any]) -> str:
+    try:
+        blob = json.dumps(pool, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    except Exception:
+        blob = repr(pool)
+    return hashlib.sha1(blob.encode("utf-8", errors="ignore")).hexdigest()
+
+
 def _load_full_pool() -> Dict[str, Any]:
     full = _read_json(POOL_FULL, None)
     if full is None:
@@ -2939,6 +4173,11 @@ try:
     AGENT_ID = int(os.environ.get('REALM_AGENT_ID', '0') or '0')
 except Exception:
     AGENT_ID = 0
+_REPORT_INSECURE_RAW = str(os.environ.get('REALM_AGENT_REPORT_INSECURE_TLS', '') or '').strip().lower()
+REPORT_VERIFY_TLS = _REPORT_INSECURE_RAW not in ('1', 'true', 'yes', 'on', 'y')
+REPORT_CA_FILE = str(os.environ.get('REALM_AGENT_REPORT_CA_FILE', '') or '').strip()
+if REPORT_CA_FILE and (not Path(REPORT_CA_FILE).exists()):
+    REPORT_CA_FILE = ''
 try:
     HEARTBEAT_INTERVAL = max(1.0, float(os.environ.get('REALM_AGENT_HEARTBEAT_INTERVAL', '3') or '3'))
 except Exception:
@@ -2959,6 +4198,13 @@ except Exception:
 _PUSH_STOP = threading.Event()
 _PUSH_THREAD: Optional[threading.Thread] = None
 _PUSH_LOCK = threading.Lock()  # 避免与 API 同时写 pool 文件导致竞争
+_DNS_REFRESH_STOP = threading.Event()
+_DNS_REFRESH_THREAD: Optional[threading.Thread] = None
+_DNS_APPLIED_BASE_POOL: Optional[Dict[str, Any]] = None
+_DNS_APPLIED_RUNTIME_POOL: Optional[Dict[str, Any]] = None
+_DNS_APPLIED_RUNTIME_SIG = ""
+_DNS_LAST_REFRESH_AT = 0.0
+_DNS_LAST_REFRESH_ERROR = ""
 _LAST_SYNC_ERROR: Optional[str] = None
 _QOS_STATUS_LOCK = threading.Lock()
 _QOS_STATUS: Dict[str, Any] = {
@@ -2983,6 +4229,7 @@ _PANEL_TASK_RESULTS_MAX = max(20, int(os.getenv("REALM_AGENT_PANEL_TASK_RESULTS_
 
 _INTRANET = IntranetManager(node_id=AGENT_ID)
 _IPTFWD = IptablesForwardManager()
+_OVERLAY = OverlayManager(node_id=AGENT_ID)
 
 
 def _queue_panel_task_result(row: Dict[str, Any]) -> None:
@@ -3063,7 +4310,123 @@ def _qos_apply_safe(pool: Optional[Dict[str, Any]], source: str) -> None:
         )
 
 
+def _dns_mark_base_pool_locked(full_pool: Dict[str, Any]) -> None:
+    global _DNS_APPLIED_BASE_POOL
+    _DNS_APPLIED_BASE_POOL = _json_clone(full_pool if isinstance(full_pool, dict) else {"endpoints": []})
+
+
+def _dns_mark_runtime_applied_locked(full_pool: Dict[str, Any], runtime_pool: Dict[str, Any], runtime_sig: str) -> None:
+    global _DNS_APPLIED_BASE_POOL, _DNS_APPLIED_RUNTIME_POOL, _DNS_APPLIED_RUNTIME_SIG
+    _DNS_APPLIED_BASE_POOL = _json_clone(full_pool if isinstance(full_pool, dict) else {"endpoints": []})
+    _DNS_APPLIED_RUNTIME_POOL = _json_clone(runtime_pool if isinstance(runtime_pool, dict) else {"endpoints": []})
+    _DNS_APPLIED_RUNTIME_SIG = str(runtime_sig or "").strip()
+
+
+def _apply_forward_runtime_locked(
+    full_pool: Dict[str, Any],
+    *,
+    prev_full: Optional[Dict[str, Any]] = None,
+    source: str = "apply",
+    force_apply: bool = True,
+) -> Dict[str, Any]:
+    """Apply runtime forwarding pool (realm + iptables).
+
+    IMPORTANT: caller must hold _PUSH_LOCK.
+    """
+    runtime_pool, dns_meta = _expand_pool_remotes_for_runtime(full_pool)
+    runtime_sig = _pool_signature(runtime_pool)
+
+    if not bool(force_apply):
+        if not bool(dns_meta.get("has_dynamic_remotes")):
+            return {"ok": True, "applied": False, "reason": "no_dynamic_remotes", "source": source, "dns": dns_meta}
+        if runtime_sig and runtime_sig == _DNS_APPLIED_RUNTIME_SIG:
+            return {"ok": True, "applied": False, "reason": "no_change", "source": source, "dns": dns_meta}
+        # Startup bootstrap: avoid restarting realm if this cycle produced no DNS expansion yet.
+        if (not _DNS_APPLIED_RUNTIME_SIG) and int(dns_meta.get("changed_rules") or 0) <= 0:
+            return {"ok": True, "applied": False, "reason": "bootstrap_no_delta", "source": source, "dns": dns_meta}
+
+    rollback_runtime_pool: Optional[Dict[str, Any]] = None
+    if isinstance(prev_full, dict):
+        rollback_runtime_pool, _rollback_meta = _expand_pool_remotes_for_runtime(prev_full)
+    elif isinstance(_DNS_APPLIED_RUNTIME_POOL, dict):
+        rollback_runtime_pool = _json_clone(_DNS_APPLIED_RUNTIME_POOL)
+
+    _IPTFWD.prepare_for_pool(runtime_pool)
+    try:
+        _apply_pool_to_config(runtime_pool)
+        _restart_realm()
+        _IPTFWD.apply_from_pool(runtime_pool)
+        try:
+            _OVERLAY.apply_from_pool(runtime_pool)
+        except Exception:
+            pass
+    except Exception:
+        if isinstance(rollback_runtime_pool, dict):
+            try:
+                _IPTFWD.apply_from_pool(rollback_runtime_pool)
+            except Exception:
+                pass
+            try:
+                _OVERLAY.apply_from_pool(rollback_runtime_pool)
+            except Exception:
+                pass
+        raise
+
+    _dns_mark_runtime_applied_locked(full_pool, runtime_pool, runtime_sig)
+    return {"ok": True, "applied": True, "source": source, "runtime_sig": runtime_sig, "dns": dns_meta}
+
+
+def _dns_refresh_tick() -> None:
+    global _DNS_LAST_REFRESH_AT, _DNS_LAST_REFRESH_ERROR
+    if (not DNS_DYNAMIC_ENABLE) or DNS_REFRESH_INTERVAL <= 0:
+        return
+    with _PUSH_LOCK:
+        base_pool = _json_clone(_DNS_APPLIED_BASE_POOL) if isinstance(_DNS_APPLIED_BASE_POOL, dict) else None
+        if not isinstance(base_pool, dict):
+            base_pool = _load_full_pool()
+            _dns_mark_base_pool_locked(base_pool)
+        try:
+            _apply_forward_runtime_locked(base_pool, source="dns_refresh", force_apply=False)
+            _DNS_LAST_REFRESH_ERROR = ""
+        except Exception as exc:
+            _DNS_LAST_REFRESH_ERROR = str(exc)
+        _DNS_LAST_REFRESH_AT = time.time()
+
+
+def _dns_refresh_loop() -> None:
+    if _DNS_REFRESH_STOP.wait(timeout=max(0.2, float(DNS_REFRESH_BOOT_DELAY))):
+        return
+    while not _DNS_REFRESH_STOP.is_set():
+        try:
+            _dns_refresh_tick()
+        except Exception:
+            pass
+        if _DNS_REFRESH_STOP.wait(timeout=max(5.0, float(DNS_REFRESH_INTERVAL))):
+            break
+
+
+def _start_dns_refresher() -> None:
+    global _DNS_REFRESH_THREAD
+    if (not DNS_DYNAMIC_ENABLE) or DNS_REFRESH_INTERVAL <= 0:
+        return
+    if _DNS_REFRESH_THREAD and _DNS_REFRESH_THREAD.is_alive():
+        return
+    _DNS_REFRESH_STOP.clear()
+    th = threading.Thread(target=_dns_refresh_loop, name="realm-agent-dns-refresh", daemon=True)
+    th.start()
+    _DNS_REFRESH_THREAD = th
+
+
+def _stop_dns_refresher() -> None:
+    _DNS_REFRESH_STOP.set()
+
+
 def _read_agent_api_key() -> str:
+    # Prefer env override to make rollouts safer (e.g. when /etc/realm-agent/api.key
+    # is temporarily missing during upgrade).
+    env_key = str(os.getenv('REALM_AGENT_API_KEY') or '').strip()
+    if env_key:
+        return env_key
     try:
         return _read_text(API_KEY_FILE).strip()
     except Exception:
@@ -3114,6 +4477,12 @@ def _build_push_report() -> Dict[str, Any]:
     except Exception:
         iptables_meta = {}
 
+    overlay_meta: Dict[str, Any] = {}
+    try:
+        overlay_meta = _OVERLAY.status()
+    except Exception:
+        overlay_meta = {}
+
     rep: Dict[str, Any] = {
         'time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
         'info': info,
@@ -3125,6 +4494,7 @@ def _build_push_report() -> Dict[str, Any]:
         'iptables': iptables_meta,
         # backward-compat alias
         'ipt': iptables_meta,
+        'overlay': overlay_meta,
     }
     if _LAST_SYNC_ERROR:
         rep['sync_error'] = _LAST_SYNC_ERROR
@@ -3167,28 +4537,21 @@ def _apply_sync_pool_cmd(cmd: Dict[str, Any]) -> None:
             except Exception:
                 pass
 
+            # Keep overlay runtime in sync (Route B reusable tunnel group).
+            # Overlay listeners are agent-managed and should be updated even when apply=false.
+            try:
+                runtime_pool, _dns_meta = _expand_pool_remotes_for_runtime(pool)
+                _OVERLAY.apply_from_pool(runtime_pool)
+            except Exception:
+                pass
+
             if do_apply:
-                # Two-phase apply for iptables-forwarded rules:
-                # 1) stop/reconcile listeners that will change (avoid port conflicts)
-                # 2) apply realm config + restart realm
-                # 3) apply desired iptables rules
-                _IPTFWD.prepare_for_pool(pool)
+                _apply_forward_runtime_locked(pool, prev_full=prev_full, source="sync_pool", force_apply=True)
+                # Keep intranet tunnel supervisor in sync for LAN/NAT nodes.
                 try:
-                    _apply_pool_to_config()
-                    _restart_realm()
-                    # Keep intranet tunnel supervisor in sync for LAN/NAT nodes.
-                    try:
-                        _INTRANET.apply_from_pool(_load_full_pool())
-                    except Exception:
-                        pass
-                    _IPTFWD.apply_from_pool(pool)
+                    _INTRANET.apply_from_pool(_load_full_pool())
                 except Exception:
-                    # Best-effort rollback of managed iptables rules to previous full pool.
-                    try:
-                        _IPTFWD.apply_from_pool(prev_full)
-                    except Exception:
-                        pass
-                    raise
+                    pass
 
             # ✅ 只有成功才 ack
             _write_int(ACK_VER_FILE, ver)
@@ -3299,18 +4662,15 @@ def _apply_pool_patch_cmd(cmd: Dict[str, Any]) -> None:
             except Exception:
                 pass
 
+            # Keep overlay runtime in sync for nodes using forward_tool=overlay or MPTCP overlay exit.
+            try:
+                runtime_pool, _dns_meta = _expand_pool_remotes_for_runtime(new_full)
+                _OVERLAY.apply_from_pool(runtime_pool)
+            except Exception:
+                pass
+
             if do_apply:
-                _IPTFWD.prepare_for_pool(new_full)
-                try:
-                    _apply_pool_to_config()
-                    _restart_realm()
-                    _IPTFWD.apply_from_pool(new_full)
-                except Exception:
-                    try:
-                        _IPTFWD.apply_from_pool(prev_full)
-                    except Exception:
-                        pass
-                    raise
+                _apply_forward_runtime_locked(new_full, prev_full=prev_full, source="pool_patch", force_apply=True)
 
             _write_int(ACK_VER_FILE, ver)
             _LAST_SYNC_ERROR = None
@@ -3320,8 +4680,13 @@ def _apply_pool_patch_cmd(cmd: Dict[str, Any]) -> None:
 
 def _get_current_agent_bind() -> tuple[str, int]:
     """Best-effort: parse current bind host/port from systemd unit."""
-    host = '0.0.0.0'
-    port = 18700
+    host = str(os.getenv('REALM_AGENT_HOST') or '').strip() or '0.0.0.0'
+    try:
+        port = int(str(os.getenv('REALM_AGENT_PORT') or '').strip() or 18700)
+    except Exception:
+        port = 18700
+    if port <= 0 or port > 65535:
+        port = 18700
     for unit_path in (Path('/etc/systemd/system/realm-agent.service'), Path('/etc/systemd/system/realm-agent-https.service')):
         if not unit_path.exists():
             continue
@@ -3342,11 +4707,37 @@ def _get_current_agent_bind() -> tuple[str, int]:
     return host, port
 
 
+def _macos_installer_url(url: str) -> str:
+    u = str(url or '').strip()
+    if not u:
+        return u
+    try:
+        p = urlparse(u)
+        path = str(p.path or '')
+        if path.endswith('_macos.sh'):
+            return u
+        if path.endswith('realm_agent.sh'):
+            path = path[:-len('realm_agent.sh')] + 'realm_agent_macos.sh'
+        elif path.endswith('.sh'):
+            path = path[:-3] + '_macos.sh'
+        else:
+            return u
+        return p._replace(path=path).geturl()
+    except Exception:
+        if u.endswith('_macos.sh'):
+            return u
+        if 'realm_agent.sh' in u:
+            return u.replace('realm_agent.sh', 'realm_agent_macos.sh')
+        if u.endswith('.sh'):
+            return u[:-3] + '_macos.sh'
+    return u
+
+
 def _apply_update_agent_cmd(cmd: Dict[str, Any]) -> None:
     """Self-update agent using panel-provided installer + zip.
 
-    IMPORTANT: must run updater in a separate transient systemd unit (systemd-run),
-    otherwise stopping realm-agent.service would kill the updater (same cgroup).
+    Prefer running updater in a separate transient systemd unit (systemd-run).
+    On non-systemd hosts (e.g. macOS), fallback to detached process execution.
     """
     try:
         desired_ver = str(cmd.get('desired_version') or '').strip()
@@ -3366,6 +4757,9 @@ def _apply_update_agent_cmd(cmd: Dict[str, Any]) -> None:
         fallback_zip_url = str(cmd.get('fallback_zip_url') or '').strip()
         fallback_zip_sha256 = str(cmd.get('fallback_zip_sha256') or '').strip()
         force = _to_bool(cmd.get('force', True), True)
+        if platform.system().lower() == 'darwin':
+            sh_url = _macos_installer_url(sh_url)
+            fallback_sh_url = _macos_installer_url(fallback_sh_url)
         now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
         if not update_id or not desired_ver or not sh_url or not zip_url:
@@ -3744,16 +5138,17 @@ emit_url_sha_candidates() {{
   local primary_sha=\"$2\"
   local fallback_url=\"$3\"
   local fallback_sha=\"$4\"
-  declare -A seen=()
+  # macOS default bash is 3.2 (no associative arrays); keep this function bash3-compatible.
+  local seen_urls=$'\\n'
 
   emit_one() {{
     local u=\"$1\"
     local s=\"$2\"
     [[ -n \"$u\" ]] || return 0
-    if [[ -n \"${{seen[$u]+x}}\" ]]; then
+    if printf '%s' \"$seen_urls\" | grep -Fqx -- \"$u\"; then
       return 0
     fi
-    seen[\"$u\"]=1
+    seen_urls+=\"$u\"$'\\n'
     printf '%s\\t%s\\n' \"$u\" \"$s\"
   }}
 
@@ -3922,16 +5317,12 @@ echo \"[update] done\" | tee -a \"$LOG\"
                 start_new_session=True,
             )
         else:
-            st = _load_update_state()
-            st.update({
-                'command_id': command_id,
-                'update_id': update_id,
-                'state': 'failed',
-                'reason_code': 'missing_systemd_run',
-                'error': '缺少 systemd-run，无法安全执行自更新（避免被 systemd cgroup 一并杀掉）',
-                'finished_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-            })
-            _save_update_state(st)
+            subprocess.Popen(
+                ['/bin/bash', str(script_path)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
     except Exception as exc:
         st = _load_update_state()
         st.update({
@@ -4032,6 +5423,137 @@ def _cmd_bool(v: Any, default: bool = False) -> bool:
     return bool(default)
 
 
+_TZ_NAME_RE = re.compile(r"^[A-Za-z0-9._+\-/]{1,128}$")
+
+
+def _normalize_tz_name(raw: Any, default: str = "Asia/Shanghai") -> str:
+    s = str(raw or "").strip()
+    if not s:
+        return str(default or "Asia/Shanghai")
+    if len(s) > 128:
+        return str(default or "Asia/Shanghai")
+    if not _TZ_NAME_RE.match(s):
+        return str(default or "Asia/Shanghai")
+    return s
+
+
+def _set_system_timezone(tz_name: str) -> Tuple[bool, str]:
+    tz = _normalize_tz_name(tz_name, default="Asia/Shanghai")
+    os_name = platform.system().lower()
+    if os_name == "darwin":
+        if not shutil.which("systemsetup"):
+            return False, "systemsetup 不可用"
+        code, out = _run_cmd(["systemsetup", "-settimezone", tz], timeout=20)
+        return (code == 0, out or "")
+
+    if shutil.which("timedatectl"):
+        code, out = _run_cmd(["timedatectl", "set-timezone", tz], timeout=20)
+        return (code == 0, out or "")
+
+    zoneinfo = Path("/usr/share/zoneinfo") / tz
+    if not zoneinfo.exists():
+        return False, f"时区文件不存在：{tz}"
+    code, out = _run_cmd(["ln", "-snf", str(zoneinfo), "/etc/localtime"], timeout=10)
+    if code != 0:
+        return False, out or "link /etc/localtime 失败"
+    try:
+        _write_text(Path("/etc/timezone"), tz + "\n")
+    except Exception:
+        pass
+    return True, ""
+
+
+def _set_system_ntp(enabled: bool) -> Tuple[bool, str]:
+    os_name = platform.system().lower()
+    if os_name == "darwin":
+        if not shutil.which("systemsetup"):
+            return False, "systemsetup 不可用"
+        cmd = ["systemsetup", "-setusingnetworktime", "on" if enabled else "off"]
+        code, out = _run_cmd(cmd, timeout=20)
+        if code == 0 and enabled and shutil.which("systemsetup"):
+            _run_cmd(["systemsetup", "-setnetworktimeserver", "time.apple.com"], timeout=20)
+        return (code == 0, out or "")
+
+    if shutil.which("timedatectl"):
+        code, out = _run_cmd(["timedatectl", "set-ntp", "true" if enabled else "false"], timeout=20)
+        return (code == 0, out or "")
+
+    return False, "timedatectl 不可用"
+
+
+def _set_system_clock(panel_ts: int) -> Tuple[bool, str]:
+    try:
+        ts = int(panel_ts)
+    except Exception:
+        ts = 0
+    if ts <= 0:
+        return False, "panel_ts 无效"
+
+    os_name = platform.system().lower()
+    if os_name == "darwin":
+        dt_local = datetime.fromtimestamp(ts)
+        stamp = dt_local.strftime("%m%d%H%M%y.%S")
+        code, out = _run_cmd(["date", stamp], timeout=20)
+        return (code == 0, out or "")
+
+    code, out = _run_cmd(["date", "-u", "-s", f"@{ts}"], timeout=20)
+    if code == 0:
+        return True, out or ""
+    dt_utc = datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+    code2, out2 = _run_cmd(["date", "-u", "-s", dt_utc], timeout=20)
+    return (code2 == 0, (out2 or out or ""))
+
+
+def _apply_time_sync_cmd(cmd: Dict[str, Any]) -> None:
+    global _LAST_SYNC_ERROR
+    try:
+        ver = int(cmd.get("version") or 0)
+    except Exception:
+        ver = 0
+    if ver <= 0:
+        return
+
+    ack = _read_int(TIME_SYNC_ACK_FILE, 0)
+    if ver <= ack:
+        return
+
+    tz = _normalize_tz_name(cmd.get("timezone"), default="Asia/Shanghai")
+    set_timezone = _cmd_bool(cmd.get("set_timezone"), default=True)
+    enable_ntp = _cmd_bool(cmd.get("enable_ntp"), default=True)
+    set_clock = _cmd_bool(cmd.get("set_clock"), default=False)
+    try:
+        panel_ts = int(cmd.get("panel_ts") or 0)
+    except Exception:
+        panel_ts = 0
+
+    errs: List[str] = []
+    warns: List[str] = []
+
+    if set_timezone:
+        ok_tz, msg_tz = _set_system_timezone(tz)
+        if not ok_tz:
+            errs.append(f"timezone:{msg_tz or '设置失败'}")
+
+    ok_ntp, msg_ntp = _set_system_ntp(enable_ntp)
+    if not ok_ntp:
+        warns.append(f"ntp:{msg_ntp or '设置失败'}")
+
+    if set_clock:
+        ok_clk, msg_clk = _set_system_clock(panel_ts)
+        if not ok_clk:
+            errs.append(f"clock:{msg_clk or '设置失败'}")
+
+    if errs:
+        _LAST_SYNC_ERROR = f"time_sync 失败：{'; '.join(errs[:4])}"
+        return
+
+    _write_int(TIME_SYNC_ACK_FILE, ver)
+    if warns:
+        _LAST_SYNC_ERROR = f"time_sync 警告：{'; '.join(warns[:4])}"
+    else:
+        _LAST_SYNC_ERROR = None
+
+
 def _apply_website_task_cmd(cmd: Dict[str, Any]) -> None:
     global _LAST_SYNC_ERROR
     t = str(cmd.get("type") or "").strip()
@@ -4065,12 +5587,108 @@ def _apply_website_task_cmd(cmd: Dict[str, Any]) -> None:
                 "sites": cmd.get("sites") if isinstance(cmd.get("sites"), list) else [],
             }
             result_payload = api_website_env_uninstall(req)
+        elif t == "create_site":
+            req = cmd.get("request") if isinstance(cmd.get("request"), dict) else {}
+            result_payload = api_website_create(req)
+            if isinstance(result_payload, dict) and bool(result_payload.get("ok")):
+                try:
+                    health_req = {
+                        "domains": req.get("domains") if isinstance(req.get("domains"), list) else [],
+                        "type": req.get("type"),
+                        "root_path": req.get("root_path"),
+                        "proxy_target": req.get("proxy_target"),
+                        "root_base": req.get("root_base"),
+                    }
+                    result_payload["health"] = api_website_health(health_req)
+                except Exception as health_exc:
+                    result_payload["health"] = {"ok": False, "error": str(health_exc)}
+        elif t == "site_update":
+            req = cmd.get("request") if isinstance(cmd.get("request"), dict) else {}
+            ensure_req = {
+                "need_nginx": True,
+                "need_php": _cmd_bool(req.get("need_php"), False),
+                "need_acme": True,
+            }
+            ensure_res = api_website_env_ensure(ensure_req)
+            if not isinstance(ensure_res, dict) or not bool(ensure_res.get("ok")):
+                err_env = "环境检查失败"
+                if isinstance(ensure_res, dict):
+                    err_env = str(ensure_res.get("error") or err_env)
+                result_payload = {"ok": False, "error": err_env}
+            else:
+                old_domains = req.get("old_domains") if isinstance(req.get("old_domains"), list) else []
+                old_domains = [str(x).strip() for x in old_domains if str(x).strip()]
+                new_domains = req.get("domains") if isinstance(req.get("domains"), list) else []
+                new_domains = [str(x).strip() for x in new_domains if str(x).strip()]
+                old_primary = str(old_domains[0]).strip().lower().strip(".") if old_domains else ""
+                new_primary = str(new_domains[0]).strip().lower().strip(".") if new_domains else ""
+                if old_primary and new_primary and old_primary != new_primary:
+                    del_req = {
+                        "domains": old_domains,
+                        "root_path": str(req.get("old_root_path") or req.get("root_path") or ""),
+                        "root_base": req.get("root_base"),
+                        "delete_root": False,
+                        "delete_cert": False,
+                    }
+                    del_res = api_website_delete(del_req)
+                    if isinstance(del_res, dict) and not bool(del_res.get("ok", True)):
+                        raise RuntimeError(str(del_res.get("error") or "删除旧站点配置失败"))
+
+                create_req = {
+                    "name": req.get("name"),
+                    "domains": new_domains,
+                    "root_path": req.get("root_path"),
+                    "type": req.get("type"),
+                    "web_server": req.get("web_server"),
+                    "proxy_target": req.get("proxy_target"),
+                    "https_redirect": req.get("https_redirect"),
+                    "gzip_enabled": req.get("gzip_enabled"),
+                    "nginx_tpl": req.get("nginx_tpl"),
+                    "root_base": req.get("root_base"),
+                }
+                result_payload = api_website_create(create_req)
+                if isinstance(result_payload, dict) and bool(result_payload.get("ok")):
+                    try:
+                        health_req = {
+                            "domains": new_domains,
+                            "type": req.get("type"),
+                            "root_path": req.get("root_path"),
+                            "proxy_target": req.get("proxy_target"),
+                            "root_base": req.get("root_base"),
+                        }
+                        result_payload["health"] = api_website_health(health_req)
+                    except Exception as health_exc:
+                        result_payload["health"] = {"ok": False, "error": str(health_exc)}
+        elif t == "site_delete":
+            req = cmd.get("request") if isinstance(cmd.get("request"), dict) else {}
+            result_payload = api_website_delete(req)
+        elif t == "site_file_op":
+            req = cmd.get("request") if isinstance(cmd.get("request"), dict) else {}
+            action = str(cmd.get("action") or "").strip().lower()
+            if action == "mkdir":
+                result_payload = api_files_mkdir(req)
+            elif action == "write":
+                result_payload = api_files_write(req)
+            elif action == "delete":
+                result_payload = api_files_delete(req)
+            elif action == "unzip":
+                result_payload = api_files_unzip(req)
+            elif action == "upload":
+                result_payload = api_files_upload(req)
+            else:
+                result_payload = {"ok": False, "error": f"不支持的文件操作：{action}"}
         elif t == "website_ssl_issue":
             req = cmd.get("request") if isinstance(cmd.get("request"), dict) else {}
             result_payload = api_ssl_issue(req)
         elif t == "website_ssl_renew":
             req = cmd.get("request") if isinstance(cmd.get("request"), dict) else {}
             result_payload = api_ssl_renew(req)
+        elif t == "remote_storage_mount":
+            req = cmd.get("request") if isinstance(cmd.get("request"), dict) else {}
+            result_payload = api_storage_mount(req)
+        elif t == "remote_storage_unmount":
+            req = cmd.get("request") if isinstance(cmd.get("request"), dict) else {}
+            result_payload = api_storage_unmount(req)
         else:
             return
 
@@ -4100,6 +5718,58 @@ def _apply_website_task_cmd(cmd: Dict[str, Any]) -> None:
     )
 
 
+def _apply_netmon_probe_cmd(cmd: Dict[str, Any]) -> None:
+    global _LAST_SYNC_ERROR
+    t = str(cmd.get("type") or "").strip()
+    try:
+        task_id = int(cmd.get("task_id") or 0)
+    except Exception:
+        task_id = 0
+    try:
+        attempt = int(cmd.get("attempt") or 0)
+    except Exception:
+        attempt = 0
+
+    if task_id <= 0:
+        return
+
+    ok = False
+    err_text = ""
+    result_payload: Dict[str, Any] = {}
+    try:
+        req = {
+            "mode": str(cmd.get("mode") or "ping").strip().lower() or "ping",
+            "targets": cmd.get("targets") if isinstance(cmd.get("targets"), list) else [],
+            "tcp_port": cmd.get("tcp_port"),
+            "timeout": cmd.get("timeout"),
+        }
+        result_payload = api_netprobe(req)
+        if not isinstance(result_payload, dict):
+            result_payload = {"ok": False, "error": "invalid_response"}
+        ok = bool(result_payload.get("ok", False))
+        if not ok:
+            err_text = str(result_payload.get("error") or "执行失败")
+            _LAST_SYNC_ERROR = f"{t} 失败：{err_text}"
+        else:
+            _LAST_SYNC_ERROR = None
+    except Exception as exc:
+        ok = False
+        err_text = str(exc)
+        result_payload = {"ok": False, "error": err_text}
+        _LAST_SYNC_ERROR = f"{t} 失败：{err_text}"
+
+    _queue_panel_task_result(
+        {
+            "task_id": int(task_id),
+            "type": "netmon_probe",
+            "attempt": int(attempt) if attempt > 0 else 1,
+            "ok": bool(ok),
+            "error": "" if ok else str(err_text or result_payload.get("error") or "执行失败"),
+            "result": result_payload,
+        }
+    )
+
+
 def _handle_panel_commands(cmds: Any) -> None:
     if not isinstance(cmds, list) or not cmds:
         return
@@ -4117,10 +5787,18 @@ def _handle_panel_commands(cmds: Any) -> None:
             'update_agent',
             'reset_traffic',
             'auto_restart_policy',
+            'time_sync',
             'website_env_ensure',
             'website_env_uninstall',
             'website_ssl_issue',
             'website_ssl_renew',
+            'create_site',
+            'site_update',
+            'site_delete',
+            'site_file_op',
+            'remote_storage_mount',
+            'remote_storage_unmount',
+            'netmon_probe',
         ):
             ok_sig = False
             sig_reason = "no_api_key"
@@ -4164,8 +5842,23 @@ def _handle_panel_commands(cmds: Any) -> None:
             _apply_reset_traffic_cmd(cmd)
         elif t == 'auto_restart_policy':
             _apply_auto_restart_policy_cmd(cmd)
-        elif t in ('website_env_ensure', 'website_env_uninstall', 'website_ssl_issue', 'website_ssl_renew'):
+        elif t == 'time_sync':
+            _apply_time_sync_cmd(cmd)
+        elif t in (
+            'website_env_ensure',
+            'website_env_uninstall',
+            'website_ssl_issue',
+            'website_ssl_renew',
+            'create_site',
+            'site_update',
+            'site_delete',
+            'site_file_op',
+            'remote_storage_mount',
+            'remote_storage_unmount',
+        ):
             _apply_website_task_cmd(cmd)
+        elif t == 'netmon_probe':
+            _apply_netmon_probe_cmd(cmd)
 
 
 def _agent_capabilities() -> Dict[str, Any]:
@@ -4175,6 +5868,7 @@ def _agent_capabilities() -> Dict[str, Any]:
         'supports_update_command_id': True,
         'supports_update_accept_ack': True,
         'supports_update_reason_code': True,
+        'supports_time_sync_command': True,
     }
 
 
@@ -4184,13 +5878,11 @@ def _push_loop() -> None:
     if not url or AGENT_ID <= 0:
         return
 
-    api_key = _read_agent_api_key()
-    if not api_key:
-        return
-
     sess = requests.Session()
     headers = {
-        'X-API-Key': api_key,
+        # NOTE: API key might be temporarily missing during upgrade.
+        # We will re-read it inside the loop and keep retrying.
+        'X-API-Key': _read_agent_api_key() or '',
         'User-Agent': f"realm-agent/{app.version} push-report",
         'Content-Type': 'application/json',
         'Content-Encoding': 'gzip',
@@ -4210,6 +5902,14 @@ def _push_loop() -> None:
         started = time.time()
         report_payload: Optional[Dict[str, Any]] = None
         try:
+            api_key = _read_agent_api_key()
+            if not api_key:
+                # Keep thread alive so the agent can recover without restart.
+                backoff = min(max_backoff, backoff * 2 + 1.0) if backoff else 2.0
+                if _PUSH_STOP.wait(timeout=max(2.0, min(10.0, backoff))):
+                    break
+                continue
+            headers['X-API-Key'] = api_key
             ack = _read_int(ACK_VER_FILE, 0)
             task_results = _peek_panel_task_results(limit=40)
             report_payload = _build_push_report()
@@ -4218,6 +5918,7 @@ def _push_loop() -> None:
                 'ack_version': ack,
                 'traffic_ack_version': _read_int(TRAFFIC_RESET_ACK_FILE, 0),
                 'auto_restart_ack_version': _read_int(AUTO_RESTART_ACK_FILE, 0),
+                'time_sync_ack_version': _read_int(TIME_SYNC_ACK_FILE, 0),
                 'agent_version': str(app.version),
                 'capabilities': _agent_capabilities(),
                 'agent_update': _load_update_state(),
@@ -4227,7 +5928,34 @@ def _push_loop() -> None:
                 payload['task_results'] = task_results
             raw = json.dumps(payload, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
             zipped = gzip.compress(raw, compresslevel=5)
-            r = sess.post(url, data=zipped, headers=headers, timeout=(REPORT_CONNECT_TIMEOUT, REPORT_READ_TIMEOUT))
+            verify_opt: Any = True
+            if REPORT_CA_FILE:
+                verify_opt = REPORT_CA_FILE
+            elif not REPORT_VERIFY_TLS:
+                verify_opt = False
+            r = sess.post(
+                url,
+                data=zipped,
+                headers=headers,
+                timeout=(REPORT_CONNECT_TIMEOUT, REPORT_READ_TIMEOUT),
+                verify=verify_opt,
+                allow_redirects=False,
+            )
+            if r.status_code in (301, 302, 307, 308):
+                loc = str(r.headers.get('Location') or '').strip()
+                if loc:
+                    new_url = urljoin(url, loc)
+                    r2 = sess.post(
+                        new_url,
+                        data=zipped,
+                        headers=headers,
+                        timeout=(REPORT_CONNECT_TIMEOUT, REPORT_READ_TIMEOUT),
+                        verify=verify_opt,
+                        allow_redirects=False,
+                    )
+                    if r2.status_code == 200:
+                        url = new_url
+                    r = r2
             if r.status_code == 200:
                 data = r.json() if r.content else {}
                 try:
@@ -4288,16 +6016,29 @@ def _on_startup() -> None:
         pass
     # Apply iptables-forwarded normal rules on boot.
     try:
-        _IPTFWD.prepare_for_pool(full_pool)
-        _IPTFWD.apply_from_pool(full_pool)
+        runtime_pool, _dns_meta = _expand_pool_remotes_for_runtime(full_pool)
+        _IPTFWD.prepare_for_pool(runtime_pool)
+        _IPTFWD.apply_from_pool(runtime_pool)
+    except Exception:
+        pass
+
+    # Apply Route-B overlay forwarders / exit proxy on boot.
+    # This makes overlay rules survive reboot without waiting for a new panel push.
+    try:
+        runtime_pool, _dns_meta = _expand_pool_remotes_for_runtime(full_pool)
+        _OVERLAY.apply_from_pool(runtime_pool)
     except Exception:
         pass
     _qos_apply_safe(full_pool, "startup")
+    with _PUSH_LOCK:
+        _dns_mark_base_pool_locked(full_pool)
     _start_push_reporter()
+    _start_dns_refresher()
 
 
 @app.on_event('shutdown')
 def _on_shutdown() -> None:
+    _stop_dns_refresher()
     _stop_push_reporter()
     try:
         _IPTFWD.stop()
@@ -4399,18 +6140,7 @@ def api_apply(_: None = Depends(_api_key_required)) -> Dict[str, Any]:
             _sync_active_pool()
             full_pool = _load_full_pool()
             _qos_apply_safe(full_pool, "apply")
-            _IPTFWD.prepare_for_pool(full_pool)
-            try:
-                _apply_pool_to_config()
-                _restart_realm()
-                _IPTFWD.apply_from_pool(full_pool)
-            except Exception:
-                # Keep managed iptables rules from staying in a partially-applied state.
-                try:
-                    _IPTFWD.apply_from_pool(full_pool)
-                except Exception:
-                    pass
-                raise
+            _apply_forward_runtime_locked(full_pool, source="api_apply", force_apply=True)
             # Apply intranet tunnel rules (handled by agent, not realm)
             try:
                 _INTRANET.apply_from_pool(full_pool)
@@ -4934,7 +6664,7 @@ def _netprobe_trace_auto_install_once() -> Dict[str, Any]:
 
 
 def _netprobe_trace_with_install_meta(payload: Dict[str, Any], install_meta: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    out = dict(payload or {})
+    out = dict(payload) if isinstance(payload, dict) else {}
     if isinstance(install_meta, dict) and install_meta.get('attempted') is True:
         out['auto_install'] = dict(install_meta)
     return out
@@ -6061,6 +7791,8 @@ def _build_stats_snapshot() -> Dict[str, Any]:
                     'token_count',
                     'ping_sent',
                     'pong_recv',
+                    'happy_eyeballs',
+                    'route_cards',
                 ):
                     if hh.get(mk) is not None:
                         item[mk] = hh.get(mk)
@@ -6351,6 +8083,15 @@ def _safe_join(root: Path, subpath: str) -> Path:
     return target
 
 
+def _normalize_upload_id(raw: Any) -> str:
+    upload_id = str(raw or "").strip()
+    if not upload_id:
+        raise HTTPException(status_code=400, detail="upload_id 不能为空")
+    if not UPLOAD_ID_RE.fullmatch(upload_id):
+        raise HTTPException(status_code=400, detail="upload_id 非法")
+    return upload_id
+
+
 def _run_cmd(
     cmd: List[str],
     timeout: Optional[int] = None,
@@ -6366,7 +8107,108 @@ def _run_cmd(
     return int(r.returncode or 0), out.strip()
 
 
+def _run_cmd_as_user(
+    cmd: List[str],
+    uid: int = -1,
+    gid: int = -1,
+    timeout: Optional[int] = None,
+    env: Optional[Dict[str, str]] = None,
+) -> Tuple[int, str]:
+    try:
+        uid_i = int(uid)
+    except Exception:
+        uid_i = -1
+    try:
+        gid_i = int(gid)
+    except Exception:
+        gid_i = -1
+    if uid_i <= 0:
+        return _run_cmd(cmd, timeout=timeout, env=env)
+    try:
+        cur_uid = int(os.getuid())
+    except Exception:
+        cur_uid = -1
+    if cur_uid != 0:
+        return _run_cmd(cmd, timeout=timeout, env=env)
+
+    user_name = ""
+    user_home = ""
+    if pwd is not None:
+        try:
+            info = pwd.getpwuid(uid_i)
+            user_name = str(getattr(info, "pw_name", "") or "").strip()
+            user_home = str(getattr(info, "pw_dir", "") or "").strip()
+        except Exception:
+            user_name = ""
+            user_home = ""
+
+    # On macOS launchd daemon context, using sudo -u is more stable than preexec setuid.
+    if platform.system().lower() == "darwin" and user_name and shutil.which("sudo"):
+        run_env = os.environ.copy()
+        if isinstance(env, dict):
+            run_env.update(env)
+        if user_home:
+            run_env["HOME"] = user_home
+        run_env["USER"] = user_name
+        run_env["LOGNAME"] = user_name
+        sudo_cmd: List[str] = ["sudo", "-n", "-H", "-u", user_name]
+        if gid_i >= 0 and grp is not None:
+            try:
+                g_name = str(getattr(grp.getgrgid(int(gid_i)), "gr_name", "") or "").strip()
+            except Exception:
+                g_name = ""
+            if g_name:
+                sudo_cmd.extend(["-g", g_name])
+        sudo_cmd.extend(cmd)
+        try:
+            r = subprocess.run(
+                sudo_cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                env=run_env,
+            )
+        except subprocess.TimeoutExpired:
+            return 124, f"命令超时（{timeout}s）"
+        except Exception as exc:
+            return 1, str(exc)
+        out = (r.stdout or "") + (r.stderr or "")
+        return int(r.returncode or 0), out.strip()
+
+    def _demote() -> None:
+        try:
+            if user_name and gid_i >= 0 and hasattr(os, "initgroups"):
+                os.initgroups(user_name, gid_i)
+        except Exception:
+            pass
+        try:
+            if gid_i >= 0:
+                os.setgid(gid_i)
+        except Exception:
+            pass
+        os.setuid(uid_i)
+
+    try:
+        r = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=env,
+            preexec_fn=_demote,
+        )
+    except subprocess.TimeoutExpired:
+        return 124, f"命令超时（{timeout}s）"
+    except Exception as exc:
+        return 1, str(exc)
+    out = (r.stdout or "") + (r.stderr or "")
+    return int(r.returncode or 0), out.strip()
+
+
 def _detect_pkg_mgr() -> Optional[str]:
+    is_darwin = platform.system().lower() == "darwin"
+    if is_darwin and _brew_binary():
+        return "brew"
     if shutil.which("apt-get"):
         return "apt"
     if shutil.which("dnf"):
@@ -6375,6 +8217,8 @@ def _detect_pkg_mgr() -> Optional[str]:
         return "yum"
     if shutil.which("apk"):
         return "apk"
+    if _brew_binary():
+        return "brew"
     return None
 
 
@@ -6388,7 +8232,10 @@ def _pkg_install(packages: List[str]) -> Tuple[bool, str]:
     if not packages:
         return True, ""
     env = os.environ.copy()
-    if mgr == "apt":
+    if mgr == "brew":
+        code, out = _brew_run(["install", *packages], timeout=1200, env=env)
+        return code == 0, out
+    elif mgr == "apt":
         env.setdefault("DEBIAN_FRONTEND", "noninteractive")
         env.setdefault("APT_LISTCHANGES_FRONTEND", "none")
         global _APT_UPDATED
@@ -6423,6 +8270,9 @@ def _pkg_install(packages: List[str]) -> Tuple[bool, str]:
 def _pkg_is_installed(mgr: str, pkg: str) -> bool:
     if not pkg:
         return False
+    if mgr == "brew":
+        code, _ = _brew_run(["list", "--versions", pkg], timeout=20)
+        return code == 0
     if mgr == "apt":
         code, _ = _run_cmd(["dpkg", "-s", pkg], timeout=10)
         return code == 0
@@ -6445,7 +8295,10 @@ def _pkg_remove(packages: List[str]) -> Tuple[bool, str]:
     if not installed:
         return True, ""
     env = os.environ.copy()
-    if mgr == "apt":
+    if mgr == "brew":
+        code, out = _brew_run(["uninstall", "--formula", *installed], timeout=900, env=env)
+        return code == 0, out
+    elif mgr == "apt":
         env.setdefault("DEBIAN_FRONTEND", "noninteractive")
         env.setdefault("APT_LISTCHANGES_FRONTEND", "none")
         cmd = ["apt-get", "purge", "-y", *installed]
@@ -6468,6 +8321,10 @@ def _start_service(name: str) -> None:
             return
         except Exception:
             continue
+    ok, _msg = _launchctl_action(name, 'start')
+    if ok:
+        return
+    _brew_service_action(name, 'start')
 
 
 def _nginx_main_conf() -> Tuple[Path, Path]:
@@ -6637,6 +8494,10 @@ def _normalize_proxy_pass_target(proxy_target: str) -> str:
 
 def _detect_php_fpm_sock() -> Optional[str]:
     candidates = [
+        "/opt/homebrew/var/run/php-fpm.sock",
+        "/usr/local/var/run/php-fpm.sock",
+        "/opt/homebrew/var/run/php/php-fpm.sock",
+        "/usr/local/var/run/php/php-fpm.sock",
         "/run/php/php-fpm.sock",
         "/run/php/php8.3-fpm.sock",
         "/run/php/php8.2-fpm.sock",
@@ -6713,6 +8574,12 @@ def _service_active(name: str) -> Tuple[Optional[bool], str]:
         if cmd[0] == "systemctl":
             # systemctl returns non-zero for inactive
             return False, out
+    st, msg = _launchctl_status(name)
+    if st is not None:
+        return st, msg
+    st2, msg2 = _brew_service_status(name)
+    if st2 is not None:
+        return st2, msg2
     return None, "status_unknown"
 
 
@@ -6766,19 +8633,29 @@ def _apply_nginx_conf(name: str, content: str) -> Tuple[bool, str, str]:
         except Exception:
             old_content = ""
 
-    # atomic write
-    tmp_path = conf_path.with_suffix(conf_path.suffix + ".tmp")
-    tmp_path.write_text(content, encoding="utf-8")
+    # Atomic write with unique temp path to avoid concurrent clobbering.
+    tmp_path: Optional[Path] = None
     try:
-        tmp_path.replace(conf_path)
+        fd, tmp_raw = tempfile.mkstemp(
+            prefix=f"{conf_name}.tmp.",
+            suffix=".conf",
+            dir=str(conf_dir),
+        )
+        os.close(fd)
+        tmp_path = Path(tmp_raw)
+        tmp_path.write_text(content, encoding="utf-8")
+        os.replace(str(tmp_path), str(conf_path))
+        tmp_path = None
     except Exception:
         # fallback: direct write
         conf_path.write_text(content, encoding="utf-8")
-        try:
-            if tmp_path.exists():
-                tmp_path.unlink()
-        except Exception:
-            pass
+    finally:
+        if tmp_path is not None:
+            try:
+                if tmp_path.exists():
+                    tmp_path.unlink()
+            except Exception:
+                pass
 
     if enabled_dir:
         enabled_dir.mkdir(parents=True, exist_ok=True)
@@ -7036,6 +8913,12 @@ def _nginx_reload() -> Tuple[bool, str]:
         code, out = _run_cmd(cmd, timeout=20)
         if code == 0:
             return True, out
+    ok, msg = _launchctl_action("nginx", "restart")
+    if ok:
+        return True, msg
+    ok, msg = _brew_service_action("nginx", "restart")
+    if ok:
+        return True, msg
     # fallback: try start if reload failed (fresh install / service not running)
     for cmd in (["systemctl", "start", "nginx"], ["service", "nginx", "start"], ["nginx"]):
         if shutil.which(cmd[0]) is None:
@@ -7043,6 +8926,12 @@ def _nginx_reload() -> Tuple[bool, str]:
         code, out = _run_cmd(cmd, timeout=20)
         if code == 0:
             return True, "nginx started"
+    ok, msg = _launchctl_action("nginx", "start")
+    if ok:
+        return True, msg
+    ok, msg = _brew_service_action("nginx", "start")
+    if ok:
+        return True, msg
     return False, "nginx reload 失败"
 
 
@@ -7561,21 +9450,30 @@ def api_website_env_ensure(payload: Dict[str, Any], _: None = Depends(_api_key_r
         if sock:
             already.append("php-fpm")
         else:
-            pkg_candidates = [
-                ["php-fpm", "php-cli"],
-                ["php81-fpm", "php81"],
-                ["php82-fpm", "php82"],
-                ["php8.2-fpm", "php8.2-cli"],
-                ["php8.1-fpm", "php8.1-cli"],
-                ["php8.0-fpm", "php8.0-cli"],
-            ]
+            mgr = _detect_pkg_mgr()
+            if mgr == "brew":
+                pkg_candidates = [
+                    ["php"],
+                    ["php@8.3"],
+                    ["php@8.2"],
+                    ["php@8.1"],
+                ]
+            else:
+                pkg_candidates = [
+                    ["php-fpm", "php-cli"],
+                    ["php81-fpm", "php81"],
+                    ["php82-fpm", "php82"],
+                    ["php8.2-fpm", "php8.2-cli"],
+                    ["php8.1-fpm", "php8.1-cli"],
+                    ["php8.0-fpm", "php8.0-cli"],
+                ]
             ok = False
             msg = ""
             for pkgs in pkg_candidates:
                 ok, msg = _pkg_install(pkgs)
                 if ok:
                     installed.append("php-fpm")
-                    for svc in ("php-fpm", "php8.2-fpm", "php8.1-fpm", "php8.0-fpm", "php81-fpm", "php82-fpm"):
+                    for svc in ("php-fpm", "php8.2-fpm", "php8.1-fpm", "php8.0-fpm", "php81-fpm", "php82-fpm", "php"):
                         _start_service(svc)
                     break
             if not ok:
@@ -8151,6 +10049,11 @@ def api_website_env_uninstall(payload: Dict[str, Any], _: None = Depends(_api_ke
             "php82-fpm",
             "php81-fpm",
             "php80-fpm",
+            "php@8.4",
+            "php@8.3",
+            "php@8.2",
+            "php@8.1",
+            "php@8.0",
             "certbot",
             "acme.sh",
         ]
@@ -8220,6 +10123,8 @@ def _site_health(payload: Dict[str, Any], verbose: bool = False) -> Dict[str, An
             checks["root_error"] = str(exc)
     else:
         checks["root_exists"] = True
+        checks["proxy_target"] = proxy_target
+        checks["proxy_target_ok"] = bool(proxy_target)
 
     if site_type == "php":
         php_sock = _detect_php_fpm_sock()
@@ -8263,7 +10168,14 @@ def _site_health(payload: Dict[str, Any], verbose: bool = False) -> Dict[str, An
         except Exception:
             checks["conf_included"] = False
 
-    ok = bool(checks.get("nginx_test_ok")) and bool(checks.get("conf_exists")) and bool(checks.get("root_exists")) and bool(checks.get("php_ok")) and bool(http_ok)
+    ok = (
+        bool(checks.get("nginx_test_ok"))
+        and bool(checks.get("conf_exists"))
+        and bool(checks.get("root_exists"))
+        and bool(checks.get("php_ok"))
+        and bool(checks.get("proxy_target_ok", True))
+        and bool(http_ok)
+    )
     if vhost_match is False:
         ok = False
 
@@ -8278,6 +10190,8 @@ def _site_health(payload: Dict[str, Any], verbose: bool = False) -> Dict[str, An
         error = str(checks.get("root_error") or "站点根目录不存在")
     elif not checks.get("php_ok"):
         error = "php-fpm 未就绪"
+    elif not checks.get("proxy_target_ok", True):
+        error = "反向代理目标为空（proxy_target）"
     elif vhost_match is False:
         error = "命中默认站点（X-Nexus-Site 不匹配）"
     elif not http_ok:
@@ -8309,6 +10223,1240 @@ def api_website_diagnose(payload: Dict[str, Any], _: None = Depends(_api_key_req
     res["time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     res["proxy_target"] = _normalize_proxy_target(str(payload.get("proxy_target") or ""))
     return res
+
+
+_STORAGE_PROTOCOLS = {"smb", "nfs", "ftp", "sftp", "webdav", "rclone"}
+_STORAGE_OPT_RE = re.compile(r"^[A-Za-z0-9._:/=,+@-]{1,160}$")
+_STORAGE_RCLONE_OPT_RE = re.compile(r"^[A-Za-z0-9._:/=,+@-]{1,200}$")
+
+
+def _storage_text(raw: Any, max_len: int = 255) -> str:
+    s = str(raw or "").replace("\r", "").replace("\n", "").strip()
+    if len(s) > int(max_len):
+        s = s[: int(max_len)].strip()
+    return s
+
+
+def _storage_protocol(raw: Any) -> str:
+    p = _storage_text(raw, max_len=24).lower()
+    return p if p in _STORAGE_PROTOCOLS else ""
+
+
+def _storage_port(raw: Any) -> int:
+    text = _storage_text(raw, max_len=16)
+    if not text:
+        return 0
+    try:
+        v = int(float(text))
+    except Exception:
+        return -1
+    if v < 0 or v > 65535:
+        return -1
+    return int(v)
+
+
+def _storage_mount_point(raw: Any) -> str:
+    text = _storage_text(raw, max_len=255)
+    if not text:
+        return ""
+    try:
+        path = os.path.abspath(os.path.expanduser(text))
+    except Exception:
+        return ""
+    if not path or not os.path.isabs(path) or path == "/":
+        return ""
+    return path
+
+
+def _storage_mount_unescape(raw: Any) -> str:
+    text = str(raw or "")
+    if not text:
+        return ""
+    # `mount` output escapes spaces and backslashes as octal sequences.
+    return (
+        text.replace("\\040", " ")
+        .replace("\\011", "\t")
+        .replace("\\012", "\n")
+        .replace("\\134", "\\")
+    )
+
+
+def _storage_mount_table_entries() -> List[Dict[str, str]]:
+    code, out = _run_cmd(["mount"], timeout=8)
+    if code != 0 or not out:
+        return []
+    rows: List[Dict[str, str]] = []
+    for line in str(out or "").splitlines():
+        ln = str(line or "").strip()
+        if " on " not in ln or " (" not in ln:
+            continue
+        try:
+            source = str(ln.split(" on ", 1)[0] or "").strip()
+            remain = str(ln.split(" on ", 1)[1] or "")
+            mount_raw = str(remain.split(" (", 1)[0] or "").strip()
+            fs_opts = str(remain.split(" (", 1)[1] or "")
+            fs_type = str(fs_opts.split(",", 1)[0] or "").strip().rstrip(")")
+        except Exception:
+            continue
+        mount_point = _storage_mount_point(_storage_mount_unescape(mount_raw))
+        if not mount_point:
+            continue
+        rows.append(
+            {
+                "source": source,
+                "mount_point": mount_point,
+                "fs_type": fs_type.lower(),
+            }
+        )
+    return rows
+
+
+def _storage_mount_table_has_mount_point(mount_point: str) -> bool:
+    mp = _storage_mount_point(mount_point)
+    if not mp:
+        return False
+    real_mp = str(os.path.realpath(mp) or mp)
+    for row in _storage_mount_table_entries():
+        cur = _storage_mount_point(row.get("mount_point"))
+        if not cur:
+            continue
+        if cur == mp or cur == real_mp:
+            return True
+        try:
+            if os.path.realpath(cur) == real_mp:
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _storage_norm_host(raw: Any) -> str:
+    host = _storage_text(raw, max_len=180).strip().lower()
+    if host.startswith("[") and host.endswith("]") and len(host) > 2:
+        host = host[1:-1]
+    return host
+
+
+def _storage_smb_share(raw: Any) -> str:
+    return _storage_text(raw, max_len=255).strip().strip("/").strip("\\")
+
+
+def _storage_macos_smb_mount_entries() -> List[Dict[str, str]]:
+    if platform.system().lower() != "darwin":
+        return []
+    out: List[Dict[str, str]] = []
+    for row in _storage_mount_table_entries():
+        if str(row.get("fs_type") or "").lower() != "smbfs":
+            continue
+        source = str(row.get("source") or "").strip()
+        if not source.startswith("//"):
+            continue
+        remote = str(source[2:] or "")
+        if "@" in remote:
+            remote = remote.split("@", 1)[1]
+        if "/" not in remote:
+            continue
+        host_part, share_part = remote.split("/", 1)
+        share_name = _storage_smb_share(share_part)
+        if not share_name:
+            continue
+        out.append(
+            {
+                "host": _storage_norm_host(host_part),
+                "share": share_name.lower(),
+                "mount_point": _storage_mount_point(row.get("mount_point")),
+            }
+        )
+    return out
+
+
+def _storage_macos_smb_same_remote_mount_points(payload: Dict[str, Any], mount_point: str) -> List[str]:
+    if platform.system().lower() != "darwin":
+        return []
+    host = _storage_norm_host(payload.get("host"))
+    share = _storage_smb_share(payload.get("share_path")).lower()
+    if not host or not share:
+        return []
+    port = _storage_port(payload.get("port"))
+    host_with_port = host if port <= 0 else f"{host}:{int(port)}"
+    host_candidates = {host, host_with_port}
+    target_mp = _storage_mount_point(mount_point)
+    target_real = str(os.path.realpath(target_mp) or target_mp)
+    found: List[str] = []
+    for row in _storage_macos_smb_mount_entries():
+        cur_host = _storage_norm_host(row.get("host"))
+        cur_share = str(row.get("share") or "").strip().lower()
+        cur_mp = _storage_mount_point(row.get("mount_point"))
+        if not cur_mp:
+            continue
+        cur_real = str(os.path.realpath(cur_mp) or cur_mp)
+        if cur_share != share:
+            continue
+        if cur_host not in host_candidates:
+            continue
+        if cur_mp == target_mp or cur_real == target_real:
+            continue
+        if cur_mp in found:
+            continue
+        found.append(cur_mp)
+    return found
+
+
+def _storage_force_unmount(mount_point: str) -> None:
+    mp = _storage_mount_point(mount_point)
+    if not mp:
+        return
+    candidates: List[List[str]] = [
+        ["umount", "-f", mp],
+        ["umount", mp],
+    ]
+    if platform.system().lower() == "darwin":
+        candidates.append(["diskutil", "unmount", "force", mp])
+    for cmd in candidates:
+        if not cmd:
+            continue
+        if not shutil.which(str(cmd[0] or "")):
+            continue
+        _run_cmd(cmd, timeout=30)
+
+
+def _storage_reset_mount_dir(mount_point: str) -> None:
+    mp = _storage_mount_point(mount_point)
+    if not mp:
+        return
+    p = Path(mp)
+    try:
+        if p.is_symlink():
+            p.unlink()
+    except Exception:
+        pass
+    try:
+        if p.exists() and p.is_dir():
+            names = [n for n in os.listdir(str(p)) if str(n or "").strip() not in ("", ".DS_Store", ".localized")]
+            if not names:
+                os.rmdir(str(p))
+    except Exception:
+        pass
+    try:
+        os.makedirs(str(p), exist_ok=True)
+    except Exception:
+        pass
+
+
+def _storage_rel_path(raw: Any, default: str = "/") -> str:
+    text = _storage_text(raw, max_len=255).replace("\\", "/")
+    if not text:
+        text = str(default or "/")
+    if not text.startswith("/"):
+        text = "/" + text
+    while "//" in text:
+        text = text.replace("//", "/")
+    return text
+
+
+def _storage_split_options(raw: Any) -> Tuple[List[str], str]:
+    text = _storage_text(raw, max_len=300)
+    if not text:
+        return [], ""
+    out: List[str] = []
+    for part in text.split(","):
+        token = str(part or "").strip()
+        if not token:
+            continue
+        if not _STORAGE_OPT_RE.fullmatch(token):
+            return [], f"挂载参数非法：{token[:32]}"
+        out.append(token)
+    return out, ""
+
+
+def _storage_split_rclone_options(raw: Any) -> Tuple[List[str], str]:
+    text = _storage_text(raw, max_len=400)
+    if not text:
+        return [], ""
+    try:
+        parts = shlex.split(text)
+    except Exception:
+        return [], "rclone 参数格式错误"
+    if len(parts) > 40:
+        return [], "rclone 参数过多"
+    out: List[str] = []
+    for p in parts:
+        t = _storage_text(p, max_len=200)
+        if not t:
+            continue
+        if not _STORAGE_RCLONE_OPT_RE.fullmatch(t):
+            return [], f"rclone 参数非法：{t[:32]}"
+        out.append(t)
+    return out, ""
+
+
+def _storage_is_mounted(mount_point: str) -> bool:
+    mp = _storage_mount_point(mount_point)
+    if not mp:
+        return False
+    candidates: List[str] = [mp]
+    try:
+        mp_real = str(os.path.realpath(mp) or mp)
+    except Exception:
+        mp_real = mp
+    if mp_real and mp_real not in candidates:
+        candidates.append(mp_real)
+    if shutil.which("mountpoint"):
+        for cur in candidates:
+            code, _ = _run_cmd(["mountpoint", "-q", cur], timeout=3)
+            if code == 0:
+                return True
+    try:
+        for cur in candidates:
+            if bool(os.path.ismount(cur)):
+                return True
+    except Exception:
+        pass
+    if platform.system().lower() == "darwin" and _storage_mount_table_has_mount_point(mp):
+        return True
+    return False
+
+
+def _storage_wait_mount_state(mount_point: str, mounted: bool, timeout_sec: float = 4.0) -> bool:
+    deadline = time.time() + max(0.1, float(timeout_sec or 0.0))
+    while time.time() < deadline:
+        cur = _storage_is_mounted(mount_point)
+        if bool(cur) == bool(mounted):
+            return True
+        time.sleep(0.15)
+    return bool(_storage_is_mounted(mount_point)) == bool(mounted)
+
+
+def _storage_dir_accessible_as_user(mount_point: str, uid: int, gid: int) -> bool:
+    mp = _storage_mount_point(mount_point)
+    if not mp:
+        return False
+    checks = [
+        ["/bin/test", "-d", mp],
+        ["/bin/test", "-x", mp],
+        ["/usr/bin/stat", "-f", "%N", mp],
+    ]
+    for cmd in checks:
+        code, _out = _run_cmd_as_user(cmd, uid=uid, gid=gid, timeout=8)
+        if code != 0:
+            return False
+    # Fallback metadata read (avoid `ls -la`, which can false-negative on protected entries).
+    code, _out = _run_cmd_as_user(["/bin/ls", "-ld", mp], uid=uid, gid=gid, timeout=8)
+    return code == 0
+
+
+def _storage_mount_dir_non_placeholder_items(mount_point: str) -> List[str]:
+    mp = _storage_mount_point(mount_point)
+    if not mp:
+        return []
+    try:
+        names = os.listdir(mp)
+    except Exception:
+        return []
+    out: List[str] = []
+    for name in names:
+        t = _storage_text(name, max_len=180)
+        if not t:
+            continue
+        if t in (".DS_Store", ".localized"):
+            continue
+        out.append(t)
+    return out
+
+
+def _storage_cleanup_mount_dir_placeholders(mount_point: str) -> None:
+    mp = _storage_mount_point(mount_point)
+    if not mp:
+        return
+    for name in (".DS_Store", ".localized"):
+        p = Path(mp) / name
+        try:
+            if p.exists() and p.is_file():
+                p.unlink()
+        except Exception:
+            continue
+
+
+def _storage_macos_home_by_user(user_name: Any) -> str:
+    if platform.system().lower() != "darwin":
+        return ""
+    if pwd is None:
+        return ""
+    name = _storage_text(user_name, max_len=64).strip()
+    if not name:
+        return ""
+    try:
+        info = pwd.getpwnam(name)
+    except Exception:
+        return ""
+    home = _storage_mount_point(getattr(info, "pw_dir", "") or "")
+    if not home:
+        return ""
+    return home
+
+
+def _storage_macos_uid_gid_by_user(user_name: Any) -> Tuple[int, int]:
+    if platform.system().lower() != "darwin":
+        return -1, -1
+    if pwd is None:
+        return -1, -1
+    name = _storage_text(user_name, max_len=64).strip()
+    if not name:
+        return -1, -1
+    try:
+        info = pwd.getpwnam(name)
+    except Exception:
+        return -1, -1
+    try:
+        uid = int(getattr(info, "pw_uid", -1))
+    except Exception:
+        uid = -1
+    try:
+        gid = int(getattr(info, "pw_gid", -1))
+    except Exception:
+        gid = -1
+    return uid, gid
+
+
+def _storage_macos_gid_by_group(group_name: Any) -> int:
+    if platform.system().lower() != "darwin":
+        return -1
+    if grp is None:
+        return -1
+    name = _storage_text(group_name, max_len=64).strip()
+    if not name:
+        return -1
+    try:
+        info = grp.getgrnam(name)
+    except Exception:
+        return -1
+    try:
+        gid = int(getattr(info, "gr_gid", -1))
+    except Exception:
+        gid = -1
+    return gid
+
+
+def _storage_macos_effective_mount_gid(preferred_gid: int = -1) -> int:
+    staff_gid = _storage_macos_gid_by_group("staff")
+    if staff_gid >= 0:
+        return int(staff_gid)
+    try:
+        gid_i = int(preferred_gid)
+    except Exception:
+        gid_i = -1
+    return int(gid_i) if gid_i >= 0 else -1
+
+
+def _storage_macos_prepare_mount_point(mount_point: str, uid: int = -1, gid: int = -1) -> None:
+    mp = _storage_mount_point(mount_point)
+    if not mp:
+        return
+    try:
+        os.makedirs(mp, exist_ok=True)
+    except Exception:
+        pass
+    try:
+        os.chmod(mp, 0o755)
+    except Exception:
+        pass
+    try:
+        uid_i = int(uid)
+    except Exception:
+        uid_i = -1
+    if uid_i <= 0:
+        return
+    gid_i = _storage_macos_effective_mount_gid(preferred_gid=gid)
+    try:
+        os.chown(mp, int(uid_i), int(gid_i if gid_i >= 0 else -1))
+    except Exception:
+        pass
+
+
+def _storage_macos_console_user(preferred_user: str = "") -> str:
+    if platform.system().lower() != "darwin":
+        return ""
+    users = _storage_macos_candidate_users(preferred_user=preferred_user)
+    return users[0] if users else ""
+
+
+def _storage_macos_scutil_console_user() -> str:
+    if platform.system().lower() != "darwin":
+        return ""
+    if not shutil.which("scutil"):
+        return ""
+    code, out = _run_cmd(["scutil", "show", "State:/Users/ConsoleUser"], timeout=5)
+    if code != 0 or not out:
+        return ""
+    for line in str(out or "").splitlines():
+        text = str(line or "").strip()
+        if "Name :" not in text:
+            continue
+        name = text.split("Name :", 1)[1].strip()
+        low = name.lower()
+        if not name or low in ("loginwindow", "root", "_mbsetupuser"):
+            continue
+        return _storage_text(name, max_len=64)
+    return ""
+
+
+def _storage_macos_who_active_user() -> str:
+    if platform.system().lower() != "darwin":
+        return ""
+    if not shutil.which("who"):
+        return ""
+    code, out = _run_cmd(["who"], timeout=5)
+    if code != 0 or not out:
+        return ""
+    best = ""
+    for line in str(out or "").splitlines():
+        text = str(line or "").strip()
+        if not text:
+            continue
+        parts = text.split()
+        if not parts:
+            continue
+        name = _storage_text(parts[0], max_len=64).strip()
+        if not name:
+            continue
+        low = name.lower()
+        if low in ("root",):
+            continue
+        if len(parts) > 1:
+            tty = _storage_text(parts[1], max_len=64).lower()
+        else:
+            tty = ""
+        # Prefer GUI/console sessions, then local terminal sessions.
+        if tty == "console":
+            return name
+        if tty.startswith("ttys") and not best:
+            best = name
+    return best
+
+
+def _storage_macos_finder_user() -> str:
+    if platform.system().lower() != "darwin":
+        return ""
+    if not shutil.which("ps"):
+        return ""
+    code, out = _run_cmd(["ps", "-axo", "user=,comm="], timeout=6)
+    if code != 0 or not out:
+        return ""
+    ranks = {"finder": 0, "dock": 1, "systemuiserver": 2}
+    best_rank = 999
+    best_user = ""
+    for line in str(out or "").splitlines():
+        text = str(line or "").strip()
+        if not text:
+            continue
+        parts = text.split(None, 1)
+        if len(parts) < 2:
+            continue
+        user = _storage_text(parts[0], max_len=64).strip()
+        comm = _storage_text(parts[1], max_len=256).strip()
+        low_user = user.lower()
+        if not user or low_user in ("root",):
+            continue
+        low_comm = comm.lower()
+        marker = ""
+        for tag in ranks:
+            if low_comm == tag or low_comm.endswith(f"/{tag}"):
+                marker = tag
+                break
+        if not marker:
+            continue
+        uid, _gid = _storage_macos_uid_gid_by_user(user)
+        if uid <= 0:
+            continue
+        rank = int(ranks.get(marker, 999))
+        if rank < best_rank:
+            best_rank = rank
+            best_user = user
+            if rank == 0:
+                break
+    return best_user
+
+
+def _storage_macos_candidate_users(preferred_user: str = "") -> List[str]:
+    if platform.system().lower() != "darwin":
+        return []
+    users: List[str] = []
+
+    def _add(raw: Any) -> None:
+        name = _storage_text(raw, max_len=64).strip()
+        if not name:
+            return
+        uid, _gid = _storage_macos_uid_gid_by_user(name)
+        if uid <= 0:
+            return
+        if name in users:
+            return
+        users.append(name)
+
+    _add(preferred_user)
+    _add(os.getenv("REALM_AGENT_DESKTOP_USER", ""))
+    _add(os.getenv("SUDO_USER", ""))
+    _add(os.getenv("USER", ""))
+    _add(os.getenv("LOGNAME", ""))
+    if pwd is not None:
+        try:
+            uid0 = int(os.stat("/dev/console").st_uid)
+        except Exception:
+            uid0 = -1
+        if uid0 > 0:
+            try:
+                name = str(getattr(pwd.getpwuid(int(uid0)), "pw_name", "") or "").strip()
+            except Exception:
+                name = ""
+            _add(name)
+    _add(_storage_macos_scutil_console_user())
+    _add(_storage_macos_finder_user())
+    _add(_storage_macos_who_active_user())
+    for home in _storage_macos_user_homes():
+        _add(Path(home).name)
+    if pwd is not None:
+        try:
+            uid = int(os.getuid())
+        except Exception:
+            uid = -1
+        if uid > 0:
+            try:
+                name = str(getattr(pwd.getpwuid(int(uid)), "pw_name", "") or "").strip()
+            except Exception:
+                name = ""
+            _add(name)
+    return users
+
+
+def _storage_macos_candidate_identities(preferred_user: str = "") -> List[Tuple[str, int, int]]:
+    out: List[Tuple[str, int, int]] = []
+    seen: set = set()
+    for name in _storage_macos_candidate_users(preferred_user=preferred_user):
+        uid, gid = _storage_macos_uid_gid_by_user(name)
+        if uid <= 0:
+            continue
+        key = f"{int(uid)}:{int(gid)}"
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append((name, int(uid), int(gid)))
+    return out
+
+
+def _storage_macos_user_homes() -> List[str]:
+    if platform.system().lower() != "darwin":
+        return []
+    base = Path("/Users")
+    try:
+        entries = list(base.iterdir())
+    except Exception:
+        return []
+    homes: List[str] = []
+    for p in entries:
+        name = str(p.name or "").strip()
+        if not name or name.startswith("."):
+            continue
+        if name in ("Shared", "Guest"):
+            continue
+        try:
+            if not p.is_dir():
+                continue
+        except Exception:
+            continue
+        home = _storage_mount_point(str(p))
+        if not home:
+            continue
+        if home in homes:
+            continue
+        homes.append(home)
+    return homes
+
+
+def _storage_macos_guess_single_user_home() -> str:
+    if platform.system().lower() != "darwin":
+        return ""
+    homes: List[str] = []
+    for home in _storage_macos_user_homes():
+        desktop = Path(home) / "Desktop"
+        if desktop.exists() and desktop.is_dir():
+            homes.append(home)
+    uniq: List[str] = []
+    for h in homes:
+        if h not in uniq:
+            uniq.append(h)
+    if len(uniq) == 1:
+        return uniq[0]
+    return ""
+
+
+def _storage_macos_console_home(preferred_user: str = "") -> str:
+    if platform.system().lower() != "darwin":
+        return ""
+    for user_name in _storage_macos_candidate_users(preferred_user=preferred_user):
+        home = _storage_macos_home_by_user(user_name)
+        if home:
+            return home
+    env_home = _storage_mount_point(os.getenv("REALM_AGENT_DESKTOP_HOME", ""))
+    if env_home:
+        return env_home
+    if pwd is not None:
+        try:
+            uid = int(os.stat("/dev/console").st_uid)
+        except Exception:
+            uid = -1
+        if uid > 0:
+            try:
+                info = pwd.getpwuid(int(uid))
+                home = _storage_mount_point(getattr(info, "pw_dir", "") or "")
+                if home:
+                    return home
+            except Exception:
+                pass
+    guess_home = _storage_macos_guess_single_user_home()
+    if guess_home:
+        return guess_home
+    try:
+        if pwd is not None and int(os.getuid()) > 0:
+            info = pwd.getpwuid(int(os.getuid()))
+            home = _storage_mount_point(getattr(info, "pw_dir", "") or "")
+            if home:
+                return home
+    except Exception:
+        pass
+    return ""
+
+
+def _storage_macos_console_uid_gid(preferred_user: str = "") -> Tuple[int, int]:
+    if platform.system().lower() != "darwin":
+        return -1, -1
+    identities = _storage_macos_candidate_identities(preferred_user=preferred_user)
+    if identities:
+        _user_name, uid, gid = identities[0]
+        return uid, gid
+    guess_home = _storage_macos_guess_single_user_home()
+    if guess_home:
+        try:
+            st = os.stat(guess_home)
+            uid = int(getattr(st, "st_uid", -1))
+            gid = int(getattr(st, "st_gid", -1))
+        except Exception:
+            uid = -1
+            gid = -1
+        if uid > 0:
+            return uid, gid
+        guess_user = _storage_text(Path(guess_home).name, max_len=64)
+        if guess_user:
+            uid2, gid2 = _storage_macos_uid_gid_by_user(guess_user)
+            if uid2 > 0:
+                return uid2, gid2
+    homes = _storage_macos_user_homes()
+    if len(homes) == 1:
+        try:
+            st = os.stat(homes[0])
+            uid = int(getattr(st, "st_uid", -1))
+            gid = int(getattr(st, "st_gid", -1))
+        except Exception:
+            uid = -1
+            gid = -1
+        if uid > 0:
+            return uid, gid
+    try:
+        uid = int(os.getuid())
+    except Exception:
+        uid = -1
+    try:
+        gid = int(os.getgid())
+    except Exception:
+        gid = -1
+    if uid > 0:
+        return uid, gid
+    return -1, -1
+
+
+def _storage_macos_desktop_link_name(mount_point: str) -> str:
+    name = _storage_text(os.path.basename(str(mount_point or "").rstrip("/")), max_len=120)
+    if not name:
+        return "remote-storage"
+    return name.replace("/", "_")
+
+
+def _storage_macos_create_desktop_link(mount_point: str, preferred_user: str = "") -> Tuple[bool, str]:
+    mp = _storage_mount_point(mount_point)
+    if not mp:
+        return False, "挂载点无效"
+    mp_real = str(os.path.realpath(mp) or mp)
+    link_name = _storage_macos_desktop_link_name(mp)
+    preferred_home = _storage_macos_console_home(preferred_user=preferred_user)
+    homes: List[str] = []
+    if preferred_home:
+        homes.append(preferred_home)
+    for home in _storage_macos_user_homes():
+        if home in homes:
+            continue
+        homes.append(home)
+    if not homes:
+        return False, "未检测到桌面用户（可设置 REALM_AGENT_DESKTOP_HOME）"
+
+    success_links: List[str] = []
+    last_err = ""
+    for home in homes:
+        desktop_dir = Path(home) / "Desktop"
+        link_path = desktop_dir / link_name
+        link_abs = str(link_path.resolve(strict=False))
+        if link_abs == mp or link_abs == mp_real:
+            # Mount point is already the desktop path; do not create a self-referential symlink.
+            if link_path.is_symlink():
+                try:
+                    link_path.unlink()
+                except Exception:
+                    pass
+            success_links.append(str(link_path))
+            continue
+        try:
+            desktop_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            last_err = f"{home}: 创建桌面目录失败：{exc}"
+            continue
+        try:
+            if link_path.is_symlink():
+                try:
+                    if Path(os.path.realpath(str(link_path))) == Path(mp):
+                        success_links.append(str(link_path))
+                        continue
+                except Exception:
+                    pass
+                link_path.unlink()
+            elif link_path.exists():
+                last_err = f"{home}: 桌面已存在同名文件：{link_path.name}"
+                continue
+            os.symlink(mp, str(link_path))
+            success_links.append(str(link_path))
+        except Exception as exc:
+            last_err = f"{home}: {exc}"
+            continue
+
+    if success_links:
+        if len(success_links) == 1:
+            return True, success_links[0]
+        return True, f"{success_links[0]} 等 {len(success_links)} 处"
+    return False, last_err or "桌面链接创建失败"
+
+
+def _storage_host_for_url(host: str) -> str:
+    h = _storage_text(host, max_len=160)
+    if not h:
+        return ""
+    if ":" in h and not h.startswith("["):
+        return f"[{h}]"
+    return h
+
+
+def _storage_build_mount_cmd(payload: Dict[str, Any]) -> Tuple[List[str], str]:
+    proto = _storage_protocol(payload.get("protocol"))
+    host = _storage_text(payload.get("host"), max_len=160)
+    port = _storage_port(payload.get("port"))
+    if port < 0:
+        return [], "端口范围错误（1-65535 或留空）"
+    share_path = _storage_text(payload.get("share_path"), max_len=255)
+    remote_path = _storage_rel_path(payload.get("remote_path"), default="/")
+    mount_point = _storage_mount_point(payload.get("mount_point"))
+    username = _storage_text(payload.get("username"), max_len=64)
+    password = _storage_text(payload.get("password"), max_len=128)
+    rclone_remote = _storage_text(payload.get("rclone_remote"), max_len=96)
+    read_only = _to_bool(payload.get("read_only"), default=False)
+    options = payload.get("options")
+    sys_name = platform.system().lower()
+    if not proto:
+        return [], "协议不受支持"
+    if not mount_point:
+        return [], "挂载点必须是绝对路径，且不能是 /"
+    if sys_name.startswith("win"):
+        return [], "当前 Agent 暂不支持 Windows 挂载"
+
+    if proto == "smb":
+        share = share_path.strip().strip("/").strip("\\")
+        if not host or not share:
+            return [], "SMB 需要 host 与 share_path"
+        if sys_name == "darwin":
+            host_part = host if port <= 0 else f"{host}:{int(port)}"
+            auth = ""
+            if username:
+                auth = f"{username}:{password}@" if password else f"{username}@"
+            remote = f"//{auth}{host_part}/{share}"
+            cmd = ["mount_smbfs"]
+            if read_only:
+                cmd.extend(["-o", "ro"])
+            if not password:
+                # Avoid interactive password prompt in non-TTY service mode.
+                cmd.append("-N")
+            cmd.extend([remote, mount_point])
+            return cmd, ""
+        extra_opts, err = _storage_split_options(options)
+        if err:
+            return [], err
+        opts: List[str] = []
+        if username:
+            opts.append(f"username={username}")
+            opts.append(f"password={password}" if password else "password=")
+        else:
+            opts.append("guest")
+        opts.append("iocharset=utf8")
+        opts.append("vers=3.0")
+        if port > 0:
+            opts.append(f"port={int(port)}")
+        opts.append("ro" if read_only else "rw")
+        opts.extend(extra_opts)
+        return ["mount", "-t", "cifs", f"//{host}/{share}", mount_point, "-o", ",".join(opts)], ""
+
+    if proto == "nfs":
+        export_path = share_path.strip() or "/"
+        if not export_path.startswith("/"):
+            export_path = "/" + export_path
+        if not host:
+            return [], "NFS 需要 host"
+        extra_opts, err = _storage_split_options(options)
+        if err:
+            return [], err
+        opts: List[str] = ["ro" if read_only else "rw"]
+        if port > 0:
+            opts.append(f"port={int(port)}")
+        opts.extend(extra_opts)
+        cmd = ["mount", "-t", "nfs"]
+        if opts:
+            cmd.extend(["-o", ",".join(opts)])
+        cmd.extend([f"{host}:{export_path}", mount_point])
+        return cmd, ""
+
+    if proto == "ftp":
+        if not host:
+            return [], "FTP 需要 host"
+        extra_opts, err = _storage_split_options(options)
+        if err:
+            return [], err
+        host_part = _storage_host_for_url(host)
+        if port > 0:
+            host_part = f"{host_part}:{int(port)}"
+        ftp_url = f"ftp://{host_part}{remote_path}"
+        user_opt = f"{username}:{password}" if username else "anonymous:"
+        opts = [f"user={user_opt}"]
+        if read_only:
+            opts.append("ro")
+        opts.extend(extra_opts)
+        return ["curlftpfs", ftp_url, mount_point, "-o", ",".join(opts)], ""
+
+    if proto == "sftp":
+        if not host:
+            return [], "SFTP 需要 host"
+        extra_opts, err = _storage_split_options(options)
+        if err:
+            return [], err
+        target = f"{username + '@' if username else ''}{host}:{remote_path}"
+        opts: List[str] = ["reconnect"]
+        if port > 0:
+            opts.append(f"port={int(port)}")
+        if read_only:
+            opts.append("ro")
+        opts.extend(extra_opts)
+        cmd = ["sshfs", target, mount_point]
+        if opts:
+            cmd.extend(["-o", ",".join(opts)])
+        return cmd, ""
+
+    if proto == "webdav":
+        if not host:
+            return [], "WebDAV 需要 host"
+        extra_opts, err = _storage_split_options(options)
+        if err:
+            return [], err
+        scheme = "https" if port in (0, 443) else "http"
+        host_part = _storage_host_for_url(host)
+        if port > 0 and port not in (80, 443):
+            host_part = f"{host_part}:{int(port)}"
+        auth = ""
+        if username:
+            auth = f"{username}:{password}@" if password else f"{username}@"
+        webdav_url = f"{scheme}://{auth}{host_part}{remote_path}"
+        if sys_name == "darwin":
+            return ["mount_webdav", webdav_url, mount_point], ""
+        cmd = ["mount", "-t", "davfs", webdav_url, mount_point]
+        if read_only or extra_opts:
+            opts: List[str] = []
+            if read_only:
+                opts.append("ro")
+            opts.extend(extra_opts)
+            if opts:
+                cmd.extend(["-o", ",".join(opts)])
+        return cmd, ""
+
+    # rclone
+    target_remote = rclone_remote or "remote"
+    path_no_lead = remote_path.lstrip("/")
+    remote_full = f"{target_remote}:{path_no_lead}" if path_no_lead else f"{target_remote}:"
+    extra_args, err = _storage_split_rclone_options(options)
+    if err:
+        return [], err
+    cmd = ["rclone", "mount", remote_full, mount_point, "--daemon", "--vfs-cache-mode", "writes"]
+    if read_only:
+        cmd.append("--read-only")
+    cmd.extend(extra_args)
+    return cmd, ""
+
+
+def _storage_umount_cmds(proto: str, mount_point: str) -> List[List[str]]:
+    cmds: List[List[str]] = []
+    if proto in ("rclone", "ftp", "sftp"):
+        if shutil.which("fusermount3"):
+            cmds.append(["fusermount3", "-u", mount_point])
+        if shutil.which("fusermount"):
+            cmds.append(["fusermount", "-u", mount_point])
+    if platform.system().lower() == "darwin":
+        cmds.append(["umount", "-f", mount_point])
+        cmds.append(["umount", mount_point])
+        if shutil.which("diskutil"):
+            cmds.append(["diskutil", "unmount", "force", mount_point])
+            cmds.append(["diskutil", "unmount", mount_point])
+    else:
+        cmds.append(["umount", mount_point])
+    return cmds
+
+
+def _storage_trim_output(raw: Any, max_len: int = 320) -> str:
+    text = _storage_text(raw, max_len=max_len)
+    return text
+
+
+@app.post("/api/v1/storage/mount")
+def api_storage_mount(payload: Dict[str, Any], _: None = Depends(_api_key_required)) -> Dict[str, Any]:
+    if not isinstance(payload, dict):
+        payload = {}
+    mount_point = _storage_mount_point(payload.get("mount_point"))
+    if not mount_point:
+        return {"ok": False, "error": "挂载点必须是绝对路径，且不能是 /"}
+    proto = _storage_protocol(payload.get("protocol"))
+    if not proto:
+        return {"ok": False, "error": "协议不受支持"}
+    is_macos_smb = (platform.system().lower() == "darwin" and proto == "smb")
+    desktop_user = _storage_text(payload.get("desktop_user"), max_len=64)
+    run_uid = -1
+    run_gid = -1
+    access_warning = ""
+    if is_macos_smb:
+        run_uid, run_gid = _storage_macos_console_uid_gid(preferred_user=desktop_user)
+    if is_macos_smb:
+        # If the same SMB share is already mounted elsewhere (Finder/previous task),
+        # unmount that location first to avoid `mount_smbfs ... File exists`.
+        for old_mp in _storage_macos_smb_same_remote_mount_points(payload, mount_point):
+            _storage_force_unmount(old_mp)
+    if _storage_is_mounted(mount_point):
+        return {"ok": True, "msg": "挂载点已处于挂载状态", "mounted": True}
+    if is_macos_smb:
+        # Keep behavior aligned with manual-recovery steps:
+        # force clear stale mount state on the target path before a fresh mount.
+        _storage_force_unmount(mount_point)
+    try:
+        os.makedirs(mount_point, exist_ok=True)
+    except Exception as exc:
+        return {"ok": False, "error": f"创建挂载点失败：{exc}"}
+    if is_macos_smb:
+        _storage_macos_prepare_mount_point(mount_point, uid=run_uid, gid=run_gid)
+    cmd, err = _storage_build_mount_cmd(payload)
+    if err:
+        return {"ok": False, "error": err}
+    if not cmd:
+        return {"ok": False, "error": "挂载命令构造失败"}
+    if not shutil.which(str(cmd[0] or "")):
+        return {"ok": False, "error": f"缺少挂载命令：{cmd[0]}"}
+    code, out = _run_cmd_as_user(cmd, uid=run_uid, gid=run_gid, timeout=90)
+    if code != 0:
+        out_text = _storage_trim_output(out, max_len=480)
+        low = out_text.lower()
+        is_macos_smb_exists_err = (is_macos_smb and "file exists" in low)
+        if is_macos_smb_exists_err:
+            # `mount_smbfs` may return "File exists" for stale/non-empty mount points.
+            if _storage_is_mounted(mount_point):
+                code = 0
+            else:
+                # First try to clear same-remote mounts at other paths.
+                for old_mp in _storage_macos_smb_same_remote_mount_points(payload, mount_point):
+                    _storage_force_unmount(old_mp)
+                _storage_cleanup_mount_dir_placeholders(mount_point)
+                remaining_items = _storage_mount_dir_non_placeholder_items(mount_point)
+                if remaining_items:
+                    sample = ",".join(remaining_items[:3])
+                    if len(remaining_items) > 3:
+                        sample = f"{sample}..."
+                    return {
+                        "ok": False,
+                        "error": (
+                            f"挂载失败：挂载点目录非空（{len(remaining_items)} 项：{sample}），"
+                            "请清空目录或更换挂载点"
+                        ),
+                    }
+                _storage_force_unmount(mount_point)
+                _storage_reset_mount_dir(mount_point)
+                code_retry, out_retry = _run_cmd_as_user(cmd, uid=run_uid, gid=run_gid, timeout=90)
+                if code_retry == 0:
+                    code = 0
+                    out = out_retry
+                else:
+                    out_retry_text = _storage_trim_output(out_retry, max_len=480)
+                    if _storage_is_mounted(mount_point):
+                        code = 0
+                        out = out_retry
+                    else:
+                        mounted_elsewhere = _storage_macos_smb_same_remote_mount_points(payload, mount_point)
+                        if mounted_elsewhere:
+                            return {
+                                "ok": False,
+                                "error": (
+                                    "挂载失败：检测到同一共享已挂载在其他路径（"
+                                    + ",".join(mounted_elsewhere[:2])
+                                    + "），请先卸载该路径后重试"
+                                ),
+                            }
+                        return {"ok": False, "error": f"挂载失败：{out_retry_text or out_text or f'退出码 {code_retry}'}"}
+    if code != 0:
+        return {"ok": False, "error": f"挂载失败：{_storage_trim_output(out) or f'退出码 {code}'}"}
+    if not _storage_wait_mount_state(mount_point, mounted=True, timeout_sec=4.0):
+        return {"ok": False, "error": "挂载命令已执行，但未检测到挂载状态"}
+    if is_macos_smb:
+        identities = _storage_macos_candidate_identities(preferred_user=desktop_user)
+        if run_uid > 0:
+            run_user = _storage_macos_console_user(preferred_user=desktop_user)
+            run_item = (run_user, int(run_uid), int(run_gid if run_gid >= 0 else -1))
+            dup = False
+            for _name, uid_i, gid_i in identities:
+                if int(uid_i) == int(run_item[1]) and int(gid_i) == int(run_item[2]):
+                    dup = True
+                    break
+            if not dup:
+                identities.insert(0, run_item)
+        access_ok = False
+        for name_i, uid_i, gid_i in identities:
+            if _storage_dir_accessible_as_user(mount_point, uid_i, gid_i):
+                access_ok = True
+                run_uid, run_gid = int(uid_i), int(gid_i)
+                if name_i:
+                    desktop_user = str(name_i)
+                break
+        if not access_ok:
+            if not identities:
+                if _storage_is_mounted(mount_point):
+                    access_warning = "未识别到本机桌面登录用户，已保留挂载，请手动验证访问权限"
+                else:
+                    return {
+                        "ok": False,
+                        "error": "挂载失败：未识别到本机桌面登录用户，无法建立可访问权限映射（可设置 REALM_AGENT_DESKTOP_USER）",
+                    }
+            remount_ok = False
+            for name_i, uid_i, gid_i in identities:
+                _storage_force_unmount(mount_point)
+                _storage_reset_mount_dir(mount_point)
+                _storage_macos_prepare_mount_point(mount_point, uid=uid_i, gid=gid_i)
+                payload_retry = dict(payload)
+                if name_i:
+                    payload_retry["desktop_user"] = str(name_i)
+                cmd_retry, err_retry = _storage_build_mount_cmd(payload_retry)
+                if err_retry or not cmd_retry:
+                    continue
+                code_retry, out_retry = _run_cmd_as_user(cmd_retry, uid=uid_i, gid=gid_i, timeout=90)
+                if code_retry != 0:
+                    continue
+                if not _storage_wait_mount_state(mount_point, mounted=True, timeout_sec=4.0):
+                    continue
+                if not _storage_dir_accessible_as_user(mount_point, uid_i, gid_i):
+                    continue
+                remount_ok = True
+                run_uid, run_gid = int(uid_i), int(gid_i)
+                if name_i:
+                    desktop_user = str(name_i)
+                out = out_retry
+                break
+            if not remount_ok:
+                if _storage_is_mounted(mount_point):
+                    access_warning = "已尝试本机用户映射，但访问校验未通过；挂载已保留，请手动验证"
+                else:
+                    return {"ok": False, "error": "挂载失败：已尝试本机用户映射，但当前用户仍无权访问挂载点"}
+    sync_items = -1
+    try:
+        sync_items = len(os.listdir(mount_point))
+    except Exception:
+        sync_items = -1
+    desktop_link_enabled = False
+    desktop_link = ""
+    desktop_link_error = ""
+    msg = "挂载成功，目录已同步"
+    if is_macos_smb:
+        if run_uid > 0:
+            mapped_user = _storage_text(desktop_user, max_len=64)
+            if mapped_user:
+                msg = f"{msg}；本地权限映射 UID={int(run_uid)}({mapped_user})"
+            else:
+                msg = f"{msg}；本地权限映射 UID={int(run_uid)}"
+        else:
+            msg = f"{msg}；未识别本地桌面用户，可能出现访问受限"
+        if access_warning:
+            msg = f"{msg}；{access_warning}"
+    return {
+        "ok": True,
+        "msg": msg,
+        "mounted": True,
+        "mount_point": mount_point,
+        "sync_items": int(sync_items),
+        "desktop_link_enabled": bool(desktop_link_enabled),
+        "desktop_link": desktop_link,
+        "desktop_link_error": desktop_link_error,
+    }
+
+
+@app.post("/api/v1/storage/unmount")
+def api_storage_unmount(payload: Dict[str, Any], _: None = Depends(_api_key_required)) -> Dict[str, Any]:
+    if not isinstance(payload, dict):
+        payload = {}
+    mount_point = _storage_mount_point(payload.get("mount_point"))
+    if not mount_point:
+        return {"ok": False, "error": "挂载点必须是绝对路径，且不能是 /"}
+    proto = _storage_protocol(payload.get("protocol"))
+    if not proto:
+        proto = "smb"
+    sys_name = platform.system().lower()
+    is_macos = sys_name == "darwin"
+    desktop_user = _storage_text(payload.get("desktop_user"), max_len=64)
+    if not _storage_is_mounted(mount_point):
+        return {"ok": True, "msg": "挂载点当前未挂载", "mounted": False}
+    last_out = ""
+    base_cmds = _storage_umount_cmds(proto, mount_point)
+    for cmd in base_cmds:
+        if not cmd:
+            continue
+        if not shutil.which(str(cmd[0] or "")):
+            continue
+        code, out = _run_cmd(cmd, timeout=45)
+        last_out = out or last_out
+        if code == 0 and _storage_wait_mount_state(mount_point, mounted=False, timeout_sec=3.0):
+            return {"ok": True, "msg": "卸载成功", "mounted": False}
+    if is_macos and _storage_is_mounted(mount_point):
+        # Some user-mounted SMB volumes on macOS require unmount in the same user context.
+        for name_i, uid_i, gid_i in _storage_macos_candidate_identities(preferred_user=desktop_user):
+            for cmd in base_cmds:
+                if not cmd:
+                    continue
+                if not shutil.which(str(cmd[0] or "")):
+                    continue
+                code, out = _run_cmd_as_user(cmd, uid=uid_i, gid=gid_i, timeout=45)
+                last_out = out or last_out
+                if code == 0 and _storage_wait_mount_state(mount_point, mounted=False, timeout_sec=3.0):
+                    who = _storage_text(name_i, max_len=64)
+                    if who:
+                        return {"ok": True, "msg": f"卸载成功（{who}）", "mounted": False}
+                    return {"ok": True, "msg": "卸载成功", "mounted": False}
+        # Final force-unmount fallback.
+        _storage_force_unmount(mount_point)
+        if _storage_wait_mount_state(mount_point, mounted=False, timeout_sec=3.0):
+            return {"ok": True, "msg": "卸载成功", "mounted": False}
+    if not _storage_is_mounted(mount_point):
+        return {"ok": True, "msg": "卸载成功", "mounted": False}
+    return {"ok": False, "error": f"卸载失败：{_storage_trim_output(last_out) or '命令执行失败'}"}
 
 
 @app.get("/api/v1/website/files/list")
@@ -8433,12 +11581,17 @@ def api_files_upload(payload: Dict[str, Any], _: None = Depends(_api_key_require
     filename = str(payload.get("filename") or "upload.bin").strip()
     filename = os.path.basename(filename) or "upload.bin"
     content_b64 = str(payload.get("content_b64") or "")
+    allow_empty = bool(payload.get("allow_empty"))
     if not content_b64:
-        return {"ok": False, "error": "缺少文件内容"}
-    try:
-        raw = base64.b64decode(content_b64.encode("ascii"))
-    except Exception:
-        return {"ok": False, "error": "文件内容解析失败"}
+        if allow_empty:
+            raw = b""
+        else:
+            return {"ok": False, "error": "缺少文件内容"}
+    else:
+        try:
+            raw = base64.b64decode(content_b64.encode("ascii"))
+        except Exception:
+            return {"ok": False, "error": "文件内容解析失败"}
     target = _safe_join(root_path, f"{path.rstrip('/')}/{filename}")
     target.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -8457,13 +11610,16 @@ def api_files_upload_chunk(payload: Dict[str, Any], _: None = Depends(_api_key_r
     path = str(payload.get("path") or "")
     filename = str(payload.get("filename") or "upload.bin").strip()
     filename = os.path.basename(filename) or "upload.bin"
-    upload_id = str(payload.get("upload_id") or "").strip()
-    if not upload_id:
-        return {"ok": False, "error": "upload_id 不能为空"}
+    try:
+        upload_id = _normalize_upload_id(payload.get("upload_id"))
+    except HTTPException as exc:
+        return {"ok": False, "error": str(exc.detail)}
     try:
         offset = int(payload.get("offset") or 0)
     except Exception:
         offset = 0
+    if offset < 0:
+        return {"ok": False, "error": "offset 参数无效（不能为负数）"}
     done = bool(payload.get("done"))
     content_b64 = str(payload.get("content_b64") or "")
     chunk_sha256 = str(payload.get("chunk_sha256") or "").strip().lower()
@@ -8489,14 +11645,20 @@ def api_files_upload_chunk(payload: Dict[str, Any], _: None = Depends(_api_key_r
 
     target = _safe_join(root_path, f"{path.rstrip('/')}/{filename}")
     target.parent.mkdir(parents=True, exist_ok=True)
-    tmp = target.with_name(target.name + f".part.{upload_id}")
+    try:
+        tmp = target.with_name(target.name + f".part.{upload_id}")
+    except Exception:
+        return {"ok": False, "error": "upload_id 非法"}
     if tmp.exists():
         try:
             cur = tmp.stat().st_size
             if offset != cur:
                 return {"ok": False, "error": "offset mismatch", "expected_offset": cur}
-        except Exception:
-            pass
+        except Exception as exc:
+            return {"ok": False, "error": f"upload state check failed: {exc}"}
+    elif offset != 0:
+        # Client resumed with a non-zero offset but server has no chunk state.
+        return {"ok": False, "error": "offset mismatch", "expected_offset": 0}
     try:
         mode = "r+b" if tmp.exists() else "wb"
         with open(tmp, mode) as f:
@@ -8523,11 +11685,15 @@ def api_files_upload_status(payload: Dict[str, Any], _: None = Depends(_api_key_
     path = str(payload.get("path") or "")
     filename = str(payload.get("filename") or "upload.bin").strip()
     filename = os.path.basename(filename) or "upload.bin"
-    upload_id = str(payload.get("upload_id") or "").strip()
-    if not upload_id:
-        return {"ok": False, "error": "upload_id 不能为空"}
+    try:
+        upload_id = _normalize_upload_id(payload.get("upload_id"))
+    except HTTPException as exc:
+        return {"ok": False, "error": str(exc.detail)}
     target = _safe_join(root_path, f"{path.rstrip('/')}/{filename}")
-    tmp = target.with_name(target.name + f".part.{upload_id}")
+    try:
+        tmp = target.with_name(target.name + f".part.{upload_id}")
+    except Exception:
+        return {"ok": False, "error": "upload_id 非法"}
     try:
         offset = tmp.stat().st_size if tmp.exists() else 0
     except Exception:
@@ -8557,10 +11723,26 @@ def api_files_unzip(payload: Dict[str, Any], _: None = Depends(_api_key_required
         import zipfile
         with zipfile.ZipFile(zip_path, "r") as zf:
             count = 0
+            total_bytes = 0
             for info in zf.infolist():
+                if count >= int(UNZIP_MAX_ENTRIES):
+                    return {"ok": False, "error": f"压缩包条目过多（限制 {int(UNZIP_MAX_ENTRIES)}）"}
                 name = (info.filename or "").replace("\\", "/").lstrip("/")
                 if not name or name.startswith("../") or "/../" in name:
                     continue
+                if not info.is_dir():
+                    fsize = int(max(0, int(info.file_size or 0)))
+                    csize = int(max(0, int(info.compress_size or 0)))
+                    if fsize > int(UNZIP_MAX_FILE_BYTES):
+                        return {"ok": False, "error": f"单文件过大（限制 {int(UNZIP_MAX_FILE_BYTES)} bytes）"}
+                    next_total = int(total_bytes + fsize)
+                    if next_total > int(UNZIP_MAX_TOTAL_BYTES):
+                        return {"ok": False, "error": f"解压总大小超限（限制 {int(UNZIP_MAX_TOTAL_BYTES)} bytes）"}
+                    if csize > 0 and fsize > 0:
+                        ratio = float(fsize) / float(csize)
+                        if ratio > float(UNZIP_MAX_RATIO):
+                            return {"ok": False, "error": "压缩比异常，已拒绝解压"}
+                    total_bytes = next_total
                 target = _safe_join(dest_dir, name)
                 if info.is_dir() or name.endswith("/"):
                     target.mkdir(parents=True, exist_ok=True)
@@ -8569,7 +11751,7 @@ def api_files_unzip(payload: Dict[str, Any], _: None = Depends(_api_key_required
                     with zf.open(info, "r") as src, open(target, "wb") as dst:
                         shutil.copyfileobj(src, dst)
                 count += 1
-        return {"ok": True, "files": count}
+        return {"ok": True, "files": count, "total_bytes": int(total_bytes)}
     except Exception as exc:
         return {"ok": False, "error": str(exc)}
 

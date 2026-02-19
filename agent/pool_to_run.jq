@@ -1,10 +1,33 @@
 def to_arr(x): if x==null then [] elif (x|type)=="array" then x elif (x|type)=="string" then [x] else [] end;
  def obj(x): if x==null then {} elif (x|type)=="object" then x else {} end;
- def algo_norm(a): (a//"round_robin")|tostring|ascii_downcase|gsub("[_ -]";"")|if .=="iphash" then "iphash" else "roundrobin" end;
+ def algo_norm(a):
+  (a//"round_robin")
+  | tostring
+  | ascii_downcase
+  | gsub("[_ -]";"")
+  | if .=="roundrobin" then "roundrobin"
+    elif .=="iphash" then "iphash"
+    elif .=="leastconn" then "least_conn"
+    elif .=="leastlatency" then "least_latency"
+    elif .=="consistenthash" then "consistent_hash"
+    elif .=="randomweight" then "roundrobin"
+    else "roundrobin"
+    end;
+ def is_weighted_algo(a): a=="roundrobin";
  def balance_str(a; n; w):
   if n<=1 then null
-  else if (a|type)=="string" and (a|test(":")) then a
-  else (algo_norm(a) + ": " + (w|join(", "))) end
+  else (algo_norm(a)) as $algo
+    | if (a|type)=="string" and (a|test(":")) then
+        ((a|split(":")) as $parts
+          | (algo_norm($parts[0]//"")) as $head
+          | (($parts[1:]|join(":")|tostring|gsub("^\\s+|\\s+$";"")) as $rhs
+            | if is_weighted_algo($head)
+              then (if $rhs=="" then ($head + ": " + (w|join(", "))) else ($head + ": " + $rhs) end)
+              else $head
+              end))
+      elif is_weighted_algo($algo) then ($algo + ": " + (w|join(", ")))
+      else $algo
+      end
   end;
 
  def ws_rem(x):
@@ -19,9 +42,12 @@ def to_arr(x): if x==null then [] elif (x|type)=="array" then x elif (x|type)=="
   if (x|type)=="object" and (x.listen_transport // "")=="ws"
   then ("ws;host="+(x.listen_ws_host//"")+";path="+(x.listen_ws_path//"")
     +(if (x.listen_tls_enabled//false) then ";tls" else "" end)
-    +(if (x.listen_tls_servername//"")!="" then ";servername="+x.listen_tls_servername else "" end)
-    +(if (x.listen_tls_insecure//false) then ";insecure" else "" end))
+    +(if (x.listen_tls_servername//"")!="" then ";servername="+x.listen_tls_servername else "" end))
   else null end;
+
+ def is_ws_transport(t):
+  ((t//"")|tostring|ascii_downcase|gsub("^\\s+|\\s+$";"")) as $s
+  | ($s=="ws" or $s=="wss" or ($s|startswith("ws;")) or ($s|startswith("wss;")));
 
  def protocol_net(p):
   if (p//"")=="udp" then { no_tcp: true, use_udp: true }
@@ -38,8 +64,8 @@ def to_arr(x): if x==null then [] elif (x|type)=="array" then x elif (x|type)=="
       | map(select((.disabled//false)|not))
       # Intranet tunnel rules are handled by realm-agent, not realm binary.
       | map(select(((obj(.extra_config).intranet_role // "") == "")))
-      # iptables-forwarded normal rules are handled by realm-agent runtime, not realm binary.
-      | map(select((((obj(.extra_config).forward_tool // .forward_tool // "")|tostring|ascii_downcase) as $ft | ($ft != "ipt" and $ft != "iptables"))))
+      # iptables/overlay normal rules are handled by realm-agent runtime, not realm binary.
+      | map(select((((obj(.extra_config).forward_tool // .forward_tool // "")|tostring|ascii_downcase) as $ft | ($ft != "ipt" and $ft != "iptables" and $ft != "overlay"))))
       | map(. as $e
           | ($e.extra_config//{}) as $x
           | ($e.remote//$e.remotes//null) as $r0
@@ -51,6 +77,10 @@ def to_arr(x): if x==null then [] elif (x|type)=="array" then x elif (x|type)=="
                 then ($e.weights|map(tostring))
                 else ([range(0;$n)|"1"])
                end) as $w
+              | (if ($e.listen_transport//"")!="" then $e.listen_transport
+                 elif (ws_lis($x)!=null) then ws_lis($x) else "" end) as $listen_t
+              | (if ($e.remote_transport//"")!="" then $e.remote_transport
+                 elif (ws_rem($x)!=null) then ws_rem($x) else "" end) as $remote_t
               | ( protocol_net($e.protocol)
                   + obj($e.network)
                   + (if ($e.accept_proxy!=null) then {accept_proxy: $e.accept_proxy} else {} end)
@@ -59,6 +89,9 @@ def to_arr(x): if x==null then [] elif (x|type)=="array" then x elif (x|type)=="
                   + (if ($e.send_proxy_version!=null) then {send_proxy_version: $e.send_proxy_version} else {} end)
                   + (if ($e.send_mptcp!=null) then {send_mptcp: $e.send_mptcp} else {} end)
                   + (if ($e.accept_mptcp!=null) then {accept_mptcp: $e.accept_mptcp} else {} end)
+                  + (if (is_ws_transport($listen_t) or is_ws_transport($remote_t))
+                     then {no_tcp:false, use_udp:false}
+                     else {} end)
                 ) as $net
               | { listen: $e.listen, remote: $rs[0], network: $net }
               + (if $n>1 then
@@ -67,10 +100,8 @@ def to_arr(x): if x==null then [] elif (x|type)=="array" then x elif (x|type)=="
               + (if ($e.through//"")!="" then {through: $e.through} else {} end)
               + (if ($e.interface//"")!="" then {interface: $e.interface} else {} end)
               + (if ($e.listen_interface//"")!="" then {listen_interface: $e.listen_interface} else {} end)
-              + (if ($e.listen_transport//"")!="" then {listen_transport:$e.listen_transport}
-                 elif (ws_lis($x)!=null) then {listen_transport: ws_lis($x)} else {} end)
-              + (if ($e.remote_transport//"")!="" then {remote_transport:$e.remote_transport}
-                 elif (ws_rem($x)!=null) then {remote_transport: ws_rem($x)} else {} end)
+              + (if ($listen_t//"")!="" then {listen_transport:$listen_t} else {} end)
+              + (if ($remote_t//"")!="" then {remote_transport:$remote_t} else {} end)
             end
         ))
 }

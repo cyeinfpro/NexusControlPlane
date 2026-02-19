@@ -1,4 +1,3 @@
-import re
 import shutil
 import socket
 from typing import Any, Dict, List, Optional
