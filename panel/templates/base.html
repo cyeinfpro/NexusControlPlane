@@ -21,7 +21,7 @@
     })();
   </script>
   <link rel="icon" type="image/svg+xml" href="/static/nexus.svg">
-  <link rel="stylesheet" href="/static/style.css?v=83.0">
+  <link rel="stylesheet" href="/static/style.css?v=87.2">
 </head>
 <body>
   <!-- Flowing background (fixed, no seams on scroll) -->
@@ -49,8 +49,10 @@
       {% set nav_active = 'netmon' %}
     {% elif p.startswith('/users') %}
       {% set nav_active = 'users' %}
-    {% elif p.startswith('/logs') %}
+    {% elif p.startswith('/logs') or p.startswith('/audit-logs') %}
       {% set nav_active = 'logs' %}
+    {% elif p.startswith('/remote-storage') %}
+      {% set nav_active = 'remote_storage' %}
     {% elif p.startswith('/settings') %}
       {% set nav_active = 'settings' %}
     {% endif %}
@@ -58,6 +60,7 @@
     {% set can_dashboard = ('*' in perms) or ('nodes.read' in perms) or ('nodes.*' in perms) %}
     {% set can_websites = ('*' in perms) or ('websites.read' in perms) or ('websites.write' in perms) or ('websites.*' in perms) or ('files.read' in perms) or ('files.write' in perms) or ('files.*' in perms) or ('cert.manage' in perms) %}
     {% set can_netmon = ('*' in perms) or ('netmon.read' in perms) or ('netmon.*' in perms) %}
+    {% set can_remote_storage = ('*' in perms) or ('nodes.read' in perms) or ('nodes.write' in perms) or ('nodes.*' in perms) %}
     {% set can_users = ('*' in perms) or ('users.manage' in perms) %}
     {% set can_logs = ('*' in perms) or ('panel.view' in perms) %}
     {% set can_settings = ('*' in perms) or ('users.manage' in perms) %}
@@ -74,6 +77,9 @@
             {% endif %}
             {% if can_netmon %}
               <a href="/netmon" class="nav-link {{ 'active' if nav_active == 'netmon' else '' }}">网络波动</a>
+            {% endif %}
+            {% if can_remote_storage %}
+              <a href="/remote-storage" class="nav-link {{ 'active' if nav_active == 'remote_storage' else '' }}">远程存储</a>
             {% endif %}
             {% if can_users %}
               <a href="/users" class="nav-link {{ 'active' if nav_active == 'users' else '' }}">用户权限</a>
@@ -98,6 +104,9 @@
               {% endif %}
               {% if can_netmon %}
                 <a href="/netmon" class="menu-item {{ 'active' if nav_active == 'netmon' else '' }}">网络波动</a>
+              {% endif %}
+              {% if can_remote_storage %}
+                <a href="/remote-storage" class="menu-item {{ 'active' if nav_active == 'remote_storage' else '' }}">远程存储</a>
               {% endif %}
               {% if can_users %}
                 <a href="/users" class="menu-item {{ 'active' if nav_active == 'users' else '' }}">用户权限</a>

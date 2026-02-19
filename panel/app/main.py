@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 
 from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.gzip import GZipMiddleware
 from starlette.middleware.sessions import SessionMiddleware
@@ -26,6 +27,7 @@ from .routers import (
     scripts,
     websites,
 )
+from .services.auto_backup import start_background as start_auto_backup_background
 from .services.netmon import start_background as start_netmon_background
 from .services.site_monitor import start_background as start_site_monitor_background
 
@@ -75,6 +77,19 @@ async def _static_app_js_no_cache(request: Request, call_next):
         resp.headers["Expires"] = "0"
     return resp
 
+
+@app.exception_handler(Exception)
+async def _api_json_exception_handler(request: Request, exc: Exception):
+    path = redact_log_text(str(request.url.path or ""))
+    crash_logger.exception(
+        "unhandled exception fallback method=%s path=%s",
+        request.method,
+        path,
+    )
+    if str(request.url.path or "").startswith("/api/"):
+        return JSONResponse({"ok": False, "error": "服务内部异常，请稍后重试"}, status_code=500)
+    return PlainTextResponse("Internal Server Error", status_code=500)
+
 # Routers
 app.include_router(auth.router)
 app.include_router(pages.router)
@@ -97,7 +112,7 @@ async def _startup() -> None:
         logger.exception("failed to install asyncio exception handler")
     # Background NetMon collector (configurable via env).
     try:
-        await start_netmon_background(app)
+        start_netmon_background(app)
     except Exception:
         logger.exception("netmon background startup failed")
     # Background site monitor
@@ -105,6 +120,11 @@ async def _startup() -> None:
         await start_site_monitor_background(app)
     except Exception:
         logger.exception("site monitor background startup failed")
+    # Background auto backup scheduler
+    try:
+        await start_auto_backup_background(app)
+    except Exception:
+        logger.exception("auto backup background startup failed")
 
 
 @app.on_event("shutdown")

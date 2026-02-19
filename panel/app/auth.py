@@ -30,7 +30,7 @@ CRED_PATH = "/etc/realm-panel/credentials.json"
 SECRET_PATH = "/etc/realm-panel/secret.key"
 DEFAULT_PBKDF2_ITERATIONS = 120_000
 _LOGIN_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{3,48}$")
-_ALLOWED_TUNNEL_TYPES = {"direct", "wss", "intranet"}
+_ALLOWED_TUNNEL_TYPES = {"direct", "wss", "intranet", "mptcp"}
 
 
 def _normalize_tunnel_type_name(value: Any) -> str:
@@ -39,6 +39,8 @@ def _normalize_tunnel_type_name(value: Any) -> str:
     # tcp/normal are historical names in some UI logic; canonicalize to "direct".
     if name in ("tcp", "normal"):
         return "direct"
+    if name in ("aggregate", "multi", "multi_link"):
+        return "mptcp"
     return name
 
 
@@ -113,6 +115,16 @@ def _to_bool(value: Any, default: bool = False) -> bool:
     if s in ("0", "false", "no", "off", "n"):
         return False
     return bool(default)
+
+
+def _coerce_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except Exception:
+        try:
+            return int(float(str(value).strip()))
+        except Exception:
+            return int(default)
 
 
 def _parse_dt(value: Any) -> Optional[datetime]:
@@ -308,9 +320,9 @@ def _auth_user_from_record(record: Dict[str, Any]) -> Optional[AuthUser]:
         return None
     policy = normalize_user_policy(record.get("policy") or {})
     return AuthUser(
-        id=int(record.get("id") or 0),
+        id=_coerce_int(record.get("id"), 0),
         username=str(record.get("username") or "").strip(),
-        role_id=int(record.get("role_id") or 0),
+        role_id=_coerce_int(record.get("role_id"), 0),
         role_name=role_name,
         permissions=frozenset(_normalize_permissions(record.get("role_permissions") or [])),
         enabled=bool(record.get("enabled") or 0),
@@ -423,7 +435,7 @@ def authenticate_user(username: str, password: str) -> Optional[AuthUser]:
         password=str(password or ""),
         salt_b64=str(rec.get("salt_b64") or ""),
         hash_b64=str(rec.get("hash_b64") or ""),
-        iterations=int(rec.get("iterations") or DEFAULT_PBKDF2_ITERATIONS),
+        iterations=_coerce_int(rec.get("iterations"), DEFAULT_PBKDF2_ITERATIONS),
     )
     if not ok:
         return None
@@ -692,7 +704,7 @@ def check_tunnel_access(
                 {"code": "node_forbidden", "allowed_node_ids": allowed_nodes},
             )
 
-    quota = int(policy.get("max_monthly_traffic_bytes") or 0)
+    quota = _coerce_int(policy.get("max_monthly_traffic_bytes"), 0)
     if quota > 0:
         if isinstance(allowed_nodes, list) and allowed_nodes:
             scope_nodes = allowed_nodes
@@ -714,7 +726,7 @@ def list_roles_public() -> List[Dict[str, Any]]:
     for r in list_roles():
         out.append(
             {
-                "id": int(r.get("id") or 0),
+                "id": _coerce_int(r.get("id"), 0),
                 "name": str(r.get("name") or ""),
                 "description": str(r.get("description") or ""),
                 "permissions": _normalize_permissions(r.get("permissions") or []),
@@ -726,7 +738,7 @@ def list_roles_public() -> List[Dict[str, Any]]:
 
 def _to_public_user(record: Dict[str, Any], include_usage: bool = True) -> Dict[str, Any]:
     policy = normalize_user_policy(record.get("policy") or {})
-    max_bytes = int(policy.get("max_monthly_traffic_bytes") or 0)
+    max_bytes = _coerce_int(policy.get("max_monthly_traffic_bytes"), 0)
     traffic_used = 0
     if include_usage and max_bytes > 0:
         try:
@@ -735,7 +747,7 @@ def _to_public_user(record: Dict[str, Any], include_usage: bool = True) -> Dict[
                 scope_nodes = None
             traffic_used = int(
                 sum_user_rule_traffic_bytes(
-                    user_id=int(record.get("id") or 0),
+                    user_id=_coerce_int(record.get("id"), 0),
                     node_ids=scope_nodes,
                     since_ts_ms=int(datetime.now(timezone.utc).timestamp() * 1000) - (30 * 24 * 3600 * 1000),
                 )
@@ -743,9 +755,9 @@ def _to_public_user(record: Dict[str, Any], include_usage: bool = True) -> Dict[
         except Exception:
             traffic_used = 0
     return {
-        "id": int(record.get("id") or 0),
+        "id": _coerce_int(record.get("id"), 0),
         "username": str(record.get("username") or ""),
-        "role_id": int(record.get("role_id") or 0),
+        "role_id": _coerce_int(record.get("role_id"), 0),
         "role_name": str(record.get("role_name") or ""),
         "enabled": bool(record.get("enabled") or 0),
         "expires_at": str(record.get("expires_at") or "").strip() or None,
@@ -842,7 +854,7 @@ def update_user_account(
         if not _LOGIN_NAME_RE.match(uname):
             raise ValueError("用户名需 3-48 位，仅支持字母/数字/._-")
         found = get_user_auth_record_by_username(uname)
-        if found and int(found.get("id") or 0) != int(user_id):
+        if found and _coerce_int(found.get("id"), 0) != int(user_id):
             raise ValueError("用户名已存在")
 
     exp: Optional[str] = None

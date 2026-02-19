@@ -6,6 +6,9 @@ ROOT_DEFAULT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 ROOT="${REALM_PANEL_ROOT:-${ROOT:-${ROOT_DEFAULT}}}"
 HOST="${REALM_PANEL_HOST:-0.0.0.0}"
 PORT="${REALM_PANEL_PORT:-6080}"
+KEEP_ALIVE_SEC="${REALM_PANEL_TIMEOUT_KEEP_ALIVE:-15}"
+LIMIT_CONCURRENCY="${REALM_PANEL_LIMIT_CONCURRENCY:-400}"
+BACKLOG="${REALM_PANEL_BACKLOG:-2048}"
 PYTHON_BIN="${ROOT}/venv/bin/python"
 APP="app.main:app"
 CRASH_LOG_FILE="${REALM_PANEL_CRASH_LOG_FILE:-/var/log/realm-panel/crash.log}"
@@ -82,5 +85,25 @@ if [[ ! -x "${PYTHON_BIN}" ]]; then
   exit 1
 fi
 
+KEEP_ALIVE_SEC="$(parse_int "${KEEP_ALIVE_SEC}" "15")"
+LIMIT_CONCURRENCY="$(parse_int "${LIMIT_CONCURRENCY}" "400")"
+BACKLOG="$(parse_int "${BACKLOG}" "2048")"
+(( KEEP_ALIVE_SEC >= 5 )) || KEEP_ALIVE_SEC=5
+(( KEEP_ALIVE_SEC <= 120 )) || KEEP_ALIVE_SEC=120
+(( LIMIT_CONCURRENCY >= 0 )) || LIMIT_CONCURRENCY=0
+(( BACKLOG >= 128 )) || BACKLOG=128
+(( BACKLOG <= 65535 )) || BACKLOG=65535
+
 cd "${APP_DIR}"
-exec "${PYTHON_BIN}" -m uvicorn "$APP" --host "$HOST" --port "$PORT" --proxy-headers
+UVICORN_ARGS=(
+  -m uvicorn "$APP"
+  --host "$HOST"
+  --port "$PORT"
+  --proxy-headers
+  --timeout-keep-alive "$KEEP_ALIVE_SEC"
+  --backlog "$BACKLOG"
+)
+if (( LIMIT_CONCURRENCY > 0 )); then
+  UVICORN_ARGS+=(--limit-concurrency "$LIMIT_CONCURRENCY")
+fi
+exec "${PYTHON_BIN}" "${UVICORN_ARGS[@]}"

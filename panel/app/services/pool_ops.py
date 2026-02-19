@@ -6,8 +6,9 @@ from urllib.parse import urlparse
 
 from ..clients.agent import agent_get
 from ..db import get_desired_pool, get_last_report
-from ..utils.normalize import format_addr, split_host_port
-from .apply import node_verify_tls
+from ..utils.normalize import split_host_port
+from .apply import node_agent_request_target
+from .node_fetch import node_info_sources_order
 
 
 def node_host_for_realm(node: Dict[str, Any]) -> str:
@@ -40,23 +41,31 @@ async def load_pool_for_node(node: Dict[str, Any]) -> Dict[str, Any]:
 
     Priority:
       1) panel desired pool
-      2) last report cache
-      3) pull from agent
+      2) report cache / panel->agent pull (configurable order)
     """
     nid = int(node.get("id") or 0)
     _ver, desired = get_desired_pool(nid)
-    if isinstance(desired, dict):
-        pool = desired
-    else:
-        rep = get_last_report(nid)
-        if isinstance(rep, dict) and isinstance(rep.get("pool"), dict):
-            pool = rep.get("pool")
-        else:
+    pool = desired if isinstance(desired, dict) else None
+    rep: Optional[Dict[str, Any]] = None
+
+    if not isinstance(pool, dict):
+        for source in node_info_sources_order(force_pull=False):
+            if source == "report":
+                if rep is None:
+                    rep = get_last_report(nid)
+                if isinstance(rep, dict) and isinstance(rep.get("pool"), dict):
+                    pool = rep.get("pool")
+                    break
+                continue
+
             try:
-                data = await agent_get(node["base_url"], node["api_key"], "/api/v1/pool", node_verify_tls(node))
-                pool = data.get("pool") if isinstance(data, dict) else None
+                target_base_url, target_verify_tls, _target_route = node_agent_request_target(node)
+                data = await agent_get(target_base_url, node["api_key"], "/api/v1/pool", target_verify_tls)
+                if isinstance(data, dict) and isinstance(data.get("pool"), dict):
+                    pool = data.get("pool")
+                    break
             except Exception:
-                pool = None
+                continue
 
     if not isinstance(pool, dict):
         pool = {}

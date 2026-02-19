@@ -1,31 +1,50 @@
 from __future__ import annotations
 
 import calendar
+import base64
 import gzip
 import io
 import json
+import logging
 import os
+import re
+import shlex
+import subprocess
+import threading
 import time
 import uuid
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
 
+try:
+    from cryptography.fernet import Fernet, InvalidToken
+except Exception:
+    Fernet = None
+    InvalidToken = Exception
+
 from ..core.deps import require_login
 from ..core.paths import STATIC_DIR
 from ..db import (
     add_certificate,
     add_site_event,
+    delete_certificates_by_site,
     delete_certificates_by_node,
-    delete_sites_by_node,
+    delete_site,
+    delete_site_checks,
+    delete_site_events,
     get_task,
     get_site,
     get_desired_pool,
     get_group_orders,
     get_node_runtime,
+    get_panel_setting,
+    insert_netmon_samples,
+    list_certificates,
     list_sites,
     list_tasks,
     list_nodes,
@@ -34,10 +53,14 @@ from ..db import (
     set_desired_pool,
     set_desired_pool_exact,
     set_desired_pool_version_exact,
+    set_panel_setting,
     update_certificate,
     update_node_basic,
     update_agent_status,
+    update_netmon_monitor,
     update_node_report,
+    update_site,
+    update_site_health,
     update_task,
 )
 from ..services.agent_commands import sign_cmd, single_rule_ops
@@ -51,7 +74,7 @@ from ..services.assets import (
     read_latest_agent_version,
 )
 try:
-    from ..services.panel_config import setting_int
+    from ..services.panel_config import setting_bool, setting_int, setting_str
 except Exception:
     def _cfg_env(names: Optional[list[str]]) -> str:
         for n in (names or []):
@@ -62,6 +85,21 @@ except Exception:
             if v:
                 return v
         return ""
+
+    def setting_bool(
+        key: str,
+        default: bool = False,
+        env_names: Optional[list[str]] = None,
+    ) -> bool:
+        raw = _cfg_env(env_names)
+        s = str(raw).strip().lower()
+        if not s:
+            return bool(default)
+        if s in ("1", "true", "yes", "on", "y"):
+            return True
+        if s in ("0", "false", "no", "off", "n"):
+            return False
+        return bool(default)
 
     def setting_int(
         key: str,
@@ -80,10 +118,638 @@ except Exception:
         if v > int(hi):
             v = int(hi)
         return int(v)
+
+    def setting_str(
+        key: str,
+        default: str = "",
+        env_names: Optional[list[str]] = None,
+    ) -> str:
+        raw = _cfg_env(env_names)
+        s = str(raw).strip()
+        if s:
+            return s
+        return str(default or "")
 from ..services.node_status import is_report_fresh
 from ..services.stats_history import ingest_stats_snapshot
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
+
+_PANEL_UPDATE_STATE_KEY = "panel_self_update_state_json"
+_PANEL_UPDATE_LOCK = threading.Lock()
+_PANEL_UPDATE_JOBS: Dict[str, Dict[str, Any]] = {}
+_PANEL_UPDATE_WORKER: Optional[threading.Thread] = None
+_PANEL_UPDATE_WORKER_JOB_ID = ""
+_PANEL_UPDATE_LOG_MAX = 240
+_PANEL_UPDATE_STALE_SEC = 1800.0
+_PANEL_UPDATE_LINE_ANSI_RE = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
+_PANEL_UPDATE_ACTIVE_STATES = {"running", "restarting"}
+_PANEL_UPDATE_TERMINAL_STATES = {"done", "failed"}
+
+
+def _panel_update_now_text(ts: Optional[float] = None) -> str:
+    base = float(ts if ts is not None else time.time())
+    try:
+        return datetime.fromtimestamp(base).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _panel_update_parse_ts(raw: Any) -> float:
+    text = str(raw or "").strip()
+    if not text:
+        return 0.0
+    try:
+        return datetime.strptime(text, "%Y-%m-%d %H:%M:%S").timestamp()
+    except Exception:
+        return 0.0
+
+
+def _panel_update_canon_status(raw: Any) -> str:
+    s = str(raw or "").strip().lower()
+    if s in _PANEL_UPDATE_ACTIVE_STATES or s in _PANEL_UPDATE_TERMINAL_STATES:
+        return s
+    if s in ("ok", "success", "completed"):
+        return "done"
+    if s in ("error", "timeout", "stale"):
+        return "failed"
+    return "running"
+
+
+def _panel_update_sanitize_line(raw: Any) -> str:
+    text = str(raw or "")
+    if not text:
+        return ""
+    text = text.replace("\x00", "")
+    text = _PANEL_UPDATE_LINE_ANSI_RE.sub("", text)
+    text = text.replace("\r", "\n")
+    lines = [str(x or "").strip() for x in text.splitlines() if str(x or "").strip()]
+    if not lines:
+        return ""
+    line = str(lines[-1] or "").strip()
+    if len(line) > 420:
+        line = line[:420].rstrip() + "..."
+    return line
+
+
+def _panel_update_progress_hint(line: str, current_progress: int, current_stage: str) -> Tuple[int, str, str, str]:
+    text = str(line or "").strip()
+    p = max(0, min(100, int(current_progress or 0)))
+    stage = str(current_stage or "").strip() or "更新中"
+    hint_status = ""
+    hint_msg = ""
+    if not text:
+        return p, stage, hint_status, hint_msg
+
+    m = re.search(r"文件拉取进度.*\((\d+)\s*/\s*(\d+)\)", text)
+    if m:
+        done = max(0, int(m.group(1) or 0))
+        total = max(1, int(m.group(2) or 1))
+        pct = max(0.0, min(1.0, float(done) / float(total)))
+        p = max(p, int(18 + pct * 30))
+        stage = f"拉取更新文件 {done}/{total}"
+
+    hints: List[Tuple[str, int, str]] = [
+        ("依赖已满足", 8, "依赖检查完成"),
+        ("安装缺失依赖", 8, "安装更新依赖"),
+        ("拉取仓库文件清单", 14, "读取更新清单"),
+        ("优先使用文件清单拉取", 14, "读取更新清单"),
+        ("开始拉取文件", 20, "拉取更新文件"),
+        ("仓库文件拉取完成", 50, "更新文件已下载"),
+        ("解压中", 54, "解压更新包"),
+        ("已定位 panel 目录", 58, "校验更新结构"),
+        ("更新面板程序文件", 64, "覆盖面板程序"),
+        ("打包 Agent 离线安装包", 72, "更新 Agent 安装包"),
+        ("同步 realm 二进制", 78, "同步二进制资源"),
+        ("安装/更新 Python 依赖", 84, "更新运行依赖"),
+        ("Python 依赖未变化", 84, "依赖检查完成"),
+        ("虚拟环境不存在，重新创建", 84, "重建运行环境"),
+        ("systemctl daemon-reload", 92, "刷新服务配置"),
+        ("systemctl restart realm-panel.service", 96, "重启面板服务"),
+        ("面板已更新并重启", 100, "更新完成"),
+    ]
+    for marker, marker_p, marker_stage in hints:
+        if marker in text:
+            p = max(p, int(marker_p))
+            stage = marker_stage
+
+    lower = text.lower()
+    if ("restart realm-panel.service" in lower) or ("systemctl restart realm-panel.service" in lower):
+        p = max(p, 96)
+        stage = "重启面板服务"
+        hint_status = "restarting"
+    if "面板已更新并重启" in text:
+        p = 100
+        stage = "更新完成"
+        hint_status = "done"
+
+    if text.startswith("[错误]") or "请使用 root 运行" in text:
+        hint_msg = text
+
+    return max(0, min(100, int(p))), stage, hint_status, hint_msg
+
+
+def _panel_update_persist(snapshot: Dict[str, Any]) -> None:
+    if not isinstance(snapshot, dict):
+        return
+    payload = {
+        "job_id": str(snapshot.get("job_id") or "").strip(),
+        "status": _panel_update_canon_status(snapshot.get("status")),
+        "progress": max(0, min(100, int(snapshot.get("progress") or 0))),
+        "stage": str(snapshot.get("stage") or "").strip(),
+        "message": str(snapshot.get("message") or "").strip(),
+        "source": str(snapshot.get("source") or "").strip(),
+        "started_at": str(snapshot.get("started_at") or "").strip(),
+        "updated_at": str(snapshot.get("updated_at") or "").strip(),
+        "finished_at": str(snapshot.get("finished_at") or "").strip(),
+    }
+    try:
+        set_panel_setting(_PANEL_UPDATE_STATE_KEY, json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+    except Exception:
+        pass
+
+
+def _panel_update_load_persisted(job_id: str = "") -> Optional[Dict[str, Any]]:
+    raw = str(get_panel_setting(_PANEL_UPDATE_STATE_KEY, "") or "").strip()
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    jid = str(data.get("job_id") or "").strip()
+    if not jid:
+        return None
+    want = str(job_id or "").strip()
+    if want and want != jid:
+        return None
+    return {
+        "job_id": jid,
+        "status": _panel_update_canon_status(data.get("status")),
+        "progress": max(0, min(100, int(data.get("progress") or 0))),
+        "stage": str(data.get("stage") or "").strip(),
+        "message": str(data.get("message") or "").strip(),
+        "source": str(data.get("source") or "").strip(),
+        "started_at": str(data.get("started_at") or "").strip(),
+        "updated_at": str(data.get("updated_at") or "").strip(),
+        "finished_at": str(data.get("finished_at") or "").strip(),
+        "logs": [],
+    }
+
+
+def _panel_update_snapshot(job_id: str = "") -> Optional[Dict[str, Any]]:
+    want = str(job_id or "").strip()
+    with _PANEL_UPDATE_LOCK:
+        if want and isinstance(_PANEL_UPDATE_JOBS.get(want), dict):
+            src = _PANEL_UPDATE_JOBS.get(want) or {}
+            return {
+                "job_id": str(src.get("job_id") or want),
+                "status": _panel_update_canon_status(src.get("status")),
+                "progress": max(0, min(100, int(src.get("progress") or 0))),
+                "stage": str(src.get("stage") or "").strip(),
+                "message": str(src.get("message") or "").strip(),
+                "source": str(src.get("source") or "").strip(),
+                "started_at": str(src.get("started_at") or "").strip(),
+                "updated_at": str(src.get("updated_at") or "").strip(),
+                "finished_at": str(src.get("finished_at") or "").strip(),
+                "logs": list(src.get("logs") or []),
+            }
+        if (not want) and _PANEL_UPDATE_WORKER_JOB_ID and isinstance(_PANEL_UPDATE_JOBS.get(_PANEL_UPDATE_WORKER_JOB_ID), dict):
+            src = _PANEL_UPDATE_JOBS.get(_PANEL_UPDATE_WORKER_JOB_ID) or {}
+            return {
+                "job_id": str(src.get("job_id") or _PANEL_UPDATE_WORKER_JOB_ID),
+                "status": _panel_update_canon_status(src.get("status")),
+                "progress": max(0, min(100, int(src.get("progress") or 0))),
+                "stage": str(src.get("stage") or "").strip(),
+                "message": str(src.get("message") or "").strip(),
+                "source": str(src.get("source") or "").strip(),
+                "started_at": str(src.get("started_at") or "").strip(),
+                "updated_at": str(src.get("updated_at") or "").strip(),
+                "finished_at": str(src.get("finished_at") or "").strip(),
+                "logs": list(src.get("logs") or []),
+            }
+        if (not want) and _PANEL_UPDATE_JOBS:
+            latest = sorted(
+                _PANEL_UPDATE_JOBS.values(),
+                key=lambda x: _panel_update_parse_ts((x or {}).get("updated_at")),
+                reverse=True,
+            )[0]
+            src = latest if isinstance(latest, dict) else {}
+            return {
+                "job_id": str(src.get("job_id") or ""),
+                "status": _panel_update_canon_status(src.get("status")),
+                "progress": max(0, min(100, int(src.get("progress") or 0))),
+                "stage": str(src.get("stage") or "").strip(),
+                "message": str(src.get("message") or "").strip(),
+                "source": str(src.get("source") or "").strip(),
+                "started_at": str(src.get("started_at") or "").strip(),
+                "updated_at": str(src.get("updated_at") or "").strip(),
+                "finished_at": str(src.get("finished_at") or "").strip(),
+                "logs": list(src.get("logs") or []),
+            }
+    return _panel_update_load_persisted(want)
+
+
+def _panel_update_worker_alive(job_id: str = "") -> bool:
+    want = str(job_id or "").strip()
+    with _PANEL_UPDATE_LOCK:
+        t = _PANEL_UPDATE_WORKER
+        jid = str(_PANEL_UPDATE_WORKER_JOB_ID or "").strip()
+    alive = bool(t is not None and t.is_alive())
+    if not alive:
+        return False
+    if want and jid != want:
+        return False
+    return True
+
+
+def _panel_update_touch(
+    job_id: str,
+    *,
+    status: Optional[str] = None,
+    progress: Optional[int] = None,
+    stage: Optional[str] = None,
+    message: Optional[str] = None,
+    source: Optional[str] = None,
+    append_log: Optional[str] = None,
+) -> Dict[str, Any]:
+    jid = str(job_id or "").strip()
+    now = _panel_update_now_text()
+    with _PANEL_UPDATE_LOCK:
+        job = _PANEL_UPDATE_JOBS.get(jid)
+        if not isinstance(job, dict):
+            job = {
+                "job_id": jid,
+                "status": "running",
+                "progress": 0,
+                "stage": "",
+                "message": "",
+                "source": "",
+                "started_at": now,
+                "updated_at": now,
+                "finished_at": "",
+                "logs": [],
+            }
+            _PANEL_UPDATE_JOBS[jid] = job
+
+        if status is not None:
+            job["status"] = _panel_update_canon_status(status)
+        if progress is not None:
+            cur = int(job.get("progress") or 0)
+            nxt = max(0, min(100, int(progress)))
+            if nxt < cur and _panel_update_canon_status(job.get("status")) in _PANEL_UPDATE_ACTIVE_STATES:
+                nxt = cur
+            job["progress"] = nxt
+        if stage is not None:
+            job["stage"] = str(stage or "").strip()
+        if message is not None:
+            job["message"] = str(message or "").strip()
+        if source is not None:
+            job["source"] = str(source or "").strip()
+        if append_log is not None:
+            ln = _panel_update_sanitize_line(append_log)
+            if ln:
+                logs = job.get("logs")
+                if not isinstance(logs, list):
+                    logs = []
+                    job["logs"] = logs
+                logs.append(ln)
+                if len(logs) > int(_PANEL_UPDATE_LOG_MAX):
+                    del logs[: len(logs) - int(_PANEL_UPDATE_LOG_MAX)]
+
+        st_now = _panel_update_canon_status(job.get("status"))
+        if st_now in _PANEL_UPDATE_TERMINAL_STATES and not str(job.get("finished_at") or "").strip():
+            job["finished_at"] = now
+        if st_now == "restarting" and int(job.get("progress") or 0) < 95:
+            job["progress"] = 95
+        job["updated_at"] = now
+
+        snap = {
+            "job_id": str(job.get("job_id") or jid),
+            "status": _panel_update_canon_status(job.get("status")),
+            "progress": max(0, min(100, int(job.get("progress") or 0))),
+            "stage": str(job.get("stage") or "").strip(),
+            "message": str(job.get("message") or "").strip(),
+            "source": str(job.get("source") or "").strip(),
+            "started_at": str(job.get("started_at") or "").strip(),
+            "updated_at": str(job.get("updated_at") or "").strip(),
+            "finished_at": str(job.get("finished_at") or "").strip(),
+            "logs": list(job.get("logs") or []),
+        }
+
+    _panel_update_persist(snap)
+    return snap
+
+
+def _panel_update_prune_memory() -> None:
+    cutoff = time.time() - float(_PANEL_UPDATE_STALE_SEC)
+    drop_ids: List[str] = []
+    with _PANEL_UPDATE_LOCK:
+        for jid, item in _PANEL_UPDATE_JOBS.items():
+            if not isinstance(item, dict):
+                drop_ids.append(str(jid))
+                continue
+            st = _panel_update_canon_status(item.get("status"))
+            if st in _PANEL_UPDATE_ACTIVE_STATES:
+                continue
+            ts = _panel_update_parse_ts(item.get("updated_at"))
+            if ts > 0 and ts < cutoff:
+                drop_ids.append(str(jid))
+        for jid in drop_ids:
+            _PANEL_UPDATE_JOBS.pop(jid, None)
+
+
+def _panel_update_local_script_path() -> str:
+    candidates: List[str] = []
+    cfg = setting_str("panel_update_script_path", default="", env_names=["REALM_PANEL_UPDATE_SCRIPT"]).strip()
+    if cfg:
+        candidates.append(cfg)
+    try:
+        cur = Path(__file__).resolve()
+        # /opt/realm-panel/panel/app/routers/api_agents.py -> /opt/realm-panel/realm_panel.sh
+        candidates.append(str(cur.parents[4] / "realm_panel.sh"))
+        candidates.append(str(cur.parents[3] / "realm_panel.sh"))
+    except Exception:
+        pass
+    candidates.extend(
+        [
+            "/opt/realm-panel/realm_panel.sh",
+            "/usr/local/bin/realm_panel.sh",
+        ]
+    )
+    seen: set[str] = set()
+    for p in candidates:
+        path = str(p or "").strip()
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        try:
+            if os.path.isfile(path):
+                return path
+        except Exception:
+            continue
+    return ""
+
+
+def _panel_update_build_command() -> Tuple[str, str]:
+    script = _panel_update_local_script_path()
+    if script:
+        quoted = shlex.quote(script)
+        return f"set -euo pipefail; printf '2\\n1\\n' | bash {quoted}", script
+    remote = (
+        "bash <(curl -fsSL https://nexus.infpro.me/nexus/realm_panel.sh "
+        "|| curl -fsSL https://raw.githubusercontent.com/cyeinfpro/NexusControlPlane/main/realm_panel.sh)"
+    )
+    cmd = "set -euo pipefail; printf '2\\n1\\n' | " + remote
+    return cmd, "remote:realm_panel.sh"
+
+
+def _panel_update_run_worker(job_id: str) -> None:
+    global _PANEL_UPDATE_WORKER
+    global _PANEL_UPDATE_WORKER_JOB_ID
+
+    jid = str(job_id or "").strip()
+    if not jid:
+        return
+
+    cmd, source = _panel_update_build_command()
+    _panel_update_touch(
+        jid,
+        status="running",
+        progress=2,
+        stage="准备执行更新脚本",
+        source=source,
+        append_log=f"任务启动：{source}",
+    )
+
+    proc: Optional[subprocess.Popen[str]] = None
+    saw_done = False
+    saw_restart = False
+    try:
+        proc = subprocess.Popen(
+            ["bash", "-lc", cmd],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        _panel_update_touch(
+            jid,
+            progress=5,
+            stage="更新任务已启动",
+            append_log=f"更新命令已启动（pid={int(proc.pid)}）",
+        )
+
+        if proc.stdout is not None:
+            for raw in proc.stdout:
+                line = _panel_update_sanitize_line(raw)
+                if not line:
+                    continue
+                cur = _panel_update_snapshot(jid) or {}
+                cur_progress = int(cur.get("progress") or 0)
+                cur_stage = str(cur.get("stage") or "").strip()
+                next_p, next_stage, hint_status, hint_msg = _panel_update_progress_hint(line, cur_progress, cur_stage)
+
+                if "面板已更新并重启" in line:
+                    saw_done = True
+                if ("restart realm-panel.service" in line.lower()) or ("systemctl restart realm-panel.service" in line.lower()):
+                    saw_restart = True
+
+                _panel_update_touch(
+                    jid,
+                    status=(hint_status or ("restarting" if saw_restart and next_p >= 92 else None)),
+                    progress=next_p,
+                    stage=next_stage,
+                    message=(hint_msg if hint_msg else None),
+                    append_log=line,
+                )
+    except Exception as exc:
+        _panel_update_touch(
+            jid,
+            status="failed",
+            progress=100,
+            stage="更新失败",
+            message=f"启动更新命令失败：{exc}",
+            append_log=f"更新失败：{exc}",
+        )
+        logger.exception("panel update worker crashed job_id=%s", jid)
+        return
+    finally:
+        try:
+            if proc is not None and proc.stdout is not None:
+                proc.stdout.close()
+        except Exception:
+            pass
+
+    rc = -1
+    try:
+        if proc is not None:
+            rc = int(proc.wait(timeout=5))
+    except Exception:
+        rc = -1
+
+    cur = _panel_update_snapshot(jid) or {}
+    cur_progress = int(cur.get("progress") or 0)
+    restart_signal_exit = rc in (-15, 143)
+    if rc == 0:
+        _panel_update_touch(
+            jid,
+            status="done",
+            progress=100,
+            stage="更新完成，正在刷新面板",
+            message="",
+            append_log="更新完成",
+        )
+    else:
+        if saw_done:
+            _panel_update_touch(
+                jid,
+                status="done",
+                progress=100,
+                stage="更新完成，正在刷新面板",
+                message="",
+                append_log=f"更新进程退出（code={rc}）",
+            )
+        elif restart_signal_exit:
+            _panel_update_touch(
+                jid,
+                status="restarting",
+                progress=max(96, cur_progress),
+                stage="面板服务重启中",
+                message="更新进程收到重启信号，等待面板恢复",
+                append_log=f"更新进程退出（code={rc}），判定为重启中",
+            )
+        elif saw_restart or cur_progress >= 90:
+            _panel_update_touch(
+                jid,
+                status="restarting",
+                progress=max(95, cur_progress),
+                stage="面板服务重启中",
+                message="更新已进入重启阶段，等待面板恢复",
+                append_log=f"更新进程退出（code={rc}），等待服务恢复",
+            )
+        else:
+            _panel_update_touch(
+                jid,
+                status="failed",
+                progress=100,
+                stage="更新失败",
+                message=f"更新命令退出码 {rc}",
+                append_log=f"更新失败：退出码 {rc}",
+            )
+
+    with _PANEL_UPDATE_LOCK:
+        if str(_PANEL_UPDATE_WORKER_JOB_ID or "").strip() == jid:
+            _PANEL_UPDATE_WORKER_JOB_ID = ""
+            _PANEL_UPDATE_WORKER = None
+
+
+def _panel_update_reconcile(snapshot: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not isinstance(snapshot, dict):
+        return None
+    jid = str(snapshot.get("job_id") or "").strip()
+    if not jid:
+        return snapshot
+    st = _panel_update_canon_status(snapshot.get("status"))
+    upd_ts = _panel_update_parse_ts(snapshot.get("updated_at"))
+    age = max(0.0, time.time() - upd_ts) if upd_ts > 0 else 0.0
+    alive = _panel_update_worker_alive(jid)
+    progress = int(snapshot.get("progress") or 0)
+    message = str(snapshot.get("message") or "").strip()
+
+    if st == "failed" and ("退出码 -15" in message or "退出码 143" in message) and age <= 120.0:
+        return _panel_update_touch(
+            jid,
+            status="restarting",
+            progress=max(96, progress),
+            stage="面板服务重启中",
+            message="检测到更新重启信号，正在等待面板恢复",
+            append_log="检测到退出码 -15/143，自动切换为重启等待状态",
+        )
+
+    if st == "running" and (not alive):
+        if age >= 12.0 and progress >= 65:
+            return _panel_update_touch(
+                jid,
+                status="restarting",
+                progress=max(95, progress),
+                stage="面板服务重启中",
+                message="更新已进入重启阶段，等待面板恢复",
+                append_log="检测到更新进程退出，正在等待面板恢复",
+            )
+        if age >= 20.0 and progress < 65:
+            return _panel_update_touch(
+                jid,
+                status="failed",
+                progress=100,
+                stage="更新失败",
+                message="更新任务中断，请重新发起更新",
+                append_log="更新任务异常中断",
+            )
+        if age >= float(_PANEL_UPDATE_STALE_SEC):
+            return _panel_update_touch(
+                jid,
+                status="failed",
+                progress=100,
+                stage="更新失败",
+                message="更新任务长时间无响应，请重试",
+                append_log="更新任务超时",
+            )
+
+    if st == "restarting" and (not alive):
+        if age >= float(_PANEL_UPDATE_STALE_SEC):
+            return _panel_update_touch(
+                jid,
+                status="failed",
+                progress=100,
+                stage="更新失败",
+                message="面板重启等待超时，请检查服务状态",
+                append_log="等待面板恢复超时",
+            )
+        if age >= 6.0:
+            return _panel_update_touch(
+                jid,
+                status="done",
+                progress=100,
+                stage="更新完成，正在刷新面板",
+                message="",
+                append_log="面板服务已恢复，更新任务完成",
+            )
+
+    return snapshot
+
+
+def _panel_update_public(snapshot: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not isinstance(snapshot, dict):
+        return {
+            "job_id": "",
+            "status": "idle",
+            "progress": 0,
+            "stage": "",
+            "message": "",
+            "source": "",
+            "started_at": "",
+            "updated_at": "",
+            "finished_at": "",
+            "logs": [],
+            "auto_reload": False,
+        }
+    st = _panel_update_canon_status(snapshot.get("status"))
+    return {
+        "job_id": str(snapshot.get("job_id") or "").strip(),
+        "status": st,
+        "progress": max(0, min(100, int(snapshot.get("progress") or 0))),
+        "stage": str(snapshot.get("stage") or "").strip(),
+        "message": str(snapshot.get("message") or "").strip(),
+        "source": str(snapshot.get("source") or "").strip(),
+        "started_at": str(snapshot.get("started_at") or "").strip(),
+        "updated_at": str(snapshot.get("updated_at") or "").strip(),
+        "finished_at": str(snapshot.get("finished_at") or "").strip(),
+        "logs": list(snapshot.get("logs") or []),
+        "auto_reload": st in ("restarting", "done"),
+    }
 
 
 def _parse_int_env(name: str, default: int) -> int:
@@ -106,6 +772,20 @@ def _parse_float_env(name: str, default: float) -> float:
         return float(default)
 
 
+def _coerce_int(raw: Any, default: int = 0) -> int:
+    try:
+        return int(raw)
+    except Exception:
+        try:
+            return int(float(str(raw).strip()))
+        except Exception:
+            return int(default)
+
+
+def _is_storage_mount_site(site: Any) -> bool:
+    return str((site or {}).get("type") or "").strip().lower() == "storage_mount"
+
+
 def _explicit_url_port(raw: Any) -> int:
     s = str(raw or "").strip()
     if not s:
@@ -119,10 +799,43 @@ def _explicit_url_port(raw: Any) -> int:
             return p
     except Exception:
         return 0
-    return 0
 
 
-_SITE_TASK_TYPES = {"website_env_ensure", "website_env_uninstall", "website_ssl_issue", "website_ssl_renew"}
+_TZ_NAME_RE = re.compile(r"^[A-Za-z0-9._+\-/]{1,128}$")
+
+
+def _normalize_tz_name(raw: Any, default: str = "Asia/Shanghai") -> str:
+    s = str(raw or "").strip()
+    if not s:
+        return str(default or "Asia/Shanghai")
+    if len(s) > 128:
+        return str(default or "Asia/Shanghai")
+    if not _TZ_NAME_RE.match(s):
+        return str(default or "Asia/Shanghai")
+    return s
+
+
+_SITE_TASK_TYPES = {
+    "website_env_ensure",
+    "website_env_uninstall",
+    "website_ssl_issue",
+    "website_ssl_renew",
+    "create_site",
+    "site_update",
+    "site_delete",
+    "site_file_op",
+    "remote_storage_mount",
+    "remote_storage_unmount",
+    "netmon_probe",
+}
+_REMOTE_STORAGE_PROFILE_SETTING_KEY = "remote_storage_profiles"
+_REMOTE_PROFILE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+_REMOTE_STORAGE_PASSWORD_KEY_SETTING = "remote_storage_password_key"
+_REMOTE_STORAGE_PASSWORD_ENV_KEYS = (
+    "REALM_REMOTE_STORAGE_PASSWORD_KEY",
+    "REALM_PANEL_SECRET_KEY",
+)
+_REMOTE_STORAGE_PASSWORD_ENC_PREFIX = "enc:v1:"
 _SITE_TASK_MAX_ATTEMPTS = max(1, min(30, _parse_int_env("REALM_WEBSITE_OP_MAX_ATTEMPTS", 10)))
 _SITE_TASK_RETRY_BASE_SEC = max(1.0, min(120.0, _parse_float_env("REALM_WEBSITE_OP_RETRY_BASE_SEC", 3.0)))
 _SITE_TASK_RETRY_MAX_SEC = max(
@@ -130,6 +843,9 @@ _SITE_TASK_RETRY_MAX_SEC = max(
     min(600.0, _parse_float_env("REALM_WEBSITE_OP_RETRY_MAX_SEC", 60.0)),
 )
 _SITE_TASK_RUNNING_REDISPATCH_SEC = max(30.0, min(600.0, _parse_float_env("REALM_WEBSITE_RUNNING_REDISPATCH_SEC", 180.0)))
+_NETMON_TASK_RUNNING_REDISPATCH_SEC = max(
+    10.0, min(300.0, _parse_float_env("REALM_NETMON_RUNNING_REDISPATCH_SEC", 45.0))
+)
 
 _AGENT_UPDATE_MAX_RETRIES = max(1, min(20, _parse_int_env("REALM_AGENT_UPDATE_MAX_RETRIES", 4)))
 _AGENT_UPDATE_ACK_TIMEOUT_SEC = max(120.0, min(7200.0, _parse_float_env("REALM_AGENT_UPDATE_ACK_TIMEOUT_SEC", 300.0)))
@@ -162,6 +878,136 @@ _AGENT_REPORT_MAX_DECOMPRESSED_BYTES = max(
     _AGENT_REPORT_MAX_COMPRESSED_BYTES,
     min(64 * 1024 * 1024, _parse_int_env("REALM_AGENT_REPORT_MAX_DECOMPRESSED_BYTES", 12 * 1024 * 1024)),
 )
+
+
+def _remote_profile_id(raw: Any) -> str:
+    s = str(raw or "").strip()
+    if not s:
+        return ""
+    if not _REMOTE_PROFILE_ID_RE.match(s):
+        return ""
+    return s
+
+
+def _remote_mount_action_for_type(task_type: str, fallback_action: Any = "") -> str:
+    t = str(task_type or "").strip().lower()
+    if t == "remote_storage_unmount":
+        return "unmount"
+    if t == "remote_storage_mount":
+        return "mount"
+    a = str(fallback_action or "").strip().lower()
+    if a in ("mount", "unmount"):
+        return a
+    return "mount"
+
+
+def _remote_mount_action_label(action: str) -> str:
+    return "卸载" if str(action or "").strip().lower() == "unmount" else "挂载"
+
+
+def _remote_storage_password_key_bytes() -> bytes:
+    raw = str(get_panel_setting(_REMOTE_STORAGE_PASSWORD_KEY_SETTING, "") or "").strip()
+    if not raw:
+        for env_name in _REMOTE_STORAGE_PASSWORD_ENV_KEYS:
+            env_value = str(os.getenv(str(env_name) or "") or "").strip()
+            if env_value:
+                raw = env_value
+                break
+    if not raw:
+        return b""
+    try:
+        decoded = base64.urlsafe_b64decode(raw.encode("utf-8"))
+        if len(decoded) == 32:
+            return raw.encode("utf-8")
+    except Exception:
+        pass
+    return b""
+
+
+def _remote_storage_decrypt_password(raw: Any) -> str:
+    token = str(raw or "").strip()
+    if not token:
+        return ""
+    if token.startswith(_REMOTE_STORAGE_PASSWORD_ENC_PREFIX):
+        token = token[len(_REMOTE_STORAGE_PASSWORD_ENC_PREFIX):]
+    if not token:
+        return ""
+    if Fernet is None:
+        return ""
+    key = _remote_storage_password_key_bytes()
+    if not key:
+        return ""
+    try:
+        plain = Fernet(key).decrypt(token.encode("utf-8")).decode("utf-8")
+    except (InvalidToken, Exception):
+        return ""
+    text = str(plain or "").strip()
+    if len(text) > 128:
+        text = text[:128]
+    return text
+
+
+def _remote_storage_load_profiles() -> List[Dict[str, Any]]:
+    raw = str(get_panel_setting(_REMOTE_STORAGE_PROFILE_SETTING_KEY, "") or "").strip()
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return []
+    if not isinstance(data, list):
+        return []
+    return [dict(x) for x in data if isinstance(x, dict)]
+
+
+def _remote_storage_save_profiles(rows: List[Dict[str, Any]]) -> None:
+    payload = json.dumps((rows or []), ensure_ascii=False, separators=(",", ":"))
+    set_panel_setting(_REMOTE_STORAGE_PROFILE_SETTING_KEY, payload)
+
+
+def _remote_storage_update_profile_mount(
+    profile_id: str,
+    action: str,
+    ok: bool,
+    message: str,
+) -> None:
+    pid = _remote_profile_id(profile_id)
+    if not pid:
+        return
+    rows = _remote_storage_load_profiles()
+    if not rows:
+        return
+    idx = -1
+    row: Dict[str, Any] = {}
+    for i, item in enumerate(rows):
+        if str((item or {}).get("id") or "").strip() == pid:
+            idx = i
+            row = item if isinstance(item, dict) else {}
+            break
+    if idx < 0 or not isinstance(row, dict):
+        return
+    act = str(action or "mount").strip().lower()
+    now_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    msg = str(message or "").strip() or (
+        f"{_remote_mount_action_label(act)}成功" if bool(ok) else f"{_remote_mount_action_label(act)}失败"
+    )
+    if len(msg) > 280:
+        msg = msg[:279] + "…"
+    row["last_sync_at"] = now_text
+    row["updated_at"] = now_text
+    row["mount_message"] = msg
+    if bool(ok):
+        if act == "unmount":
+            row["mount_status"] = "unmounted"
+            row["mounted_at"] = ""
+        else:
+            row["mount_status"] = "mounted"
+            row["mounted_at"] = now_text
+    else:
+        row["mount_status"] = "error"
+    rows[idx] = row
+    rows.sort(key=lambda x: str((x or {}).get("updated_at") or ""), reverse=True)
+    _remote_storage_save_profiles(rows)
 
 
 class _RequestBodyTooLargeError(RuntimeError):
@@ -462,6 +1308,32 @@ def _site_task_last_dispatched_ts(task: Dict[str, Any]) -> float:
         return 0.0
 
 
+def _site_task_supersede_remote_mount(task: Dict[str, Any], reason: str) -> None:
+    task_id = _coerce_int((task or {}).get("id"), 0)
+    if task_id <= 0:
+        return
+    t = str((task or {}).get("type") or "").strip().lower()
+    payload = (task or {}).get("payload") if isinstance((task or {}).get("payload"), dict) else {}
+    profile_id = _remote_profile_id(payload.get("profile_id"))
+    result_payload = (task or {}).get("result") if isinstance((task or {}).get("result"), dict) else {}
+    result_payload = dict(result_payload)
+    result_payload.update(
+        {
+            "op": t or "remote_storage_mount",
+            "profile_id": profile_id,
+            "superseded": True,
+            "superseded_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+    )
+    update_task(
+        int(task_id),
+        status="failed",
+        progress=100,
+        error=str(reason or "已被新任务替代"),
+        result=result_payload,
+    )
+
+
 def _normalize_proxy_target(target: str) -> str:
     t = (target or "").strip()
     if not t:
@@ -487,6 +1359,28 @@ def _is_ssl_renew_skip_error(err: Any) -> bool:
         "skipping. next renewal time is",
     )
     return any(s in msg for s in signs)
+
+
+def _remote_mount_retryable_error(err: Any) -> bool:
+    msg = str(err or "").strip().lower()
+    if not msg:
+        return True
+    non_retry_signals = (
+        "file exists",
+        "operation not permitted",
+        "permission denied",
+        "access denied",
+        "authentication",
+        "auth failed",
+        "invalid argument",
+        "挂载点目录非空",
+        "挂载点必须是绝对路径",
+        "协议不受支持",
+        "缺少挂载命令",
+    )
+    if any(s in msg for s in non_retry_signals):
+        return False
+    return True
 
 
 def _node_root_base(node: Dict[str, Any]) -> str:
@@ -535,11 +1429,58 @@ def _merge_node_env_caps(node: Dict[str, Any], env_data: Any) -> None:
         pass
 
 
+def _netmon_payload_mids_by_target(payload: Dict[str, Any]) -> Dict[str, List[int]]:
+    out: Dict[str, List[int]] = {}
+    rows = payload.get("mids_by_target") if isinstance(payload, dict) else {}
+    if not isinstance(rows, dict):
+        return out
+    for key, val in rows.items():
+        target = str(key or "").strip()
+        if not target:
+            continue
+        mids: List[int] = []
+        arr = val if isinstance(val, list) else []
+        for x in arr:
+            try:
+                mid = int(x)
+            except Exception:
+                continue
+            if mid > 0 and mid not in mids:
+                mids.append(mid)
+        if mids:
+            out[target] = mids
+    return out
+
+
+def _netmon_payload_monitor_ids(payload: Dict[str, Any]) -> List[int]:
+    mids: List[int] = []
+    for arr in _netmon_payload_mids_by_target(payload).values():
+        for mid in arr:
+            if mid > 0 and mid not in mids:
+                mids.append(mid)
+    return mids
+
+
+def _netmon_touch_monitor_last_run(payload: Dict[str, Any], msg: str, ts_ms: Optional[int] = None) -> None:
+    mids = _netmon_payload_monitor_ids(payload if isinstance(payload, dict) else {})
+    if not mids:
+        return
+    now_ms = int(time.time() * 1000)
+    ts = int(ts_ms) if ts_ms is not None else now_ms
+    for mid in mids:
+        try:
+            update_netmon_monitor(int(mid), last_run_ts_ms=int(ts), last_run_msg=str(msg or ""))
+        except Exception:
+            continue
+
+
 def _site_event_action(task_type: str) -> str:
     if task_type == "website_ssl_issue":
         return "ssl_issue"
     if task_type == "website_ssl_renew":
         return "ssl_renew"
+    if task_type == "create_site":
+        return "site_create"
     return task_type
 
 
@@ -557,9 +1498,76 @@ def _site_task_final_fail(node: Dict[str, Any], task: Dict[str, Any], err_text: 
     }
     update_task(task_id, status="failed", progress=100, error=str(err_text or ""), result=result_payload)
 
+    if t == "netmon_probe":
+        _netmon_touch_monitor_last_run(payload, "dispatch_failed")
+        return
+
+    if t == "create_site":
+        site_id = _coerce_int(payload.get("site_id"), 0) if isinstance(payload, dict) else 0
+        if site_id > 0:
+            try:
+                update_site(int(site_id), status="error")
+            except Exception:
+                pass
+            add_site_event(
+                int(site_id),
+                "site_create",
+                status="failed",
+                actor="agent",
+                error=str(err_text or ""),
+                payload={"task_id": int(task_id), "attempt": int(attempt)},
+            )
+        return
+
+    if t == "site_update":
+        site_id = _coerce_int(payload.get("site_id"), 0) if isinstance(payload, dict) else 0
+        if site_id > 0:
+            add_site_event(
+                int(site_id),
+                "site_update",
+                status="failed",
+                actor="agent",
+                error=str(err_text or ""),
+                payload={"task_id": int(task_id), "attempt": int(attempt)},
+            )
+        return
+
+    if t == "site_delete":
+        site_id = _coerce_int(payload.get("site_id"), 0) if isinstance(payload, dict) else 0
+        if site_id > 0:
+            add_site_event(
+                int(site_id),
+                "site_delete",
+                status="failed",
+                actor="agent",
+                error=str(err_text or ""),
+                payload={"task_id": int(task_id), "attempt": int(attempt)},
+            )
+        return
+
+    if t == "site_file_op":
+        site_id = _coerce_int(payload.get("site_id"), 0) if isinstance(payload, dict) else 0
+        action = str(payload.get("action") or "").strip().lower() if isinstance(payload, dict) else ""
+        if site_id > 0 and action:
+            add_site_event(
+                int(site_id),
+                f"site_file_{action}",
+                status="failed",
+                actor="agent",
+                error=str(err_text or ""),
+                payload={"task_id": int(task_id), "attempt": int(attempt)},
+            )
+        return
+
+    if t in ("remote_storage_mount", "remote_storage_unmount"):
+        profile_id = _remote_profile_id((payload or {}).get("profile_id"))
+        act = _remote_mount_action_for_type(t, (payload or {}).get("action"))
+        _remote_storage_update_profile_mount(profile_id, act, False, str(err_text or "任务执行失败"))
+        return
+
     if t in ("website_ssl_issue", "website_ssl_renew"):
-        site_id = int(payload.get("site_id") or 0) if isinstance(payload, dict) else 0
-        cert_id = int(payload.get("cert_id") or 0) if isinstance(payload, dict) else 0
+        site_id = _coerce_int(payload.get("site_id"), 0) if isinstance(payload, dict) else 0
+        cert_id = _coerce_int(payload.get("cert_id"), 0) if isinstance(payload, dict) else 0
         if cert_id > 0:
             update_certificate(int(cert_id), status="failed", last_error=str(err_text or ""))
         else:
@@ -607,8 +1615,17 @@ def _site_task_retry(node: Dict[str, Any], task: Dict[str, Any], err_text: str, 
         result=result_payload,
     )
     payload = task.get("payload") if isinstance(task.get("payload"), dict) else {}
+    if t == "netmon_probe":
+        _netmon_touch_monitor_last_run(payload, "dispatch_retrying")
+        return
+    if t in ("remote_storage_mount", "remote_storage_unmount"):
+        profile_id = _remote_profile_id((payload or {}).get("profile_id"))
+        act = _remote_mount_action_for_type(t, (payload or {}).get("action"))
+        retry_msg = f"{_remote_mount_action_label(act)}失败，{int(max(1.0, backoff))} 秒后重试：{str(err_text or '').strip() or '任务执行失败'}"
+        _remote_storage_update_profile_mount(profile_id, act, False, retry_msg)
+        return
     if t in ("website_ssl_issue", "website_ssl_renew"):
-        cert_id = int(payload.get("cert_id") or 0)
+        cert_id = _coerce_int(payload.get("cert_id"), 0)
         if cert_id > 0:
             update_certificate(int(cert_id), status="pending", last_error=str(err_text or ""))
 
@@ -623,22 +1640,301 @@ def _site_task_mark_success(node: Dict[str, Any], task: Dict[str, Any], result_d
     result_payload["attempts"] = int(attempt)
     result_payload["max_attempts"] = int(max_attempts)
     result_payload["reported_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    update_task(task_id, status="success", progress=100, error="", result=result_payload)
 
     node_id = int(node.get("id") or 0)
+    if t == "netmon_probe":
+        ts_ms = int(time.time() * 1000)
+        try:
+            ts_ms = int(result_payload.get("ts") or result_payload.get("ts_ms") or payload.get("queued_ts_ms") or ts_ms)
+        except Exception:
+            ts_ms = int(time.time() * 1000)
+
+        mids_map = _netmon_payload_mids_by_target(payload)
+        result_map = result_payload.get("results") if isinstance(result_payload.get("results"), dict) else {}
+        rows: List[Tuple[int, int, int, int, Optional[float], Optional[str]]] = []
+        mon_state: Dict[int, Dict[str, Any]] = {}
+
+        for target, mids in mids_map.items():
+            item = result_map.get(target) if isinstance(result_map, dict) else None
+            if isinstance(item, dict) and bool(item.get("ok")):
+                try:
+                    latency = float(item.get("latency_ms")) if item.get("latency_ms") is not None else None
+                except Exception:
+                    latency = None
+                for mid in mids:
+                    mid_i = int(mid)
+                    if mid_i <= 0:
+                        continue
+                    st = mon_state.get(mid_i)
+                    if not st:
+                        st = {"ok_any": False, "err": ""}
+                        mon_state[mid_i] = st
+                    st["ok_any"] = True
+                    rows.append((mid_i, int(node_id), int(ts_ms), 1, latency, None))
+                continue
+
+            err = ""
+            if isinstance(item, dict):
+                err = str(item.get("error") or "probe_failed")
+            else:
+                err = "no_data"
+            if len(err) > 200:
+                err = err[:200] + "…"
+            for mid in mids:
+                mid_i = int(mid)
+                if mid_i <= 0:
+                    continue
+                st = mon_state.get(mid_i)
+                if not st:
+                    st = {"ok_any": False, "err": ""}
+                    mon_state[mid_i] = st
+                if not st.get("err"):
+                    st["err"] = err
+                rows.append((mid_i, int(node_id), int(ts_ms), 0, None, err))
+
+        inserted = 0
+        try:
+            if rows:
+                inserted = int(insert_netmon_samples(rows) or 0)
+        except Exception:
+            inserted = 0
+
+        for mid, st in mon_state.items():
+            try:
+                msg = "ok" if bool(st.get("ok_any")) else str(st.get("err") or "failed")
+                update_netmon_monitor(int(mid), last_run_ts_ms=int(ts_ms), last_run_msg=msg)
+            except Exception:
+                continue
+
+        result_payload["inserted_samples"] = int(inserted)
+        result_payload["monitor_count"] = int(len(mon_state))
+        update_task(task_id, status="success", progress=100, error="", result=result_payload)
+        return
+
+    if t == "create_site":
+        site_id = _coerce_int(payload.get("site_id"), 0) if isinstance(payload, dict) else 0
+        health = result_payload.get("health") if isinstance(result_payload.get("health"), dict) else {}
+        health_status = "unknown"
+        health_error = ""
+        health_code = 0
+        health_latency = 0
+        if isinstance(health, dict) and health:
+            try:
+                health_code = int(health.get("status_code") or 0)
+            except Exception:
+                health_code = 0
+            try:
+                health_latency = int(health.get("latency_ms") or 0)
+            except Exception:
+                health_latency = 0
+            if bool(health.get("ok")):
+                health_status = "ok"
+                health_error = ""
+            else:
+                health_status = "fail"
+                health_error = str(health.get("error") or "")
+
+        if site_id > 0:
+            try:
+                update_site(int(site_id), status="running" if health_status != "fail" else "error")
+            except Exception:
+                pass
+            try:
+                update_site_health(
+                    int(site_id),
+                    health_status,
+                    health_code=health_code,
+                    health_latency_ms=health_latency,
+                    health_error=str(health_error or ""),
+                )
+            except Exception:
+                pass
+            add_site_event(
+                int(site_id),
+                "site_create",
+                status="success",
+                actor="agent",
+                result=result_payload,
+                payload={"task_id": int(task_id), "attempt": int(attempt)},
+            )
+        update_task(task_id, status="success", progress=100, error="", result=result_payload)
+        return
+
+    if t == "site_update":
+        site_id = _coerce_int(payload.get("site_id"), 0) if isinstance(payload, dict) else 0
+        domains = payload.get("domains") if isinstance(payload.get("domains"), list) else []
+        domains = [str(x).strip() for x in domains if str(x).strip()]
+        if not domains:
+            site_obj = get_site(int(site_id)) if site_id > 0 else None
+            domains = list(site_obj.get("domains") or []) if isinstance(site_obj, dict) else []
+        site_type = str(payload.get("site_type") or "static").strip().lower()
+        if site_type not in ("static", "php", "reverse_proxy"):
+            site_type = "static"
+        root_path = str(payload.get("root_path") or "")
+        proxy_target = _normalize_proxy_target(payload.get("proxy_target") or "")
+        name = str(payload.get("name") or (domains[0] if domains else f"站点#{site_id}")).strip()
+        https_flag = bool(payload.get("https_redirect"))
+        gzip_flag = bool(payload.get("gzip_enabled"))
+        nginx_tpl = str(payload.get("nginx_tpl") or "")
+
+        health = result_payload.get("health") if isinstance(result_payload.get("health"), dict) else {}
+        health_status = "unknown"
+        health_error = ""
+        health_code = 0
+        health_latency = 0
+        if isinstance(health, dict) and health:
+            try:
+                health_code = int(health.get("status_code") or 0)
+            except Exception:
+                health_code = 0
+            try:
+                health_latency = int(health.get("latency_ms") or 0)
+            except Exception:
+                health_latency = 0
+            if bool(health.get("ok")):
+                health_status = "ok"
+            else:
+                health_status = "fail"
+                health_error = str(health.get("error") or "")
+
+        if site_id > 0:
+            try:
+                update_site(
+                    int(site_id),
+                    name=name,
+                    domains=domains,
+                    site_type=site_type,
+                    root_path=root_path if site_type != "reverse_proxy" else (root_path or ""),
+                    proxy_target=proxy_target,
+                    https_redirect=https_flag,
+                    gzip_enabled=gzip_flag,
+                    nginx_tpl=nginx_tpl,
+                    status="running" if health_status != "fail" else "error",
+                )
+            except Exception:
+                pass
+
+            try:
+                update_site_health(
+                    int(site_id),
+                    health_status,
+                    health_code=health_code,
+                    health_latency_ms=health_latency,
+                    health_error=str(health_error or ""),
+                )
+            except Exception:
+                pass
+
+            try:
+                old_domains = payload.get("old_domains") if isinstance(payload.get("old_domains"), list) else []
+
+                def _nd(v: Any) -> str:
+                    return str(v or "").strip().lower().strip(".")
+
+                old_set = {_nd(x) for x in old_domains if _nd(x)}
+                new_set = {_nd(x) for x in domains if _nd(x)}
+                if old_set != new_set:
+                    certs = list_certificates(site_id=int(site_id))
+                    if certs:
+                        update_certificate(
+                            int(certs[0].get("id") or 0),
+                            domains=domains,
+                            status="pending",
+                            last_error="站点域名已变更，建议重新申请/续期 SSL 证书",
+                        )
+            except Exception:
+                pass
+
+            add_site_event(
+                int(site_id),
+                "site_update",
+                status="success",
+                actor="agent",
+                result=result_payload,
+                payload={"task_id": int(task_id), "attempt": int(attempt)},
+            )
+
+        update_task(task_id, status="success", progress=100, error="", result=result_payload)
+        return
+
+    if t == "site_delete":
+        site_id = _coerce_int(payload.get("site_id"), 0) if isinstance(payload, dict) else 0
+        if site_id > 0:
+            try:
+                delete_certificates_by_site(int(site_id))
+            except Exception:
+                pass
+            try:
+                delete_site_events(int(site_id))
+            except Exception:
+                pass
+            try:
+                delete_site_checks(int(site_id))
+            except Exception:
+                pass
+            try:
+                delete_site(int(site_id))
+            except Exception:
+                pass
+        update_task(task_id, status="success", progress=100, error="", result=result_payload)
+        return
+
+    if t == "site_file_op":
+        site_id = _coerce_int(payload.get("site_id"), 0) if isinstance(payload, dict) else 0
+        action = str(payload.get("action") or "").strip().lower() if isinstance(payload, dict) else ""
+        if site_id > 0 and action:
+            add_site_event(
+                int(site_id),
+                f"site_file_{action}",
+                status="success",
+                actor="agent",
+                result=result_payload,
+                payload={"task_id": int(task_id), "attempt": int(attempt)},
+            )
+        update_task(task_id, status="success", progress=100, error="", result=result_payload)
+        return
+
+    if t in ("remote_storage_mount", "remote_storage_unmount"):
+        profile_id = _remote_profile_id((payload or {}).get("profile_id"))
+        act = _remote_mount_action_for_type(t, (payload or {}).get("action"))
+        msg_text = str(
+            result_payload.get("msg")
+            or result_payload.get("message")
+            or result_payload.get("detail")
+            or f"{_remote_mount_action_label(act)}成功"
+        ).strip()
+        _remote_storage_update_profile_mount(profile_id, act, True, msg_text)
+        update_task(task_id, status="success", progress=100, error="", result=result_payload)
+        return
+
+    update_task(task_id, status="success", progress=100, error="", result=result_payload)
+
     if t == "website_env_ensure":
         _merge_node_env_caps(node, result_payload)
         return
     if t == "website_env_uninstall":
         if bool(payload.get("purge_data")) and node_id > 0:
             delete_certificates_by_node(node_id)
-            delete_sites_by_node(node_id)
+            try:
+                rows = list_sites(node_id=node_id)
+            except Exception:
+                rows = []
+            for s in rows:
+                if not isinstance(s, dict) or _is_storage_mount_site(s):
+                    continue
+                sid = _coerce_int(s.get("id"), 0)
+                if sid <= 0:
+                    continue
+                try:
+                    delete_site(int(sid))
+                except Exception:
+                    pass
         return
     if t not in ("website_ssl_issue", "website_ssl_renew"):
         return
 
-    site_id = int(payload.get("site_id") or 0)
-    cert_id = int(payload.get("cert_id") or 0)
+    site_id = _coerce_int(payload.get("site_id"), 0)
+    cert_id = _coerce_int(payload.get("cert_id"), 0)
     site = get_site(int(site_id)) if site_id > 0 else None
     domains = result_payload.get("domains")
     if not isinstance(domains, list):
@@ -727,6 +2023,9 @@ def _apply_site_task_result(node: Dict[str, Any], row: Dict[str, Any]) -> None:
     if ok:
         _site_task_mark_success(node, task, result_data, attempt)
         return
+    if t in ("remote_storage_mount", "remote_storage_unmount") and not _remote_mount_retryable_error(err_text):
+        _site_task_final_fail(node, task, err_text or "任务执行失败", attempt)
+        return
     if attempt >= max_attempts:
         _site_task_final_fail(node, task, err_text or "任务执行失败", attempt)
         return
@@ -750,6 +2049,222 @@ def _build_website_cmd(task: Dict[str, Any], node: Dict[str, Any], attempt: int)
     task_id = int(task.get("id") or 0)
     payload = task.get("payload") if isinstance(task.get("payload"), dict) else {}
     node_id = int(node.get("id") or 0)
+    if t == "netmon_probe":
+        mode = str(payload.get("mode") or "ping").strip().lower()
+        if mode not in ("ping", "tcping"):
+            mode = "ping"
+        try:
+            tcp_port = int(payload.get("tcp_port") or 443)
+        except Exception:
+            tcp_port = 443
+        if tcp_port < 1 or tcp_port > 65535:
+            tcp_port = 443
+        try:
+            timeout_f = float(payload.get("timeout") or 1.5)
+        except Exception:
+            timeout_f = 1.5
+        if timeout_f < 0.2:
+            timeout_f = 0.2
+        if timeout_f > 10.0:
+            timeout_f = 10.0
+        targets_raw = payload.get("targets") if isinstance(payload.get("targets"), list) else []
+        targets: List[str] = []
+        for x in targets_raw:
+            s = str(x or "").strip()
+            if not s:
+                continue
+            if len(s) > 128:
+                continue
+            if s not in targets:
+                targets.append(s)
+        targets = targets[:50]
+        if not targets:
+            return None, "netmon targets 为空"
+        if not _netmon_payload_mids_by_target(payload):
+            return None, "netmon mids_by_target 无效"
+        return {
+            "type": "netmon_probe",
+            "task_id": int(task_id),
+            "attempt": int(attempt),
+            "mode": mode,
+            "targets": targets,
+            "tcp_port": int(tcp_port),
+            "timeout": float(timeout_f),
+        }, ""
+
+    if t == "create_site":
+        site_id = _coerce_int(payload.get("site_id"), 0)
+        if site_id <= 0:
+            return None, "site_id 无效"
+        site = get_site(int(site_id))
+        if not isinstance(site, dict):
+            return None, "站点不存在"
+        if int(site.get("node_id") or 0) != node_id:
+            return None, "站点与节点不匹配"
+        domains = [str(x).strip() for x in (site.get("domains") or []) if str(x).strip()]
+        if not domains:
+            return None, "站点域名为空"
+        site_type = str(site.get("type") or "static").strip().lower()
+        if site_type not in ("static", "php", "reverse_proxy"):
+            site_type = "static"
+        proxy_target = _normalize_proxy_target(site.get("proxy_target") or "")
+        if site_type == "reverse_proxy" and not proxy_target:
+            return None, "反向代理必须填写目标地址"
+        req_payload = {
+            "name": str(site.get("name") or domains[0]),
+            "domains": domains,
+            "root_path": str(site.get("root_path") or ""),
+            "type": site_type,
+            "web_server": str(site.get("web_server") or "nginx"),
+            "proxy_target": proxy_target,
+            "https_redirect": bool(site.get("https_redirect") or False),
+            "gzip_enabled": True if site.get("gzip_enabled") is None else bool(site.get("gzip_enabled")),
+            "nginx_tpl": str(site.get("nginx_tpl") or ""),
+            "root_base": _node_root_base(node),
+        }
+        return {
+            "type": "create_site",
+            "task_id": int(task_id),
+            "site_id": int(site_id),
+            "attempt": int(attempt),
+            "request": req_payload,
+        }, ""
+
+    if t == "site_update":
+        site_id = _coerce_int(payload.get("site_id"), 0)
+        if site_id <= 0:
+            return None, "site_id 无效"
+        site = get_site(int(site_id))
+        if not isinstance(site, dict):
+            return None, "站点不存在"
+        if int(site.get("node_id") or 0) != node_id:
+            return None, "站点与节点不匹配"
+
+        domains = payload.get("domains") if isinstance(payload.get("domains"), list) else []
+        domains = [str(x).strip() for x in domains if str(x).strip()]
+        if not domains:
+            return None, "站点域名为空"
+
+        site_type = str(payload.get("site_type") or "static").strip().lower()
+        if site_type not in ("static", "php", "reverse_proxy"):
+            site_type = "static"
+        root_path = str(payload.get("root_path") or "")
+        proxy_target = _normalize_proxy_target(payload.get("proxy_target") or "")
+        if site_type == "reverse_proxy" and not proxy_target:
+            return None, "反向代理必须填写目标地址"
+
+        old_domains = payload.get("old_domains") if isinstance(payload.get("old_domains"), list) else []
+        old_domains = [str(x).strip() for x in old_domains if str(x).strip()]
+        if not old_domains:
+            old_domains = list(site.get("domains") or [])
+        old_root_path = str(payload.get("old_root_path") or site.get("root_path") or "")
+
+        req_payload = {
+            "name": str(payload.get("name") or site.get("name") or domains[0]).strip(),
+            "domains": domains,
+            "type": site_type,
+            "web_server": str(site.get("web_server") or "nginx"),
+            "proxy_target": proxy_target,
+            "https_redirect": bool(payload.get("https_redirect")),
+            "gzip_enabled": bool(payload.get("gzip_enabled")),
+            "nginx_tpl": str(payload.get("nginx_tpl") or ""),
+            "root_path": root_path,
+            "root_base": _node_root_base(node),
+            "old_domains": old_domains,
+            "old_root_path": old_root_path,
+            "need_php": bool(site_type == "php"),
+        }
+        return {
+            "type": "site_update",
+            "task_id": int(task_id),
+            "site_id": int(site_id),
+            "attempt": int(attempt),
+            "request": req_payload,
+        }, ""
+
+    if t == "site_delete":
+        site_id = _coerce_int(payload.get("site_id"), 0)
+        if site_id <= 0:
+            return None, "site_id 无效"
+        site = get_site(int(site_id))
+        if not isinstance(site, dict):
+            return None, "站点不存在"
+        if int(site.get("node_id") or 0) != node_id:
+            return None, "站点与节点不匹配"
+        domains = [str(x).strip() for x in (site.get("domains") or []) if str(x).strip()]
+        if not domains:
+            return None, "站点域名为空"
+        req_payload = {
+            "domains": domains,
+            "root_path": str(site.get("root_path") or ""),
+            "delete_root": bool(payload.get("delete_root")),
+            "delete_cert": bool(payload.get("delete_cert")),
+            "root_base": _node_root_base(node),
+        }
+        return {
+            "type": "site_delete",
+            "task_id": int(task_id),
+            "site_id": int(site_id),
+            "attempt": int(attempt),
+            "request": req_payload,
+        }, ""
+
+    if t == "site_file_op":
+        site_id = _coerce_int(payload.get("site_id"), 0)
+        if site_id <= 0:
+            return None, "site_id 无效"
+        site = get_site(int(site_id))
+        if not isinstance(site, dict):
+            return None, "站点不存在"
+        if int(site.get("node_id") or 0) != node_id:
+            return None, "站点与节点不匹配"
+        action = str(payload.get("action") or "").strip().lower()
+        if action not in ("upload", "write", "mkdir", "delete", "unzip"):
+            return None, "不支持的文件任务类型"
+        req = payload.get("request") if isinstance(payload.get("request"), dict) else {}
+        req_payload = dict(req or {})
+        root = str(req_payload.get("root") or site.get("root_path") or "").strip()
+        if not root:
+            return None, "站点根目录为空"
+        req_payload["root"] = root
+        req_payload["root_base"] = _node_root_base(node)
+        if action == "upload":
+            content_b64 = str(req_payload.get("content_b64") or "")
+            allow_empty = bool(req_payload.get("allow_empty"))
+            if not content_b64 and not allow_empty:
+                return None, "上传文件内容为空"
+        return {
+            "type": "site_file_op",
+            "task_id": int(task_id),
+            "site_id": int(site_id),
+            "attempt": int(attempt),
+            "action": action,
+            "request": req_payload,
+        }, ""
+
+    if t in ("remote_storage_mount", "remote_storage_unmount"):
+        profile_id = _remote_profile_id(payload.get("profile_id"))
+        if not profile_id:
+            return None, "profile_id 无效"
+        req = payload.get("request") if isinstance(payload.get("request"), dict) else {}
+        if not isinstance(req, dict) or not req:
+            return None, "挂载请求为空"
+        req_payload = dict(req)
+        pwd = str(req_payload.get("password") or "").strip()
+        if not pwd:
+            pwd = _remote_storage_decrypt_password(req_payload.get("password_enc"))
+        req_payload["password"] = pwd
+        req_payload.pop("password_enc", None)
+        action = _remote_mount_action_for_type(t, payload.get("action"))
+        return {
+            "type": t,
+            "task_id": int(task_id),
+            "profile_id": profile_id,
+            "attempt": int(attempt),
+            "action": action,
+            "request": req_payload,
+        }, ""
+
     if t == "website_env_ensure":
         include_php = bool(payload.get("include_php"))
         return {
@@ -767,7 +2282,7 @@ def _build_website_cmd(task: Dict[str, Any], node: Dict[str, Any], attempt: int)
         sites_payload: List[Dict[str, Any]] = []
         if purge_data and node_id > 0:
             for s in list_sites(node_id=node_id):
-                if not isinstance(s, dict):
+                if not isinstance(s, dict) or _is_storage_mount_site(s):
                     continue
                 sites_payload.append(
                     {
@@ -786,8 +2301,8 @@ def _build_website_cmd(task: Dict[str, Any], node: Dict[str, Any], attempt: int)
         }, ""
 
     if t in ("website_ssl_issue", "website_ssl_renew"):
-        site_id = int(payload.get("site_id") or 0)
-        cert_id = int(payload.get("cert_id") or 0)
+        site_id = _coerce_int(payload.get("site_id"), 0)
+        cert_id = _coerce_int(payload.get("cert_id"), 0)
         if site_id <= 0:
             return None, "site_id 无效"
         site = get_site(int(site_id))
@@ -848,21 +2363,51 @@ def _next_site_task_command(node: Dict[str, Any], api_key: str) -> Optional[Dict
     if not pending:
         return None
 
-    pending.sort(key=lambda x: int(x.get("id") or 0))
+    pending.sort(key=lambda x: _coerce_int((x or {}).get("id"), 0))
     now_ts = float(time.time())
+    latest_remote_task_id_by_profile: Dict[str, int] = {}
+    for row in pending:
+        if not isinstance(row, dict):
+            continue
+        t_row = str(row.get("type") or "").strip().lower()
+        if t_row not in ("remote_storage_mount", "remote_storage_unmount"):
+            continue
+        payload_row = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+        profile_id_row = _remote_profile_id(payload_row.get("profile_id"))
+        if not profile_id_row:
+            continue
+        task_id_row = _coerce_int(row.get("id"), 0)
+        if task_id_row <= 0:
+            continue
+        prev_task_id = int(latest_remote_task_id_by_profile.get(profile_id_row) or 0)
+        if task_id_row > prev_task_id:
+            latest_remote_task_id_by_profile[profile_id_row] = int(task_id_row)
 
     for task in pending:
-        task_id = int(task.get("id") or 0)
+        task_id = _coerce_int(task.get("id"), 0)
         task_type = str(task.get("type") or "").strip().lower()
         if task_id <= 0:
             continue
+
+        if task_type in ("remote_storage_mount", "remote_storage_unmount"):
+            payload = task.get("payload") if isinstance(task.get("payload"), dict) else {}
+            profile_id = _remote_profile_id(payload.get("profile_id"))
+            latest_task_id = int(latest_remote_task_id_by_profile.get(profile_id) or 0) if profile_id else 0
+            if latest_task_id > int(task_id):
+                _site_task_supersede_remote_mount(task, "已被同方案的新挂载任务替代")
+                continue
 
         status = str(task.get("status") or "").strip().lower()
         if status == "queued" and not _site_task_retry_ready(task, now_ts):
             continue
         if status == "running":
             last_dispatched_ts = _site_task_last_dispatched_ts(task)
-            if last_dispatched_ts > 0 and (now_ts - last_dispatched_ts) < _SITE_TASK_RUNNING_REDISPATCH_SEC:
+            running_redisp = (
+                float(_NETMON_TASK_RUNNING_REDISPATCH_SEC)
+                if task_type == "netmon_probe"
+                else float(_SITE_TASK_RUNNING_REDISPATCH_SEC)
+            )
+            if last_dispatched_ts > 0 and (now_ts - last_dispatched_ts) < running_redisp:
                 continue
 
         cur_attempt = _site_task_current_attempt(task)
@@ -899,7 +2444,7 @@ def _next_site_task_command(node: Dict[str, Any], api_key: str) -> Optional[Dict
 
         if task_type in ("website_ssl_issue", "website_ssl_renew") and int(attempt) == 1:
             payload = task.get("payload") if isinstance(task.get("payload"), dict) else {}
-            site_id = int(payload.get("site_id") or 0)
+            site_id = _coerce_int(payload.get("site_id"), 0)
             if site_id > 0:
                 add_site_event(
                     int(site_id),
@@ -1029,6 +2574,11 @@ async def api_agent_report(request: Request):
         auto_restart_ack = int(auto_restart_ack_version) if auto_restart_ack_version is not None else None
     except Exception:
         auto_restart_ack = None
+    time_sync_ack_version = payload.get("time_sync_ack_version")
+    try:
+        time_sync_ack = int(time_sync_ack_version) if time_sync_ack_version is not None else None
+    except Exception:
+        time_sync_ack = None
 
     report_for_store: Any = report
     if isinstance(report, dict) and bool(node.get("desired_pool_present")) and "pool" in report:
@@ -1056,7 +2606,7 @@ async def api_agent_report(request: Request):
     except Exception:
         pass
 
-    # Website async task results from agent execution (best-effort).
+    # Website/NetMon async task results from agent execution (best-effort).
     try:
         _ingest_site_task_results(node, payload.get("task_results"))
     except Exception:
@@ -1666,28 +3216,71 @@ async def api_agent_report(request: Request):
     try:
         if desired_restart_ver > 0 and desired_restart_ver > ack_restart_ver:
             pol = node_auto_restart_policy_from_row(node if isinstance(node, dict) else {})
+            interval_v = _coerce_int(pol.get("interval"), 1)
+            if interval_v < 1:
+                interval_v = 1
+            if interval_v > 365:
+                interval_v = 365
+            hour_v = _coerce_int(pol.get("hour"), 4)
+            if hour_v < 0:
+                hour_v = 0
+            if hour_v > 23:
+                hour_v = 23
+            minute_v = _coerce_int(pol.get("minute"), 8)
+            if minute_v < 0:
+                minute_v = 0
+            if minute_v > 59:
+                minute_v = 59
+            weekdays_raw = pol.get("weekdays")
+            weekdays_v = list(weekdays_raw) if isinstance(weekdays_raw, list) else [1, 2, 3, 4, 5, 6, 7]
+            monthdays_raw = pol.get("monthdays")
+            monthdays_v = list(monthdays_raw) if isinstance(monthdays_raw, list) else [1]
             pcmd = {
                 "type": "auto_restart_policy",
                 "version": int(desired_restart_ver),
                 "policy": {
                     "enabled": bool(pol.get("enabled", True)),
                     "schedule_type": str(pol.get("schedule_type") or "daily"),
-                    "interval": int(pol.get("interval") or 1),
-                    "hour": int(pol.get("hour")) if pol.get("hour") is not None else 4,
-                    "minute": int(pol.get("minute")) if pol.get("minute") is not None else 8,
-                    "weekdays": list(pol.get("weekdays") or [1, 2, 3, 4, 5, 6, 7]),
-                    "monthdays": list(pol.get("monthdays") or [1]),
+                    "interval": int(interval_v),
+                    "hour": int(hour_v),
+                    "minute": int(minute_v),
+                    "weekdays": weekdays_v,
+                    "monthdays": monthdays_v,
                 },
             }
             cmds.append(_sign_for_node(pcmd))
     except Exception:
         pass
 
-    # 下发命令：网站任务（环境安装/卸载、SSL 申请/续签）
+    # 下发命令：网站任务 + NetMon 私网探测任务（均由 agent push-report 队列执行）
     try:
         site_cmd = _next_site_task_command(node, str(node.get("api_key") or ""))
         if isinstance(site_cmd, dict):
             cmds.append(site_cmd)
+    except Exception:
+        pass
+
+    # 下发命令：系统时间同步（可选，面板设置驱动）
+    # 必须放在 commands 尾部：若执行了立即校时，避免影响后续命令验签时间窗。
+    try:
+        time_sync_enabled = bool(setting_bool("agent_time_sync_enabled", default=False))
+        if time_sync_enabled:
+            desired_time_sync_ver = int(setting_int("agent_time_sync_version", default=1, lo=1, hi=2147483647))
+            ack_time_sync_ver = int(time_sync_ack) if time_sync_ack is not None else 0
+            if desired_time_sync_ver > ack_time_sync_ver:
+                tcmd = {
+                    "type": "time_sync",
+                    "version": int(desired_time_sync_ver),
+                    "timezone": _normalize_tz_name(
+                        setting_str("agent_time_sync_timezone", default="Asia/Shanghai"),
+                        default="Asia/Shanghai",
+                    ),
+                    "set_timezone": bool(setting_bool("agent_time_sync_set_timezone", default=True)),
+                    "enable_ntp": bool(setting_bool("agent_time_sync_enable_ntp", default=True)),
+                    "set_clock": bool(setting_bool("agent_time_sync_set_clock", default=False)),
+                    "panel_ts": int(now_ts),
+                }
+                cmds.append(_sign_for_node(tcmd))
     except Exception:
         pass
 
@@ -1871,3 +3464,65 @@ async def api_agents_update_progress(update_id: str = "", user: str = Depends(re
         pass
 
     return {"ok": True, "update_id": uid, "summary": summary, "nodes": items}
+
+
+@router.post("/api/panel/update/start")
+async def api_panel_update_start(_: Request, user: str = Depends(require_login)):
+    global _PANEL_UPDATE_WORKER
+    global _PANEL_UPDATE_WORKER_JOB_ID
+    _ = user
+    _panel_update_prune_memory()
+    current = _panel_update_reconcile(_panel_update_snapshot(""))
+    if isinstance(current, dict):
+        st = _panel_update_canon_status(current.get("status"))
+        if st in _PANEL_UPDATE_ACTIVE_STATES:
+            return {"ok": True, "reused": True, **_panel_update_public(current)}
+
+    job_id = uuid.uuid4().hex
+    _panel_update_touch(
+        job_id,
+        status="running",
+        progress=1,
+        stage="准备更新任务",
+        message="",
+        append_log="任务已创建，等待执行",
+    )
+
+    try:
+        t = threading.Thread(
+            target=_panel_update_run_worker,
+            args=(job_id,),
+            name=f"panel-update-{job_id[:8]}",
+            daemon=True,
+        )
+        with _PANEL_UPDATE_LOCK:
+            _PANEL_UPDATE_WORKER = t
+            _PANEL_UPDATE_WORKER_JOB_ID = str(job_id)
+        t.start()
+    except Exception as exc:
+        snap = _panel_update_touch(
+            job_id,
+            status="failed",
+            progress=100,
+            stage="更新失败",
+            message=f"更新任务启动失败：{exc}",
+            append_log=f"更新任务启动失败：{exc}",
+        )
+        return JSONResponse({"ok": False, "error": snap.get("message") or "更新任务启动失败"}, status_code=500)
+
+    snap = _panel_update_snapshot(job_id)
+    return {"ok": True, "reused": False, **_panel_update_public(_panel_update_reconcile(snap))}
+
+
+@router.get("/api/panel/update/progress")
+async def api_panel_update_progress(job_id: str = "", user: str = Depends(require_login)):
+    _ = user
+    _panel_update_prune_memory()
+    jid = str(job_id or "").strip()
+    snap = _panel_update_snapshot(jid)
+    if not isinstance(snap, dict):
+        if jid:
+            return JSONResponse({"ok": False, "error": "更新任务不存在或已过期"}, status_code=404)
+        return {"ok": True, **_panel_update_public(None)}
+    snap = _panel_update_reconcile(snap)
+    return {"ok": True, **_panel_update_public(snap)}

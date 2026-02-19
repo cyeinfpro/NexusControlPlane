@@ -67,7 +67,7 @@ def make_share_token(payload: Dict[str, Any], ttl_sec: Optional[int] = None) -> 
         exp = int(time.time()) + int(_clamp_share_ttl_sec(ttl_sec))
     except Exception:
         exp = int(time.time()) + 86400
-    p = dict(payload or {})
+    p = dict(payload) if isinstance(payload, dict) else {}
     p["exp"] = exp
     raw = _share_canon(p).encode("utf-8")
     sig = hmac.new(SECRET_KEY.encode("utf-8"), raw, hashlib.sha256).hexdigest()

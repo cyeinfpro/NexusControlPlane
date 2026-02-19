@@ -2,23 +2,28 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import copy
+from collections import Counter
 import hashlib
 import inspect
 import io
 import json
+import logging
 import os
 import random
 import re
+import tempfile
 import threading
 import time
 import uuid
 import zipfile
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlencode, urlparse
+from urllib.parse import quote, urlencode, urlparse
 
 from fastapi import APIRouter, Depends, File, Request, UploadFile
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response
+from starlette.background import BackgroundTask
 
 from ..auth import (
     can_access_rule_endpoint,
@@ -27,10 +32,12 @@ from ..auth import (
     is_rule_owner_scoped,
     stamp_endpoint_owner,
 )
-from ..clients.agent import agent_get, agent_get_raw, agent_ping, agent_post
+from ..clients.agent import agent_get, agent_get_raw_stream, agent_ping, agent_post
+from ..core.bg_tasks import spawn_background_task
 from ..core.deps import require_login
 from ..core.settings import DEFAULT_AGENT_PORT
 from ..db import (
+    add_audit_log,
     add_certificate,
     add_netmon_monitor,
     add_node,
@@ -42,11 +49,14 @@ from ..db import (
     get_desired_pool,
     get_group_orders,
     get_last_report,
+    get_last_reports,
     get_node,
+    get_node_runtime,
     get_node_by_api_key,
     get_node_by_base_url,
     insert_netmon_samples,
     node_auto_restart_policy_from_row,
+    normalize_node_system_type,
     list_certificates,
     list_netmon_monitors,
     list_netmon_samples,
@@ -57,10 +67,14 @@ from ..db import (
     upsert_role,
     upsert_site_file_favorite,
     clear_rule_stats_samples,
+    clear_node_direct_tunnel,
     list_nodes,
+    list_nodes_runtime,
+    set_node_direct_tunnel,
     set_desired_pool,
     set_panel_setting,
     set_node_auto_restart_policy,
+    touch_node_last_seen,
     upsert_rule_owner_map,
     upsert_group_order,
     update_certificate,
@@ -70,9 +84,10 @@ from ..db import (
     update_site,
     update_site_health,
 )
-from ..services.apply import node_verify_tls, schedule_apply_pool
+from ..services.apply import node_agent_request_target, node_verify_tls, schedule_apply_pool
 from ..services.backup import get_pool_for_backup
 from ..services.assets import panel_public_base_url
+from ..services.node_fetch import FETCH_ORDER_PULL_FIRST, node_info_fetch_order, node_info_sources_order
 from ..services.node_status import is_report_fresh
 try:
     from ..services.panel_config import setting_bool, setting_float, setting_int
@@ -133,7 +148,7 @@ except Exception:
         if v > float(hi):
             v = float(hi)
         return float(v)
-from ..services.pool_ops import load_pool_for_node, remove_endpoints_by_sync_id
+from ..services.pool_ops import choose_receiver_port, load_pool_for_node, node_host_for_realm, remove_endpoints_by_sync_id
 from ..services.stats_history import config as stats_history_config, ingest_stats_snapshot
 from ..utils.crypto import generate_api_key
 from ..utils.normalize import (
@@ -146,14 +161,17 @@ from ..utils.normalize import (
 from ..utils.validate import PoolValidationError, PoolValidationIssue, validate_pool_inplace
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 _FULL_BACKUP_JOBS: Dict[str, Dict[str, Any]] = {}
 _FULL_BACKUP_LOCK = threading.Lock()
 _FULL_BACKUP_TTL_SEC = 1800
+_FULL_BACKUP_ACTIVE_MAX_SEC = 6 * 3600
 
 _FULL_RESTORE_JOBS: Dict[str, Dict[str, Any]] = {}
 _FULL_RESTORE_LOCK = threading.Lock()
 _FULL_RESTORE_TTL_SEC = 1800
+_FULL_RESTORE_ACTIVE_MAX_SEC = 6 * 3600
 _RESTORE_UPLOAD_CHUNK_SIZE = 1024 * 1024
 
 
@@ -185,7 +203,118 @@ def _format_bytes(num: int) -> str:
     return f"{n:.1f} PB"
 
 
+def _remove_file_quiet(path: Any) -> None:
+    p = str(path or "").strip()
+    if not p:
+        return
+    try:
+        if os.path.exists(p):
+            os.remove(p)
+    except Exception:
+        pass
+
+
+def _download_content_disposition(filename: str, fallback: str = "download.bin") -> str:
+    """Build RFC 5987 compatible Content-Disposition value.
+
+    Keep ASCII-only `filename` for old clients and provide UTF-8 `filename*`.
+    """
+    raw = str(filename or "").replace("\r", "").replace("\n", "").replace('"', "").strip()
+    if not raw:
+        raw = str(fallback or "download.bin").strip() or "download.bin"
+    ascii_name = "".join(
+        ch
+        if (("0" <= ch <= "9") or ("a" <= ch <= "z") or ("A" <= ch <= "Z") or ch in ("-", "_", "."))
+        else "_"
+        for ch in raw
+    ).strip("._")
+    if not ascii_name:
+        ascii_name = str(fallback or "download.bin").strip() or "download.bin"
+    try:
+        encoded = quote(raw, safe="")
+    except Exception:
+        try:
+            raw = raw.encode("utf-8", "ignore").decode("utf-8")
+        except Exception:
+            raw = ""
+        if not raw:
+            raw = ascii_name
+        encoded = quote(raw, safe="")
+    value = f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{encoded}"
+    try:
+        value.encode("latin-1")
+    except Exception:
+        value = f"attachment; filename=\"{ascii_name}\""
+    return value
+
+
 _FULL_RESTORE_MAX_BYTES = _parse_restore_upload_max_bytes()
+
+
+def _parse_full_restore_inmem_max_bytes() -> int:
+    raw_b = os.getenv("REALM_FULL_RESTORE_INMEM_MAX_BYTES")
+    raw_mb = os.getenv("REALM_FULL_RESTORE_INMEM_MAX_MB")
+    try:
+        if raw_b:
+            v = max(1, int(float(str(raw_b).strip())))
+            return min(v, _FULL_RESTORE_MAX_BYTES)
+    except Exception:
+        pass
+    try:
+        if raw_mb:
+            v = max(1, int(float(str(raw_mb).strip()))) * 1024 * 1024
+            return min(v, _FULL_RESTORE_MAX_BYTES)
+    except Exception:
+        pass
+    # Full restore currently parses zip in-memory; keep a safe cap to avoid OOM.
+    return min(256 * 1024 * 1024, _FULL_RESTORE_MAX_BYTES)
+
+
+_FULL_RESTORE_INMEM_MAX_BYTES = _parse_full_restore_inmem_max_bytes()
+
+
+def _parse_nodes_restore_upload_max_bytes() -> int:
+    raw_b = os.getenv("REALM_NODES_RESTORE_MAX_BYTES")
+    raw_mb = os.getenv("REALM_NODES_RESTORE_MAX_MB")
+    try:
+        if raw_b:
+            v = max(1, int(float(str(raw_b).strip())))
+            return min(v, _FULL_RESTORE_MAX_BYTES)
+    except Exception:
+        pass
+    try:
+        if raw_mb:
+            v = max(1, int(float(str(raw_mb).strip()))) * 1024 * 1024
+            return min(v, _FULL_RESTORE_MAX_BYTES)
+    except Exception:
+        pass
+    # default 64MB, and never exceed full-restore cap.
+    return min(64 * 1024 * 1024, _FULL_RESTORE_MAX_BYTES)
+
+
+_NODES_RESTORE_MAX_BYTES = _parse_nodes_restore_upload_max_bytes()
+
+
+def _parse_rule_restore_upload_max_bytes() -> int:
+    raw_b = os.getenv("REALM_RULE_RESTORE_MAX_BYTES")
+    raw_mb = os.getenv("REALM_RULE_RESTORE_MAX_MB")
+    try:
+        if raw_b:
+            v = max(1, int(float(str(raw_b).strip())))
+            return min(v, _NODES_RESTORE_MAX_BYTES)
+    except Exception:
+        pass
+    try:
+        if raw_mb:
+            v = max(1, int(float(str(raw_mb).strip()))) * 1024 * 1024
+            return min(v, _NODES_RESTORE_MAX_BYTES)
+    except Exception:
+        pass
+    # default 32MB, and never exceed nodes-restore cap.
+    return min(32 * 1024 * 1024, _NODES_RESTORE_MAX_BYTES)
+
+
+_RULE_RESTORE_MAX_BYTES = _parse_rule_restore_upload_max_bytes()
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -222,6 +351,36 @@ def _env_int(name: str, default: int, lo: int, hi: int) -> int:
 _BACKUP_SITE_FILE_FETCH_BASE_TIMEOUT = _env_float("REALM_BACKUP_SITE_FILE_FETCH_BASE_TIMEOUT", 45.0, 20.0, 600.0)
 _BACKUP_SITE_FILE_FETCH_PER_MB_SEC = _env_float("REALM_BACKUP_SITE_FILE_FETCH_PER_MB_SEC", 1.5, 0.0, 20.0)
 _BACKUP_SITE_FILE_FETCH_MAX_TIMEOUT = _env_float("REALM_BACKUP_SITE_FILE_FETCH_MAX_TIMEOUT", 1800.0, 60.0, 7200.0)
+_BACKUP_SITE_SCAN_MAX_SEC = _env_float("REALM_BACKUP_SITE_SCAN_MAX_SEC", 900.0, 30.0, 7200.0)
+_BACKUP_SITE_FILE_STREAM_CHUNK_BYTES = _env_int(
+    "REALM_BACKUP_SITE_FILE_STREAM_CHUNK_BYTES",
+    256 * 1024,
+    16 * 1024,
+    4 * 1024 * 1024,
+)
+_BACKUP_SITE_FILE_MAX_FILES_PER_SITE = _env_int(
+    "REALM_BACKUP_SITE_FILE_MAX_FILES_PER_SITE",
+    300000,
+    1000,
+    5000000,
+)
+_BACKUP_SITE_FILE_MAX_TOTAL_FILES = _env_int(
+    "REALM_BACKUP_SITE_FILE_MAX_TOTAL_FILES",
+    1000000,
+    5000,
+    10000000,
+)
+_BACKUP_NETMON_SAMPLES_MAX = _env_int("REALM_BACKUP_NETMON_SAMPLES_MAX", 200000, 1000, 5000000)
+_BACKUP_PANEL_STATE_MAX_ROWS_PER_TABLE = _env_int(
+    "REALM_BACKUP_PANEL_STATE_MAX_ROWS_PER_TABLE",
+    50000,
+    1000,
+    1000000,
+)
+_BACKUP_CONFIG_ONLY = _env_flag("REALM_BACKUP_CONFIG_ONLY", True)
+_BACKUP_SKIP_SITE_FILES = _env_flag("REALM_BACKUP_SKIP_SITE_FILES", False)
+_FULL_BACKUP_EVENT_MAX = _env_int("REALM_FULL_BACKUP_EVENT_MAX", 800, 100, 5000)
+_FULL_BACKUP_MAX_CONCURRENT = _env_int("REALM_FULL_BACKUP_MAX_CONCURRENT", 1, 1, 4)
 _FULL_RESTORE_EXEC_TIMEOUT_SEC = _env_float(
     "REALM_FULL_RESTORE_EXEC_TIMEOUT_SEC",
     3600.0,
@@ -242,10 +401,18 @@ _POOL_JOB_RETRY_MAX_SEC = _env_float("REALM_POOL_JOB_RETRY_MAX_SEC", 8.0, 1.0, 1
 _POOL_JOB_ACK_TIMEOUT_SEC = _env_float("REALM_POOL_JOB_ACK_TIMEOUT_SEC", 45.0, 5.0, 600.0)
 _POOL_JOB_ACK_POLL_SEC = _env_float("REALM_POOL_JOB_ACK_POLL_SEC", 1.0, 0.2, 10.0)
 _POOL_JOB_REQUIRE_ACK = _env_flag("REALM_POOL_JOB_REQUIRE_ACK", True)
+_SYS_SNAPSHOT_CACHE_ENABLED = _env_flag("REALM_SYS_SNAPSHOT_CACHE_ENABLED", True)
+_SYS_SNAPSHOT_CACHE_TTL_SEC = _env_float("REALM_SYS_SNAPSHOT_CACHE_TTL_SEC", 2.5, 0.5, 30.0)
+_SYS_SNAPSHOT_ERROR_CACHE_TTL_SEC = _env_float("REALM_SYS_SNAPSHOT_ERROR_CACHE_TTL_SEC", 8.0, 1.0, 120.0)
+_SYS_SNAPSHOT_CACHE_MAX_ITEMS = _env_int("REALM_SYS_SNAPSHOT_CACHE_MAX_ITEMS", 4096, 64, 50000)
+_SYS_SNAPSHOT_CACHE_CLEANUP_INTERVAL_SEC = _env_float("REALM_SYS_SNAPSHOT_CACHE_CLEANUP_INTERVAL_SEC", 15.0, 1.0, 300.0)
 
 _POOL_JOBS: Dict[str, Dict[str, Any]] = {}
 _POOL_JOBS_LOCK = threading.Lock()
 _POOL_JOB_EXEC_LOCK = asyncio.Lock()
+_SYS_SNAPSHOT_CACHE: Dict[str, Dict[str, Any]] = {}
+_SYS_SNAPSHOT_CACHE_LOCK = threading.Lock()
+_SYS_SNAPSHOT_CACHE_NEXT_CLEANUP_AT = 0.0
 
 
 def _save_precheck_enabled() -> bool:
@@ -310,6 +477,16 @@ def _to_int_loose(v: Any, default: int) -> int:
             return int(float(str(v).strip()))
         except Exception:
             return int(default)
+
+
+def _to_float_loose(v: Any, default: float) -> float:
+    try:
+        return float(v)
+    except Exception:
+        try:
+            return float(str(v).strip())
+        except Exception:
+            return float(default)
 
 
 def _norm_int_seq(values: Any, lo: int, hi: int) -> List[int]:
@@ -439,6 +616,222 @@ def _normalize_auto_restart_policy_from_payload(data: Dict[str, Any], node: Dict
     return has_any, policy
 
 
+def _parse_backup_direct_tunnel(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    dt_raw = item.get("direct_tunnel")
+    data: Dict[str, Any]
+    if isinstance(dt_raw, dict):
+        data = dict(dt_raw)
+    else:
+        dt_keys = {
+            "direct_tunnel_enabled",
+            "direct_tunnel_sync_id",
+            "direct_tunnel_relay_node_id",
+            "direct_tunnel_listen_port",
+            "direct_tunnel_public_host",
+            "direct_tunnel_scheme",
+            "direct_tunnel_verify_tls",
+            "direct_tunnel_updated_at",
+        }
+        if not any(k in item for k in dt_keys):
+            return None
+        data = {
+            "enabled": item.get("direct_tunnel_enabled"),
+            "sync_id": item.get("direct_tunnel_sync_id"),
+            "relay_node_id": item.get("direct_tunnel_relay_node_id"),
+            "listen_port": item.get("direct_tunnel_listen_port"),
+            "public_host": item.get("direct_tunnel_public_host"),
+            "scheme": item.get("direct_tunnel_scheme"),
+            "verify_tls": item.get("direct_tunnel_verify_tls"),
+            "updated_at": item.get("direct_tunnel_updated_at"),
+        }
+
+    listen_port = _to_int_loose(data.get("listen_port"), 0)
+    if listen_port < 1 or listen_port > 65535:
+        listen_port = 0
+    scheme = str(data.get("scheme") or "").strip().lower()
+    if scheme not in ("http", "https"):
+        scheme = ""
+    relay_source_id = _to_int_loose(
+        data.get(
+            "relay_source_id",
+            data.get(
+                "relay_node_source_id",
+                data.get("relay_node_id"),
+            ),
+        ),
+        0,
+    )
+    relay_node_id = _to_int_loose(data.get("relay_node_id"), 0)
+    relay_node_base_url = str(data.get("relay_node_base_url") or "").strip().rstrip("/")
+    return {
+        "enabled": _to_bool_loose(data.get("enabled"), False),
+        "sync_id": str(data.get("sync_id") or "").strip(),
+        "relay_source_id": max(0, int(relay_source_id)),
+        "relay_node_id": max(0, int(relay_node_id)),
+        "relay_node_base_url": relay_node_base_url,
+        "listen_port": int(listen_port),
+        "public_host": str(data.get("public_host") or "").strip(),
+        "scheme": scheme,
+        "verify_tls": _to_bool_loose(data.get("verify_tls"), False),
+        "updated_at": str(data.get("updated_at") or "").strip(),
+    }
+
+
+def _parse_backup_auto_restart_policy(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    raw = item.get("auto_restart_policy")
+    payload: Dict[str, Any] = {}
+    if isinstance(raw, dict):
+        if "enabled" in raw:
+            payload["auto_restart_enabled"] = raw.get("enabled")
+        if "schedule_type" in raw:
+            payload["auto_restart_schedule_type"] = raw.get("schedule_type")
+        if "interval" in raw:
+            payload["auto_restart_interval"] = raw.get("interval")
+        if "hour" in raw:
+            payload["auto_restart_hour"] = raw.get("hour")
+        if "minute" in raw:
+            payload["auto_restart_minute"] = raw.get("minute")
+        if "weekdays" in raw:
+            payload["auto_restart_weekdays"] = raw.get("weekdays")
+        if "monthdays" in raw:
+            payload["auto_restart_monthdays"] = raw.get("monthdays")
+    else:
+        for k in (
+            "auto_restart_enabled",
+            "auto_restart_schedule_type",
+            "auto_restart_interval",
+            "auto_restart_hour",
+            "auto_restart_minute",
+            "auto_restart_time",
+            "auto_restart_weekdays",
+            "auto_restart_monthdays",
+        ):
+            if k in item:
+                payload[k] = item.get(k)
+    has_any, policy = _normalize_auto_restart_policy_from_payload(payload, {})
+    if not has_any:
+        return None
+    return policy
+
+
+def _resolve_restore_target_node_id(
+    source_id: Optional[int],
+    base_url: Optional[str],
+    mapping: Dict[str, int],
+    baseurl_to_nodeid: Dict[str, int],
+) -> Optional[int]:
+    if source_id is not None and int(source_id) > 0:
+        hit = mapping.get(str(int(source_id)))
+        if hit:
+            return int(hit)
+    bu = str(base_url or "").strip().rstrip("/")
+    if bu:
+        hit2 = baseurl_to_nodeid.get(bu)
+        if hit2:
+            return int(hit2)
+        ex = get_node_by_base_url(bu)
+        if ex:
+            return _to_int_loose((ex or {}).get("id"), 0) or None
+    return None
+
+
+def _resolve_restore_relay_node_id(
+    direct_tunnel: Dict[str, Any],
+    mapping: Dict[str, int],
+    baseurl_to_nodeid: Dict[str, int],
+) -> int:
+    relay_source_id = _to_int_loose(direct_tunnel.get("relay_source_id"), 0)
+    if relay_source_id > 0:
+        hit = mapping.get(str(relay_source_id))
+        if hit:
+            return int(hit)
+    relay_base_url = str(direct_tunnel.get("relay_node_base_url") or "").strip().rstrip("/")
+    if relay_base_url:
+        hit2 = baseurl_to_nodeid.get(relay_base_url)
+        if hit2:
+            return int(hit2)
+        ex = get_node_by_base_url(relay_base_url)
+        if ex:
+            return _to_int_loose((ex or {}).get("id"), 0)
+    relay_node_id = _to_int_loose(direct_tunnel.get("relay_node_id"), 0)
+    if relay_node_id > 0:
+        hit3 = mapping.get(str(relay_node_id))
+        if hit3:
+            return int(hit3)
+        if get_node(int(relay_node_id)):
+            return int(relay_node_id)
+    return 0
+
+
+def _restore_node_feature_configs(
+    nodes_list: List[Any],
+    mapping: Dict[str, int],
+    baseurl_to_nodeid: Dict[str, int],
+) -> Dict[str, Any]:
+    out: Dict[str, Any] = {
+        "direct_tunnel": {"restored": 0, "skipped": 0, "failed": 0},
+        "auto_restart_policy": {"restored": 0, "skipped": 0, "failed": 0},
+        "errors": [],
+    }
+    for item in nodes_list:
+        if not isinstance(item, dict):
+            continue
+        source_id_raw = item.get("source_id")
+        source_id: Optional[int] = None
+        try:
+            source_id = int(source_id_raw) if source_id_raw is not None else None
+        except Exception:
+            source_id = None
+        base_url = str(item.get("base_url") or "").strip().rstrip("/")
+        target_node_id = _resolve_restore_target_node_id(source_id, base_url, mapping, baseurl_to_nodeid)
+        if not target_node_id or target_node_id <= 0:
+            continue
+
+        dt_cfg = _parse_backup_direct_tunnel(item)
+        if dt_cfg is None:
+            out["direct_tunnel"]["skipped"] += 1
+        else:
+            try:
+                relay_target_id = _resolve_restore_relay_node_id(dt_cfg, mapping, baseurl_to_nodeid)
+                set_node_direct_tunnel(
+                    int(target_node_id),
+                    enabled=bool(dt_cfg.get("enabled")),
+                    sync_id=str(dt_cfg.get("sync_id") or ""),
+                    relay_node_id=max(0, int(relay_target_id)),
+                    listen_port=_to_int_loose(dt_cfg.get("listen_port"), 0),
+                    public_host=str(dt_cfg.get("public_host") or ""),
+                    scheme=str(dt_cfg.get("scheme") or ""),
+                    verify_tls=_to_bool_loose(dt_cfg.get("verify_tls"), False),
+                    updated_at=str(dt_cfg.get("updated_at") or "").strip() or None,
+                )
+                out["direct_tunnel"]["restored"] += 1
+            except Exception as exc:
+                out["direct_tunnel"]["failed"] += 1
+                out["errors"].append(f"节点[{target_node_id}]直连隧道恢复失败：{exc}")
+
+        auto_restart_cfg = _parse_backup_auto_restart_policy(item)
+        if auto_restart_cfg is None:
+            out["auto_restart_policy"]["skipped"] += 1
+        else:
+            try:
+                set_node_auto_restart_policy(
+                    int(target_node_id),
+                    enabled=_to_bool_loose(auto_restart_cfg.get("enabled"), True),
+                    schedule_type=str(auto_restart_cfg.get("schedule_type") or "daily"),
+                    interval=_to_int_loose(auto_restart_cfg.get("interval"), 1),
+                    hour=_to_int_loose(auto_restart_cfg.get("hour"), 4),
+                    minute=_to_int_loose(auto_restart_cfg.get("minute"), 8),
+                    weekdays=_norm_int_seq(auto_restart_cfg.get("weekdays"), 1, 7) or [1, 2, 3, 4, 5, 6, 7],
+                    monthdays=_norm_int_seq(auto_restart_cfg.get("monthdays"), 1, 31) or [1],
+                )
+                out["auto_restart_policy"]["restored"] += 1
+            except Exception as exc:
+                out["auto_restart_policy"]["failed"] += 1
+                out["errors"].append(f"节点[{target_node_id}]自动重启策略恢复失败：{exc}")
+    out["errors"] = list((out.get("errors") or []))[:50]
+    return out
+
+
 def _pool_job_now() -> float:
     return float(time.time())
 
@@ -448,7 +841,7 @@ def _prune_pool_jobs_locked(now_ts: Optional[float] = None) -> None:
     stale_ids: List[str] = []
     for jid, job in _POOL_JOBS.items():
         st = str(job.get("status") or "")
-        updated = float(job.get("updated_at") or 0.0)
+        updated = _to_float_loose(job.get("updated_at"), 0.0)
         if st in ("success", "error") and (now - updated) > float(_POOL_JOB_TTL_SEC):
             stale_ids.append(jid)
     for jid in stale_ids:
@@ -456,19 +849,20 @@ def _prune_pool_jobs_locked(now_ts: Optional[float] = None) -> None:
 
 
 def _pool_job_view(job: Dict[str, Any], include_result: bool = True) -> Dict[str, Any]:
+    meta = job.get("meta")
     out: Dict[str, Any] = {
         "job_id": str(job.get("job_id") or ""),
-        "node_id": int(job.get("node_id") or 0),
+        "node_id": _to_int_loose(job.get("node_id"), 0),
         "kind": str(job.get("kind") or ""),
         "status": str(job.get("status") or ""),
-        "created_at": float(job.get("created_at") or 0.0),
-        "updated_at": float(job.get("updated_at") or 0.0),
-        "attempts": int(job.get("attempts") or 0),
-        "max_attempts": int(job.get("max_attempts") or 0),
-        "next_retry_at": float(job.get("next_retry_at") or 0.0),
-        "status_code": int(job.get("status_code") or 0),
+        "created_at": _to_float_loose(job.get("created_at"), 0.0),
+        "updated_at": _to_float_loose(job.get("updated_at"), 0.0),
+        "attempts": _to_int_loose(job.get("attempts"), 0),
+        "max_attempts": _to_int_loose(job.get("max_attempts"), 0),
+        "next_retry_at": _to_float_loose(job.get("next_retry_at"), 0.0),
+        "status_code": _to_int_loose(job.get("status_code"), 0),
         "error": str(job.get("error") or ""),
-        "meta": dict(job.get("meta") or {}),
+        "meta": dict(meta) if isinstance(meta, dict) else {},
     }
     if include_result:
         res = job.get("result")
@@ -570,6 +964,13 @@ def _resolve_rule_user(user_or_name: Any) -> Any:
     return user_or_name
 
 
+def _is_relay_sync_rule(ex: Any) -> bool:
+    if not isinstance(ex, dict):
+        return False
+    mode = str(ex.get("sync_tunnel_mode") or ex.get("sync_tunnel_type") or "").strip().lower()
+    return mode in ("relay", "wss_relay")
+
+
 def _rule_key_for_endpoint(endpoint: Dict[str, Any]) -> str:
     ex = endpoint.get("extra_config")
     if not isinstance(ex, dict):
@@ -582,6 +983,96 @@ def _rule_key_for_endpoint(endpoint: Dict[str, Any]) -> str:
     listen = str(endpoint.get("listen") or "").strip()
     proto = str(endpoint.get("protocol") or "tcp+udp").strip().lower()
     return f"tcp:{listen}|{proto}"
+
+
+def _request_source_ip(request: Optional[Request]) -> str:
+    req = request if isinstance(request, Request) else None
+    if req is None:
+        return ""
+    try:
+        xff = str(req.headers.get("x-forwarded-for") or "").strip()
+        if xff:
+            first = str(xff.split(",")[0] or "").strip()
+            if first:
+                return first[:255]
+    except Exception:
+        pass
+    try:
+        xr = str(req.headers.get("x-real-ip") or "").strip()
+        if xr:
+            return xr[:255]
+    except Exception:
+        pass
+    try:
+        host = str((req.client.host if req.client else "") or "").strip()
+        if host:
+            return host[:255]
+    except Exception:
+        pass
+    return ""
+
+
+def _audit_log_node_action(
+    action: str,
+    user: str,
+    node_id: int,
+    node_name: str = "",
+    detail: Optional[Dict[str, Any]] = None,
+    request: Optional[Request] = None,
+) -> None:
+    try:
+        add_audit_log(
+            action=action,
+            actor=str(user or "").strip(),
+            node_id=int(node_id or 0),
+            node_name=str(node_name or "").strip(),
+            detail=detail if isinstance(detail, dict) else {},
+            source_ip=_request_source_ip(request),
+        )
+    except Exception:
+        pass
+
+
+def _pool_change_summary(old_pool: Dict[str, Any], new_pool: Dict[str, Any]) -> Dict[str, Any]:
+    def _keys(pool: Dict[str, Any]) -> List[str]:
+        keys: List[str] = []
+        eps = pool.get("endpoints") if isinstance(pool.get("endpoints"), list) else []
+        for idx, ep in enumerate(eps):
+            if not isinstance(ep, dict):
+                continue
+            try:
+                k = _rule_key_for_endpoint(ep)
+            except Exception:
+                k = ""
+            if not k:
+                k = f"idx:{idx}"
+            keys.append(k)
+        return keys
+
+    old_keys = Counter(_keys(old_pool if isinstance(old_pool, dict) else {}))
+    new_keys = Counter(_keys(new_pool if isinstance(new_pool, dict) else {}))
+    created = int(sum((new_keys - old_keys).values()))
+    deleted = int(sum((old_keys - new_keys).values()))
+
+    old_eps = (old_pool.get("endpoints") if isinstance(old_pool.get("endpoints"), list) else []) if isinstance(old_pool, dict) else []
+    new_eps = (new_pool.get("endpoints") if isinstance(new_pool.get("endpoints"), list) else []) if isinstance(new_pool, dict) else []
+    updated_hint = 0
+    if created == 0 and deleted == 0:
+        try:
+            old_sig = json.dumps(old_eps, ensure_ascii=False, sort_keys=True)
+            new_sig = json.dumps(new_eps, ensure_ascii=False, sort_keys=True)
+            if old_sig != new_sig:
+                updated_hint = 1
+        except Exception:
+            updated_hint = 0
+
+    return {
+        "rules_before": int(sum(old_keys.values())),
+        "rules_after": int(sum(new_keys.values())),
+        "created_rules": int(created),
+        "deleted_rules": int(deleted),
+        "updated_hint": int(updated_hint),
+    }
 
 
 def _visible_endpoint_tuples(user: str, pool: Dict[str, Any]) -> List[Tuple[int, Dict[str, Any]]]:
@@ -767,12 +1258,27 @@ async def _pool_job_wait_ack(node_id: int, desired_ver: int) -> Tuple[bool, str]
 
 
 async def _pool_job_invoke(kind: str, node_id: int, payload: Dict[str, Any], user: str) -> Tuple[int, Dict[str, Any]]:
-    if kind == "pool_save":
-        payload2 = dict(payload or {})
+    if kind in ("pool_save", "rule_restore"):
+        payload2 = dict(payload) if isinstance(payload, dict) else {}
         payload2["_async_job"] = True
         ret = await api_pool_set(None, int(node_id), payload2, user=user)
     elif kind == "rule_delete":
-        ret = await api_rule_delete(int(node_id), payload, user=user)
+        ret = await api_rule_delete(None, int(node_id), payload, user=user)
+    elif kind == "direct_tunnel_configure":
+        ret = await _direct_tunnel_configure_impl(
+            int(node_id),
+            payload if isinstance(payload, dict) else {},
+            user=user,
+            request=None,
+            audit_action="node.direct_tunnel.configure_async_done",
+        )
+    elif kind == "direct_tunnel_disable":
+        ret = await _direct_tunnel_disable_impl(
+            int(node_id),
+            user=user,
+            request=None,
+            audit_action="node.direct_tunnel.disable_async_done",
+        )
     else:
         return 400, {"ok": False, "error": f"unsupported_job_kind:{kind}"}
 
@@ -878,14 +1384,23 @@ def _enqueue_pool_job(node_id: int, kind: str, payload: Dict[str, Any], user: st
         "status_code": 0,
         "error": "",
         "result": {},
-        "meta": dict(meta or {}),
-        "_payload": dict(payload or {}),
+        "meta": dict(meta) if isinstance(meta, dict) else {},
+        "_payload": dict(payload) if isinstance(payload, dict) else {},
         "_user": str(user or "system"),
     }
     with _POOL_JOBS_LOCK:
         _prune_pool_jobs_locked(now)
         _POOL_JOBS[job_id] = job
-    asyncio.create_task(_run_pool_job(job_id))
+    try:
+        spawn_background_task(_run_pool_job(job_id), label="pool-job")
+    except Exception as exc:
+        _pool_job_set(
+            job_id,
+            status="error",
+            status_code=500,
+            error=f"任务调度失败：{exc}",
+            next_retry_at=0.0,
+        )
     return _pool_job_view(job, include_result=False)
 
 
@@ -909,6 +1424,15 @@ async def _read_full_restore_upload(file: UploadFile) -> tuple[Optional[bytes], 
                     f"备份包过大（当前限制 {_format_bytes(_FULL_RESTORE_MAX_BYTES)}）",
                     413,
                 )
+            if total > _FULL_RESTORE_INMEM_MAX_BYTES:
+                return (
+                    None,
+                    (
+                        "备份包过大，超出当前内存处理上限 "
+                        f"({_format_bytes(_FULL_RESTORE_INMEM_MAX_BYTES)})"
+                    ),
+                    413,
+                )
             buf.extend(chunk)
     except asyncio.CancelledError:
         raise
@@ -917,7 +1441,11 @@ async def _read_full_restore_upload(file: UploadFile) -> tuple[Optional[bytes], 
 
     raw = bytes(buf)
     if not raw or raw[:2] != b"PK":
-        return None, "请上传 nexus-backup-*.zip（兼容旧版备份包）", 400
+        return (
+            None,
+            "请上传全量备份 ZIP（支持 nexus-backup-*.zip 与 nexus-auto-backup-*.zip）",
+            400,
+        )
     return raw, None, 200
 
 
@@ -936,15 +1464,24 @@ def _backup_steps_template() -> List[Dict[str, Any]]:
 
 def _prune_full_backup_jobs() -> None:
     now = time.time()
+    stale_file_paths: List[str] = []
     with _FULL_BACKUP_LOCK:
         stale_ids: List[str] = []
         for jid, job in _FULL_BACKUP_JOBS.items():
             st = str(job.get("status") or "")
-            updated_at = float(job.get("updated_at") or 0.0)
+            created_at = _to_float_loose(job.get("created_at"), 0.0)
+            updated_at = _to_float_loose(job.get("updated_at"), 0.0)
+            if st in ("queued", "running") and created_at > 0 and (now - created_at) > float(_FULL_BACKUP_ACTIVE_MAX_SEC):
+                stale_ids.append(jid)
+                continue
             if st in ("done", "failed") and (now - updated_at) > _FULL_BACKUP_TTL_SEC:
                 stale_ids.append(jid)
         for jid in stale_ids:
-            _FULL_BACKUP_JOBS.pop(jid, None)
+            job = _FULL_BACKUP_JOBS.pop(jid, None)
+            if isinstance(job, dict):
+                stale_file_paths.append(str(job.get("file_path") or ""))
+    for p in stale_file_paths:
+        _remove_file_quiet(p)
 
 
 def _backup_job_snapshot(job_id: str) -> Optional[Dict[str, Any]]:
@@ -952,20 +1489,104 @@ def _backup_job_snapshot(job_id: str) -> Optional[Dict[str, Any]]:
         job = _FULL_BACKUP_JOBS.get(job_id)
         if not isinstance(job, dict):
             return None
+        file_path = str(job.get("file_path") or "")
+        in_mem_ok = bool(job.get("content"))
+        try:
+            file_ok = bool(file_path and os.path.exists(file_path))
+        except Exception:
+            file_ok = False
+        counts = job.get("counts")
+        steps = job.get("steps")
+        events = job.get("events")
         return {
             "job_id": str(job_id),
             "status": str(job.get("status") or "unknown"),
-            "progress": int(job.get("progress") or 0),
+            "progress": _to_int_loose(job.get("progress"), 0),
             "stage": str(job.get("stage") or ""),
             "error": str(job.get("error") or ""),
-            "created_at": float(job.get("created_at") or 0.0),
-            "updated_at": float(job.get("updated_at") or 0.0),
-            "size_bytes": int(job.get("size_bytes") or 0),
+            "created_at": _to_float_loose(job.get("created_at"), 0.0),
+            "updated_at": _to_float_loose(job.get("updated_at"), 0.0),
+            "size_bytes": _to_int_loose(job.get("size_bytes"), 0),
             "filename": str(job.get("filename") or ""),
-            "steps": list(job.get("steps") or []),
-            "counts": dict(job.get("counts") or {}),
-            "can_download": bool(job.get("status") == "done" and bool(job.get("content"))),
+            "steps": list(steps) if isinstance(steps, list) else [],
+            "counts": dict(counts) if isinstance(counts, dict) else {},
+            "events": list(events) if isinstance(events, list) else [],
+            "event_total": _to_int_loose(job.get("event_total"), 0),
+            "can_download": bool(job.get("status") == "done" and (in_mem_ok or file_ok)),
         }
+
+
+def _active_full_backup_job_ids() -> List[str]:
+    now = time.time()
+    out: List[str] = []
+    with _FULL_BACKUP_LOCK:
+        for jid, job in _FULL_BACKUP_JOBS.items():
+            if not isinstance(job, dict):
+                continue
+            st = str(job.get("status") or "")
+            if st not in ("queued", "running"):
+                continue
+            created_at = _to_float_loose(job.get("created_at"), 0.0)
+            if created_at > 0 and (now - created_at) > float(_FULL_BACKUP_ACTIVE_MAX_SEC):
+                continue
+            out.append(str(jid))
+    return out
+
+
+def _backup_event_level(level: Any) -> str:
+    s = str(level or "").strip().lower()
+    if s in ("debug", "info", "warn", "error"):
+        return s
+    return "info"
+
+
+def _append_backup_event(
+    job: Dict[str, Any],
+    *,
+    ts: float,
+    stage: str,
+    progress: int,
+    level: str,
+    detail: str,
+) -> None:
+    detail_s = str(detail or "").strip()
+    if not detail_s:
+        return
+    stage_s = str(stage or "").strip()
+    lvl = _backup_event_level(level)
+    events = job.get("events")
+    if not isinstance(events, list):
+        events = []
+        job["events"] = events
+    event_total = _to_int_loose(job.get("event_total"), 0)
+    event = {
+        "ts_ms": int(max(0.0, float(ts)) * 1000.0),
+        "stage": stage_s,
+        "progress": int(max(0, min(100, int(progress)))),
+        "level": lvl,
+        "detail": detail_s,
+    }
+    if events:
+        last = events[-1]
+        if (
+            isinstance(last, dict)
+            and str(last.get("detail") or "") == detail_s
+            and str(last.get("stage") or "") == stage_s
+            and str(last.get("level") or "") == lvl
+        ):
+            try:
+                rep = int(last.get("repeat") or 1)
+            except Exception:
+                rep = 1
+            last["repeat"] = int(rep + 1)
+            last["ts_ms"] = int(event["ts_ms"])
+            last["progress"] = int(event["progress"])
+            job["event_total"] = int(event_total + 1)
+            return
+    events.append(event)
+    if len(events) > int(_FULL_BACKUP_EVENT_MAX):
+        del events[: len(events) - int(_FULL_BACKUP_EVENT_MAX)]
+    job["event_total"] = int(event_total + 1)
 
 
 def _touch_backup_job(
@@ -982,8 +1603,12 @@ def _touch_backup_job(
     filename: Optional[str] = None,
     size_bytes: Optional[int] = None,
     content: Optional[bytes] = None,
+    file_path: Optional[str] = None,
+    event_text: Optional[str] = None,
+    event_level: Optional[str] = None,
 ) -> None:
     now = time.time()
+    remove_old_path = ""
     with _FULL_BACKUP_LOCK:
         job = _FULL_BACKUP_JOBS.get(job_id)
         if not isinstance(job, dict):
@@ -1005,6 +1630,15 @@ def _touch_backup_job(
             job["size_bytes"] = int(size_bytes)
         if content is not None:
             job["content"] = bytes(content)
+        if file_path is not None:
+            new_path = str(file_path or "").strip()
+            old_path = str(job.get("file_path") or "").strip()
+            if old_path and old_path != new_path:
+                remove_old_path = old_path
+            job["file_path"] = new_path
+            if new_path:
+                # Release in-memory blob when switching to file-backed artifact.
+                job["content"] = b""
         if step_key:
             for s in (job.get("steps") or []):
                 if str(s.get("key") or "") == str(step_key):
@@ -1013,7 +1647,18 @@ def _touch_backup_job(
                     if step_detail is not None:
                         s["detail"] = str(step_detail)
                     break
+        if event_text is not None:
+            _append_backup_event(
+                job,
+                ts=now,
+                stage=str(stage if stage is not None else (job.get("stage") or "")),
+                progress=_to_int_loose(progress if progress is not None else job.get("progress"), 0),
+                level=str(event_level if event_level is not None else ("error" if str(job.get("status") or "") == "failed" else "info")),
+                detail=str(event_text or ""),
+            )
         job["updated_at"] = now
+    if remove_old_path:
+        _remove_file_quiet(remove_old_path)
 
 
 async def _emit_backup_progress(callback: Any, payload: Dict[str, Any]) -> None:
@@ -1054,6 +1699,70 @@ def _site_pkg_dir_name(site: Dict[str, Any]) -> str:
     return f"site-{sid}-{safe}"
 
 
+def _site_scan_label(site: Dict[str, Any]) -> str:
+    domains = site.get("domains") if isinstance(site.get("domains"), list) else []
+    if domains:
+        for raw in domains:
+            d = str(raw or "").strip()
+            if not d:
+                continue
+            if d.startswith("__"):
+                # Internal marker domain (e.g. remote storage profile binding), not user-facing.
+                continue
+            return d
+    name = str(site.get("name") or "").strip()
+    if name:
+        return name
+    sid = int(site.get("source_id") or site.get("id") or 0)
+    return f"site-{sid}" if sid > 0 else "site"
+
+
+def _is_remote_storage_mount_site(site: Dict[str, Any]) -> bool:
+    if str(site.get("type") or "").strip().lower() == "storage_mount":
+        return True
+    domains = site.get("domains") if isinstance(site.get("domains"), list) else []
+    for d in domains:
+        if str(d or "").strip().lower().startswith("__remote_storage__:"):
+            return True
+    return False
+
+
+_REMOTE_PROFILE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def _normalize_remote_profile_id(raw: Any) -> str:
+    text = str(raw or "").strip()
+    if not text or not _REMOTE_PROFILE_ID_RE.match(text):
+        return ""
+    return text
+
+
+def _normalize_remote_profile_item(raw: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(raw, dict):
+        return None
+    pid = _normalize_remote_profile_id(raw.get("id"))
+    if not pid:
+        return None
+    item = dict(raw)
+    item["id"] = pid
+    # Legacy website bridge field, no longer used.
+    item.pop("site_id", None)
+    return item
+
+
+def _normalize_remote_profiles_list(raw: Any) -> Tuple[List[Dict[str, Any]], int]:
+    rows = raw if isinstance(raw, list) else []
+    out: List[Dict[str, Any]] = []
+    invalid = 0
+    for row in rows:
+        normalized = _normalize_remote_profile_item(row)
+        if not isinstance(normalized, dict):
+            invalid += 1
+            continue
+        out.append(normalized)
+    return out, int(invalid)
+
+
 def _site_file_fetch_timeout(size_hint_bytes: int) -> float:
     try:
         sz = max(0, int(size_hint_bytes or 0))
@@ -1068,12 +1777,73 @@ def _site_file_fetch_timeout(size_hint_bytes: int) -> float:
     return float(timeout)
 
 
-async def _collect_site_file_index(site: Dict[str, Any], node: Dict[str, Any]) -> Dict[str, Any]:
+def _backup_agent_request_target(node: Dict[str, Any]) -> Tuple[str, bool]:
+    dt = node.get("direct_tunnel") if isinstance(node.get("direct_tunnel"), dict) else {}
+    if bool(dt.get("enabled")):
+        relay_node_id = _to_int_loose(dt.get("relay_node_id"), 0)
+        listen_port = _to_int_loose(dt.get("listen_port"), 0)
+        if relay_node_id > 0 and 1 <= listen_port <= 65535:
+            host = str(dt.get("public_host") or "").strip()
+            if not host:
+                relay = get_node(relay_node_id)
+                if isinstance(relay, dict):
+                    relay_raw = str(relay.get("base_url") or "").strip()
+                    if relay_raw:
+                        if "://" not in relay_raw:
+                            relay_raw = f"http://{relay_raw}"
+                        try:
+                            host = str(urlparse(relay_raw).hostname or "").strip()
+                        except Exception:
+                            host = ""
+            if host:
+                scheme = str(dt.get("scheme") or "").strip().lower()
+                if scheme not in ("http", "https"):
+                    node_raw = str((node or {}).get("base_url") or "").strip()
+                    if "://" not in node_raw:
+                        node_raw = f"http://{node_raw}" if node_raw else "http://"
+                    try:
+                        scheme = str(urlparse(node_raw).scheme or "http").strip().lower()
+                    except Exception:
+                        scheme = "http"
+                    if scheme not in ("http", "https"):
+                        scheme = "http"
+                return f"{scheme}://{format_host_for_url(host)}:{int(listen_port)}", bool(dt.get("verify_tls"))
+    return str((node or {}).get("base_url") or "").strip(), bool(node_verify_tls(node))
+
+
+def _backup_node_root_base(node: Dict[str, Any], root_path: str = "") -> str:
+    base = str(node.get("website_root_base") or "").strip()
+    root = str(root_path or "").strip()
+    if not root:
+        return base
+    b = base.rstrip("/")
+    if not b:
+        return root
+    if root == b or root.startswith(b + "/"):
+        return base
+    return root
+
+
+async def _collect_site_file_index(
+    site: Dict[str, Any],
+    node: Dict[str, Any],
+    *,
+    progress_callback: Any = None,
+    site_index: int = 0,
+    total_sites: int = 0,
+) -> Dict[str, Any]:
     root = str(site.get("root_path") or "").strip()
+    target_base_url, target_verify_tls = _backup_agent_request_target(node)
+    node_base_url = str(node.get("base_url") or "").strip()
+    via_tunnel = bool(target_base_url and target_base_url != node_base_url)
+    site_name = _site_scan_label(site)
+    route_label = "直连隧道路由" if via_tunnel else "base_url 直连"
     out: Dict[str, Any] = {
         "source_site_id": int(site.get("source_id") or site.get("id") or 0),
         "source_node_id": int(site.get("node_source_id") or site.get("node_id") or 0),
         "node_base_url": str(site.get("node_base_url") or node.get("base_url") or ""),
+        "fetch_base_url": str(target_base_url or ""),
+        "fetch_via_tunnel": bool(via_tunnel),
         "root_path": root,
         "package_dir": _site_pkg_dir_name(site),
         "dirs": [],
@@ -1083,36 +1853,180 @@ async def _collect_site_file_index(site: Dict[str, Any], node: Dict[str, Any]) -
         "total_bytes": 0,
         "errors": [],
     }
+    site_head = (
+        f"{site_index}/{total_sites} · {site_name}"
+        if total_sites > 0 and site_index > 0
+        else site_name
+    )
+    site_base_progress = (
+        68 + int(((site_index - 1) / max(1, total_sites)) * 10)
+        if total_sites > 0 and site_index > 0
+        else 68
+    )
     if not root:
-        out["errors"].append("站点 root_path 为空，跳过文件备份")
+        msg = "站点 root_path 为空，跳过文件备份"
+        out["errors"].append(msg)
+        await _emit_backup_progress(
+            progress_callback,
+            {
+                "progress": site_base_progress,
+                "stage": "扫描网站文件",
+                "step_key": "site_files",
+                "step_status": "running",
+                "step_detail": f"{site_head} · root_path 为空，跳过",
+                "event_level": "warn",
+                "event_text": f"扫描站点 {site_name}（{route_label}）：{msg}",
+            },
+        )
+        return out
+    if not target_base_url:
+        msg = "节点 Agent 地址为空，跳过文件备份"
+        out["errors"].append(msg)
+        await _emit_backup_progress(
+            progress_callback,
+            {
+                "progress": site_base_progress,
+                "stage": "扫描网站文件",
+                "step_key": "site_files",
+                "step_status": "running",
+                "step_detail": f"{site_head} · Agent 地址为空，跳过",
+                "event_level": "warn",
+                "event_text": f"扫描站点 {site_name}（{route_label}）：{msg}",
+            },
+        )
         return out
 
-    root_base = str(node.get("website_root_base") or "").strip()
+    root_base = _backup_node_root_base(node, root)
     queue: List[str] = [""]
     seen_dirs = set([""])
     dirs: List[str] = []
     files: List[Dict[str, Any]] = []
+    loop_ticks = 0
+    dirs_scanned = 0
+    scan_started = time.time()
+    last_emit_ts = 0.0
+    list_error_events = 0
+
+    def _site_scan_progress_now() -> int:
+        if total_sites <= 0 or site_index <= 0:
+            return 68
+        site_base = 68 + int(((site_index - 1) / max(1, total_sites)) * 10)
+        site_cap = 68 + int((site_index / max(1, total_sites)) * 10)
+        span = max(1, site_cap - site_base - 1)
+        ratio = dirs_scanned / max(1, dirs_scanned + len(queue))
+        return min(site_cap - 1, site_base + int(ratio * span))
 
     while queue:
+        if float(_BACKUP_SITE_SCAN_MAX_SEC) > 0 and (time.time() - scan_started) > float(_BACKUP_SITE_SCAN_MAX_SEC):
+            msg = f"站点文件扫描超时（>{int(_BACKUP_SITE_SCAN_MAX_SEC)} 秒），已提前结束"
+            out["errors"].append(msg)
+            await _emit_backup_progress(
+                progress_callback,
+                {
+                    "progress": _site_scan_progress_now(),
+                    "stage": "扫描网站文件",
+                    "step_key": "site_files",
+                    "step_status": "running",
+                    "step_detail": f"{site_head} · 扫描超时，已提前结束",
+                    "event_level": "warn",
+                    "event_text": f"扫描站点 {site_name}（{route_label}）：{msg}",
+                },
+            )
+            break
         rel = queue.pop(0)
+        dirs_scanned += 1
+        now_ts = time.time()
+        if (
+            progress_callback is not None
+            and total_sites > 0
+            and site_index > 0
+            and (dirs_scanned == 1 or (dirs_scanned % 25) == 0 or (now_ts - last_emit_ts) >= 2.5)
+        ):
+            await _emit_backup_progress(
+                progress_callback,
+                {
+                    "progress": _site_scan_progress_now(),
+                    "stage": "扫描网站文件",
+                    "step_key": "site_files",
+                    "step_status": "running",
+                    "step_detail": (
+                        f"{site_index}/{total_sites} · {site_name} · 已扫目录 {dirs_scanned} · 待扫 {len(queue)}"
+                    ),
+                },
+            )
+            last_emit_ts = now_ts
         q = urlencode({"root": root, "path": rel, "root_base": root_base})
         try:
             data = await agent_get(
-                node["base_url"],
-                node["api_key"],
+                target_base_url,
+                str(node.get("api_key") or ""),
                 f"/api/v1/website/files/list?{q}",
-                node_verify_tls(node),
+                target_verify_tls,
                 timeout=20,
             )
         except Exception as exc:
-            out["errors"].append(f"目录读取失败 [{rel or '/'}]：{exc}")
+            msg = f"目录读取失败 [{rel or '/'}]：{exc}"
+            out["errors"].append(msg)
+            if list_error_events < 6:
+                list_error_events += 1
+                await _emit_backup_progress(
+                    progress_callback,
+                    {
+                        "progress": _site_scan_progress_now(),
+                        "stage": "扫描网站文件",
+                        "step_key": "site_files",
+                        "step_status": "running",
+                        "step_detail": f"{site_head} · 目录读取失败 {rel or '/'}",
+                        "event_level": "warn",
+                        "event_text": f"扫描站点 {site_name}（{route_label}）：{msg}",
+                    },
+                )
             continue
 
         if not data.get("ok", True):
-            out["errors"].append(f"目录读取失败 [{rel or '/'}]：{data.get('error') or 'unknown'}")
+            msg = f"目录读取失败 [{rel or '/'}]：{data.get('error') or 'unknown'}"
+            out["errors"].append(msg)
+            if list_error_events < 6:
+                list_error_events += 1
+                await _emit_backup_progress(
+                    progress_callback,
+                    {
+                        "progress": _site_scan_progress_now(),
+                        "stage": "扫描网站文件",
+                        "step_key": "site_files",
+                        "step_status": "running",
+                        "step_detail": f"{site_head} · 目录读取失败 {rel or '/'}",
+                        "event_level": "warn",
+                        "event_text": f"扫描站点 {site_name}（{route_label}）：{msg}",
+                    },
+                )
             continue
 
-        for it in (data.get("items") or []):
+        items = data.get("items")
+        if not isinstance(items, list):
+            msg = f"目录读取失败 [{rel or '/'}]：返回数据格式异常"
+            out["errors"].append(msg)
+            if list_error_events < 6:
+                list_error_events += 1
+                await _emit_backup_progress(
+                    progress_callback,
+                    {
+                        "progress": _site_scan_progress_now(),
+                        "stage": "扫描网站文件",
+                        "step_key": "site_files",
+                        "step_status": "running",
+                        "step_detail": f"{site_head} · 目录返回格式异常 {rel or '/'}",
+                        "event_level": "warn",
+                        "event_text": f"扫描站点 {site_name}（{route_label}）：{msg}",
+                    },
+                )
+            continue
+
+        for it in items:
+            loop_ticks += 1
+            if (loop_ticks % 500) == 0:
+                # Yield periodically to keep progress API responsive on huge directories.
+                await asyncio.sleep(0)
             if not isinstance(it, dict):
                 continue
             p = _clean_site_rel_path(it.get("path"))
@@ -1124,6 +2038,23 @@ async def _collect_site_file_index(site: Dict[str, Any], node: Dict[str, Any]) -
                     dirs.append(p)
                     queue.append(p)
                 continue
+            if len(files) >= int(_BACKUP_SITE_FILE_MAX_FILES_PER_SITE):
+                msg = f"文件数量超过单站点上限（{int(_BACKUP_SITE_FILE_MAX_FILES_PER_SITE)}），其余文件已跳过"
+                out["errors"].append(msg)
+                await _emit_backup_progress(
+                    progress_callback,
+                    {
+                        "progress": _site_scan_progress_now(),
+                        "stage": "扫描网站文件",
+                        "step_key": "site_files",
+                        "step_status": "running",
+                        "step_detail": f"{site_head} · 文件数达到单站点上限，已截断",
+                        "event_level": "warn",
+                        "event_text": f"扫描站点 {site_name}（{route_label}）：{msg}",
+                    },
+                )
+                queue.clear()
+                break
             try:
                 size_i = max(0, int(it.get("size") or 0))
             except Exception:
@@ -1134,7 +2065,9 @@ async def _collect_site_file_index(site: Dict[str, Any], node: Dict[str, Any]) -
     seen_file_paths = set()
     cleaned: List[Dict[str, Any]] = []
     total_bytes = 0
-    for f in sorted(files, key=lambda x: str(x.get("path") or "")):
+    for idx, f in enumerate(sorted(files, key=lambda x: str(x.get("path") or "")), start=1):
+        if (idx % 1000) == 0:
+            await asyncio.sleep(0)
         p = str(f.get("path") or "")
         if not p or p in seen_file_paths:
             continue
@@ -1152,9 +2085,11 @@ async def _collect_site_file_index(site: Dict[str, Any], node: Dict[str, Any]) -
 
 
 async def _build_full_backup_bundle(
-    request: Request,
+    request: Optional[Request] = None,
     progress_callback: Any = None,
     nodes_override: Optional[List[Dict[str, Any]]] = None,
+    include_content: bool = True,
+    panel_public_url_override: str = "",
 ) -> Dict[str, Any]:
     await _emit_backup_progress(
         progress_callback,
@@ -1163,22 +2098,74 @@ async def _build_full_backup_bundle(
 
     nodes = list(nodes_override) if isinstance(nodes_override, list) else list_nodes()
     group_orders = get_group_orders()
-    node_map = {int(n.get("id") or 0): n for n in nodes}
-    sites = list_sites()
-    certs = list_certificates()
-    monitors = list_netmon_monitors()
-    monitor_ids: List[int] = []
-    for m in monitors:
+
+    def _safe_int(v: Any, default: int = 0) -> int:
         try:
-            mid = int(m.get("id") or 0)
+            return int(v)
         except Exception:
-            mid = 0
-        if mid > 0:
-            monitor_ids.append(mid)
-    netmon_samples = list_netmon_samples(monitor_ids, 0) if monitor_ids else []
+            return int(default)
+
+    def _clean_node_ids(raw: Any) -> List[int]:
+        if not isinstance(raw, list):
+            return []
+        out: List[int] = []
+        for x in raw:
+            nid = _safe_int(x, 0)
+            if nid > 0 and nid not in out:
+                out.append(nid)
+        return out
+
+    node_map: Dict[int, Dict[str, Any]] = {}
+    for n in nodes:
+        nid = _safe_int((n or {}).get("id"), 0)
+        if nid > 0 and nid not in node_map:
+            node_map[nid] = n
+    node_ids_scope = set(node_map.keys())
+
+    sites_all = list_sites()
+    if node_ids_scope:
+        sites = [s for s in sites_all if _safe_int((s or {}).get("node_id"), 0) in node_ids_scope]
+    else:
+        sites = []
+
+    certs_all = list_certificates()
+    if node_ids_scope:
+        certs = [c for c in certs_all if _safe_int((c or {}).get("node_id"), 0) in node_ids_scope]
+    else:
+        certs = []
+
+    monitors_raw = list_netmon_monitors()
+    monitors: List[Dict[str, Any]] = []
+    for m in monitors_raw:
+        if not isinstance(m, dict):
+            continue
+        node_ids = _clean_node_ids(m.get("node_ids"))
+        if node_ids_scope:
+            node_ids = [nid for nid in node_ids if nid in node_ids_scope]
+            if not node_ids:
+                continue
+        m2 = dict(m)
+        m2["node_ids"] = list(node_ids)
+        monitors.append(m2)
+
+    monitor_ids = [_safe_int(m.get("id"), 0) for m in monitors if _safe_int(m.get("id"), 0) > 0]
+    if bool(_BACKUP_CONFIG_ONLY):
+        netmon_samples = []
+    else:
+        netmon_samples_all = list_netmon_samples(
+            monitor_ids,
+            0,
+            limit=int(_BACKUP_NETMON_SAMPLES_MAX),
+        ) if monitor_ids else []
+        if node_ids_scope:
+            netmon_samples = [
+                s for s in netmon_samples_all if _safe_int((s or {}).get("node_id"), 0) in node_ids_scope
+            ]
+        else:
+            netmon_samples = []
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
 
-    fixed_zip_files = 9  # + panel/state.json + netmon/samples.json
+    fixed_zip_files = 11  # + panel/state.json + remote_storage/profiles.json + netmon/config.json + netmon/samples.json
     await _emit_backup_progress(
         progress_callback,
         {
@@ -1192,6 +2179,7 @@ async def _build_full_backup_bundle(
                 "rules": len(nodes),
                 "sites": len(sites),
                 "site_files": 0,
+                "remote_storage_profiles": 0,
                 "certificates": len(certs),
                 "netmon_monitors": len(monitors),
                 "netmon_samples": len(netmon_samples),
@@ -1264,10 +2252,70 @@ async def _build_full_backup_bundle(
         progress_callback,
         {"progress": 60, "stage": "整理网站配置", "step_key": "sites", "step_status": "running", "step_detail": f"{len(sites)} 个站点"},
     )
+
+    def _backup_node_auto_restart_policy(node: Dict[str, Any]) -> Dict[str, Any]:
+        pol = node.get("auto_restart_policy") if isinstance(node.get("auto_restart_policy"), dict) else {}
+        schedule_type = str(pol.get("schedule_type") or "daily").strip().lower()
+        if schedule_type not in ("daily", "weekly", "monthly"):
+            schedule_type = "daily"
+        interval = _safe_int(pol.get("interval"), 1)
+        if interval < 1:
+            interval = 1
+        if interval > 365:
+            interval = 365
+        hour = _safe_int(pol.get("hour"), 4)
+        if hour < 0:
+            hour = 0
+        if hour > 23:
+            hour = 23
+        minute = _safe_int(pol.get("minute"), 8)
+        if minute < 0:
+            minute = 0
+        if minute > 59:
+            minute = 59
+        weekdays = _norm_int_seq(pol.get("weekdays"), 1, 7) or [1, 2, 3, 4, 5, 6, 7]
+        monthdays = _norm_int_seq(pol.get("monthdays"), 1, 31) or [1]
+        return {
+            "enabled": bool(pol.get("enabled", True)),
+            "schedule_type": schedule_type,
+            "interval": int(interval),
+            "hour": int(hour),
+            "minute": int(minute),
+            "weekdays": weekdays,
+            "monthdays": monthdays,
+            "desired_version": _safe_int(pol.get("desired_version"), 0),
+            "ack_version": _safe_int(pol.get("ack_version"), 0),
+            "updated_at": str(pol.get("updated_at") or ""),
+        }
+
+    def _backup_node_direct_tunnel(node: Dict[str, Any]) -> Dict[str, Any]:
+        dt = node.get("direct_tunnel") if isinstance(node.get("direct_tunnel"), dict) else {}
+        relay_source_id = _safe_int(dt.get("relay_node_id"), 0)
+        relay_node = node_map.get(relay_source_id) if relay_source_id > 0 else None
+        relay_base_url = str((relay_node or {}).get("base_url") or "").strip().rstrip("/")
+        listen_port = _safe_int(dt.get("listen_port"), 0)
+        if listen_port < 1 or listen_port > 65535:
+            listen_port = 0
+        scheme = str(dt.get("scheme") or "").strip().lower()
+        if scheme not in ("http", "https"):
+            scheme = ""
+        return {
+            "enabled": bool(dt.get("enabled") or False),
+            "sync_id": str(dt.get("sync_id") or ""),
+            "relay_source_id": max(0, int(relay_source_id)),
+            "relay_node_id": max(0, int(relay_source_id)),
+            "relay_node_base_url": relay_base_url,
+            "listen_port": int(listen_port),
+            "public_host": str(dt.get("public_host") or ""),
+            "scheme": scheme,
+            "verify_tls": bool(dt.get("verify_tls") or False),
+            "updated_at": str(dt.get("updated_at") or ""),
+        }
+
     nodes_payload = {
         "kind": "realm_full_backup",
         "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "panel_public_url": panel_public_base_url(request),
+        "panel_public_url": str(panel_public_url_override or (panel_public_base_url(request) if request is not None else "")),
         "group_orders": [
             {"group_name": k, "sort_order": int(v)}
             for k, v in sorted(group_orders.items(), key=lambda kv: (kv[1], kv[0]))
@@ -1284,6 +2332,9 @@ async def _build_full_backup_bundle(
                 "role": n.get("role") or "normal",
                 "capabilities": n.get("capabilities") if isinstance(n.get("capabilities"), dict) else {},
                 "website_root_base": n.get("website_root_base") or "",
+                "system_type": normalize_node_system_type(n.get("system_type"), default="auto"),
+                "direct_tunnel": _backup_node_direct_tunnel(n),
+                "auto_restart_policy": _backup_node_auto_restart_policy(n),
             }
             for n in nodes
         ],
@@ -1332,121 +2383,275 @@ async def _build_full_backup_bundle(
     site_file_total = 0
     site_file_bytes = 0
     site_file_failed = 0
-    total_sites = len(sites_payload["sites"])
-    await _emit_backup_progress(
-        progress_callback,
-        {"progress": 68, "stage": "扫描网站文件", "step_key": "site_files", "step_status": "running", "step_detail": f"0/{total_sites}"},
-    )
-    if total_sites:
-        for i, s in enumerate(sites_payload["sites"], start=1):
-            sid = int(s.get("source_id") or 0)
-            nid = int(s.get("node_source_id") or 0)
-            node = node_map.get(nid)
-            if not node:
-                entry = {
-                    "source_site_id": sid,
-                    "source_node_id": nid,
-                    "node_base_url": str(s.get("node_base_url") or ""),
-                    "root_path": str(s.get("root_path") or ""),
-                    "package_dir": _site_pkg_dir_name(s),
-                    "dirs": [],
-                    "dir_count": 0,
-                    "files": [],
-                    "file_count": 0,
-                    "total_bytes": 0,
-                    "errors": ["未找到站点节点，跳过文件备份"],
-                }
-            else:
-                entry = await _collect_site_file_index(s, node)
-
-            pkg_dir = str(entry.get("package_dir") or _site_pkg_dir_name(s))
-            dirs_idx = entry.get("dirs") if isinstance(entry.get("dirs"), list) else []
-            cleaned_dirs: List[str] = []
-            seen_dirs: set[str] = set()
-            for d in dirs_idx:
-                rel_dir = _clean_site_rel_path(d)
-                if not rel_dir or rel_dir in seen_dirs:
-                    continue
-                seen_dirs.add(rel_dir)
-                cleaned_dirs.append(rel_dir)
-            cleaned_dirs.sort()
-            files_idx = entry.get("files") if isinstance(entry.get("files"), list) else []
-            cleaned_files = []
-            for f in files_idx:
-                if not isinstance(f, dict):
-                    continue
-                rel_path = _clean_site_rel_path(f.get("path"))
-                if not rel_path:
-                    continue
-                size_i = max(0, int(f.get("size") or 0))
-                cleaned_files.append(
+    total_sites = 0
+    skipped_storage_count = 0
+    if bool(_BACKUP_SKIP_SITE_FILES):
+        await _emit_backup_progress(
+            progress_callback,
+            {
+                "progress": 68,
+                "stage": "网站文件扫描已跳过",
+                "step_key": "site_files",
+                "step_status": "done",
+                "step_detail": "配置模式：仅备份配置项，跳过网站文件内容",
+                "event_level": "info",
+                "event_text": "配置模式已启用：网站文件内容不纳入全量备份",
+                "counts": {
+                    "nodes": len(nodes),
+                    "rules": len(rules_entries),
+                    "sites": len(sites_payload["sites"]),
+                    "site_files": 0,
+                    "remote_storage_profiles": 0,
+                    "certificates": len(certs),
+                    "netmon_monitors": len(monitors),
+                    "netmon_samples": 0,
+                    "panel_items": 0,
+                    "files": fixed_zip_files + len(rules_entries),
+                },
+            },
+        )
+    else:
+        scan_sites: List[Dict[str, Any]] = []
+        skipped_storage_sites: List[Dict[str, str]] = []
+        for s in (sites_payload.get("sites") or []):
+            if not isinstance(s, dict):
+                continue
+            if _is_remote_storage_mount_site(s):
+                skipped_storage_sites.append(
                     {
-                        "path": rel_path,
-                        "size": size_i,
-                        "zip_path": f"websites/files/{pkg_dir}/{rel_path}",
+                        "name": _site_scan_label(s),
+                        "root_path": str(s.get("root_path") or "").strip(),
                     }
                 )
-            entry["dirs"] = cleaned_dirs
-            entry["dir_count"] = len(cleaned_dirs)
-            entry["files"] = cleaned_files
-            entry["file_count"] = len(cleaned_files)
-            entry["total_bytes"] = int(sum(int(x.get("size") or 0) for x in cleaned_files))
-
-            site_file_total += int(entry["file_count"])
-            site_file_bytes += int(entry["total_bytes"])
-            site_file_failed += len(entry.get("errors") or [])
-            site_files_manifest["sites"].append(entry)
-
-            p = 68 + int((i / max(1, total_sites)) * 10)
-            await _emit_backup_progress(
-                progress_callback,
-                {
-                    "progress": p,
-                    "stage": "扫描网站文件",
-                    "step_key": "site_files",
-                    "step_status": "running",
-                    "step_detail": f"{i}/{total_sites} · 已发现 {site_file_total} 个文件",
-                    "counts": {
-                        "nodes": len(nodes),
-                        "rules": len(rules_entries),
-                        "sites": len(sites_payload["sites"]),
-                        "site_files": site_file_total,
-                        "certificates": len(certs),
-                        "netmon_monitors": len(monitors),
-                        "netmon_samples": len(netmon_samples),
-                        "panel_items": 0,
-                        "files": fixed_zip_files + len(rules_entries) + site_file_total,
-                    },
-                },
-            )
-    site_files_manifest["summary"] = {
-        "sites": len(site_files_manifest["sites"]),
-        "files_total": site_file_total,
-        "files_ok": 0,
-        "files_failed": 0,
-        "bytes_total": site_file_bytes,
-    }
-    await _emit_backup_progress(
-        progress_callback,
-        {
-            "progress": 78,
-            "stage": "网站文件扫描完成",
-            "step_key": "site_files",
-            "step_status": "done",
-            "step_detail": f"{site_file_total} 个文件",
-            "counts": {
-                "nodes": len(nodes),
-                "rules": len(rules_entries),
-                "sites": len(sites_payload["sites"]),
-                "site_files": site_file_total,
-                "certificates": len(certs),
-                "netmon_monitors": len(monitors),
-                "netmon_samples": len(netmon_samples),
-                "panel_items": 0,
-                "files": fixed_zip_files + len(rules_entries) + site_file_total,
+                continue
+            scan_sites.append(s)
+        total_sites = len(scan_sites)
+        skipped_storage_count = len(skipped_storage_sites)
+        start_detail = f"0/{total_sites}"
+        if skipped_storage_count > 0:
+            start_detail += f" · 已跳过远程存储 {skipped_storage_count}"
+        await _emit_backup_progress(
+            progress_callback,
+            {
+                "progress": 68,
+                "stage": "扫描网站文件",
+                "step_key": "site_files",
+                "step_status": "running",
+                "step_detail": start_detail,
             },
-        },
-    )
+        )
+        if skipped_storage_sites:
+            for idx, row in enumerate(skipped_storage_sites, start=1):
+                n = str(row.get("name") or "storage_mount")
+                root_hint = str(row.get("root_path") or "").strip() or "-"
+                await _emit_backup_progress(
+                    progress_callback,
+                    {
+                        "progress": 68,
+                        "stage": "扫描网站文件",
+                        "step_key": "site_files",
+                        "step_status": "running",
+                        "step_detail": f"跳过远程存储 {idx}/{skipped_storage_count} · {n}",
+                        "event_level": "info",
+                        "event_text": f"跳过远程存储挂载站点 {n}（root={root_hint}）",
+                    },
+                )
+        if total_sites:
+            for i, s in enumerate(scan_sites, start=1):
+                sid = int(s.get("source_id") or 0)
+                nid = int(s.get("node_source_id") or 0)
+                site_name = _site_scan_label(s)
+                root_hint = str(s.get("root_path") or "").strip() or "-"
+                node = node_map.get(nid)
+                if not node:
+                    entry = {
+                        "source_site_id": sid,
+                        "source_node_id": nid,
+                        "node_base_url": str(s.get("node_base_url") or ""),
+                        "root_path": str(s.get("root_path") or ""),
+                        "package_dir": _site_pkg_dir_name(s),
+                        "dirs": [],
+                        "dir_count": 0,
+                        "files": [],
+                        "file_count": 0,
+                        "total_bytes": 0,
+                        "errors": ["未找到站点节点，跳过文件备份"],
+                    }
+                    await _emit_backup_progress(
+                        progress_callback,
+                        {
+                            "progress": 68 + int((i / max(1, total_sites)) * 10),
+                            "stage": "扫描网站文件",
+                            "step_key": "site_files",
+                            "step_status": "running",
+                            "step_detail": f"{i}/{total_sites} · {site_name} · 节点不存在，跳过",
+                            "event_level": "warn",
+                            "event_text": f"扫描站点 {site_name}（root={root_hint}）：节点不存在，跳过",
+                        },
+                    )
+                else:
+                    target_base_url, _target_verify_tls = _backup_agent_request_target(node)
+                    via_tunnel = bool(str(target_base_url or "").strip() and str(target_base_url or "").strip() != str(node.get("base_url") or "").strip())
+                    await _emit_backup_progress(
+                        progress_callback,
+                        {
+                            "progress": 68 + int(((i - 1) / max(1, total_sites)) * 10),
+                            "stage": "扫描网站文件",
+                            "step_key": "site_files",
+                            "step_status": "running",
+                            "step_detail": f"{i}/{total_sites} · {site_name} · 准备扫描",
+                            "event_level": "info",
+                            "event_text": (
+                                f"开始扫描站点 {site_name}（node={nid}，"
+                                f"{'直连隧道路由' if via_tunnel else 'base_url 直连'}，root={root_hint}）"
+                            ),
+                        },
+                    )
+                    entry = await _collect_site_file_index(
+                        s,
+                        node,
+                        progress_callback=progress_callback,
+                        site_index=i,
+                        total_sites=total_sites,
+                    )
+
+                pkg_dir = str(entry.get("package_dir") or _site_pkg_dir_name(s))
+                dirs_idx = entry.get("dirs") if isinstance(entry.get("dirs"), list) else []
+                cleaned_dirs: List[str] = []
+                seen_dirs: set[str] = set()
+                for d in dirs_idx:
+                    rel_dir = _clean_site_rel_path(d)
+                    if not rel_dir or rel_dir in seen_dirs:
+                        continue
+                    seen_dirs.add(rel_dir)
+                    cleaned_dirs.append(rel_dir)
+                cleaned_dirs.sort()
+                files_idx = entry.get("files") if isinstance(entry.get("files"), list) else []
+                cleaned_files = []
+                for f in files_idx:
+                    if not isinstance(f, dict):
+                        continue
+                    rel_path = _clean_site_rel_path(f.get("path"))
+                    if not rel_path:
+                        continue
+                    size_i = max(0, int(f.get("size") or 0))
+                    cleaned_files.append(
+                        {
+                            "path": rel_path,
+                            "size": size_i,
+                            "zip_path": f"websites/files/{pkg_dir}/{rel_path}",
+                        }
+                    )
+                entry["dirs"] = cleaned_dirs
+                entry["dir_count"] = len(cleaned_dirs)
+                entry["files"] = cleaned_files
+                entry["file_count"] = len(cleaned_files)
+                entry["total_bytes"] = int(sum(int(x.get("size") or 0) for x in cleaned_files))
+                entry["site_label"] = site_name
+                entry["scan_root_path"] = str(s.get("root_path") or "").strip()
+                entry["fetch_route"] = "direct_tunnel" if bool(entry.get("fetch_via_tunnel")) else "base_url"
+
+                site_file_total += int(entry["file_count"])
+                site_file_bytes += int(entry["total_bytes"])
+                site_file_failed += len(entry.get("errors") or [])
+                site_files_manifest["sites"].append(entry)
+                if site_file_total >= int(_BACKUP_SITE_FILE_MAX_TOTAL_FILES):
+                    site_files_manifest["summary"] = {
+                        "sites": len(site_files_manifest["sites"]),
+                        "sites_scanned": int(total_sites),
+                        "sites_skipped": int(skipped_storage_count),
+                        "files_total": site_file_total,
+                        "files_ok": 0,
+                        "files_failed": 0,
+                        "bytes_total": site_file_bytes,
+                    }
+                    await _emit_backup_progress(
+                        progress_callback,
+                        {
+                            "progress": 78,
+                            "stage": "网站文件扫描中止",
+                            "step_key": "site_files",
+                            "step_status": "done",
+                            "step_detail": f"文件数达到上限 {int(_BACKUP_SITE_FILE_MAX_TOTAL_FILES)}，已提前结束扫描",
+                        },
+                    )
+                    break
+
+                site_err_count = len(entry.get("errors") or [])
+                site_route_label = "直连隧道路由" if bool(entry.get("fetch_via_tunnel")) else "base_url 直连"
+                site_root = str(entry.get("scan_root_path") or "").strip() or "-"
+                site_summary = (
+                    f"站点扫描完成 {site_name}（{site_route_label}，root={site_root}）："
+                    f"文件 {int(entry.get('file_count') or 0)}，大小 {int(entry.get('total_bytes') or 0)} bytes，错误 {site_err_count}"
+                )
+                if site_err_count > 0:
+                    first_err = str((entry.get("errors") or [""])[0] or "").strip()
+                    if first_err:
+                        site_summary += f"；首个错误：{first_err[:180]}"
+                p = 68 + int((i / max(1, total_sites)) * 10)
+                await _emit_backup_progress(
+                    progress_callback,
+                    {
+                        "progress": p,
+                        "stage": "扫描网站文件",
+                        "step_key": "site_files",
+                        "step_status": "running",
+                        "step_detail": f"{i}/{total_sites} · {site_name} · 已发现 {site_file_total} 个文件",
+                        "event_level": "warn" if site_err_count > 0 else "info",
+                        "event_text": site_summary,
+                        "counts": {
+                            "nodes": len(nodes),
+                            "rules": len(rules_entries),
+                            "sites": len(sites_payload["sites"]),
+                            "site_files": site_file_total,
+                            "remote_storage_profiles": 0,
+                            "certificates": len(certs),
+                            "netmon_monitors": len(monitors),
+                            "netmon_samples": len(netmon_samples),
+                            "panel_items": 0,
+                            "files": fixed_zip_files + len(rules_entries) + site_file_total,
+                        },
+                    },
+                )
+        site_files_manifest["summary"] = {
+            "sites": len(site_files_manifest["sites"]),
+            "sites_scanned": int(total_sites),
+            "sites_skipped": int(skipped_storage_count),
+            "files_total": site_file_total,
+            "files_ok": 0,
+            "files_failed": 0,
+            "bytes_total": site_file_bytes,
+        }
+        await _emit_backup_progress(
+            progress_callback,
+            {
+                "progress": 78,
+                "stage": "网站文件扫描完成",
+                "step_key": "site_files",
+                "step_status": "done",
+                "step_detail": (
+                    f"{site_file_total} 个文件 · 扫描站点 {total_sites}"
+                    + (f" · 跳过远程存储 {skipped_storage_count}" if skipped_storage_count > 0 else "")
+                ),
+                "event_level": "info",
+                "event_text": (
+                    f"网站文件扫描完成：文件 {site_file_total}，扫描站点 {total_sites}"
+                    + (f"，跳过远程存储 {skipped_storage_count}" if skipped_storage_count > 0 else "")
+                ),
+                "counts": {
+                    "nodes": len(nodes),
+                    "rules": len(rules_entries),
+                    "sites": len(sites_payload["sites"]),
+                    "site_files": site_file_total,
+                    "remote_storage_profiles": 0,
+                    "certificates": len(certs),
+                    "netmon_monitors": len(monitors),
+                    "netmon_samples": len(netmon_samples),
+                    "panel_items": 0,
+                    "files": fixed_zip_files + len(rules_entries) + site_file_total,
+                },
+            },
+        )
 
     await _emit_backup_progress(
         progress_callback,
@@ -1484,10 +2689,11 @@ async def _build_full_backup_bundle(
         progress_callback,
         {"progress": 86, "stage": "整理网络波动配置", "step_key": "netmon", "step_status": "running", "step_detail": f"{len(monitors)} 个监控"},
     )
-    monitors_payload = {
-        "kind": "realm_netmon_backup",
-        "created_at": nodes_payload["created_at"],
-        "monitors": [
+    monitors_items: List[Dict[str, Any]] = []
+    for m in monitors:
+        node_ids = _clean_node_ids(m.get("node_ids"))
+        node_base_urls = [str((node_map.get(nid) or {}).get("base_url") or "") for nid in node_ids]
+        monitors_items.append(
             {
                 "source_id": int(m.get("id") or 0),
                 "target": str(m.get("target") or ""),
@@ -1497,19 +2703,20 @@ async def _build_full_backup_bundle(
                 "warn_ms": int(m.get("warn_ms") or 0),
                 "crit_ms": int(m.get("crit_ms") or 0),
                 "enabled": bool(m.get("enabled") or 0),
-                "node_source_ids": [int(x) for x in (m.get("node_ids") or []) if int(x) > 0],
-                "node_base_urls": [
-                    str((node_map.get(int(x) or 0) or {}).get("base_url") or "")
-                    for x in (m.get("node_ids") or [])
-                    if int(x) > 0
-                ],
+                "node_ids": list(node_ids),
+                "node_source_ids": list(node_ids),
+                "node_base_urls": node_base_urls,
                 "last_run_ts_ms": int(m.get("last_run_ts_ms") or 0),
                 "last_run_msg": str(m.get("last_run_msg") or ""),
                 "created_at": m.get("created_at"),
                 "updated_at": m.get("updated_at"),
             }
-            for m in monitors
-        ],
+        )
+
+    monitors_payload = {
+        "kind": "realm_netmon_backup",
+        "created_at": nodes_payload["created_at"],
+        "monitors": monitors_items,
     }
     netmon_samples_payload = {
         "kind": "realm_netmon_samples_backup",
@@ -1556,12 +2763,23 @@ async def _build_full_backup_bundle(
             "stage": "网络波动配置完成",
             "step_key": "netmon",
             "step_status": "done",
-            "step_detail": f"{len(monitors_payload['monitors'])} 个监控 · {len(netmon_samples_payload['samples'])} 条样本",
+            "step_detail": (
+                f"{len(monitors_payload['monitors'])} 个监控 · 配置模式已跳过样本"
+                if bool(_BACKUP_CONFIG_ONLY)
+                else f"{len(monitors_payload['monitors'])} 个监控 · {len(netmon_samples_payload['samples'])} 条样本"
+            ),
+            "event_level": "info",
+            "event_text": (
+                f"网络波动配置完成：{len(monitors_payload['monitors'])} 个监控，配置模式已跳过历史样本"
+                if bool(_BACKUP_CONFIG_ONLY)
+                else ""
+            ),
             "counts": {
                 "nodes": len(nodes),
                 "rules": len(rules_entries),
                 "sites": len(sites_payload["sites"]),
                 "site_files": site_file_total,
+                "remote_storage_profiles": 0,
                 "certificates": len(certs),
                 "netmon_monitors": len(monitors),
                 "netmon_samples": len(netmon_samples),
@@ -1573,7 +2791,17 @@ async def _build_full_backup_bundle(
 
     await _emit_backup_progress(
         progress_callback,
-        {"progress": 91, "stage": "整理面板状态数据", "step_key": "panel_state", "step_status": "running", "step_detail": "角色/用户/分享/诊断记录"},
+        {
+            "progress": 91,
+            "stage": "整理面板状态数据",
+            "step_key": "panel_state",
+            "step_status": "running",
+            "step_detail": (
+                "配置模式：角色/用户/令牌/规则归属"
+                if bool(_BACKUP_CONFIG_ONLY)
+                else "角色/用户/分享/任务/审计/统计记录"
+            ),
+        },
     )
 
     def _safe_json_loads(raw: Any, default: Any) -> Any:
@@ -1581,6 +2809,14 @@ async def _build_full_backup_bundle(
             return json.loads(str(raw or "")) if str(raw or "").strip() else default
         except Exception:
             return default
+
+    remote_storage_payload: Dict[str, Any] = {
+        "kind": "realm_remote_storage_profiles_backup",
+        "created_at": nodes_payload["created_at"],
+        "profiles": [],
+        "summary": {},
+        "errors": [],
+    }
 
     panel_state_payload: Dict[str, Any] = {
         "kind": "realm_panel_state_backup",
@@ -1595,19 +2831,63 @@ async def _build_full_backup_bundle(
         "site_file_share_revocations": [],
         "site_events": [],
         "site_checks": [],
+        "audit_logs": [],
+        "tasks": [],
+        "rule_stats_samples": [],
         "summary": {},
         "errors": [],
     }
+    panel_state_row_cap = int(_BACKUP_PANEL_STATE_MAX_ROWS_PER_TABLE)
+    panel_state_config_only = bool(_BACKUP_CONFIG_ONLY)
+    panel_state_history_cap = 0 if panel_state_config_only else int(panel_state_row_cap)
+
+    async def _panel_state_heartbeat(detail: str, *, event_level: str = "info", event_text: str = "") -> None:
+        txt = str(detail or "").strip()
+        if not txt:
+            return
+        await _emit_backup_progress(
+            progress_callback,
+            {
+                "progress": 91,
+                "stage": "整理面板状态数据",
+                "step_key": "panel_state",
+                "step_status": "running",
+                "step_detail": txt,
+                "event_level": str(event_level or "info"),
+                "event_text": str(event_text or txt),
+            },
+        )
+
+    def _panel_state_cap_warn(label: str, rows_len: int) -> None:
+        if panel_state_row_cap > 0 and int(rows_len) >= int(panel_state_row_cap):
+            panel_state_payload["errors"].append(f"{label} 达到上限 {int(panel_state_row_cap)} 条，已截断")
     try:
         panel_settings_map = list_panel_settings()
+        remote_profiles_raw = panel_settings_map.get("remote_storage_profiles")
+        remote_profiles = _safe_json_loads(remote_profiles_raw, [])
+        remote_profiles_override_value = ""
+        if isinstance(remote_profiles, list):
+            normalized_profiles, invalid_profile_items = _normalize_remote_profiles_list(remote_profiles)
+            remote_storage_payload["profiles"] = normalized_profiles
+            remote_profiles_override_value = json.dumps(normalized_profiles, ensure_ascii=False, separators=(",", ":"))
+            if invalid_profile_items > 0:
+                remote_storage_payload["errors"].append(
+                    f"remote_storage_profiles 含 {int(invalid_profile_items)} 条非法条目，已跳过"
+                )
+        elif str(remote_profiles_raw or "").strip():
+            remote_storage_payload["errors"].append("remote_storage_profiles 格式异常（期望数组）")
+
         for skey, sval in sorted(panel_settings_map.items(), key=lambda kv: str(kv[0])):
             key_s = str(skey or "").strip()
             if not key_s:
                 continue
+            value_s = str(sval or "")
+            if key_s == "remote_storage_profiles" and remote_profiles_override_value:
+                value_s = remote_profiles_override_value
             panel_state_payload["panel_settings"].append(
                 {
                     "key": key_s,
-                    "value": str(sval or ""),
+                    "value": value_s,
                 }
             )
 
@@ -1630,13 +2910,19 @@ async def _build_full_backup_bundle(
                 }
             )
 
+        await _panel_state_heartbeat(
+            f"面板基础信息：设置 {len(panel_state_payload['panel_settings'])} · 角色 {len(panel_state_payload['roles'])}"
+        )
+
         with connect() as conn:
             user_rows = conn.execute(
                 "SELECT id, username, salt_b64, hash_b64, iterations, role_id, enabled, expires_at, policy_json, "
-                "last_login_at, created_by, created_at, updated_at FROM users ORDER BY id ASC"
+                "last_login_at, created_by, created_at, updated_at FROM users ORDER BY id ASC LIMIT ?",
+                (panel_state_row_cap,),
             ).fetchall()
+            _panel_state_cap_warn("users", len(user_rows))
             user_name_by_id: Dict[int, str] = {}
-            for row in user_rows:
+            for idx, row in enumerate(user_rows, start=1):
                 d = dict(row)
                 src_uid = int(d.get("id") or 0)
                 username = str(d.get("username") or "").strip()
@@ -1663,12 +2949,17 @@ async def _build_full_backup_bundle(
                         "updated_at": d.get("updated_at"),
                     }
                 )
+                if (idx % 500) == 0:
+                    await asyncio.sleep(0)
+            await _panel_state_heartbeat(f"用户 {len(panel_state_payload['users'])} 条")
 
             token_rows = conn.execute(
                 "SELECT id, user_id, token_sha256, name, scopes_json, expires_at, last_used_at, created_by, created_at, revoked_at "
-                "FROM user_tokens ORDER BY id ASC"
+                "FROM user_tokens ORDER BY id ASC LIMIT ?",
+                (panel_state_row_cap,),
             ).fetchall()
-            for row in token_rows:
+            _panel_state_cap_warn("user_tokens", len(token_rows))
+            for idx, row in enumerate(token_rows, start=1):
                 d = dict(row)
                 scopes = _safe_json_loads(d.get("scopes_json"), [])
                 if not isinstance(scopes, list):
@@ -1689,12 +2980,17 @@ async def _build_full_backup_bundle(
                         "revoked_at": d.get("revoked_at"),
                     }
                 )
+                if (idx % 500) == 0:
+                    await asyncio.sleep(0)
+            await _panel_state_heartbeat(f"令牌 {len(panel_state_payload['user_tokens'])} 条")
 
             owner_rows = conn.execute(
                 "SELECT id, node_id, rule_key, owner_user_id, owner_username, first_seen_at, last_seen_at, active "
-                "FROM rule_owner_map ORDER BY id ASC"
+                "FROM rule_owner_map ORDER BY id ASC LIMIT ?",
+                (panel_state_row_cap,),
             ).fetchall()
-            for row in owner_rows:
+            _panel_state_cap_warn("rule_owner_map", len(owner_rows))
+            for idx, row in enumerate(owner_rows, start=1):
                 d = dict(row)
                 panel_state_payload["rule_owner_map"].append(
                     {
@@ -1708,12 +3004,19 @@ async def _build_full_backup_bundle(
                         "active": bool(d.get("active") or 0),
                     }
                 )
+                if (idx % 500) == 0:
+                    await asyncio.sleep(0)
+            await _panel_state_heartbeat(f"规则归属 {len(panel_state_payload['rule_owner_map'])} 条")
+            if panel_state_config_only:
+                await _panel_state_heartbeat("配置模式：已跳过分享/事件/检测/审计/任务/统计历史")
 
             fav_rows = conn.execute(
                 "SELECT id, site_id, owner, path, is_dir, created_at, updated_at "
-                "FROM site_file_favorites ORDER BY id ASC"
+                "FROM site_file_favorites ORDER BY id ASC LIMIT ?",
+                (panel_state_history_cap,),
             ).fetchall()
-            for row in fav_rows:
+            _panel_state_cap_warn("site_file_favorites", len(fav_rows))
+            for idx, row in enumerate(fav_rows, start=1):
                 d = dict(row)
                 panel_state_payload["site_file_favorites"].append(
                     {
@@ -1726,12 +3029,16 @@ async def _build_full_backup_bundle(
                         "updated_at": d.get("updated_at"),
                     }
                 )
+                if (idx % 500) == 0:
+                    await asyncio.sleep(0)
 
             share_rows = conn.execute(
                 "SELECT code, site_id, token, token_sha256, created_by, created_at "
-                "FROM site_file_share_short_links ORDER BY created_at ASC"
+                "FROM site_file_share_short_links ORDER BY created_at ASC LIMIT ?",
+                (panel_state_history_cap,),
             ).fetchall()
-            for row in share_rows:
+            _panel_state_cap_warn("site_file_share_short_links", len(share_rows))
+            for idx, row in enumerate(share_rows, start=1):
                 d = dict(row)
                 panel_state_payload["site_file_share_short_links"].append(
                     {
@@ -1743,12 +3050,16 @@ async def _build_full_backup_bundle(
                         "created_at": d.get("created_at"),
                     }
                 )
+                if (idx % 500) == 0:
+                    await asyncio.sleep(0)
 
             rev_rows = conn.execute(
                 "SELECT id, site_id, token_sha256, revoked_by, reason, revoked_at "
-                "FROM site_file_share_revocations ORDER BY id ASC"
+                "FROM site_file_share_revocations ORDER BY id ASC LIMIT ?",
+                (panel_state_history_cap,),
             ).fetchall()
-            for row in rev_rows:
+            _panel_state_cap_warn("site_file_share_revocations", len(rev_rows))
+            for idx, row in enumerate(rev_rows, start=1):
                 d = dict(row)
                 panel_state_payload["site_file_share_revocations"].append(
                     {
@@ -1760,12 +3071,19 @@ async def _build_full_backup_bundle(
                         "revoked_at": d.get("revoked_at"),
                     }
                 )
+                if (idx % 500) == 0:
+                    await asyncio.sleep(0)
+            await _panel_state_heartbeat(
+                f"文件分享：收藏 {len(panel_state_payload['site_file_favorites'])} · 短链 {len(panel_state_payload['site_file_share_short_links'])} · 吊销 {len(panel_state_payload['site_file_share_revocations'])}"
+            )
 
             evt_rows = conn.execute(
                 "SELECT id, site_id, action, status, actor, payload_json, result_json, error, created_at "
-                "FROM site_events ORDER BY id ASC"
+                "FROM site_events ORDER BY id ASC LIMIT ?",
+                (panel_state_history_cap,),
             ).fetchall()
-            for row in evt_rows:
+            _panel_state_cap_warn("site_events", len(evt_rows))
+            for idx, row in enumerate(evt_rows, start=1):
                 d = dict(row)
                 payload_obj = _safe_json_loads(d.get("payload_json"), {})
                 result_obj = _safe_json_loads(d.get("result_json"), {})
@@ -1786,12 +3104,16 @@ async def _build_full_backup_bundle(
                         "created_at": d.get("created_at"),
                     }
                 )
+                if (idx % 500) == 0:
+                    await asyncio.sleep(0)
 
             chk_rows = conn.execute(
                 "SELECT id, site_id, ok, status_code, latency_ms, error, checked_at "
-                "FROM site_checks ORDER BY id ASC"
+                "FROM site_checks ORDER BY id ASC LIMIT ?",
+                (panel_state_history_cap,),
             ).fetchall()
-            for row in chk_rows:
+            _panel_state_cap_warn("site_checks", len(chk_rows))
+            for idx, row in enumerate(chk_rows, start=1):
                 d = dict(row)
                 panel_state_payload["site_checks"].append(
                     {
@@ -1804,8 +3126,137 @@ async def _build_full_backup_bundle(
                         "checked_at": d.get("checked_at"),
                     }
                 )
+                if (idx % 500) == 0:
+                    await asyncio.sleep(0)
+            await _panel_state_heartbeat(
+                f"站点记录：事件 {len(panel_state_payload['site_events'])} · 检测 {len(panel_state_payload['site_checks'])}"
+            )
+
+            node_ids_for_scope = sorted([int(x) for x in node_ids_scope if int(x) > 0])
+            node_ids_params = tuple(node_ids_for_scope)
+
+            if node_ids_for_scope:
+                placeholders = ",".join(["?"] * len(node_ids_for_scope))
+                audit_rows = conn.execute(
+                    "SELECT id, actor, action, node_id, node_name, source_ip, detail_json, created_at "
+                    f"FROM audit_logs WHERE node_id IN ({placeholders}) OR node_id=0 ORDER BY id ASC LIMIT ?",
+                    tuple(list(node_ids_params) + [panel_state_history_cap]),
+                ).fetchall()
+            else:
+                audit_rows = conn.execute(
+                    "SELECT id, actor, action, node_id, node_name, source_ip, detail_json, created_at "
+                    "FROM audit_logs ORDER BY id ASC LIMIT ?",
+                    (panel_state_history_cap,),
+                ).fetchall()
+            _panel_state_cap_warn("audit_logs", len(audit_rows))
+            for idx, row in enumerate(audit_rows, start=1):
+                d = dict(row)
+                src_nid = int(d.get("node_id") or 0)
+                detail_obj = _safe_json_loads(d.get("detail_json"), {})
+                if not isinstance(detail_obj, dict):
+                    detail_obj = {}
+                panel_state_payload["audit_logs"].append(
+                    {
+                        "source_id": int(d.get("id") or 0),
+                        "actor": str(d.get("actor") or ""),
+                        "action": str(d.get("action") or ""),
+                        "source_node_id": src_nid,
+                        "node_base_url": str((node_map.get(src_nid) or {}).get("base_url") or ""),
+                        "node_name": str(d.get("node_name") or ""),
+                        "source_ip": str(d.get("source_ip") or ""),
+                        "detail": detail_obj,
+                        "created_at": d.get("created_at"),
+                    }
+                )
+                if (idx % 500) == 0:
+                    await asyncio.sleep(0)
+            await _panel_state_heartbeat(f"审计日志 {len(panel_state_payload['audit_logs'])} 条")
+
+            if node_ids_for_scope:
+                placeholders = ",".join(["?"] * len(node_ids_for_scope))
+                task_rows = conn.execute(
+                    "SELECT id, node_id, type, payload_json, status, progress, result_json, error, created_at, updated_at "
+                    f"FROM tasks WHERE node_id IN ({placeholders}) ORDER BY id ASC LIMIT ?",
+                    tuple(list(node_ids_params) + [panel_state_history_cap]),
+                ).fetchall()
+            else:
+                task_rows = conn.execute(
+                    "SELECT id, node_id, type, payload_json, status, progress, result_json, error, created_at, updated_at "
+                    "FROM tasks ORDER BY id ASC LIMIT ?",
+                    (panel_state_history_cap,),
+                ).fetchall()
+            _panel_state_cap_warn("tasks", len(task_rows))
+            for idx, row in enumerate(task_rows, start=1):
+                d = dict(row)
+                src_nid = int(d.get("node_id") or 0)
+                payload_obj = _safe_json_loads(d.get("payload_json"), {})
+                result_obj = _safe_json_loads(d.get("result_json"), {})
+                if not isinstance(payload_obj, (dict, list)):
+                    payload_obj = {}
+                if not isinstance(result_obj, (dict, list)):
+                    result_obj = {}
+                panel_state_payload["tasks"].append(
+                    {
+                        "source_id": int(d.get("id") or 0),
+                        "source_node_id": src_nid,
+                        "node_base_url": str((node_map.get(src_nid) or {}).get("base_url") or ""),
+                        "type": str(d.get("type") or ""),
+                        "payload": payload_obj,
+                        "status": str(d.get("status") or ""),
+                        "progress": int(d.get("progress") or 0),
+                        "result": result_obj,
+                        "error": str(d.get("error") or ""),
+                        "created_at": d.get("created_at"),
+                        "updated_at": d.get("updated_at"),
+                    }
+                )
+                if (idx % 500) == 0:
+                    await asyncio.sleep(0)
+            await _panel_state_heartbeat(f"任务记录 {len(panel_state_payload['tasks'])} 条")
+
+            if node_ids_for_scope:
+                placeholders = ",".join(["?"] * len(node_ids_for_scope))
+                stat_rows = conn.execute(
+                    "SELECT id, node_id, rule_key, ts_ms, rx_bytes, tx_bytes, connections_active, connections_total, created_at "
+                    f"FROM rule_stats_samples WHERE node_id IN ({placeholders}) ORDER BY id ASC LIMIT ?",
+                    tuple(list(node_ids_params) + [panel_state_history_cap]),
+                ).fetchall()
+            else:
+                stat_rows = conn.execute(
+                    "SELECT id, node_id, rule_key, ts_ms, rx_bytes, tx_bytes, connections_active, connections_total, created_at "
+                    "FROM rule_stats_samples ORDER BY id ASC LIMIT ?",
+                    (panel_state_history_cap,),
+                ).fetchall()
+            _panel_state_cap_warn("rule_stats_samples", len(stat_rows))
+            for idx, row in enumerate(stat_rows, start=1):
+                d = dict(row)
+                src_nid = int(d.get("node_id") or 0)
+                panel_state_payload["rule_stats_samples"].append(
+                    {
+                        "source_id": int(d.get("id") or 0),
+                        "source_node_id": src_nid,
+                        "node_base_url": str((node_map.get(src_nid) or {}).get("base_url") or ""),
+                        "rule_key": str(d.get("rule_key") or ""),
+                        "ts_ms": int(d.get("ts_ms") or 0),
+                        "rx_bytes": int(d.get("rx_bytes") or 0),
+                        "tx_bytes": int(d.get("tx_bytes") or 0),
+                        "connections_active": int(d.get("connections_active") or 0),
+                        "connections_total": int(d.get("connections_total") or 0),
+                        "created_at": d.get("created_at"),
+                    }
+                )
+                if (idx % 500) == 0:
+                    await asyncio.sleep(0)
+            await _panel_state_heartbeat(f"规则统计样本 {len(panel_state_payload['rule_stats_samples'])} 条")
     except Exception as exc:
         panel_state_payload["errors"].append(f"panel_state_collect_failed: {exc}")
+        remote_storage_payload["errors"].append(f"remote_storage_profiles_collect_failed: {exc}")
+
+    remote_storage_profiles_total = len(remote_storage_payload.get("profiles") or [])
+    remote_storage_payload["summary"] = {
+        "profiles": int(remote_storage_profiles_total),
+        "errors": len(remote_storage_payload.get("errors") or []),
+    }
 
     panel_state_payload["summary"] = {
         "panel_settings": len(panel_state_payload["panel_settings"]),
@@ -1818,6 +3269,9 @@ async def _build_full_backup_bundle(
         "site_file_share_revocations": len(panel_state_payload["site_file_share_revocations"]),
         "site_events": len(panel_state_payload["site_events"]),
         "site_checks": len(panel_state_payload["site_checks"]),
+        "audit_logs": len(panel_state_payload["audit_logs"]),
+        "tasks": len(panel_state_payload["tasks"]),
+        "rule_stats_samples": len(panel_state_payload["rule_stats_samples"]),
         "errors": len(panel_state_payload.get("errors") or []),
         "total_items": (
             len(panel_state_payload["panel_settings"])
@@ -1830,6 +3284,9 @@ async def _build_full_backup_bundle(
             + len(panel_state_payload["site_file_share_revocations"])
             + len(panel_state_payload["site_events"])
             + len(panel_state_payload["site_checks"])
+            + len(panel_state_payload["audit_logs"])
+            + len(panel_state_payload["tasks"])
+            + len(panel_state_payload["rule_stats_samples"])
         ),
     }
     panel_items_total = int((panel_state_payload.get("summary") or {}).get("total_items") or 0)
@@ -1840,12 +3297,13 @@ async def _build_full_backup_bundle(
             "stage": "面板状态数据完成",
             "step_key": "panel_state",
             "step_status": "done",
-            "step_detail": f"{panel_items_total} 条",
+            "step_detail": f"{panel_items_total} 条 · 挂载方案 {int(remote_storage_profiles_total)}",
             "counts": {
                 "nodes": len(nodes),
                 "rules": len(rules_entries),
                 "sites": len(sites_payload["sites"]),
                 "site_files": site_file_total,
+                "remote_storage_profiles": int(remote_storage_profiles_total),
                 "certificates": len(certs),
                 "netmon_monitors": len(monitors),
                 "netmon_samples": len(netmon_samples),
@@ -1860,9 +3318,12 @@ async def _build_full_backup_bundle(
         "created_at": nodes_payload["created_at"],
         "nodes": len(nodes),
         "sites": len(sites_payload["sites"]),
+        "site_file_sites_scanned": int(total_sites),
+        "site_file_sites_skipped": int(skipped_storage_count),
         "site_files": int(site_file_total),
         "site_files_failed": int(site_file_failed),
         "site_file_bytes": int(site_file_bytes),
+        "remote_storage_profiles": int(remote_storage_profiles_total),
         "certificates": len(certs_payload["certificates"]),
         "netmon_monitors": len(monitors_payload["monitors"]),
         "netmon_samples": len(netmon_samples_payload["samples"]),
@@ -1876,108 +3337,232 @@ async def _build_full_backup_bundle(
         progress_callback,
         {"progress": 94, "stage": "打包压缩", "step_key": "package", "step_status": "running", "step_detail": f"{meta_payload['files']} 个文件"},
     )
-    buf = io.BytesIO()
+    fd, bundle_path = tempfile.mkstemp(prefix="nexus-backup-", suffix=".zip")
+    os.close(fd)
     site_files_ok = 0
     site_files_failed_transfer = 0
     site_files_bytes_ok = 0
-    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as z:
-        z.writestr("nodes.json", json.dumps(nodes_payload, ensure_ascii=False, indent=2))
-        z.writestr("websites/sites.json", json.dumps(sites_payload, ensure_ascii=False, indent=2))
-        z.writestr("websites/certificates.json", json.dumps(certs_payload, ensure_ascii=False, indent=2))
-        z.writestr("netmon/monitors.json", json.dumps(monitors_payload, ensure_ascii=False, indent=2))
-        z.writestr("netmon/samples.json", json.dumps(netmon_samples_payload, ensure_ascii=False, indent=2))
-        z.writestr("panel/state.json", json.dumps(panel_state_payload, ensure_ascii=False, indent=2))
-        for path, data in rules_entries:
-            z.writestr(path, json.dumps(data, ensure_ascii=False, indent=2))
+    try:
+        with zipfile.ZipFile(bundle_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
+            z.writestr("nodes.json", json.dumps(nodes_payload, ensure_ascii=False, indent=2))
+            z.writestr("websites/sites.json", json.dumps(sites_payload, ensure_ascii=False, indent=2))
+            z.writestr("websites/certificates.json", json.dumps(certs_payload, ensure_ascii=False, indent=2))
+            z.writestr("netmon/monitors.json", json.dumps(monitors_payload, ensure_ascii=False, indent=2))
+            z.writestr("netmon/config.json", json.dumps(monitors_payload, ensure_ascii=False, indent=2))
+            z.writestr("netmon/samples.json", json.dumps(netmon_samples_payload, ensure_ascii=False, indent=2))
+            z.writestr("panel/state.json", json.dumps(panel_state_payload, ensure_ascii=False, indent=2))
+            z.writestr("remote_storage/profiles.json", json.dumps(remote_storage_payload, ensure_ascii=False, indent=2))
+            for path, data in rules_entries:
+                z.writestr(path, json.dumps(data, ensure_ascii=False, indent=2))
 
-        file_jobs: List[tuple[Dict[str, Any], Dict[str, Any]]] = []
-        for site_item in (site_files_manifest.get("sites") or []):
-            for file_item in (site_item.get("files") or []):
-                if isinstance(file_item, dict):
-                    file_jobs.append((site_item, file_item))
-        total_jobs = len(file_jobs)
-        if total_jobs:
-            for i, (site_item, file_item) in enumerate(file_jobs, start=1):
-                node = node_map.get(int(site_item.get("source_node_id") or 0))
-                rel_path = _clean_site_rel_path(file_item.get("path"))
-                zip_path = str(file_item.get("zip_path") or "").strip()
-                root = str(site_item.get("root_path") or "").strip()
-                if not node or not root or not rel_path or not zip_path:
-                    file_item["status"] = "failed"
-                    file_item["error"] = "元数据不完整，跳过"
-                    site_files_failed_transfer += 1
-                else:
-                    try:
-                        r = await agent_get_raw(
-                            node.get("base_url", ""),
-                            node.get("api_key", ""),
-                            "/api/v1/website/files/raw",
-                            node_verify_tls(node),
-                            params={
-                                "root": root,
-                                "path": rel_path,
-                                "root_base": str(node.get("website_root_base") or ""),
+            file_jobs: List[tuple[Dict[str, Any], Dict[str, Any]]] = []
+            site_job_totals: Dict[str, int] = {}
+            site_job_done: Dict[str, int] = {}
+            site_job_ok: Dict[str, int] = {}
+            site_job_fail: Dict[str, int] = {}
+            last_site_job_key = ""
+            for site_item in (site_files_manifest.get("sites") or []):
+                if not isinstance(site_item, dict):
+                    continue
+                site_id = int(site_item.get("source_site_id") or 0)
+                site_name = str(site_item.get("site_label") or site_item.get("package_dir") or "").strip()
+                site_key = f"{site_id}:{site_name}"
+                for file_item in (site_item.get("files") or []):
+                    if isinstance(file_item, dict):
+                        file_jobs.append((site_item, file_item))
+                        site_job_totals[site_key] = int(site_job_totals.get(site_key) or 0) + 1
+            total_jobs = len(file_jobs)
+            if total_jobs:
+                for i, (site_item, file_item) in enumerate(file_jobs, start=1):
+                    site_id = int(site_item.get("source_site_id") or 0)
+                    site_label = str(
+                        site_item.get("site_label")
+                        or site_item.get("package_dir")
+                        or (f"site-{site_id}" if site_id > 0 else "site")
+                    ).strip()
+                    site_root = str(site_item.get("scan_root_path") or site_item.get("root_path") or "").strip() or "-"
+                    site_route_label = "直连隧道路由" if bool(site_item.get("fetch_via_tunnel")) else "base_url 直连"
+                    site_key = f"{site_id}:{site_label}"
+                    if site_key != last_site_job_key:
+                        last_site_job_key = site_key
+                        site_jobs_total = int(site_job_totals.get(site_key) or 0)
+                        await _emit_backup_progress(
+                            progress_callback,
+                            {
+                                "progress": 94 + int(((i - 1) / max(1, total_jobs)) * 5),
+                                "stage": "打包压缩",
+                                "step_key": "package",
+                                "step_status": "running",
+                                "step_detail": f"拉取网站文件 {i}/{total_jobs} · {site_label}",
+                                "event_level": "info",
+                                "event_text": (
+                                    f"开始拉取站点文件 {site_label}（{site_route_label}，root={site_root}）："
+                                    f"共 {site_jobs_total} 个文件"
+                                ),
                             },
-                            timeout=_site_file_fetch_timeout(int(file_item.get("size") or 0)),
                         )
-                        if r.status_code != 200:
-                            raise RuntimeError(f"HTTP {r.status_code}")
-                        raw = bytes(r.content or b"")
-                        z.writestr(zip_path, raw)
-                        file_item["status"] = "ok"
-                        file_item["size"] = len(raw)
-                        site_files_ok += 1
-                        site_files_bytes_ok += len(raw)
-                    except Exception as exc:
+                    node = node_map.get(int(site_item.get("source_node_id") or 0))
+                    rel_path = _clean_site_rel_path(file_item.get("path"))
+                    zip_item_path = str(file_item.get("zip_path") or "").strip()
+                    root = str(site_item.get("root_path") or "").strip()
+                    p = 94 + int((i / max(1, total_jobs)) * 5)
+                    if not node or not root or not rel_path or not zip_item_path:
                         file_item["status"] = "failed"
-                        file_item["error"] = str(exc)
+                        file_item["error"] = "元数据不完整，跳过"
                         site_files_failed_transfer += 1
-                        errs = site_item.get("errors")
-                        if not isinstance(errs, list):
-                            site_item["errors"] = []
-                        site_item["errors"].append(f"文件拉取失败：{rel_path} · {exc}")
+                        site_job_fail[site_key] = int(site_job_fail.get(site_key) or 0) + 1
+                    else:
+                        target_base_url, target_verify_tls = _backup_agent_request_target(node)
+                        try:
+                            r = await agent_get_raw_stream(
+                                target_base_url,
+                                str(node.get("api_key") or ""),
+                                "/api/v1/website/files/raw",
+                                target_verify_tls,
+                                params={
+                                    "root": root,
+                                    "path": rel_path,
+                                    "root_base": _backup_node_root_base(node, root),
+                                },
+                                timeout=_site_file_fetch_timeout(int(file_item.get("size") or 0)),
+                            )
+                            if r.status_code != 200:
+                                detail = ""
+                                try:
+                                    body = await r.aread()
+                                    detail = (body or b"").decode(errors="ignore").strip()
+                                except Exception:
+                                    detail = ""
+                                finally:
+                                    try:
+                                        await r.aclose()
+                                    except Exception:
+                                        pass
+                                if detail:
+                                    raise RuntimeError(f"HTTP {r.status_code}: {detail[:160]}")
+                                raise RuntimeError(f"HTTP {r.status_code}")
+                            size_written = 0
+                            tmp_fd, tmp_path = tempfile.mkstemp(prefix="nexus-site-file-", suffix=".tmp")
+                            os.close(tmp_fd)
+                            try:
+                                with open(tmp_path, "wb") as wf:
+                                    async for chunk in r.aiter_bytes(chunk_size=int(_BACKUP_SITE_FILE_STREAM_CHUNK_BYTES)):
+                                        if not chunk:
+                                            continue
+                                        wf.write(chunk)
+                                        size_written += len(chunk)
+                                z.write(tmp_path, arcname=zip_item_path)
+                            finally:
+                                try:
+                                    await r.aclose()
+                                except Exception:
+                                    pass
+                                _remove_file_quiet(tmp_path)
+                            file_item["status"] = "ok"
+                            file_item["size"] = int(size_written)
+                            site_files_ok += 1
+                            site_files_bytes_ok += int(size_written)
+                            site_job_ok[site_key] = int(site_job_ok.get(site_key) or 0) + 1
+                        except Exception as exc:
+                            file_item["status"] = "failed"
+                            file_item["error"] = str(exc)
+                            site_files_failed_transfer += 1
+                            site_job_fail[site_key] = int(site_job_fail.get(site_key) or 0) + 1
+                            errs = site_item.get("errors")
+                            if not isinstance(errs, list):
+                                site_item["errors"] = []
+                            site_item["errors"].append(f"文件拉取失败：{rel_path} · {exc}")
+                            await _emit_backup_progress(
+                                progress_callback,
+                                {
+                                    "progress": p,
+                                    "stage": "打包压缩",
+                                    "step_key": "package",
+                                    "step_status": "running",
+                                    "step_detail": f"拉取网站文件 {i}/{total_jobs} · {site_label}",
+                                    "event_level": "warn",
+                                    "event_text": f"文件拉取失败：{site_label}/{rel_path}（{site_route_label}） · {exc}",
+                                },
+                            )
 
-                p = 94 + int((i / max(1, total_jobs)) * 5)
-                await _emit_backup_progress(
-                    progress_callback,
-                    {
-                        "progress": p,
-                        "stage": "打包压缩",
-                        "step_key": "package",
-                        "step_status": "running",
-                        "step_detail": f"拉取网站文件 {i}/{total_jobs}",
-                    },
-                )
+                    site_job_done[site_key] = int(site_job_done.get(site_key) or 0) + 1
+                    if int(site_job_done.get(site_key) or 0) >= int(site_job_totals.get(site_key) or 0):
+                        done_ok = int(site_job_ok.get(site_key) or 0)
+                        done_fail = int(site_job_fail.get(site_key) or 0)
+                        await _emit_backup_progress(
+                            progress_callback,
+                            {
+                                "progress": p,
+                                "stage": "打包压缩",
+                                "step_key": "package",
+                                "step_status": "running",
+                                "step_detail": f"拉取网站文件 {i}/{total_jobs} · {site_label}",
+                                "event_level": "warn" if done_fail > 0 else "info",
+                                "event_text": (
+                                    f"站点文件拉取完成 {site_label}（{site_route_label}）："
+                                    f"成功 {done_ok}，失败 {done_fail}"
+                                ),
+                            },
+                        )
+                    await _emit_backup_progress(
+                        progress_callback,
+                        {
+                            "progress": p,
+                            "stage": "打包压缩",
+                            "step_key": "package",
+                            "step_status": "running",
+                            "step_detail": f"拉取网站文件 {i}/{total_jobs} · {site_label}",
+                        },
+                    )
 
-        # Finalize file manifest/meta with actual transfer result
-        site_files_manifest["summary"] = {
-            "sites": len(site_files_manifest.get("sites") or []),
-            "files_total": total_jobs,
-            "files_ok": int(site_files_ok),
-            "files_failed": int(site_files_failed_transfer),
-            "bytes_total": int(site_files_bytes_ok),
-        }
-        z.writestr("websites/files_manifest.json", json.dumps(site_files_manifest, ensure_ascii=False, indent=2))
+            # Finalize file manifest/meta with actual transfer result
+            site_files_manifest["summary"] = {
+                "sites": len(site_files_manifest.get("sites") or []),
+                "sites_scanned": int(total_sites),
+                "sites_skipped": int(skipped_storage_count),
+                "files_total": total_jobs,
+                "files_ok": int(site_files_ok),
+                "files_failed": int(site_files_failed_transfer),
+                "bytes_total": int(site_files_bytes_ok),
+            }
+            z.writestr("websites/files_manifest.json", json.dumps(site_files_manifest, ensure_ascii=False, indent=2))
 
-        meta_payload["site_files"] = int(site_files_ok)
-        meta_payload["site_files_failed"] = int(site_files_failed_transfer + site_file_failed)
-        meta_payload["site_file_bytes"] = int(site_files_bytes_ok)
-        meta_payload["panel_items"] = panel_items_total
-        meta_payload["panel_state_errors"] = int((panel_state_payload.get("summary") or {}).get("errors") or 0)
-        meta_payload["files"] = fixed_zip_files + len(rules_entries) + int(site_files_ok)
-        z.writestr("backup_meta.json", json.dumps(meta_payload, ensure_ascii=False, indent=2))
-        z.writestr(
-            "README.txt",
-            "Nexus 全量备份说明\n\n"
-            "1) 恢复节点列表：登录面板 → 控制台 → 点击『恢复节点列表』，上传本压缩包（或解压后的 nodes.json）。\n"
-            "2) 全量恢复：控制台 → 全量恢复，自动恢复 nodes/rules/websites/certificates/netmon/panel_state。\n"
-            "3) 网站文件已打包在 websites/files/ 目录，恢复时会按站点映射自动回传到节点。\n"
-            "4) 网络波动历史样本位于 netmon/samples.json，会在全量恢复时同步写回。\n"
-            "5) 恢复单节点规则：进入节点页面 → 更多 → 恢复规则，把 rules/ 目录下对应节点的规则文件上传/粘贴即可。\n",
-        )
+            meta_payload["site_files"] = int(site_files_ok)
+            meta_payload["site_files_failed"] = int(site_files_failed_transfer + site_file_failed)
+            meta_payload["site_file_bytes"] = int(site_files_bytes_ok)
+            meta_payload["remote_storage_profiles"] = int(remote_storage_profiles_total)
+            meta_payload["panel_items"] = panel_items_total
+            meta_payload["panel_state_errors"] = int((panel_state_payload.get("summary") or {}).get("errors") or 0)
+            meta_payload["files"] = fixed_zip_files + len(rules_entries) + int(site_files_ok)
+            z.writestr("backup_meta.json", json.dumps(meta_payload, ensure_ascii=False, indent=2))
+            z.writestr(
+                "README.txt",
+                "Nexus 全量备份说明\n\n"
+                "1) 恢复节点列表：登录面板 → 控制台 → 点击『恢复节点列表』，上传本压缩包（或解压后的 nodes.json）。\n"
+                "2) 全量恢复：控制台 → 全量恢复，自动恢复 nodes(含直连隧道/自动重启策略)/rules/websites/certificates/netmon/panel_state。\n"
+                "3) 网站文件已打包在 websites/files/ 目录，恢复时会按站点映射自动回传到节点。\n"
+                "4) 网络波动配置位于 netmon/monitors.json（兼容 netmon/config.json），历史样本位于 netmon/samples.json。\n"
+                "5) 远程存储挂载方案单独保存在 remote_storage/profiles.json。\n"
+                "6) panel/state.json 包含用户权限、面板设置、分享记录、审计日志、任务与规则统计样本等面板状态数据。\n"
+                "7) 恢复单节点规则：进入节点页面 → 更多 → 恢复规则，把 rules/ 目录下对应节点的规则文件上传/粘贴即可。\n",
+            )
+    except Exception:
+        _remove_file_quiet(bundle_path)
+        raise
 
     filename = f"nexus-backup-{ts}.zip"
-    content = buf.getvalue()
+    try:
+        size_bytes = int(os.path.getsize(bundle_path))
+    except Exception:
+        size_bytes = 0
+    content = b""
+    if include_content:
+        try:
+            with open(bundle_path, "rb") as f:
+                content = bytes(f.read())
+        except Exception:
+            _remove_file_quiet(bundle_path)
+            raise
     await _emit_backup_progress(
         progress_callback,
         {
@@ -1985,12 +3570,13 @@ async def _build_full_backup_bundle(
             "stage": "备份完成",
             "step_key": "package",
             "step_status": "done",
-            "step_detail": f"{len(content)} bytes",
+            "step_detail": f"{size_bytes} bytes",
             "counts": {
                 "nodes": meta_payload["nodes"],
                 "rules": meta_payload["rules"],
                 "sites": meta_payload["sites"],
                 "site_files": int(meta_payload.get("site_files") or 0),
+                "remote_storage_profiles": int(meta_payload.get("remote_storage_profiles") or 0),
                 "certificates": meta_payload["certificates"],
                 "netmon_monitors": meta_payload["netmon_monitors"],
                 "netmon_samples": int(meta_payload.get("netmon_samples") or 0),
@@ -2003,6 +3589,8 @@ async def _build_full_backup_bundle(
     return {
         "filename": filename,
         "content": content,
+        "zip_path": bundle_path,
+        "size_bytes": size_bytes,
         "meta": meta_payload,
     }
 
@@ -2025,7 +3613,11 @@ def _prune_full_restore_jobs() -> None:
         stale_ids: List[str] = []
         for jid, job in _FULL_RESTORE_JOBS.items():
             st = str(job.get("status") or "")
-            updated_at = float(job.get("updated_at") or 0.0)
+            created_at = _to_float_loose(job.get("created_at"), 0.0)
+            updated_at = _to_float_loose(job.get("updated_at"), 0.0)
+            if st in ("queued", "running") and created_at > 0 and (now - created_at) > float(_FULL_RESTORE_ACTIVE_MAX_SEC):
+                stale_ids.append(jid)
+                continue
             if st in ("done", "failed") and (now - updated_at) > _FULL_RESTORE_TTL_SEC:
                 stale_ids.append(jid)
         for jid in stale_ids:
@@ -2037,16 +3629,18 @@ def _restore_job_snapshot(job_id: str) -> Optional[Dict[str, Any]]:
         job = _FULL_RESTORE_JOBS.get(job_id)
         if not isinstance(job, dict):
             return None
+        result = job.get("result")
+        steps = job.get("steps")
         return {
             "job_id": str(job_id),
             "status": str(job.get("status") or "unknown"),
-            "progress": int(job.get("progress") or 0),
+            "progress": _to_int_loose(job.get("progress"), 0),
             "stage": str(job.get("stage") or ""),
             "error": str(job.get("error") or ""),
-            "created_at": float(job.get("created_at") or 0.0),
-            "updated_at": float(job.get("updated_at") or 0.0),
-            "steps": list(job.get("steps") or []),
-            "result": dict(job.get("result") or {}),
+            "created_at": _to_float_loose(job.get("created_at"), 0.0),
+            "updated_at": _to_float_loose(job.get("updated_at"), 0.0),
+            "steps": list(steps) if isinstance(steps, list) else [],
+            "result": dict(result) if isinstance(result, dict) else {},
         }
 
 
@@ -2106,6 +3700,30 @@ def _restore_stage_by_progress(progress: int) -> Dict[str, str]:
     return {"key": "finalize", "stage": "收尾与校验…"}
 
 
+def _restore_running_detail(step_key: str, elapsed_sec: int) -> str:
+    k = str(step_key or "").strip()
+    sec = max(0, int(elapsed_sec or 0))
+    if k == "upload":
+        return f"上传中（流式接收） {sec}s"
+    if k == "parse":
+        return f"解析压缩包目录与元数据 {sec}s"
+    if k == "rules":
+        return f"恢复节点与规则并尝试下发 {sec}s"
+    if k == "sites_files":
+        return f"恢复网站配置与文件内容（大文件会更慢） {sec}s"
+    if k == "certs_netmon":
+        return f"恢复证书与网络波动配置 {sec}s"
+    if k == "panel_state":
+        return f"恢复用户权限与面板状态配置 {sec}s"
+    if k == "finalize":
+        if sec < 30:
+            return f"校验映射与恢复统计 {sec}s"
+        if sec < 90:
+            return f"提交数据库事务并同步状态 {sec}s"
+        return f"清理临时资源与最终一致性校验 {sec}s"
+    return f"执行中 {sec}s"
+
+
 async def _restore_progress_ticker(job_id: str) -> None:
     order = ["upload", "parse", "rules", "sites_files", "certs_netmon", "panel_state", "finalize"]
     while True:
@@ -2127,7 +3745,7 @@ async def _restore_progress_ticker(job_id: str) -> None:
                 stage="收尾与校验…",
                 step_key="finalize",
                 step_status="running",
-                step_detail=f"执行中 {elapsed}s",
+                step_detail=_restore_running_detail("finalize", elapsed),
             )
             continue
         bump = random.randint(1, 3) if cur < 60 else random.randint(1, 2)
@@ -2135,12 +3753,20 @@ async def _restore_progress_ticker(job_id: str) -> None:
         pos = _restore_stage_by_progress(nxt)
         cur_key = str(pos.get("key") or "")
         idx = order.index(cur_key) if cur_key in order else 0
-        _touch_restore_job(job_id, progress=nxt, stage=pos.get("stage"), step_key=cur_key, step_status="running")
+        elapsed = max(0, int(now_ts - created_at))
+        _touch_restore_job(
+            job_id,
+            progress=nxt,
+            stage=pos.get("stage"),
+            step_key=cur_key,
+            step_status="running",
+            step_detail=_restore_running_detail(cur_key, elapsed),
+        )
         for i, k in enumerate(order):
             if i < idx:
-                _touch_restore_job(job_id, step_key=k, step_status="done")
+                _touch_restore_job(job_id, step_key=k, step_status="done", step_detail="已完成")
             elif i > idx:
-                _touch_restore_job(job_id, step_key=k, step_status="pending")
+                _touch_restore_job(job_id, step_key=k, step_status="pending", step_detail="")
 
 
 def _parse_json_response_obj(resp: JSONResponse) -> Dict[str, Any]:
@@ -2165,28 +3791,65 @@ def _restore_cancel_message(exc: BaseException, fallback: str) -> str:
     return fallback
 
 
+def _touch_node_last_seen_safe(node_id: int, node: Optional[Dict[str, Any]] = None) -> None:
+    """Direct-agent success should also refresh online timestamp."""
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        touch_node_last_seen(int(node_id), last_seen_at=now_str)
+    except Exception:
+        return
+    if isinstance(node, dict):
+        node["last_seen_at"] = now_str
+
+
+def _report_ping_payload(node_id: int, node: Dict[str, Any], allow_stale: bool) -> Optional[Dict[str, Any]]:
+    fresh = bool(is_report_fresh(node))
+    if (not allow_stale) and (not fresh):
+        return None
+    rep = get_last_report(node_id)
+    if not isinstance(rep, dict):
+        return None
+    info = rep.get("info")
+    return {
+        "ok": True,
+        "source": "report",
+        "stale": (not fresh),
+        "last_seen_at": node.get("last_seen_at"),
+        "info": info,
+    }
+
+
 @router.get("/api/nodes/{node_id}/ping")
 async def api_ping(request: Request, node_id: int, user: str = Depends(require_login)):
     node = get_node(node_id)
     if not node:
         return JSONResponse({"ok": False, "error": "节点不存在"}, status_code=404)
 
-    # Push-report mode: agent has reported recently -> online (no need panel->agent reachability)
-    if is_report_fresh(node):
-        rep = get_last_report(node_id)
-        info = rep.get("info") if isinstance(rep, dict) else None
-        # keep兼容旧前端：ping 只关心 ok + latency_ms
-        return {
-            "ok": True,
-            "source": "report",
-            "last_seen_at": node.get("last_seen_at"),
-            "info": info,
-        }
+    last_direct_err = ""
+    for idx, source in enumerate(node_info_sources_order(force_pull=False)):
+        if source == "report":
+            payload = _report_ping_payload(node_id, node, allow_stale=(idx > 0))
+            if isinstance(payload, dict):
+                return payload
+            continue
 
-    info = await agent_ping(node["base_url"], node["api_key"], node_verify_tls(node))
-    if not info.get("ok"):
-        return {"ok": False, "error": info.get("error", "offline")}
-    return info
+        try:
+            target_base_url, target_verify_tls, _target_route = node_agent_request_target(node)
+            info = await agent_ping(target_base_url, node["api_key"], target_verify_tls)
+        except Exception as exc:
+            last_direct_err = str(exc)
+            continue
+        if bool(info.get("ok")):
+            _touch_node_last_seen_safe(node_id, node)
+            if "source" not in info:
+                info["source"] = "agent"
+            return info
+        last_direct_err = str(info.get("error", "offline"))
+
+    fallback = _report_ping_payload(node_id, node, allow_stale=True)
+    if isinstance(fallback, dict):
+        return fallback
+    return {"ok": False, "error": last_direct_err or "offline"}
 
 
 @router.post("/api/nodes/{node_id}/trace")
@@ -2211,12 +3874,13 @@ async def api_trace_route(request: Request, node_id: int, payload: Dict[str, Any
     }
 
     try:
+        target_base_url, target_verify_tls, _target_route = node_agent_request_target(node)
         data = await agent_post(
-            node.get("base_url", ""),
+            target_base_url,
             node.get("api_key", ""),
             "/api/v1/netprobe/trace",
             body,
-            node_verify_tls(node),
+            target_verify_tls,
             timeout=_TRACE_ROUTE_HTTP_TIMEOUT,
         )
     except Exception as exc:
@@ -2250,18 +3914,38 @@ async def api_pool_get(request: Request, node_id: int, user: str = Depends(requi
             "source": "panel_desired",
         }
 
-    # If no desired pool, try last report snapshot
-    rep = get_last_report(node_id)
-    if isinstance(rep, dict) and isinstance(rep.get("pool"), dict):
-        return {"ok": True, "pool": _filter_pool_for_user(user, rep.get("pool")), "source": "report_cache"}
+    rep: Optional[Dict[str, Any]] = None
+    last_pull_err = ""
+    for source in node_info_sources_order(force_pull=False):
+        if source == "report":
+            if rep is None:
+                rep = get_last_report(node_id)
+            if isinstance(rep, dict) and isinstance(rep.get("pool"), dict):
+                return {
+                    "ok": True,
+                    "pool": _filter_pool_for_user(user, rep.get("pool")),
+                    "source": "report_cache",
+                    "stale": (not bool(is_report_fresh(node))),
+                }
+            continue
+        try:
+            target_base_url, target_verify_tls, _target_route = node_agent_request_target(node)
+            data = await agent_get(target_base_url, node["api_key"], "/api/v1/pool", target_verify_tls)
+            if isinstance(data, dict):
+                return _pool_like_response_with_filter(user, data)
+            return data
+        except Exception as exc:
+            last_pull_err = str(exc)
+            continue
 
-    try:
-        data = await agent_get(node["base_url"], node["api_key"], "/api/v1/pool", node_verify_tls(node))
-        if isinstance(data, dict):
-            return _pool_like_response_with_filter(user, data)
-        return data
-    except Exception as exc:
-        return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
+    if isinstance(rep, dict) and isinstance(rep.get("pool"), dict):
+        return {
+            "ok": True,
+            "pool": _filter_pool_for_user(user, rep.get("pool")),
+            "source": "report_cache",
+            "stale": True,
+        }
+    return JSONResponse({"ok": False, "error": last_pull_err or "暂无可用规则快照"}, status_code=502)
 
 
 @router.get("/api/nodes/{node_id}/backup")
@@ -2269,33 +3953,76 @@ async def api_backup(request: Request, node_id: int, user: str = Depends(require
     node = get_node(node_id)
     if not node:
         return JSONResponse({"ok": False, "error": "节点不存在"}, status_code=404)
-    data = await get_pool_for_backup(node)
-    if isinstance(data, dict):
-        data = _pool_like_response_with_filter(user, data)
-    # 规则文件名包含节点名，便于区分
-    safe = safe_filename_part(node.get("name") or f"node-{node_id}")
-    filename = f"realm-rules-{safe}-id{node_id}.json"
-    payload = json.dumps(data, ensure_ascii=False, indent=2)
-    headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
-    return Response(content=payload, media_type="application/json", headers=headers)
+    try:
+        data = await get_pool_for_backup(node)
+        if isinstance(data, dict):
+            data = _pool_like_response_with_filter(user, data)
+        # 规则文件名包含节点名，便于区分
+        safe = safe_filename_part(node.get("name") or f"node-{node_id}")
+        filename = f"realm-rules-{safe}-id{node_id}.json"
+        payload = json.dumps(data, ensure_ascii=False, indent=2, default=str)
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": f"备份失败：{exc}"}, status_code=500)
+    try:
+        headers = {"Content-Disposition": _download_content_disposition(filename, fallback=f"realm-rules-node-{node_id}.json")}
+        return Response(content=payload, media_type="application/json", headers=headers)
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": f"备份响应构造失败：{exc}"}, status_code=500)
 
 
 @router.get("/api/backup/full")
 async def api_backup_full(request: Request, user: str = Depends(require_login)):
     """Direct download full backup zip (legacy one-shot behavior)."""
     visible_nodes = filter_nodes_for_user(user, list_nodes())
-    bundle = await _build_full_backup_bundle(request, nodes_override=visible_nodes)
+    panel_public_url = panel_public_base_url(request)
+
+    def _run_sync() -> Dict[str, Any]:
+        return asyncio.run(
+            _build_full_backup_bundle(
+                request=None,
+                nodes_override=visible_nodes,
+                include_content=False,
+                panel_public_url_override=panel_public_url,
+            )
+        )
+
+    bundle = await asyncio.to_thread(_run_sync)
     filename = str(bundle.get("filename") or f"nexus-backup-{datetime.now().strftime('%Y%m%d-%H%M%S')}.zip")
-    content = bytes(bundle.get("content") or b"")
-    headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
-    return Response(content=content, media_type="application/zip", headers=headers)
+    bundle_path = str(bundle.get("zip_path") or "").strip()
+    if not bundle_path or not os.path.exists(bundle_path):
+        return JSONResponse({"ok": False, "error": "备份文件生成失败"}, status_code=500)
+    return FileResponse(
+        path=bundle_path,
+        media_type="application/zip",
+        filename=filename,
+        background=BackgroundTask(_remove_file_quiet, bundle_path),
+    )
 
 
 @router.post("/api/backup/full/start")
 async def api_backup_full_start(request: Request, user: str = Depends(require_login)):
     """Start full backup in background and return a job id for progress polling."""
     visible_nodes = filter_nodes_for_user(user, list_nodes())
+    panel_public_url = panel_public_base_url(request)
     _prune_full_backup_jobs()
+    active_ids = _active_full_backup_job_ids()
+    logger.info(
+        "full backup start requested user=%s visible_nodes=%d active_jobs=%d",
+        str(user or ""),
+        len(visible_nodes),
+        len(active_ids),
+    )
+    if active_ids and int(_FULL_BACKUP_MAX_CONCURRENT) <= 1:
+        # Reuse newest active job to avoid duplicate heavy backup tasks.
+        reuse_id = str(active_ids[-1] or "").strip()
+        snap = _backup_job_snapshot(reuse_id) if reuse_id else None
+        if snap:
+            return {"ok": True, "reused": True, **snap}
+    if len(active_ids) >= int(_FULL_BACKUP_MAX_CONCURRENT):
+        return JSONResponse(
+            {"ok": False, "error": f"当前已有 {len(active_ids)} 个备份任务进行中，请稍后再试"},
+            status_code=429,
+        )
     job_id = uuid.uuid4().hex
     now = time.time()
 
@@ -2315,16 +4042,42 @@ async def api_backup_full_start(request: Request, user: str = Depends(require_lo
                 "rules": 0,
                 "sites": 0,
                 "site_files": 0,
+                "remote_storage_profiles": 0,
                 "certificates": 0,
                 "netmon_monitors": 0,
+                "netmon_samples": 0,
                 "files": 0,
             },
             "content": b"",
+            "file_path": "",
+            "events": [
+                {
+                    "ts_ms": int(max(0.0, now) * 1000.0),
+                    "stage": "准备备份任务",
+                    "progress": 1,
+                    "level": "info",
+                    "detail": "任务已创建，等待后台执行",
+                }
+            ],
+            "event_total": 1,
         }
 
     async def _progress_cb(payload: Dict[str, Any]) -> None:
         if not isinstance(payload, dict):
             return
+        stage_s = str(payload.get("stage") or "").strip()
+        detail_s = str(payload.get("step_detail") or "").strip()
+        event_text = str(payload.get("event_text") or "").strip()
+        if not event_text:
+            if stage_s and detail_s:
+                event_text = f"{stage_s} · {detail_s}"
+            elif stage_s:
+                event_text = stage_s
+            elif detail_s:
+                event_text = detail_s
+        event_level = str(payload.get("event_level") or "").strip().lower()
+        if not event_level:
+            event_level = "error" if str(payload.get("step_status") or "").strip().lower() == "failed" else "info"
         _touch_backup_job(
             job_id,
             progress=payload.get("progress"),
@@ -2333,42 +4086,104 @@ async def api_backup_full_start(request: Request, user: str = Depends(require_lo
             step_key=payload.get("step_key"),
             step_status=payload.get("step_status"),
             step_detail=payload.get("step_detail"),
+            event_text=event_text,
+            event_level=event_level,
         )
 
     async def _run() -> None:
+        bundle_path = ""
+        started_at = time.time()
         try:
-            bundle = await _build_full_backup_bundle(request, _progress_cb, nodes_override=visible_nodes)
+            bundle = await _build_full_backup_bundle(
+                None,
+                _progress_cb,
+                nodes_override=visible_nodes,
+                include_content=False,
+                panel_public_url_override=panel_public_url,
+            )
             meta = bundle.get("meta") if isinstance(bundle.get("meta"), dict) else {}
             counts = {
                 "nodes": int(meta.get("nodes") or 0),
                 "rules": int(meta.get("rules") or 0),
                 "sites": int(meta.get("sites") or 0),
                 "site_files": int(meta.get("site_files") or 0),
+                "remote_storage_profiles": int(meta.get("remote_storage_profiles") or 0),
                 "certificates": int(meta.get("certificates") or 0),
                 "netmon_monitors": int(meta.get("netmon_monitors") or 0),
+                "netmon_samples": int(meta.get("netmon_samples") or 0),
                 "files": int(meta.get("files") or 0),
             }
-            content = bytes(bundle.get("content") or b"")
+            bundle_path = str(bundle.get("zip_path") or "").strip()
+            if not bundle_path or not os.path.exists(bundle_path):
+                raise RuntimeError("备份文件生成失败")
+            try:
+                size_bytes = int(os.path.getsize(bundle_path))
+            except Exception:
+                size_bytes = int(bundle.get("size_bytes") or 0)
             _touch_backup_job(
                 job_id,
                 status="done",
                 progress=100,
                 stage="备份完成",
                 filename=str(bundle.get("filename") or ""),
-                size_bytes=len(content),
+                size_bytes=size_bytes,
                 counts=counts,
-                content=content,
+                file_path=bundle_path,
+                event_text=f"备份完成，生成 {int(size_bytes)} bytes",
+                event_level="info",
             )
+            logger.info(
+                "full backup done job_id=%s size_bytes=%d files=%d duration_sec=%.2f",
+                str(job_id),
+                int(size_bytes),
+                int(counts.get("files") or 0),
+                max(0.0, time.time() - started_at),
+            )
+            bundle_path = ""
         except Exception as exc:
+            logger.exception("full backup failed job_id=%s", str(job_id))
+            if bundle_path:
+                _remove_file_quiet(bundle_path)
             _touch_backup_job(
                 job_id,
                 status="failed",
                 progress=100,
                 stage="备份失败",
                 error=str(exc),
+                event_text=f"备份失败：{exc}",
+                event_level="error",
             )
 
-    asyncio.create_task(_run())
+    def _thread_entry() -> None:
+        try:
+            asyncio.run(_run())
+        except Exception as exc:
+            logger.exception("backup-job thread crashed job_id=%s", job_id)
+            _touch_backup_job(
+                job_id,
+                status="failed",
+                progress=100,
+                stage="备份失败",
+                error=f"任务线程崩溃：{exc}",
+                event_text=f"任务线程崩溃：{exc}",
+                event_level="error",
+            )
+
+    try:
+        t = threading.Thread(target=_thread_entry, name=f"backup-job-{job_id}", daemon=True)
+        t.start()
+        logger.info("full backup worker started job_id=%s thread=%s", str(job_id), str(t.name))
+    except Exception as exc:
+        _touch_backup_job(
+            job_id,
+            status="failed",
+            progress=100,
+            stage="备份失败",
+            error=f"任务调度失败：{exc}",
+            event_text=f"任务调度失败：{exc}",
+            event_level="error",
+        )
+        return JSONResponse({"ok": False, "error": f"创建备份任务失败：{exc}"}, status_code=500)
     snap = _backup_job_snapshot(job_id)
     if not snap:
         return JSONResponse({"ok": False, "error": "创建备份任务失败"}, status_code=500)
@@ -2378,19 +4193,25 @@ async def api_backup_full_start(request: Request, user: str = Depends(require_lo
 @router.get("/api/backup/full/progress")
 async def api_backup_full_progress(job_id: str = "", user: str = Depends(require_login)):
     """Get backup job progress."""
-    _prune_full_backup_jobs()
+    _ = user
     jid = str(job_id or "").strip()
-    if not jid:
-        return JSONResponse({"ok": False, "error": "缺少 job_id"}, status_code=400)
-    snap = _backup_job_snapshot(jid)
-    if not snap:
-        return JSONResponse({"ok": False, "error": "备份任务不存在或已过期"}, status_code=404)
-    return {"ok": True, **snap}
+    try:
+        _prune_full_backup_jobs()
+        if not jid:
+            return JSONResponse({"ok": False, "error": "缺少 job_id"}, status_code=400)
+        snap = _backup_job_snapshot(jid)
+        if not snap:
+            return JSONResponse({"ok": False, "error": "备份任务不存在或已过期"}, status_code=404)
+        return {"ok": True, **snap}
+    except Exception as exc:
+        logger.exception("backup progress query failed job_id=%s", jid)
+        return JSONResponse({"ok": False, "error": f"进度查询异常：{exc}"}, status_code=500)
 
 
 @router.get("/api/backup/full/download")
 async def api_backup_full_download(job_id: str = "", user: str = Depends(require_login)):
     """Download finished backup by job id."""
+    _prune_full_backup_jobs()
     jid = str(job_id or "").strip()
     if not jid:
         return JSONResponse({"ok": False, "error": "缺少 job_id"}, status_code=400)
@@ -2401,15 +4222,25 @@ async def api_backup_full_download(job_id: str = "", user: str = Depends(require
             return JSONResponse({"ok": False, "error": "备份任务不存在或已过期"}, status_code=404)
         status = str(job.get("status") or "")
         filename = str(job.get("filename") or "")
+        file_path = str(job.get("file_path") or "").strip()
         content = bytes(job.get("content") or b"")
 
-    if status != "done" or not content:
+    if status != "done":
         return JSONResponse({"ok": False, "error": "备份尚未完成，请稍候再试"}, status_code=409)
 
     if not filename:
         filename = f"nexus-backup-{datetime.now().strftime('%Y%m%d-%H%M%S')}.zip"
-    headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
-    return Response(content=content, media_type="application/zip", headers=headers)
+    if file_path:
+        if not os.path.exists(file_path):
+            return JSONResponse({"ok": False, "error": "备份文件已失效，请重新生成"}, status_code=410)
+        return FileResponse(path=file_path, media_type="application/zip", filename=filename)
+    if not content:
+        return JSONResponse({"ok": False, "error": "备份文件不可用，请重新生成"}, status_code=410)
+    try:
+        headers = {"Content-Disposition": _download_content_disposition(filename, fallback="nexus-backup.zip")}
+        return Response(content=content, media_type="application/zip", headers=headers)
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": f"备份下载响应失败：{exc}"}, status_code=500)
 
 
 @router.post("/api/restore/nodes")
@@ -2420,24 +4251,46 @@ async def api_restore_nodes(
 ):
     """Restore nodes list from nodes.json or full backup zip."""
     try:
-        raw = await file.read()
+        await file.seek(0)
+    except Exception:
+        pass
+    total = 0
+    buf = bytearray()
+    try:
+        while True:
+            chunk = await file.read(_RESTORE_UPLOAD_CHUNK_SIZE)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > _NODES_RESTORE_MAX_BYTES:
+                return JSONResponse(
+                    {
+                        "ok": False,
+                        "error": f"上传文件过大（当前限制 {_format_bytes(_NODES_RESTORE_MAX_BYTES)}）",
+                    },
+                    status_code=413,
+                )
+            buf.extend(chunk)
     except Exception as exc:
         return JSONResponse({"ok": False, "error": f"读取文件失败：{exc}"}, status_code=400)
+    raw = bytes(buf)
+    if not raw:
+        return JSONResponse({"ok": False, "error": "上传文件为空"}, status_code=400)
 
     payload = None
     # Zip?
     if raw[:2] == b"PK":
         try:
-            z = zipfile.ZipFile(io.BytesIO(raw))
-            # find nodes.json
-            name = None
-            for n in z.namelist():
-                if n.lower().endswith("nodes.json"):
-                    name = n
-                    break
-            if not name:
-                return JSONResponse({"ok": False, "error": "压缩包中未找到 nodes.json"}, status_code=400)
-            payload = json.loads(z.read(name).decode("utf-8"))
+            with zipfile.ZipFile(io.BytesIO(raw)) as z:
+                # find nodes.json
+                name = None
+                for n in z.namelist():
+                    if n.lower().endswith("nodes.json"):
+                        name = n
+                        break
+                if not name:
+                    return JSONResponse({"ok": False, "error": "压缩包中未找到 nodes.json"}, status_code=400)
+                payload = json.loads(z.read(name).decode("utf-8"))
         except Exception as exc:
             return JSONResponse({"ok": False, "error": f"压缩包解析失败：{exc}"}, status_code=400)
     else:
@@ -2478,6 +4331,7 @@ async def api_restore_nodes(
     updated = 0
     skipped = 0
     mapping: Dict[str, int] = {}
+    baseurl_to_nodeid: Dict[str, int] = {}
 
     for item in nodes_list:
         if not isinstance(item, dict):
@@ -2501,6 +4355,7 @@ async def api_restore_nodes(
             )
         )
         group_name = (group_name or "默认分组").strip() or "默认分组"
+        system_type = normalize_node_system_type(item.get("system_type"), default="auto")
         source_id = item.get("source_id")
         try:
             source_id_i = int(source_id) if source_id is not None else None
@@ -2528,9 +4383,11 @@ async def api_restore_nodes(
                 role=role,
                 capabilities=capabilities,
                 website_root_base=website_root_base,
+                system_type=system_type,
             )
             updated += 1
             node_id = int(existing["id"])
+            baseurl_to_nodeid[base_url] = int(node_id)
             if source_id_i is not None and source_id_i > 0:
                 mapping[str(source_id_i)] = node_id
         else:
@@ -2550,6 +4407,7 @@ async def api_restore_nodes(
                         capabilities=capabilities,
                         website_root_base=website_root_base,
                         preferred_id=preferred_id,
+                        system_type=system_type,
                     )
                 )
                 added += 1
@@ -2571,15 +4429,21 @@ async def api_restore_nodes(
                         role=role,
                         capabilities=capabilities,
                         website_root_base=website_root_base,
+                        system_type=system_type,
                     )
                     updated += 1
                     node_id = int(fallback["id"])
+                    baseurl_to_nodeid[base_url] = int(node_id)
                 else:
                     skipped += 1
                     continue
 
             if source_id_i is not None and source_id_i > 0 and node_id is not None:
                 mapping[str(source_id_i)] = int(node_id)
+            if node_id is not None:
+                baseurl_to_nodeid[base_url] = int(node_id)
+
+    node_features = _restore_node_feature_configs(nodes_list, mapping, baseurl_to_nodeid)
 
     return {
         "ok": True,
@@ -2587,6 +4451,7 @@ async def api_restore_nodes(
         "updated": updated,
         "skipped": skipped,
         "mapping": mapping,
+        "node_features": node_features,
     }
 
 
@@ -2622,11 +4487,14 @@ async def api_restore_full_start(
     _touch_restore_job(job_id, step_key="parse", step_status="running", step_detail="准备解析")
 
     async def _run() -> None:
+        nonlocal raw
         ticker: Optional[asyncio.Task] = None
         upf: Optional[UploadFile] = None
         try:
             ticker = asyncio.create_task(_restore_progress_ticker(job_id))
             upf = UploadFile(filename=str(file.filename or "restore.zip"), file=io.BytesIO(raw))
+            # Release original buffer as soon as UploadFile wrapper is prepared.
+            raw = b""
             restore_resp = await asyncio.wait_for(
                 api_restore_full(file=upf, user=user),
                 timeout=float(_FULL_RESTORE_EXEC_TIMEOUT_SEC),
@@ -2719,8 +4587,22 @@ async def api_restore_full_start(
                     await upf.close()
                 except Exception:
                     pass
+            raw = b""
 
-    asyncio.create_task(_run())
+    try:
+        spawn_background_task(_run(), label="restore-job")
+    except Exception as exc:
+        _touch_restore_job(
+            job_id,
+            status="failed",
+            progress=100,
+            stage="恢复失败",
+            error=f"任务调度失败：{exc}",
+            step_key="finalize",
+            step_status="failed",
+            step_detail="任务调度失败",
+        )
+        return JSONResponse({"ok": False, "error": f"创建恢复任务失败：{exc}"}, status_code=500)
     snap = _restore_job_snapshot(job_id)
     if not snap:
         return JSONResponse({"ok": False, "error": "创建恢复任务失败"}, status_code=500)
@@ -2758,13 +4640,39 @@ async def api_restore_full(
     except Exception as exc:
         return JSONResponse({"ok": False, "error": f"压缩包解析失败：{exc}"}, status_code=400)
     zip_names = z.namelist()
-    zip_table = {str(n).lower(): n for n in zip_names}
+
+    def _zip_norm_path(raw_path: Any) -> str:
+        p = str(raw_path or "").replace("\\", "/").strip()
+        while p.startswith("./"):
+            p = p[2:]
+        return p.lstrip("/").lower()
+
+    zip_table: Dict[str, str] = {}
+    zip_index_rows: List[Tuple[str, str]] = []
+    for _raw_name in zip_names:
+        _norm_name = _zip_norm_path(_raw_name)
+        if not _norm_name:
+            continue
+        if _norm_name not in zip_table:
+            zip_table[_norm_name] = _raw_name
+        zip_index_rows.append((_norm_name, _raw_name))
 
     def _find_zip_path(*candidates: str) -> Optional[str]:
         for c in candidates:
-            hit = zip_table.get(str(c).lower())
+            cand_norm = _zip_norm_path(c)
+            if not cand_norm:
+                continue
+            hit = zip_table.get(cand_norm)
             if hit:
                 return hit
+            suffix = f"/{cand_norm}"
+            fallback_hits: List[Tuple[int, int, str]] = []
+            for row_norm, row_raw in zip_index_rows:
+                if row_norm.endswith(suffix):
+                    fallback_hits.append((row_norm.count("/"), len(row_norm), row_raw))
+            if fallback_hits:
+                fallback_hits.sort(key=lambda x: (x[0], x[1]))
+                return fallback_hits[0][2]
         return None
 
     # ---- read nodes.json ----
@@ -2830,6 +4738,7 @@ async def api_restore_full(
         website_root_base = str(item.get("website_root_base") or "").strip()
         group_name = item.get("group_name") or "默认分组"
         group_name = str(group_name).strip() or "默认分组"
+        system_type = normalize_node_system_type(item.get("system_type"), default="auto")
         source_id = item.get("source_id")
         try:
             source_id_i = int(source_id) if source_id is not None else None
@@ -2860,6 +4769,7 @@ async def api_restore_full(
                 role=role,
                 capabilities=capabilities,
                 website_root_base=website_root_base,
+                system_type=system_type,
             )
             updated += 1
             node_id = int(existing["id"])
@@ -2879,6 +4789,7 @@ async def api_restore_full(
                         capabilities=capabilities,
                         website_root_base=website_root_base,
                         preferred_id=preferred_id,
+                        system_type=system_type,
                     )
                 )
                 added += 1
@@ -2900,6 +4811,7 @@ async def api_restore_full(
                         role=role,
                         capabilities=capabilities,
                         website_root_base=website_root_base,
+                        system_type=system_type,
                     )
                     updated += 1
                     node_id = int(fallback["id"])
@@ -2911,8 +4823,16 @@ async def api_restore_full(
         if source_id_i is not None and source_id_i > 0:
             mapping[str(source_id_i)] = node_id
 
+    node_features = _restore_node_feature_configs(nodes_list, mapping, baseurl_to_nodeid)
+
     # ---- restore rules (batch) ----
-    rule_paths = [n for n in zip_names if n.lower().startswith("rules/") and n.lower().endswith(".json")]
+    rule_paths: List[str] = []
+    for n in zip_names:
+        rule_key = _zip_norm_path(n)
+        if not rule_key or not rule_key.endswith(".json"):
+            continue
+        if rule_key.startswith("rules/") or "/rules/" in rule_key:
+            rule_paths.append(n)
 
     import re as _re
 
@@ -2927,15 +4847,16 @@ async def api_restore_full(
         # best-effort immediate apply
         applied = False
         try:
+            target_base_url, target_verify_tls, _target_route = node_agent_request_target(node)
             data = await agent_post(
-                node["base_url"],
+                target_base_url,
                 node["api_key"],
                 "/api/v1/pool",
                 {"pool": pool},
-                node_verify_tls(node),
+                target_verify_tls,
             )
             if isinstance(data, dict) and data.get("ok", True):
-                await agent_post(node["base_url"], node["api_key"], "/api/v1/apply", {}, node_verify_tls(node))
+                await agent_post(target_base_url, node["api_key"], "/api/v1/apply", {}, target_verify_tls)
                 applied = True
         except Exception:
             applied = False
@@ -3261,6 +5182,7 @@ async def api_restore_full(
                 raise RuntimeError("文件名为空")
             root_base = str(node.get("website_root_base") or "").strip()
             upload_id = uuid.uuid4().hex
+            target_base_url, target_verify_tls, _target_route = node_agent_request_target(node)
             if not raw:
                 payload_empty = {
                     "root": root_path,
@@ -3273,11 +5195,11 @@ async def api_restore_full(
                     "root_base": root_base,
                 }
                 resp_empty = await agent_post(
-                    node["base_url"],
+                    target_base_url,
                     node["api_key"],
                     "/api/v1/website/files/upload_chunk",
                     payload_empty,
-                    node_verify_tls(node),
+                    target_verify_tls,
                     timeout=20,
                 )
                 if not resp_empty.get("ok", True):
@@ -3302,11 +5224,11 @@ async def api_restore_full(
                     "root_base": root_base,
                 }
                 resp_chunk = await agent_post(
-                    node["base_url"],
+                    target_base_url,
                     node["api_key"],
                     "/api/v1/website/files/upload_chunk",
                     payload_chunk,
-                    node_verify_tls(node),
+                    target_verify_tls,
                     timeout=45,
                 )
                 if not resp_chunk.get("ok", True):
@@ -3334,12 +5256,13 @@ async def api_restore_full(
                 "name": dirname,
                 "root_base": str(node.get("website_root_base") or "").strip(),
             }
+            target_base_url, target_verify_tls, _target_route = node_agent_request_target(node)
             resp_dir = await agent_post(
-                node["base_url"],
+                target_base_url,
                 node["api_key"],
                 "/api/v1/website/files/mkdir",
                 payload_dir,
-                node_verify_tls(node),
+                target_verify_tls,
                 timeout=20,
             )
             if not resp_dir.get("ok", True):
@@ -3362,12 +5285,13 @@ async def api_restore_full(
                 "root_base": str(node.get("website_root_base") or "").strip(),
             }
             try:
+                target_base_url, target_verify_tls, _target_route = node_agent_request_target(node)
                 resp_probe = await agent_post(
-                    node["base_url"],
+                    target_base_url,
                     node["api_key"],
                     "/api/v1/website/files/upload_status",
                     payload_probe,
-                    node_verify_tls(node),
+                    target_verify_tls,
                     timeout=8,
                 )
                 if not bool(resp_probe.get("ok", False)):
@@ -3619,7 +5543,7 @@ async def api_restore_full(
     except Exception:
         monitor_index = {}
 
-    monitors_path = _find_zip_path("netmon/monitors.json")
+    monitors_path = _find_zip_path("netmon/monitors.json", "netmon/config.json")
     if monitors_path:
         try:
             monitors_payload = json.loads(z.read(monitors_path).decode("utf-8"))
@@ -3649,7 +5573,7 @@ async def api_restore_full(
             crit_ms = _as_int(item.get("crit_ms"), 0)
             enabled = _as_bool(item.get("enabled"), True)
 
-            src_node_ids_raw = item.get("node_source_ids")
+            src_node_ids_raw = item.get("node_source_ids", item.get("node_ids"))
             src_node_ids = src_node_ids_raw if isinstance(src_node_ids_raw, list) else []
             base_urls_raw = item.get("node_base_urls")
             base_urls = base_urls_raw if isinstance(base_urls_raw, list) else []
@@ -3799,6 +5723,9 @@ async def api_restore_full(
         "site_file_share_revocations": {"added": 0, "updated": 0, "skipped": 0},
         "site_events": {"restored": 0, "skipped": 0},
         "site_checks": {"restored": 0, "skipped": 0},
+        "audit_logs": {"restored": 0, "skipped": 0},
+        "tasks": {"added": 0, "updated": 0, "skipped": 0},
+        "rule_stats_samples": {"restored": 0, "updated": 0, "skipped": 0},
         "errors": [],
     }
 
@@ -3815,6 +5742,47 @@ async def api_restore_full(
             out.append(s)
         return out
 
+    def _stable_json(val: Any, default_obj: Any) -> str:
+        obj = val
+        if not isinstance(obj, (dict, list)):
+            obj = default_obj
+        try:
+            return json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        except Exception:
+            return json.dumps(default_obj, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+    remote_profiles_override_json = ""
+    remote_profiles_restored = 0
+    remote_profiles_skipped = 0
+    remote_profiles_source = ""
+    remote_profiles_path = _find_zip_path("remote_storage/profiles.json")
+    if remote_profiles_path:
+        remote_profiles_source = str(remote_profiles_path or "")
+        try:
+            remote_profiles_payload = json.loads(z.read(remote_profiles_path).decode("utf-8"))
+            if isinstance(remote_profiles_payload, dict):
+                remote_profiles_items = (
+                    remote_profiles_payload.get("profiles")
+                    if isinstance(remote_profiles_payload.get("profiles"), list)
+                    else []
+                )
+            elif isinstance(remote_profiles_payload, list):
+                remote_profiles_items = remote_profiles_payload
+            else:
+                remote_profiles_items = []
+            normalized_profiles, invalid_remote_profiles = _normalize_remote_profiles_list(remote_profiles_items)
+            remote_profiles_override_json = json.dumps(normalized_profiles, ensure_ascii=False, separators=(",", ":"))
+            remote_profiles_restored = len(normalized_profiles)
+            remote_profiles_skipped = int(invalid_remote_profiles)
+            if invalid_remote_profiles > 0:
+                panel_state_result["errors"].append(
+                    f"remote_storage/profiles.json 含 {int(invalid_remote_profiles)} 条非法条目，已跳过"
+                )
+        except Exception as exc:
+            panel_state_result["errors"].append(f"remote_storage/profiles.json 解析失败：{exc}")
+
+    existing_settings = list_panel_settings()
+    panel_state_payload: Dict[str, Any] = {}
     panel_state_path = _find_zip_path("panel/state.json")
     if panel_state_path:
         try:
@@ -3828,7 +5796,6 @@ async def api_restore_full(
         settings_items = panel_state_payload.get("panel_settings")
         if not isinstance(settings_items, list):
             settings_items = []
-        existing_settings = list_panel_settings()
         for item in settings_items:
             if not isinstance(item, dict):
                 panel_state_result["panel_settings"]["skipped"] += 1
@@ -3836,6 +5803,8 @@ async def api_restore_full(
             key_s = str(item.get("key") or "").strip()
             if not key_s:
                 panel_state_result["panel_settings"]["skipped"] += 1
+                continue
+            if key_s == "remote_storage_profiles" and remote_profiles_override_json:
                 continue
             existed = key_s in existing_settings
             try:
@@ -3849,482 +5818,692 @@ async def api_restore_full(
                 panel_state_result["panel_settings"]["skipped"] += 1
                 panel_state_result["errors"].append(f"面板设置恢复失败[{key_s}]：{exc}")
 
-        role_source_to_target: Dict[str, int] = {}
-        role_name_to_target: Dict[str, int] = {}
-        user_source_to_target: Dict[str, int] = {}
-        username_to_target: Dict[str, int] = {}
-
-        for role in list_roles():
-            rid = _as_int(role.get("id"), 0)
-            rname = str(role.get("name") or "").strip()
-            if rid > 0 and rname:
-                role_name_to_target[rname] = rid
-
-        role_items = panel_state_payload.get("roles")
-        if not isinstance(role_items, list):
-            role_items = []
-        for item in role_items:
-            if not isinstance(item, dict):
-                panel_state_result["roles"]["skipped"] += 1
-                continue
-            role_name = str(item.get("name") or "").strip()
-            if not role_name:
-                panel_state_result["roles"]["skipped"] += 1
-                continue
-            existed = role_name in role_name_to_target
-            try:
-                rid = int(
-                    upsert_role(
-                        role_name,
-                        permissions=_norm_str_list(item.get("permissions")),
-                        description=str(item.get("description") or ""),
-                        builtin=bool(item.get("builtin") or False),
-                    )
-                )
-            except Exception as exc:
-                panel_state_result["roles"]["skipped"] += 1
-                panel_state_result["errors"].append(f"角色恢复失败[{role_name}]：{exc}")
-                continue
-            role_name_to_target[role_name] = rid
-            src_rid = item.get("source_id")
-            if src_rid is not None:
-                role_source_to_target[str(_as_int(src_rid, 0))] = rid
+    if remote_profiles_override_json:
+        existed = "remote_storage_profiles" in existing_settings
+        try:
+            set_panel_setting("remote_storage_profiles", remote_profiles_override_json)
             if existed:
-                panel_state_result["roles"]["updated"] += 1
+                panel_state_result["panel_settings"]["updated"] += 1
             else:
-                panel_state_result["roles"]["added"] += 1
+                panel_state_result["panel_settings"]["added"] += 1
+            existing_settings["remote_storage_profiles"] = remote_profiles_override_json
+        except Exception as exc:
+            panel_state_result["panel_settings"]["skipped"] += 1
+            panel_state_result["errors"].append(f"远程存储配置恢复失败[remote_storage_profiles]：{exc}")
 
-        with connect() as conn:
-            existing_users = conn.execute(
-                "SELECT id, username FROM users ORDER BY id ASC"
-            ).fetchall()
-            for row in existing_users:
-                d = dict(row)
-                uid = _as_int(d.get("id"), 0)
-                uname = str(d.get("username") or "").strip()
-                if uid > 0 and uname:
-                    username_to_target[uname] = uid
+    role_source_to_target: Dict[str, int] = {}
+    role_name_to_target: Dict[str, int] = {}
+    user_source_to_target: Dict[str, int] = {}
+    username_to_target: Dict[str, int] = {}
 
-        user_items = panel_state_payload.get("users")
-        if not isinstance(user_items, list):
-            user_items = []
-        for item in user_items:
-            if not isinstance(item, dict):
-                panel_state_result["users"]["skipped"] += 1
-                continue
-            username = str(item.get("username") or "").strip()
-            if not username:
-                panel_state_result["users"]["skipped"] += 1
-                continue
+    for role in list_roles():
+        rid = _as_int(role.get("id"), 0)
+        rname = str(role.get("name") or "").strip()
+        if rid > 0 and rname:
+            role_name_to_target[rname] = rid
 
-            target_role_id = 0
-            src_role_id = item.get("source_role_id")
-            if src_role_id is not None:
-                target_role_id = _as_int(role_source_to_target.get(str(_as_int(src_role_id, 0))), 0)
-            if target_role_id <= 0:
-                role_name = str(item.get("role_name") or "").strip()
-                if role_name:
-                    target_role_id = _as_int(role_name_to_target.get(role_name), 0)
-            if target_role_id <= 0:
-                fallback_role = get_role_by_name("viewer") or get_role_by_name("owner")
-                target_role_id = _as_int((fallback_role or {}).get("id"), 0)
-            if target_role_id <= 0:
-                panel_state_result["users"]["skipped"] += 1
-                panel_state_result["errors"].append(f"用户恢复失败[{username}]：缺少可用角色")
-                continue
+    role_items = panel_state_payload.get("roles")
+    if not isinstance(role_items, list):
+        role_items = []
+    for item in role_items:
+        if not isinstance(item, dict):
+            panel_state_result["roles"]["skipped"] += 1
+            continue
+        role_name = str(item.get("name") or "").strip()
+        if not role_name:
+            panel_state_result["roles"]["skipped"] += 1
+            continue
+        existed = role_name in role_name_to_target
+        try:
+            rid = int(
+                upsert_role(
+                    role_name,
+                    permissions=_norm_str_list(item.get("permissions")),
+                    description=str(item.get("description") or ""),
+                    builtin=bool(item.get("builtin") or False),
+                )
+            )
+        except Exception as exc:
+            panel_state_result["roles"]["skipped"] += 1
+            panel_state_result["errors"].append(f"角色恢复失败[{role_name}]：{exc}")
+            continue
+        role_name_to_target[role_name] = rid
+        src_rid = item.get("source_id")
+        if src_rid is not None:
+            role_source_to_target[str(_as_int(src_rid, 0))] = rid
+        if existed:
+            panel_state_result["roles"]["updated"] += 1
+        else:
+            panel_state_result["roles"]["added"] += 1
 
-            policy = item.get("policy") if isinstance(item.get("policy"), dict) else {}
-            salt_b64 = str(item.get("salt_b64") or "").strip()
-            hash_b64 = str(item.get("hash_b64") or "").strip()
-            iterations = max(1, _as_int(item.get("iterations"), 120000))
-            enabled = _as_bool(item.get("enabled"), True)
-            expires_at = str(item.get("expires_at") or "").strip() or None
+    with connect() as conn:
+        existing_users = conn.execute(
+            "SELECT id, username FROM users ORDER BY id ASC"
+        ).fetchall()
+        for row in existing_users:
+            d = dict(row)
+            uid = _as_int(d.get("id"), 0)
+            uname = str(d.get("username") or "").strip()
+            if uid > 0 and uname:
+                username_to_target[uname] = uid
 
-            existing_uid = _as_int(username_to_target.get(username), 0)
-            try:
-                if existing_uid > 0:
-                    update_user_record(
-                        existing_uid,
+    user_items = panel_state_payload.get("users")
+    if not isinstance(user_items, list):
+        user_items = []
+    for item in user_items:
+        if not isinstance(item, dict):
+            panel_state_result["users"]["skipped"] += 1
+            continue
+        username = str(item.get("username") or "").strip()
+        if not username:
+            panel_state_result["users"]["skipped"] += 1
+            continue
+
+        target_role_id = 0
+        src_role_id = item.get("source_role_id")
+        if src_role_id is not None:
+            target_role_id = _as_int(role_source_to_target.get(str(_as_int(src_role_id, 0))), 0)
+        if target_role_id <= 0:
+            role_name = str(item.get("role_name") or "").strip()
+            if role_name:
+                target_role_id = _as_int(role_name_to_target.get(role_name), 0)
+        if target_role_id <= 0:
+            fallback_role = get_role_by_name("viewer") or get_role_by_name("owner")
+            target_role_id = _as_int((fallback_role or {}).get("id"), 0)
+        if target_role_id <= 0:
+            panel_state_result["users"]["skipped"] += 1
+            panel_state_result["errors"].append(f"用户恢复失败[{username}]：缺少可用角色")
+            continue
+
+        policy = item.get("policy") if isinstance(item.get("policy"), dict) else {}
+        salt_b64 = str(item.get("salt_b64") or "").strip()
+        hash_b64 = str(item.get("hash_b64") or "").strip()
+        iterations = max(1, _as_int(item.get("iterations"), 120000))
+        enabled = _as_bool(item.get("enabled"), True)
+        expires_at = str(item.get("expires_at") or "").strip() or None
+
+        existing_uid = _as_int(username_to_target.get(username), 0)
+        try:
+            if existing_uid > 0:
+                update_user_record(
+                    existing_uid,
+                    username=username,
+                    salt_b64=salt_b64 if salt_b64 else None,
+                    hash_b64=hash_b64 if hash_b64 else None,
+                    iterations=iterations if (salt_b64 and hash_b64) else None,
+                    role_id=target_role_id,
+                    enabled=enabled,
+                    expires_at=expires_at,
+                    policy=policy,
+                )
+                target_uid = existing_uid
+                panel_state_result["users"]["updated"] += 1
+            else:
+                if not salt_b64 or not hash_b64:
+                    panel_state_result["users"]["skipped"] += 1
+                    panel_state_result["errors"].append(f"用户恢复失败[{username}]：缺少密码哈希")
+                    continue
+                target_uid = int(
+                    create_user_record(
                         username=username,
-                        salt_b64=salt_b64 if salt_b64 else None,
-                        hash_b64=hash_b64 if hash_b64 else None,
-                        iterations=iterations if (salt_b64 and hash_b64) else None,
+                        salt_b64=salt_b64,
+                        hash_b64=hash_b64,
+                        iterations=iterations,
                         role_id=target_role_id,
                         enabled=enabled,
                         expires_at=expires_at,
                         policy=policy,
+                        created_by=str(item.get("created_by") or ""),
                     )
-                    target_uid = existing_uid
-                    panel_state_result["users"]["updated"] += 1
-                else:
-                    if not salt_b64 or not hash_b64:
-                        panel_state_result["users"]["skipped"] += 1
-                        panel_state_result["errors"].append(f"用户恢复失败[{username}]：缺少密码哈希")
-                        continue
-                    target_uid = int(
-                        create_user_record(
-                            username=username,
-                            salt_b64=salt_b64,
-                            hash_b64=hash_b64,
-                            iterations=iterations,
-                            role_id=target_role_id,
-                            enabled=enabled,
-                            expires_at=expires_at,
-                            policy=policy,
-                            created_by=str(item.get("created_by") or ""),
-                        )
-                    )
-                    panel_state_result["users"]["added"] += 1
-                username_to_target[username] = target_uid
-            except Exception as exc:
-                panel_state_result["users"]["skipped"] += 1
-                panel_state_result["errors"].append(f"用户恢复失败[{username}]：{exc}")
-                continue
+                )
+                panel_state_result["users"]["added"] += 1
+            username_to_target[username] = target_uid
+        except Exception as exc:
+            panel_state_result["users"]["skipped"] += 1
+            panel_state_result["errors"].append(f"用户恢复失败[{username}]：{exc}")
+            continue
 
-            src_uid = item.get("source_id")
-            if src_uid is not None:
-                user_source_to_target[str(_as_int(src_uid, 0))] = int(target_uid)
+        src_uid = item.get("source_id")
+        if src_uid is not None:
+            user_source_to_target[str(_as_int(src_uid, 0))] = int(target_uid)
 
-        token_items = panel_state_payload.get("user_tokens")
-        if not isinstance(token_items, list):
-            token_items = []
-        with connect() as conn:
-            for item in token_items:
-                if not isinstance(item, dict):
-                    panel_state_result["user_tokens"]["skipped"] += 1
-                    continue
-                token_sha256 = str(item.get("token_sha256") or "").strip().lower()
-                if not token_sha256:
-                    panel_state_result["user_tokens"]["skipped"] += 1
-                    continue
-                target_uid = 0
-                src_user_id = item.get("source_user_id")
-                if src_user_id is not None:
-                    target_uid = _as_int(user_source_to_target.get(str(_as_int(src_user_id, 0))), 0)
-                if target_uid <= 0:
-                    target_uid = _as_int(username_to_target.get(str(item.get("source_username") or "").strip()), 0)
-                if target_uid <= 0:
-                    panel_state_result["user_tokens"]["skipped"] += 1
-                    continue
-                scopes = _norm_str_list(item.get("scopes"))
-                scopes_json = json.dumps(scopes, ensure_ascii=False)
-                exists = conn.execute(
-                    "SELECT id FROM user_tokens WHERE token_sha256=? LIMIT 1",
-                    (token_sha256,),
-                ).fetchone()
-                if exists:
-                    conn.execute(
-                        "UPDATE user_tokens SET user_id=?, name=?, scopes_json=?, expires_at=?, last_used_at=?, created_by=?, created_at=COALESCE(?, created_at), revoked_at=? "
-                        "WHERE id=?",
-                        (
-                            int(target_uid),
-                            str(item.get("name") or ""),
-                            scopes_json,
-                            str(item.get("expires_at") or "").strip() or None,
-                            str(item.get("last_used_at") or "").strip() or None,
-                            str(item.get("created_by") or ""),
-                            str(item.get("created_at") or "").strip() or None,
-                            str(item.get("revoked_at") or "").strip() or None,
-                            int(exists["id"]),
-                        ),
-                    )
-                    panel_state_result["user_tokens"]["updated"] += 1
-                else:
-                    conn.execute(
-                        "INSERT INTO user_tokens("
-                        "user_id, token_sha256, name, scopes_json, expires_at, last_used_at, created_by, created_at, revoked_at"
-                        ") VALUES(?,?,?,?,?,?,?,?,?)",
-                        (
-                            int(target_uid),
-                            token_sha256,
-                            str(item.get("name") or ""),
-                            scopes_json,
-                            str(item.get("expires_at") or "").strip() or None,
-                            str(item.get("last_used_at") or "").strip() or None,
-                            str(item.get("created_by") or ""),
-                            str(item.get("created_at") or "").strip() or None,
-                            str(item.get("revoked_at") or "").strip() or None,
-                        ),
-                    )
-                    panel_state_result["user_tokens"]["added"] += 1
-            conn.commit()
-
-        owner_items = panel_state_payload.get("rule_owner_map")
-        if not isinstance(owner_items, list):
-            owner_items = []
-        with connect() as conn:
-            for item in owner_items:
-                if not isinstance(item, dict):
-                    panel_state_result["rule_owner_map"]["skipped"] += 1
-                    continue
-                source_node_id = _as_int(item.get("source_node_id"), 0)
-                target_node_id = _resolve_node_id(source_node_id if source_node_id > 0 else None, None)
-                rule_key = str(item.get("rule_key") or "").strip()
-                if not target_node_id or not rule_key:
-                    panel_state_result["rule_owner_map"]["skipped"] += 1
-                    continue
-                owner_uid = 0
-                src_owner_uid = item.get("owner_source_user_id")
-                if src_owner_uid is not None:
-                    owner_uid = _as_int(user_source_to_target.get(str(_as_int(src_owner_uid, 0))), 0)
-                owner_username = str(item.get("owner_username") or "").strip()
-                if owner_uid <= 0 and owner_username:
-                    owner_uid = _as_int(username_to_target.get(owner_username), 0)
-                active = 1 if _as_bool(item.get("active"), True) else 0
-                first_seen_at = str(item.get("first_seen_at") or "").strip() or None
-                last_seen_at = str(item.get("last_seen_at") or "").strip() or None
-                exists = conn.execute(
-                    "SELECT id FROM rule_owner_map WHERE node_id=? AND rule_key=? LIMIT 1",
-                    (int(target_node_id), rule_key),
-                ).fetchone()
-                if exists:
-                    conn.execute(
-                        "UPDATE rule_owner_map SET owner_user_id=?, owner_username=?, first_seen_at=COALESCE(?, first_seen_at), "
-                        "last_seen_at=COALESCE(?, last_seen_at), active=? WHERE id=?",
-                        (
-                            int(owner_uid),
-                            owner_username,
-                            first_seen_at,
-                            last_seen_at,
-                            int(active),
-                            int(exists["id"]),
-                        ),
-                    )
-                    panel_state_result["rule_owner_map"]["updated"] += 1
-                else:
-                    conn.execute(
-                        "INSERT INTO rule_owner_map("
-                        "node_id, rule_key, owner_user_id, owner_username, first_seen_at, last_seen_at, active"
-                        ") VALUES(?,?,?,?,COALESCE(?, datetime('now')),COALESCE(?, datetime('now')),?)",
-                        (
-                            int(target_node_id),
-                            rule_key,
-                            int(owner_uid),
-                            owner_username,
-                            first_seen_at,
-                            last_seen_at,
-                            int(active),
-                        ),
-                    )
-                    panel_state_result["rule_owner_map"]["added"] += 1
-            conn.commit()
-
-        current_site_ids: Dict[int, int] = {}
-        try:
-            for s in list_sites():
-                sid = _as_int(s.get("id"), 0)
-                if sid > 0:
-                    current_site_ids[sid] = sid
-        except Exception:
-            current_site_ids = {}
-
-        def _resolve_site_id(source_site_id: Any) -> Optional[int]:
-            sid = _as_int(source_site_id, 0)
-            if sid <= 0:
-                return None
-            if str(sid) in site_mapping:
-                return _as_int(site_mapping.get(str(sid)), 0) or None
-            if sid in current_site_ids:
-                return sid
-            return None
-
-        fav_items = panel_state_payload.get("site_file_favorites")
-        if not isinstance(fav_items, list):
-            fav_items = []
-        favorite_existing: set[tuple[int, str, str]] = set()
-        with connect() as conn:
-            fav_rows = conn.execute(
-                "SELECT site_id, owner, path FROM site_file_favorites"
-            ).fetchall()
-            for row in fav_rows:
-                d = dict(row)
-                sid = _as_int(d.get("site_id"), 0)
-                owner = str(d.get("owner") or "").strip()
-                path = str(d.get("path") or "").strip()
-                if sid > 0 and owner and path:
-                    favorite_existing.add((sid, owner, path))
-        for item in fav_items:
+    token_items = panel_state_payload.get("user_tokens")
+    if not isinstance(token_items, list):
+        token_items = []
+    with connect() as conn:
+        for item in token_items:
             if not isinstance(item, dict):
-                panel_state_result["site_file_favorites"]["skipped"] += 1
+                panel_state_result["user_tokens"]["skipped"] += 1
+                continue
+            token_sha256 = str(item.get("token_sha256") or "").strip().lower()
+            if not token_sha256:
+                panel_state_result["user_tokens"]["skipped"] += 1
+                continue
+            target_uid = 0
+            src_user_id = item.get("source_user_id")
+            if src_user_id is not None:
+                target_uid = _as_int(user_source_to_target.get(str(_as_int(src_user_id, 0))), 0)
+            if target_uid <= 0:
+                target_uid = _as_int(username_to_target.get(str(item.get("source_username") or "").strip()), 0)
+            if target_uid <= 0:
+                panel_state_result["user_tokens"]["skipped"] += 1
+                continue
+            scopes = _norm_str_list(item.get("scopes"))
+            scopes_json = json.dumps(scopes, ensure_ascii=False)
+            exists = conn.execute(
+                "SELECT id FROM user_tokens WHERE token_sha256=? LIMIT 1",
+                (token_sha256,),
+            ).fetchone()
+            if exists:
+                conn.execute(
+                    "UPDATE user_tokens SET user_id=?, name=?, scopes_json=?, expires_at=?, last_used_at=?, created_by=?, created_at=COALESCE(?, created_at), revoked_at=? "
+                    "WHERE id=?",
+                    (
+                        int(target_uid),
+                        str(item.get("name") or ""),
+                        scopes_json,
+                        str(item.get("expires_at") or "").strip() or None,
+                        str(item.get("last_used_at") or "").strip() or None,
+                        str(item.get("created_by") or ""),
+                        str(item.get("created_at") or "").strip() or None,
+                        str(item.get("revoked_at") or "").strip() or None,
+                        int(exists["id"]),
+                    ),
+                )
+                panel_state_result["user_tokens"]["updated"] += 1
+            else:
+                conn.execute(
+                    "INSERT INTO user_tokens("
+                    "user_id, token_sha256, name, scopes_json, expires_at, last_used_at, created_by, created_at, revoked_at"
+                    ") VALUES(?,?,?,?,?,?,?,?,?)",
+                    (
+                        int(target_uid),
+                        token_sha256,
+                        str(item.get("name") or ""),
+                        scopes_json,
+                        str(item.get("expires_at") or "").strip() or None,
+                        str(item.get("last_used_at") or "").strip() or None,
+                        str(item.get("created_by") or ""),
+                        str(item.get("created_at") or "").strip() or None,
+                        str(item.get("revoked_at") or "").strip() or None,
+                    ),
+                )
+                panel_state_result["user_tokens"]["added"] += 1
+        conn.commit()
+
+    owner_items = panel_state_payload.get("rule_owner_map")
+    if not isinstance(owner_items, list):
+        owner_items = []
+    with connect() as conn:
+        for item in owner_items:
+            if not isinstance(item, dict):
+                panel_state_result["rule_owner_map"]["skipped"] += 1
+                continue
+            source_node_id = _as_int(item.get("source_node_id"), 0)
+            target_node_id = _resolve_node_id(source_node_id if source_node_id > 0 else None, None)
+            rule_key = str(item.get("rule_key") or "").strip()
+            if not target_node_id or not rule_key:
+                panel_state_result["rule_owner_map"]["skipped"] += 1
+                continue
+            owner_uid = 0
+            src_owner_uid = item.get("owner_source_user_id")
+            if src_owner_uid is not None:
+                owner_uid = _as_int(user_source_to_target.get(str(_as_int(src_owner_uid, 0))), 0)
+            owner_username = str(item.get("owner_username") or "").strip()
+            if owner_uid <= 0 and owner_username:
+                owner_uid = _as_int(username_to_target.get(owner_username), 0)
+            active = 1 if _as_bool(item.get("active"), True) else 0
+            first_seen_at = str(item.get("first_seen_at") or "").strip() or None
+            last_seen_at = str(item.get("last_seen_at") or "").strip() or None
+            exists = conn.execute(
+                "SELECT id FROM rule_owner_map WHERE node_id=? AND rule_key=? LIMIT 1",
+                (int(target_node_id), rule_key),
+            ).fetchone()
+            if exists:
+                conn.execute(
+                    "UPDATE rule_owner_map SET owner_user_id=?, owner_username=?, first_seen_at=COALESCE(?, first_seen_at), "
+                    "last_seen_at=COALESCE(?, last_seen_at), active=? WHERE id=?",
+                    (
+                        int(owner_uid),
+                        owner_username,
+                        first_seen_at,
+                        last_seen_at,
+                        int(active),
+                        int(exists["id"]),
+                    ),
+                )
+                panel_state_result["rule_owner_map"]["updated"] += 1
+            else:
+                conn.execute(
+                    "INSERT INTO rule_owner_map("
+                    "node_id, rule_key, owner_user_id, owner_username, first_seen_at, last_seen_at, active"
+                    ") VALUES(?,?,?,?,COALESCE(?, datetime('now')),COALESCE(?, datetime('now')),?)",
+                    (
+                        int(target_node_id),
+                        rule_key,
+                        int(owner_uid),
+                        owner_username,
+                        first_seen_at,
+                        last_seen_at,
+                        int(active),
+                    ),
+                )
+                panel_state_result["rule_owner_map"]["added"] += 1
+        conn.commit()
+
+    current_site_ids: Dict[int, int] = {}
+    try:
+        for s in list_sites():
+            sid = _as_int(s.get("id"), 0)
+            if sid > 0:
+                current_site_ids[sid] = sid
+    except Exception:
+        current_site_ids = {}
+
+    def _resolve_site_id(source_site_id: Any) -> Optional[int]:
+        sid = _as_int(source_site_id, 0)
+        if sid <= 0:
+            return None
+        if str(sid) in site_mapping:
+            return _as_int(site_mapping.get(str(sid)), 0) or None
+        if sid in current_site_ids:
+            return sid
+        return None
+
+    fav_items = panel_state_payload.get("site_file_favorites")
+    if not isinstance(fav_items, list):
+        fav_items = []
+    favorite_existing: set[tuple[int, str, str]] = set()
+    with connect() as conn:
+        fav_rows = conn.execute(
+            "SELECT site_id, owner, path FROM site_file_favorites"
+        ).fetchall()
+        for row in fav_rows:
+            d = dict(row)
+            sid = _as_int(d.get("site_id"), 0)
+            owner = str(d.get("owner") or "").strip()
+            path = str(d.get("path") or "").strip()
+            if sid > 0 and owner and path:
+                favorite_existing.add((sid, owner, path))
+    for item in fav_items:
+        if not isinstance(item, dict):
+            panel_state_result["site_file_favorites"]["skipped"] += 1
+            continue
+        target_site_id = _resolve_site_id(item.get("source_site_id"))
+        owner = str(item.get("owner") or "").strip()
+        path = str(item.get("path") or "").strip()
+        if not target_site_id or not owner or not path:
+            panel_state_result["site_file_favorites"]["skipped"] += 1
+            continue
+        existed = (int(target_site_id), owner, path) in favorite_existing
+        try:
+            upsert_site_file_favorite(
+                int(target_site_id),
+                owner=owner,
+                path=path,
+                is_dir=_as_bool(item.get("is_dir"), False),
+            )
+            favorite_existing.add((int(target_site_id), owner, path))
+            if existed:
+                panel_state_result["site_file_favorites"]["updated"] += 1
+            else:
+                panel_state_result["site_file_favorites"]["added"] += 1
+        except Exception as exc:
+            panel_state_result["site_file_favorites"]["skipped"] += 1
+            panel_state_result["errors"].append(f"文件收藏恢复失败[{target_site_id}:{path}]：{exc}")
+
+    rev_items = panel_state_payload.get("site_file_share_revocations")
+    if not isinstance(rev_items, list):
+        rev_items = []
+    with connect() as conn:
+        for item in rev_items:
+            if not isinstance(item, dict):
+                panel_state_result["site_file_share_revocations"]["skipped"] += 1
                 continue
             target_site_id = _resolve_site_id(item.get("source_site_id"))
-            owner = str(item.get("owner") or "").strip()
-            path = str(item.get("path") or "").strip()
-            if not target_site_id or not owner or not path:
-                panel_state_result["site_file_favorites"]["skipped"] += 1
+            digest = str(item.get("token_sha256") or "").strip().lower()
+            if not target_site_id or not digest:
+                panel_state_result["site_file_share_revocations"]["skipped"] += 1
                 continue
-            existed = (int(target_site_id), owner, path) in favorite_existing
-            try:
-                upsert_site_file_favorite(
-                    int(target_site_id),
-                    owner=owner,
-                    path=path,
-                    is_dir=_as_bool(item.get("is_dir"), False),
-                )
-                favorite_existing.add((int(target_site_id), owner, path))
-                if existed:
-                    panel_state_result["site_file_favorites"]["updated"] += 1
-                else:
-                    panel_state_result["site_file_favorites"]["added"] += 1
-            except Exception as exc:
-                panel_state_result["site_file_favorites"]["skipped"] += 1
-                panel_state_result["errors"].append(f"文件收藏恢复失败[{target_site_id}:{path}]：{exc}")
-
-        rev_items = panel_state_payload.get("site_file_share_revocations")
-        if not isinstance(rev_items, list):
-            rev_items = []
-        with connect() as conn:
-            for item in rev_items:
-                if not isinstance(item, dict):
-                    panel_state_result["site_file_share_revocations"]["skipped"] += 1
-                    continue
-                target_site_id = _resolve_site_id(item.get("source_site_id"))
-                digest = str(item.get("token_sha256") or "").strip().lower()
-                if not target_site_id or not digest:
-                    panel_state_result["site_file_share_revocations"]["skipped"] += 1
-                    continue
-                exists = conn.execute(
-                    "SELECT id FROM site_file_share_revocations WHERE site_id=? AND token_sha256=? LIMIT 1",
-                    (int(target_site_id), digest),
-                ).fetchone()
-                if exists:
-                    conn.execute(
-                        "UPDATE site_file_share_revocations SET revoked_by=?, reason=?, revoked_at=COALESCE(?, revoked_at) WHERE id=?",
-                        (
-                            str(item.get("revoked_by") or ""),
-                            str(item.get("reason") or ""),
-                            str(item.get("revoked_at") or "").strip() or None,
-                            int(exists["id"]),
-                        ),
-                    )
-                    panel_state_result["site_file_share_revocations"]["updated"] += 1
-                else:
-                    conn.execute(
-                        "INSERT INTO site_file_share_revocations(site_id, token_sha256, revoked_by, reason, revoked_at) "
-                        "VALUES(?,?,?,?,COALESCE(?, datetime('now')))",
-                        (
-                            int(target_site_id),
-                            digest,
-                            str(item.get("revoked_by") or ""),
-                            str(item.get("reason") or ""),
-                            str(item.get("revoked_at") or "").strip() or None,
-                        ),
-                    )
-                    panel_state_result["site_file_share_revocations"]["added"] += 1
-            conn.commit()
-
-        share_items = panel_state_payload.get("site_file_share_short_links")
-        if not isinstance(share_items, list):
-            share_items = []
-        with connect() as conn:
-            for item in share_items:
-                if not isinstance(item, dict):
-                    panel_state_result["site_file_share_short_links"]["skipped"] += 1
-                    continue
-                code = str(item.get("code") or "").strip()
-                token = str(item.get("token") or "").strip()
-                digest = str(item.get("token_sha256") or "").strip().lower()
-                if token and (not digest):
-                    digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
-                target_site_id = _resolve_site_id(item.get("source_site_id"))
-                if not code or not target_site_id or not token or not digest:
-                    panel_state_result["site_file_share_short_links"]["skipped"] += 1
-                    continue
-                exists = conn.execute(
-                    "SELECT code FROM site_file_share_short_links WHERE code=? LIMIT 1",
-                    (code,),
-                ).fetchone()
-                if exists:
-                    conn.execute(
-                        "UPDATE site_file_share_short_links SET site_id=?, token=?, token_sha256=?, created_by=?, created_at=COALESCE(?, created_at) "
-                        "WHERE code=?",
-                        (
-                            int(target_site_id),
-                            token,
-                            digest,
-                            str(item.get("created_by") or ""),
-                            str(item.get("created_at") or "").strip() or None,
-                            code,
-                        ),
-                    )
-                    panel_state_result["site_file_share_short_links"]["updated"] += 1
-                else:
-                    conn.execute(
-                        "INSERT INTO site_file_share_short_links(code, site_id, token, token_sha256, created_by, created_at) "
-                        "VALUES(?,?,?,?,?,COALESCE(?, datetime('now')))",
-                        (
-                            code,
-                            int(target_site_id),
-                            token,
-                            digest,
-                            str(item.get("created_by") or ""),
-                            str(item.get("created_at") or "").strip() or None,
-                        ),
-                    )
-                    panel_state_result["site_file_share_short_links"]["added"] += 1
-            conn.commit()
-
-        event_items = panel_state_payload.get("site_events")
-        if not isinstance(event_items, list):
-            event_items = []
-        with connect() as conn:
-            for item in event_items:
-                if not isinstance(item, dict):
-                    panel_state_result["site_events"]["skipped"] += 1
-                    continue
-                target_site_id = _resolve_site_id(item.get("source_site_id"))
-                if not target_site_id:
-                    panel_state_result["site_events"]["skipped"] += 1
-                    continue
-                payload_obj = item.get("payload") if isinstance(item.get("payload"), dict) else {}
-                result_obj = item.get("result") if isinstance(item.get("result"), dict) else {}
+            exists = conn.execute(
+                "SELECT id FROM site_file_share_revocations WHERE site_id=? AND token_sha256=? LIMIT 1",
+                (int(target_site_id), digest),
+            ).fetchone()
+            if exists:
                 conn.execute(
-                    "INSERT INTO site_events(site_id, action, status, actor, payload_json, result_json, error, created_at) "
-                    "VALUES(?,?,?,?,?,?,?,COALESCE(?, datetime('now')))",
+                    "UPDATE site_file_share_revocations SET revoked_by=?, reason=?, revoked_at=COALESCE(?, revoked_at) WHERE id=?",
+                    (
+                        str(item.get("revoked_by") or ""),
+                        str(item.get("reason") or ""),
+                        str(item.get("revoked_at") or "").strip() or None,
+                        int(exists["id"]),
+                    ),
+                )
+                panel_state_result["site_file_share_revocations"]["updated"] += 1
+            else:
+                conn.execute(
+                    "INSERT INTO site_file_share_revocations(site_id, token_sha256, revoked_by, reason, revoked_at) "
+                    "VALUES(?,?,?,?,COALESCE(?, datetime('now')))",
                     (
                         int(target_site_id),
-                        str(item.get("action") or ""),
-                        str(item.get("status") or "success"),
-                        str(item.get("actor") or ""),
-                        json.dumps(payload_obj, ensure_ascii=False),
-                        json.dumps(result_obj, ensure_ascii=False),
-                        str(item.get("error") or ""),
+                        digest,
+                        str(item.get("revoked_by") or ""),
+                        str(item.get("reason") or ""),
+                        str(item.get("revoked_at") or "").strip() or None,
+                    ),
+                )
+                panel_state_result["site_file_share_revocations"]["added"] += 1
+        conn.commit()
+
+    share_items = panel_state_payload.get("site_file_share_short_links")
+    if not isinstance(share_items, list):
+        share_items = []
+    with connect() as conn:
+        for item in share_items:
+            if not isinstance(item, dict):
+                panel_state_result["site_file_share_short_links"]["skipped"] += 1
+                continue
+            code = str(item.get("code") or "").strip()
+            token = str(item.get("token") or "").strip()
+            digest = str(item.get("token_sha256") or "").strip().lower()
+            if token and (not digest):
+                digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
+            target_site_id = _resolve_site_id(item.get("source_site_id"))
+            if not code or not target_site_id or not token or not digest:
+                panel_state_result["site_file_share_short_links"]["skipped"] += 1
+                continue
+            exists = conn.execute(
+                "SELECT code FROM site_file_share_short_links WHERE code=? LIMIT 1",
+                (code,),
+            ).fetchone()
+            if exists:
+                conn.execute(
+                    "UPDATE site_file_share_short_links SET site_id=?, token=?, token_sha256=?, created_by=?, created_at=COALESCE(?, created_at) "
+                    "WHERE code=?",
+                    (
+                        int(target_site_id),
+                        token,
+                        digest,
+                        str(item.get("created_by") or ""),
+                        str(item.get("created_at") or "").strip() or None,
+                        code,
+                    ),
+                )
+                panel_state_result["site_file_share_short_links"]["updated"] += 1
+            else:
+                conn.execute(
+                    "INSERT INTO site_file_share_short_links(code, site_id, token, token_sha256, created_by, created_at) "
+                    "VALUES(?,?,?,?,?,COALESCE(?, datetime('now')))",
+                    (
+                        code,
+                        int(target_site_id),
+                        token,
+                        digest,
+                        str(item.get("created_by") or ""),
                         str(item.get("created_at") or "").strip() or None,
                     ),
                 )
-                panel_state_result["site_events"]["restored"] += 1
-            conn.commit()
+                panel_state_result["site_file_share_short_links"]["added"] += 1
+        conn.commit()
 
-        check_items = panel_state_payload.get("site_checks")
-        if not isinstance(check_items, list):
-            check_items = []
-        with connect() as conn:
-            for item in check_items:
-                if not isinstance(item, dict):
-                    panel_state_result["site_checks"]["skipped"] += 1
+    event_items = panel_state_payload.get("site_events")
+    if not isinstance(event_items, list):
+        event_items = []
+    with connect() as conn:
+        for item in event_items:
+            if not isinstance(item, dict):
+                panel_state_result["site_events"]["skipped"] += 1
+                continue
+            target_site_id = _resolve_site_id(item.get("source_site_id"))
+            if not target_site_id:
+                panel_state_result["site_events"]["skipped"] += 1
+                continue
+            payload_obj = item.get("payload") if isinstance(item.get("payload"), dict) else {}
+            result_obj = item.get("result") if isinstance(item.get("result"), dict) else {}
+            conn.execute(
+                "INSERT INTO site_events(site_id, action, status, actor, payload_json, result_json, error, created_at) "
+                "VALUES(?,?,?,?,?,?,?,COALESCE(?, datetime('now')))",
+                (
+                    int(target_site_id),
+                    str(item.get("action") or ""),
+                    str(item.get("status") or "success"),
+                    str(item.get("actor") or ""),
+                    json.dumps(payload_obj, ensure_ascii=False),
+                    json.dumps(result_obj, ensure_ascii=False),
+                    str(item.get("error") or ""),
+                    str(item.get("created_at") or "").strip() or None,
+                ),
+            )
+            panel_state_result["site_events"]["restored"] += 1
+        conn.commit()
+
+    check_items = panel_state_payload.get("site_checks")
+    if not isinstance(check_items, list):
+        check_items = []
+    with connect() as conn:
+        for item in check_items:
+            if not isinstance(item, dict):
+                panel_state_result["site_checks"]["skipped"] += 1
+                continue
+            target_site_id = _resolve_site_id(item.get("source_site_id"))
+            if not target_site_id:
+                panel_state_result["site_checks"]["skipped"] += 1
+                continue
+            conn.execute(
+                "INSERT INTO site_checks(site_id, ok, status_code, latency_ms, error, checked_at) "
+                "VALUES(?,?,?,?,?,COALESCE(?, datetime('now')))",
+                (
+                    int(target_site_id),
+                    1 if _as_bool(item.get("ok"), False) else 0,
+                    _as_int(item.get("status_code"), 0),
+                    _as_int(item.get("latency_ms"), 0),
+                    str(item.get("error") or ""),
+                    str(item.get("checked_at") or "").strip() or None,
+                ),
+            )
+            panel_state_result["site_checks"]["restored"] += 1
+        conn.commit()
+
+    audit_items = panel_state_payload.get("audit_logs")
+    if not isinstance(audit_items, list):
+        audit_items = []
+    with connect() as conn:
+        for item in audit_items:
+            if not isinstance(item, dict):
+                panel_state_result["audit_logs"]["skipped"] += 1
+                continue
+            src_node_id = _as_int(item.get("source_node_id"), 0)
+            node_base_url = str(item.get("node_base_url") or "").strip().rstrip("/") or None
+            target_node_id = 0
+            if src_node_id > 0 or node_base_url:
+                hit_node = _resolve_node_id(src_node_id if src_node_id > 0 else None, node_base_url)
+                if not hit_node:
+                    panel_state_result["audit_logs"]["skipped"] += 1
                     continue
-                target_site_id = _resolve_site_id(item.get("source_site_id"))
-                if not target_site_id:
-                    panel_state_result["site_checks"]["skipped"] += 1
-                    continue
+                target_node_id = int(hit_node)
+
+            actor = str(item.get("actor") or "")
+            action = str(item.get("action") or "")
+            node_name = str(item.get("node_name") or "")
+            source_ip = str(item.get("source_ip") or "")
+            created_at_raw = str(item.get("created_at") or "").strip()
+            created_at = created_at_raw or None
+            created_key = created_at_raw
+            detail_json = _stable_json(item.get("detail"), {})
+
+            exists = conn.execute(
+                "SELECT id FROM audit_logs "
+                "WHERE actor=? AND action=? AND node_id=? AND node_name=? AND source_ip=? AND detail_json=? AND COALESCE(created_at, '')=? "
+                "LIMIT 1",
+                (
+                    actor,
+                    action,
+                    int(target_node_id),
+                    node_name,
+                    source_ip,
+                    detail_json,
+                    created_key,
+                ),
+            ).fetchone()
+            if exists:
+                panel_state_result["audit_logs"]["skipped"] += 1
+                continue
+            conn.execute(
+                "INSERT INTO audit_logs(actor, action, node_id, node_name, source_ip, detail_json, created_at) "
+                "VALUES(?,?,?,?,?,?,COALESCE(?, datetime('now')))",
+                (
+                    actor,
+                    action,
+                    int(target_node_id),
+                    node_name,
+                    source_ip,
+                    detail_json,
+                    created_at,
+                ),
+            )
+            panel_state_result["audit_logs"]["restored"] += 1
+        conn.commit()
+
+    task_items = panel_state_payload.get("tasks")
+    if not isinstance(task_items, list):
+        task_items = []
+    with connect() as conn:
+        for item in task_items:
+            if not isinstance(item, dict):
+                panel_state_result["tasks"]["skipped"] += 1
+                continue
+            src_node_id = _as_int(item.get("source_node_id"), 0)
+            node_base_url = str(item.get("node_base_url") or "").strip().rstrip("/") or None
+            target_node_id = _resolve_node_id(src_node_id if src_node_id > 0 else None, node_base_url)
+            if not target_node_id:
+                panel_state_result["tasks"]["skipped"] += 1
+                continue
+
+            task_type = str(item.get("type") or "").strip()
+            if not task_type:
+                panel_state_result["tasks"]["skipped"] += 1
+                continue
+            payload_json = _stable_json(item.get("payload"), {})
+            result_json = _stable_json(item.get("result"), {})
+            status = str(item.get("status") or "queued").strip() or "queued"
+            progress = _as_int(item.get("progress"), 0)
+            if progress < 0:
+                progress = 0
+            if progress > 100:
+                progress = 100
+            err = str(item.get("error") or "")
+            created_at_raw = str(item.get("created_at") or "").strip()
+            created_at = created_at_raw or None
+            created_key = created_at_raw
+            updated_at = str(item.get("updated_at") or "").strip() or None
+
+            exists = conn.execute(
+                "SELECT id FROM tasks WHERE node_id=? AND type=? AND payload_json=? AND COALESCE(created_at, '')=? LIMIT 1",
+                (
+                    int(target_node_id),
+                    task_type,
+                    payload_json,
+                    created_key,
+                ),
+            ).fetchone()
+            if exists:
                 conn.execute(
-                    "INSERT INTO site_checks(site_id, ok, status_code, latency_ms, error, checked_at) "
-                    "VALUES(?,?,?,?,?,COALESCE(?, datetime('now')))",
+                    "UPDATE tasks SET status=?, progress=?, result_json=?, error=?, updated_at=COALESCE(?, updated_at) WHERE id=?",
                     (
-                        int(target_site_id),
-                        1 if _as_bool(item.get("ok"), False) else 0,
-                        _as_int(item.get("status_code"), 0),
-                        _as_int(item.get("latency_ms"), 0),
-                        str(item.get("error") or ""),
-                        str(item.get("checked_at") or "").strip() or None,
+                        status,
+                        int(progress),
+                        result_json,
+                        err,
+                        updated_at,
+                        int(exists["id"]),
                     ),
                 )
-                panel_state_result["site_checks"]["restored"] += 1
-            conn.commit()
+                panel_state_result["tasks"]["updated"] += 1
+            else:
+                conn.execute(
+                    "INSERT INTO tasks(node_id, type, payload_json, status, progress, result_json, error, created_at, updated_at) "
+                    "VALUES(?,?,?,?,?,?,?,COALESCE(?, datetime('now')),COALESCE(?, datetime('now')))",
+                    (
+                        int(target_node_id),
+                        task_type,
+                        payload_json,
+                        status,
+                        int(progress),
+                        result_json,
+                        err,
+                        created_at,
+                        updated_at,
+                    ),
+                )
+                panel_state_result["tasks"]["added"] += 1
+        conn.commit()
+
+    stat_items = panel_state_payload.get("rule_stats_samples")
+    if not isinstance(stat_items, list):
+        stat_items = []
+    with connect() as conn:
+        for item in stat_items:
+            if not isinstance(item, dict):
+                panel_state_result["rule_stats_samples"]["skipped"] += 1
+                continue
+            src_node_id = _as_int(item.get("source_node_id"), 0)
+            node_base_url = str(item.get("node_base_url") or "").strip().rstrip("/") or None
+            target_node_id = _resolve_node_id(src_node_id if src_node_id > 0 else None, node_base_url)
+            if not target_node_id:
+                panel_state_result["rule_stats_samples"]["skipped"] += 1
+                continue
+            rule_key = str(item.get("rule_key") or "").strip()
+            ts_ms = _as_int(item.get("ts_ms"), 0)
+            if not rule_key or ts_ms <= 0:
+                panel_state_result["rule_stats_samples"]["skipped"] += 1
+                continue
+            rx_bytes = max(0, _as_int(item.get("rx_bytes"), 0))
+            tx_bytes = max(0, _as_int(item.get("tx_bytes"), 0))
+            conn_active = max(0, _as_int(item.get("connections_active"), 0))
+            conn_total = max(0, _as_int(item.get("connections_total"), 0))
+
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO rule_stats_samples("
+                "node_id, rule_key, ts_ms, rx_bytes, tx_bytes, connections_active, connections_total"
+                ") VALUES(?,?,?,?,?,?,?)",
+                (
+                    int(target_node_id),
+                    rule_key,
+                    int(ts_ms),
+                    int(rx_bytes),
+                    int(tx_bytes),
+                    int(conn_active),
+                    int(conn_total),
+                ),
+            )
+            if int(cur.rowcount or 0) > 0:
+                panel_state_result["rule_stats_samples"]["restored"] += 1
+            else:
+                conn.execute(
+                    "UPDATE rule_stats_samples SET rx_bytes=?, tx_bytes=?, connections_active=?, connections_total=? "
+                    "WHERE node_id=? AND rule_key=? AND ts_ms=?",
+                    (
+                        int(rx_bytes),
+                        int(tx_bytes),
+                        int(conn_active),
+                        int(conn_total),
+                        int(target_node_id),
+                        rule_key,
+                        int(ts_ms),
+                    ),
+                )
+                panel_state_result["rule_stats_samples"]["updated"] += 1
+        conn.commit()
 
     return {
         "ok": True,
-        "nodes": {"added": added, "updated": updated, "skipped": skipped, "mapping": mapping},
+        "nodes": {
+            "added": added,
+            "updated": updated,
+            "skipped": skipped,
+            "mapping": mapping,
+            "node_features": node_features,
+        },
         "rules": {
             "total": total_rules,
             "restored": restored_rules,
@@ -4373,6 +6552,14 @@ async def api_restore_full(
             "site_file_share_revocations": panel_state_result["site_file_share_revocations"],
             "site_events": panel_state_result["site_events"],
             "site_checks": panel_state_result["site_checks"],
+            "audit_logs": panel_state_result["audit_logs"],
+            "tasks": panel_state_result["tasks"],
+            "rule_stats_samples": panel_state_result["rule_stats_samples"],
+        },
+        "remote_storage_profiles": {
+            "source": remote_profiles_source,
+            "restored": int(remote_profiles_restored),
+            "skipped": int(remote_profiles_skipped),
         },
         "site_unmatched": site_unmatched[:50],
         "site_file_failed": site_file_failed_items[:50],
@@ -4394,7 +6581,29 @@ async def api_restore(
     if not node:
         return JSONResponse({"ok": False, "error": "节点不存在"}, status_code=404)
     try:
-        raw = await file.read()
+        await file.seek(0)
+    except Exception:
+        pass
+    total = 0
+    buf = bytearray()
+    try:
+        while True:
+            chunk = await file.read(_RESTORE_UPLOAD_CHUNK_SIZE)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > _RULE_RESTORE_MAX_BYTES:
+                return JSONResponse(
+                    {
+                        "ok": False,
+                        "error": f"上传文件过大（当前限制 {_format_bytes(_RULE_RESTORE_MAX_BYTES)}）",
+                    },
+                    status_code=413,
+                )
+            buf.extend(chunk)
+        raw = bytes(buf)
+        if not raw:
+            return JSONResponse({"ok": False, "error": "上传文件为空"}, status_code=400)
         payload = json.loads(raw.decode("utf-8"))
     except Exception as exc:
         return JSONResponse({"ok": False, "error": f"备份文件解析失败：{exc}"}, status_code=400)
@@ -4406,11 +6615,33 @@ async def api_restore(
         return JSONResponse({"ok": False, "error": "备份内容缺少 pool 数据"}, status_code=400)
 
     sanitize_pool(pool)
-
-    # Store on panel; apply will be done asynchronously (avoid blocking / proxy timeouts).
-    desired_ver, _ = set_desired_pool(node_id, pool)
-    schedule_apply_pool(node, pool)
-    return {"ok": True, "desired_version": desired_ver, "queued": True}
+    try:
+        job = _enqueue_pool_job(
+            node_id=int(node_id),
+            kind="rule_restore",
+            payload={"pool": pool},
+            user=user,
+            meta={
+                "action": "rule_restore",
+                "filename": str(file.filename or ""),
+                "upload_bytes": int(total),
+            },
+        )
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": f"创建恢复任务失败：{exc}"}, status_code=500)
+    _audit_log_node_action(
+        action="rule.restore_async_enqueue",
+        user=user,
+        node_id=int(node_id),
+        node_name=str(node.get("name") or ""),
+        detail={
+            "job_id": str(job.get("job_id") or ""),
+            "filename": str(file.filename or ""),
+            "upload_bytes": int(total),
+        },
+        request=request,
+    )
+    return {"ok": True, "job": job, "queued": True}
 
 
 def _append_precheck_issue(
@@ -4527,12 +6758,13 @@ async def _run_pool_save_precheck(node: Dict[str, Any], pool: Dict[str, Any]) ->
 
     body = {"mode": "rules", "rules": rules_payload, "timeout": probe_timeout}
     try:
+        target_base_url, target_verify_tls, _target_route = node_agent_request_target(node)
         data = await agent_post(
-            node.get("base_url", ""),
+            target_base_url,
             node.get("api_key", ""),
             "/api/v1/netprobe",
             body,
-            node_verify_tls(node),
+            target_verify_tls,
             timeout=http_timeout,
         )
     except Exception as exc:
@@ -4731,8 +6963,10 @@ async def api_pool_set(request: Request, node_id: int, payload: Dict[str, Any], 
             if sid and (
                 ex0.get("sync_lock") is True
                 or ex0.get("sync_role") == "receiver"
-                or ex0.get("intranet_lock") is True
-                or ex0.get("intranet_role") == "client"
+                or (
+                    (not _is_relay_sync_rule(ex0))
+                    and (ex0.get("intranet_lock") is True or ex0.get("intranet_role") == "client")
+                )
             ):
                 locked[str(sid)] = ep
 
@@ -4749,7 +6983,8 @@ async def api_pool_set(request: Request, node_id: int, payload: Dict[str, Any], 
                     posted[str(sid)] = ep
 
             def _canon(e: Dict[str, Any]) -> Dict[str, Any]:
-                ex = dict(e.get("extra_config") or {})
+                ex_raw = e.get("extra_config")
+                ex = dict(ex_raw) if isinstance(ex_raw, dict) else {}
                 ex.pop("last_sync_at", None)
                 ex.pop("sync_updated_at", None)
                 ex.pop("intranet_updated_at", None)
@@ -4845,6 +7080,32 @@ async def api_pool_set(request: Request, node_id: int, payload: Dict[str, Any], 
     except Exception as exc:
         return JSONResponse({"ok": False, "error": f"保存失败：下发任务创建失败（{exc}）"}, status_code=500)
 
+    audit_detail = _pool_change_summary(existing_pool, pool)
+    audit_detail.update(
+        {
+            "desired_version": int(desired_ver),
+            "queued": True,
+            "precheck_issues": int(len(precheck_issues)),
+            "async_job": bool(is_async_job),
+        }
+    )
+    if int(audit_detail.get("created_rules") or 0) > 0 and int(audit_detail.get("deleted_rules") or 0) == 0:
+        audit_action = "rule.create"
+    elif int(audit_detail.get("deleted_rules") or 0) > 0 and int(audit_detail.get("created_rules") or 0) == 0:
+        audit_action = "rule.delete"
+    elif int(audit_detail.get("created_rules") or 0) > 0 and int(audit_detail.get("deleted_rules") or 0) > 0:
+        audit_action = "rule.batch_change"
+    else:
+        audit_action = "pool.save"
+    _audit_log_node_action(
+        action=audit_action,
+        user=user,
+        node_id=int(node_id),
+        node_name=str(node.get("name") or ""),
+        detail=audit_detail,
+        request=request,
+    )
+
     return {
         "ok": True,
         "pool": _filter_pool_for_user(user, pool),
@@ -4859,7 +7120,7 @@ async def api_pool_set(request: Request, node_id: int, payload: Dict[str, Any], 
 
 
 @router.post("/api/nodes/{node_id}/pool_async")
-async def api_pool_set_async(node_id: int, payload: Dict[str, Any], user: str = Depends(require_login)):
+async def api_pool_set_async(request: Request, node_id: int, payload: Dict[str, Any], user: str = Depends(require_login)):
     node = get_node(node_id)
     if not node:
         return JSONResponse({"ok": False, "error": "节点不存在"}, status_code=404)
@@ -4891,11 +7152,24 @@ async def api_pool_set_async(node_id: int, payload: Dict[str, Any], user: str = 
         user=user,
         meta={"action": "pool_save"},
     )
+    _audit_log_node_action(
+        action="pool.save_async_enqueue",
+        user=user,
+        node_id=int(node_id),
+        node_name=str(node.get("name") or ""),
+        detail={"job_id": str(job.get("job_id") or ""), "has_unlock_ids": bool(unlock_ids)},
+        request=request,
+    )
     return {"ok": True, "job": job}
 
 
 @router.post("/api/nodes/{node_id}/rule_delete")
-async def api_rule_delete(node_id: int, payload: Dict[str, Any], user: str = Depends(require_login)):
+async def api_rule_delete(
+    request: Request,
+    node_id: int,
+    payload: Dict[str, Any],
+    user: str = Depends(require_login),
+):
     """Delete one endpoint by index (best-effort immediate queue).
 
     This endpoint is intentionally lightweight and does not run full save-time precheck,
@@ -4961,11 +7235,26 @@ async def api_rule_delete(node_id: int, payload: Dict[str, Any], user: str = Dep
                 {"ok": False, "error": "该规则由发送机同步生成，已锁定不可删除，请在发送机节点操作。"},
                 status_code=403,
             )
-        if ex.get("intranet_lock") is True or ex.get("intranet_role") == "client":
+        if (
+            (not _is_relay_sync_rule(ex))
+            and (ex.get("intranet_lock") is True or ex.get("intranet_role") == "client")
+            and (not allow_unlock)
+        ):
             return JSONResponse(
                 {"ok": False, "error": "该规则由公网入口同步生成，已锁定不可删除，请在公网入口节点操作。"},
                 status_code=403,
             )
+
+    deleted_rule_key = ""
+    deleted_listen = ""
+    try:
+        deleted_rule_key = _rule_key_for_endpoint(ep)
+    except Exception:
+        deleted_rule_key = ""
+    try:
+        deleted_listen = str(ep.get("listen") or "").strip() if isinstance(ep, dict) else ""
+    except Exception:
+        deleted_listen = ""
 
     del eps[idx]
     pool["endpoints"] = eps
@@ -4978,6 +7267,21 @@ async def api_rule_delete(node_id: int, payload: Dict[str, Any], user: str = Dep
         schedule_apply_pool(node, pool)
     except Exception as exc:
         return JSONResponse({"ok": False, "error": f"删除失败：下发任务创建失败（{exc}）"}, status_code=500)
+
+    _audit_log_node_action(
+        action="rule.delete",
+        user=user,
+        node_id=int(node_id),
+        node_name=str(node.get("name") or ""),
+        detail={
+            "rule_idx": int(idx),
+            "rule_key": deleted_rule_key,
+            "listen": deleted_listen,
+            "desired_version": int(desired_ver),
+            "rules_after": int(len(eps)),
+        },
+        request=request,
+    )
     return {
         "ok": True,
         "pool": _filter_pool_for_user(user, pool),
@@ -4988,7 +7292,7 @@ async def api_rule_delete(node_id: int, payload: Dict[str, Any], user: str = Dep
 
 
 @router.post("/api/nodes/{node_id}/rule_delete_async")
-async def api_rule_delete_async(node_id: int, payload: Dict[str, Any], user: str = Depends(require_login)):
+async def api_rule_delete_async(request: Request, node_id: int, payload: Dict[str, Any], user: str = Depends(require_login)):
     node = get_node(node_id)
     if not node:
         return JSONResponse({"ok": False, "error": "节点不存在"}, status_code=404)
@@ -5011,6 +7315,14 @@ async def api_rule_delete_async(node_id: int, payload: Dict[str, Any], user: str
             "idx": int(idx_meta),
         },
     )
+    _audit_log_node_action(
+        action="rule.delete_async_enqueue",
+        user=user,
+        node_id=int(node_id),
+        node_name=str(node.get("name") or ""),
+        detail={"job_id": str(job.get("job_id") or ""), "idx": int(idx_meta)},
+        request=request,
+    )
     return {"ok": True, "job": job}
 
 
@@ -5019,6 +7331,11 @@ async def api_pool_job_get(node_id: int, job_id: str, user: str = Depends(requir
     jid = str(job_id or "").strip()
     if not jid:
         return JSONResponse({"ok": False, "error": "job_id 不能为空"}, status_code=400)
+    node = get_node(int(node_id))
+    if not node:
+        return JSONResponse({"ok": False, "error": "节点不存在"}, status_code=404)
+    if not _user_can_access_node(user, node):
+        return JSONResponse({"ok": False, "error": "无权访问该节点"}, status_code=403)
     with _POOL_JOBS_LOCK:
         _prune_pool_jobs_locked()
         job = _POOL_JOBS.get(jid)
@@ -5032,6 +7349,11 @@ async def api_pool_job_retry(node_id: int, job_id: str, user: str = Depends(requ
     jid = str(job_id or "").strip()
     if not jid:
         return JSONResponse({"ok": False, "error": "job_id 不能为空"}, status_code=400)
+    node = get_node(int(node_id))
+    if not node:
+        return JSONResponse({"ok": False, "error": "节点不存在"}, status_code=404)
+    if not _user_can_access_node(user, node):
+        return JSONResponse({"ok": False, "error": "无权访问该节点"}, status_code=403)
 
     kind = ""
     payload: Dict[str, Any] = {}
@@ -5045,7 +7367,7 @@ async def api_pool_job_retry(node_id: int, job_id: str, user: str = Depends(requ
         if st not in ("error", "success"):
             return JSONResponse({"ok": False, "error": "任务仍在执行中，请稍后再试"}, status_code=409)
         kind = str(job.get("kind") or "")
-        if kind not in ("pool_save", "rule_delete"):
+        if kind not in ("pool_save", "rule_restore", "rule_delete", "direct_tunnel_configure", "direct_tunnel_disable"):
             return JSONResponse({"ok": False, "error": "不支持该任务类型重试"}, status_code=400)
         payload0 = job.get("_payload")
         if not isinstance(payload0, dict):
@@ -5145,6 +7467,20 @@ async def api_node_purge(
     desired_ver, _ = set_desired_pool(node_id, new_pool)
     schedule_apply_pool(node, new_pool)
 
+    _audit_log_node_action(
+        action="rule.purge_all",
+        user=user,
+        node_id=int(node_id),
+        node_name=str(node.get("name") or ""),
+        detail={
+            "rules_before": int(len(cur_pool.get("endpoints") or [])) if isinstance(cur_pool.get("endpoints"), list) else 0,
+            "rules_after": 0,
+            "peer_nodes_touched": sorted(set(peers_cleared)),
+            "desired_version": int(desired_ver),
+        },
+        request=request,
+    )
+
     return {
         "ok": True,
         "node_id": int(node_id),
@@ -5153,6 +7489,502 @@ async def api_node_purge(
         "desired_version": desired_ver,
         "queued": True,
     }
+
+
+def _jsonresponse_payload(resp: JSONResponse) -> Dict[str, Any]:
+    try:
+        body = resp.body
+        if isinstance(body, (bytes, bytearray)):
+            txt = body.decode("utf-8", errors="ignore")
+        else:
+            txt = str(body or "")
+        data = json.loads(txt) if txt else {}
+        return data if isinstance(data, dict) else {"ok": False, "error": str(data)}
+    except Exception:
+        return {"ok": False, "error": "unknown_response"}
+
+
+def _node_base_scheme(node: Dict[str, Any]) -> str:
+    raw = str((node or {}).get("base_url") or "").strip()
+    if not raw:
+        return "http"
+    if "://" not in raw:
+        raw = "http://" + raw
+    try:
+        sch = str(urlparse(raw).scheme or "http").strip().lower()
+    except Exception:
+        sch = "http"
+    if sch not in ("http", "https"):
+        sch = "http"
+    return sch
+
+
+def _node_agent_port(node: Dict[str, Any]) -> int:
+    raw = str((node or {}).get("base_url") or "").strip()
+    if not raw:
+        return int(DEFAULT_AGENT_PORT)
+    if "://" not in raw:
+        raw = "http://" + raw
+    try:
+        p = int(urlparse(raw).port or DEFAULT_AGENT_PORT)
+    except Exception:
+        p = int(DEFAULT_AGENT_PORT)
+    if p < 1 or p > 65535:
+        p = int(DEFAULT_AGENT_PORT)
+    return int(p)
+
+
+def _direct_tunnel_sync_id_for_node(node_id: int, existing: Any = "") -> str:
+    cur = str(existing or "").strip()
+    if cur:
+        return cur
+    return f"node-direct-{int(node_id)}"
+
+
+def _direct_tunnel_public_host(relay: Optional[Dict[str, Any]], fallback: Any = "") -> str:
+    host = ""
+    if isinstance(relay, dict):
+        host = node_host_for_realm(relay)
+        if host.startswith("[") and host.endswith("]"):
+            host = host[1:-1]
+    if not host:
+        host = str(fallback or "").strip()
+    return host
+
+
+def _user_can_access_node(user: str, node: Optional[Dict[str, Any]]) -> bool:
+    if not isinstance(node, dict):
+        return False
+    nid = _to_int_loose(node.get("id"), 0)
+    if nid <= 0:
+        return False
+    try:
+        visible = filter_nodes_for_user(user, [node])
+    except Exception:
+        return False
+    return any(_to_int_loose((x or {}).get("id"), 0) == nid for x in visible)
+
+
+def _node_direct_tunnel_view(node: Dict[str, Any], relay: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    dt = (node or {}).get("direct_tunnel") if isinstance(node, dict) else {}
+    if not isinstance(dt, dict):
+        dt = {}
+    enabled = bool(dt.get("enabled"))
+    relay_id = _to_int_loose(dt.get("relay_node_id"), 0)
+    listen_port = _to_int_loose(dt.get("listen_port"), 0)
+    host = _direct_tunnel_public_host(relay, dt.get("public_host"))
+    scheme = str(dt.get("scheme") or "").strip().lower() or _node_base_scheme(node)
+    if scheme not in ("http", "https"):
+        scheme = "http"
+    direct_base_url = ""
+    if enabled and host and 1 <= listen_port <= 65535:
+        direct_base_url = f"{scheme}://{format_host_for_url(host)}:{int(listen_port)}"
+    out = {
+        "enabled": enabled,
+        "sync_id": str(dt.get("sync_id") or "").strip(),
+        "relay_node_id": int(relay_id),
+        "listen_port": int(listen_port if 1 <= listen_port <= 65535 else 0),
+        "public_host": str(host or ""),
+        "scheme": scheme,
+        "verify_tls": bool(dt.get("verify_tls")),
+        "updated_at": str(dt.get("updated_at") or ""),
+        "direct_base_url": direct_base_url,
+    }
+    if isinstance(relay, dict):
+        out["relay_node"] = {
+            "id": _to_int_loose(relay.get("id"), 0),
+            "name": str(relay.get("name") or ""),
+            "base_url": str(relay.get("base_url") or ""),
+            "display_ip": extract_ip_for_display(str(relay.get("base_url") or "")),
+            "online": bool(is_report_fresh(relay)),
+        }
+    return out
+
+
+async def _suggest_direct_tunnel_port(node: Dict[str, Any], relay: Dict[str, Any], preferred: Optional[int]) -> int:
+    relay_pool = await load_pool_for_node(relay)
+    dt = node.get("direct_tunnel") if isinstance(node, dict) else {}
+    sync_id = _direct_tunnel_sync_id_for_node(
+        _to_int_loose(node.get("id"), 0),
+        (dt or {}).get("sync_id") if isinstance(dt, dict) else "",
+    )
+    p = _to_int_loose(preferred, 0)
+    if p < 1 or p > 65535:
+        p = 0
+    return int(choose_receiver_port(relay_pool, p or None, ignore_sync_id=sync_id))
+
+
+@router.get("/api/nodes/{node_id}/direct_tunnel/options")
+async def api_node_direct_tunnel_options(node_id: int, user: str = Depends(require_login)):
+    node = get_node(int(node_id))
+    if not node:
+        return JSONResponse({"ok": False, "error": "节点不存在"}, status_code=404)
+    if not _user_can_access_node(user, node):
+        return JSONResponse({"ok": False, "error": "无权访问该节点"}, status_code=403)
+    if not bool(node.get("is_private") or False):
+        return JSONResponse({"ok": False, "error": "仅内网节点支持直连隧道配置"}, status_code=400)
+
+    all_nodes = filter_nodes_for_user(user, list_nodes())
+    relay_nodes: List[Dict[str, Any]] = []
+    for n in all_nodes:
+        nid = _to_int_loose((n or {}).get("id"), 0)
+        if nid <= 0 or nid == int(node_id):
+            continue
+        host = _direct_tunnel_public_host(n)
+        if not host:
+            continue
+        relay_nodes.append(
+            {
+                "id": nid,
+                "name": str(n.get("name") or f"节点-{nid}"),
+                "base_url": str(n.get("base_url") or ""),
+                "display_ip": extract_ip_for_display(str(n.get("base_url") or "")),
+                "is_private": bool(n.get("is_private") or 0),
+                "online": bool(is_report_fresh(n)),
+            }
+        )
+    relay_nodes.sort(
+        key=lambda x: (
+            1 if bool(x.get("is_private")) else 0,
+            0 if bool(x.get("online")) else 1,
+            _to_int_loose((x or {}).get("id"), 0),
+        )
+    )
+
+    dt = node.get("direct_tunnel") if isinstance(node, dict) else {}
+    relay_id = _to_int_loose((dt or {}).get("relay_node_id"), 0) if isinstance(dt, dict) else 0
+    relay = get_node(relay_id) if relay_id > 0 else None
+    if relay is not None and not _user_can_access_node(user, relay):
+        relay = None
+    current = _node_direct_tunnel_view(node, relay=relay)
+
+    recommended = 0
+    for row in relay_nodes:
+        if bool(row.get("is_private")):
+            continue
+        recommended = _to_int_loose((row or {}).get("id"), 0)
+        if bool(row.get("online")):
+            break
+    if recommended <= 0 and relay_nodes:
+        recommended = _to_int_loose((relay_nodes[0] or {}).get("id"), 0)
+
+    return {
+        "ok": True,
+        "node_id": int(node_id),
+        "current": current,
+        "relay_nodes": relay_nodes,
+        "recommended_relay_node_id": int(recommended or 0),
+    }
+
+
+@router.post("/api/nodes/{node_id}/direct_tunnel/suggest_port")
+async def api_node_direct_tunnel_suggest_port(node_id: int, request: Request, user: str = Depends(require_login)):
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+
+    node = get_node(int(node_id))
+    if not node:
+        return JSONResponse({"ok": False, "error": "节点不存在"}, status_code=404)
+    if not _user_can_access_node(user, node):
+        return JSONResponse({"ok": False, "error": "无权访问该节点"}, status_code=403)
+    if not bool(node.get("is_private") or False):
+        return JSONResponse({"ok": False, "error": "仅内网节点支持直连隧道配置"}, status_code=400)
+
+    try:
+        relay_node_id = int(payload.get("relay_node_id") or 0)
+    except Exception:
+        relay_node_id = 0
+    if relay_node_id <= 0:
+        return JSONResponse({"ok": False, "error": "relay_node_id 无效"}, status_code=400)
+
+    relay = get_node(int(relay_node_id))
+    if not relay:
+        return JSONResponse({"ok": False, "error": "中继节点不存在"}, status_code=404)
+    if _to_int_loose(relay.get("id"), 0) == int(node_id):
+        return JSONResponse({"ok": False, "error": "中继节点不能是当前节点"}, status_code=400)
+    if not _user_can_access_node(user, relay):
+        return JSONResponse({"ok": False, "error": "无权访问中继节点"}, status_code=403)
+
+    preferred = 0
+    try:
+        preferred = int(payload.get("preferred_port") or 0)
+    except Exception:
+        preferred = 0
+    port = await _suggest_direct_tunnel_port(node, relay, preferred if preferred > 0 else None)
+    return {"ok": True, "listen_port": int(port)}
+
+
+async def _direct_tunnel_configure_impl(
+    node_id: int,
+    payload: Dict[str, Any],
+    *,
+    user: str,
+    request: Optional[Request] = None,
+    audit_action: str = "node.direct_tunnel.configure",
+) -> Any:
+    node = get_node(int(node_id))
+    if not node:
+        return JSONResponse({"ok": False, "error": "节点不存在"}, status_code=404)
+    if not _user_can_access_node(user, node):
+        return JSONResponse({"ok": False, "error": "无权访问该节点"}, status_code=403)
+    if not bool(node.get("is_private") or False):
+        return JSONResponse({"ok": False, "error": "仅内网节点支持直连隧道配置"}, status_code=400)
+
+    data = payload if isinstance(payload, dict) else {}
+    try:
+        relay_node_id = int(data.get("relay_node_id") or 0)
+    except Exception:
+        relay_node_id = 0
+    if relay_node_id <= 0:
+        return JSONResponse({"ok": False, "error": "请选择中继节点"}, status_code=400)
+
+    relay = get_node(int(relay_node_id))
+    if not relay:
+        return JSONResponse({"ok": False, "error": "中继节点不存在"}, status_code=404)
+    if _to_int_loose(relay.get("id"), 0) == int(node_id):
+        return JSONResponse({"ok": False, "error": "中继节点不能是当前节点"}, status_code=400)
+    if not _user_can_access_node(user, relay):
+        return JSONResponse({"ok": False, "error": "无权访问中继节点"}, status_code=403)
+
+    dt_cur = node.get("direct_tunnel") if isinstance(node, dict) else {}
+    sync_id = _direct_tunnel_sync_id_for_node(int(node_id), (dt_cur or {}).get("sync_id") if isinstance(dt_cur, dict) else "")
+    listen_port = 0
+    try:
+        listen_port = int(data.get("listen_port") or 0)
+    except Exception:
+        listen_port = 0
+    if listen_port <= 0:
+        listen_port = await _suggest_direct_tunnel_port(node, relay, None)
+    if listen_port < 1 or listen_port > 65535:
+        return JSONResponse({"ok": False, "error": "监听端口无效"}, status_code=400)
+
+    verify_tls = bool(data.get("verify_tls") or False)
+    scheme = _node_base_scheme(node)
+    agent_port = _node_agent_port(node)
+
+    # Reuse existing intranet sync pipeline: sender(relay) <-> receiver(private node).
+    intranet_payload = {
+        "sender_node_id": int(relay_node_id),
+        "receiver_node_id": int(node_id),
+        "sync_id": sync_id,
+        "listen": f"0.0.0.0:{int(listen_port)}",
+        "remotes": [f"127.0.0.1:{int(agent_port)}"],
+        "protocol": "tcp",
+        "balance": "roundrobin",
+        "disabled": False,
+        "remark": f"[NodeDirect] 节点#{int(node_id)} 管理直连隧道",
+    }
+    from .api_sync import api_intranet_tunnel_save  # lazy import to avoid hard cycle at module load time
+
+    ret = await api_intranet_tunnel_save(intranet_payload, user=user)
+    if isinstance(ret, JSONResponse):
+        body = _jsonresponse_payload(ret)
+        status = int(getattr(ret, "status_code", 500) or 500)
+        return JSONResponse({"ok": False, "error": str(body.get("error") or "隧道配置失败"), "detail": body}, status_code=status)
+    if not isinstance(ret, dict) or not bool(ret.get("ok")):
+        return JSONResponse({"ok": False, "error": "隧道配置失败"}, status_code=500)
+
+    public_host = _direct_tunnel_public_host(relay)
+    if not public_host:
+        return JSONResponse({"ok": False, "error": "中继节点公网入口地址为空，请检查中继节点 base_url"}, status_code=400)
+
+    set_node_direct_tunnel(
+        int(node_id),
+        enabled=True,
+        sync_id=sync_id,
+        relay_node_id=int(relay_node_id),
+        listen_port=int(listen_port),
+        public_host=public_host,
+        scheme=scheme,
+        verify_tls=bool(verify_tls),
+    )
+    updated = get_node(int(node_id)) or node
+    relay2 = get_node(int(relay_node_id)) or relay
+    current = _node_direct_tunnel_view(updated, relay=relay2)
+
+    _audit_log_node_action(
+        action=str(audit_action or "node.direct_tunnel.configure"),
+        user=user,
+        node_id=int(node_id),
+        node_name=str(updated.get("name") or node.get("name") or ""),
+        detail={
+            "relay_node_id": int(relay_node_id),
+            "sync_id": str(sync_id),
+            "listen_port": int(listen_port),
+            "verify_tls": bool(verify_tls),
+            "direct_base_url": str(current.get("direct_base_url") or ""),
+        },
+        request=request,
+    )
+
+    return {"ok": True, "current": current, "sync_result": ret}
+
+
+async def _direct_tunnel_disable_impl(
+    node_id: int,
+    *,
+    user: str,
+    request: Optional[Request] = None,
+    audit_action: str = "node.direct_tunnel.disable",
+) -> Any:
+    node = get_node(int(node_id))
+    if not node:
+        return JSONResponse({"ok": False, "error": "节点不存在"}, status_code=404)
+    if not _user_can_access_node(user, node):
+        return JSONResponse({"ok": False, "error": "无权访问该节点"}, status_code=403)
+
+    dt = node.get("direct_tunnel") if isinstance(node, dict) else {}
+    if not isinstance(dt, dict):
+        dt = {}
+    sync_id = str(dt.get("sync_id") or "").strip()
+    relay_node_id = int(dt.get("relay_node_id") or 0)
+
+    delete_result: Dict[str, Any] = {"ok": True, "skipped": True}
+    if sync_id and relay_node_id > 0:
+        from .api_sync import api_intranet_tunnel_delete  # lazy import
+
+        ret = await api_intranet_tunnel_delete(
+            {
+                "sender_node_id": int(relay_node_id),
+                "receiver_node_id": int(node_id),
+                "sync_id": sync_id,
+            },
+            user=user,
+        )
+        if isinstance(ret, JSONResponse):
+            body = _jsonresponse_payload(ret)
+            if int(getattr(ret, "status_code", 500) or 500) not in (200, 404):
+                return JSONResponse({"ok": False, "error": str(body.get("error") or "关闭隧道失败"), "detail": body}, status_code=400)
+            delete_result = body if isinstance(body, dict) else {"ok": False, "error": "delete_failed"}
+        elif isinstance(ret, dict):
+            delete_result = ret
+
+    clear_node_direct_tunnel(int(node_id))
+    updated = get_node(int(node_id)) or node
+    current = _node_direct_tunnel_view(updated, relay=None)
+
+    _audit_log_node_action(
+        action=str(audit_action or "node.direct_tunnel.disable"),
+        user=user,
+        node_id=int(node_id),
+        node_name=str(updated.get("name") or node.get("name") or ""),
+        detail={"sync_id": sync_id, "relay_node_id": int(relay_node_id)},
+        request=request,
+    )
+
+    return {"ok": True, "current": current, "delete_result": delete_result}
+
+
+@router.post("/api/nodes/{node_id}/direct_tunnel/configure")
+async def api_node_direct_tunnel_configure(node_id: int, request: Request, user: str = Depends(require_login)):
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    return await _direct_tunnel_configure_impl(
+        int(node_id),
+        payload if isinstance(payload, dict) else {},
+        user=user,
+        request=request,
+        audit_action="node.direct_tunnel.configure",
+    )
+
+
+@router.post("/api/nodes/{node_id}/direct_tunnel/disable")
+async def api_node_direct_tunnel_disable(node_id: int, request: Request, user: str = Depends(require_login)):
+    return await _direct_tunnel_disable_impl(
+        int(node_id),
+        user=user,
+        request=request,
+        audit_action="node.direct_tunnel.disable",
+    )
+
+
+@router.post("/api/nodes/{node_id}/direct_tunnel/configure_async")
+async def api_node_direct_tunnel_configure_async(node_id: int, request: Request, user: str = Depends(require_login)):
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    data = payload if isinstance(payload, dict) else {}
+    node = get_node(int(node_id))
+    if not node:
+        return JSONResponse({"ok": False, "error": "节点不存在"}, status_code=404)
+    if not _user_can_access_node(user, node):
+        return JSONResponse({"ok": False, "error": "无权访问该节点"}, status_code=403)
+    if not bool(node.get("is_private") or False):
+        return JSONResponse({"ok": False, "error": "仅内网节点支持直连隧道配置"}, status_code=400)
+    try:
+        relay_meta = int(data.get("relay_node_id") or 0)
+    except Exception:
+        relay_meta = 0
+    if relay_meta <= 0:
+        return JSONResponse({"ok": False, "error": "请选择中继节点"}, status_code=400)
+    relay = get_node(int(relay_meta))
+    if not relay:
+        return JSONResponse({"ok": False, "error": "中继节点不存在"}, status_code=404)
+    if _to_int_loose(relay.get("id"), 0) == int(node_id):
+        return JSONResponse({"ok": False, "error": "中继节点不能是当前节点"}, status_code=400)
+    if not _user_can_access_node(user, relay):
+        return JSONResponse({"ok": False, "error": "无权访问中继节点"}, status_code=403)
+    try:
+        listen_meta = int(data.get("listen_port") or 0)
+    except Exception:
+        listen_meta = 0
+
+    job = _enqueue_pool_job(
+        node_id=int(node_id),
+        kind="direct_tunnel_configure",
+        payload=data,
+        user=user,
+        meta={
+            "action": "direct_tunnel_configure",
+            "relay_node_id": int(relay_meta),
+            "listen_port": int(listen_meta),
+            "verify_tls": bool(data.get("verify_tls") or False),
+        },
+    )
+    _audit_log_node_action(
+        action="node.direct_tunnel.configure_async_enqueue",
+        user=user,
+        node_id=int(node_id),
+        node_name=str(node.get("name") or ""),
+        detail={
+            "job_id": str(job.get("job_id") or ""),
+            "relay_node_id": int(relay_meta),
+            "listen_port": int(listen_meta),
+            "verify_tls": bool(data.get("verify_tls") or False),
+        },
+        request=request,
+    )
+    return {"ok": True, "job": job}
+
+
+@router.post("/api/nodes/{node_id}/direct_tunnel/disable_async")
+async def api_node_direct_tunnel_disable_async(node_id: int, request: Request, user: str = Depends(require_login)):
+    node = get_node(int(node_id))
+    if not node:
+        return JSONResponse({"ok": False, "error": "节点不存在"}, status_code=404)
+    if not _user_can_access_node(user, node):
+        return JSONResponse({"ok": False, "error": "无权访问该节点"}, status_code=403)
+    job = _enqueue_pool_job(
+        node_id=int(node_id),
+        kind="direct_tunnel_disable",
+        payload={},
+        user=user,
+        meta={"action": "direct_tunnel_disable"},
+    )
+    _audit_log_node_action(
+        action="node.direct_tunnel.disable_async_enqueue",
+        user=user,
+        node_id=int(node_id),
+        node_name=str(node.get("name") or ""),
+        detail={"job_id": str(job.get("job_id") or "")},
+        request=request,
+    )
+    return {"ok": True, "job": job}
 
 
 @router.post("/api/nodes/create")
@@ -5171,6 +8003,7 @@ async def api_nodes_create(request: Request, user: str = Depends(require_login))
     is_website = data.get("is_website")
     website_root_base = str(data.get("website_root_base") or "").strip()
     group_name = str(data.get("group_name") or "").strip() or "默认分组"
+    system_type = normalize_node_system_type(data.get("system_type"), default="auto")
 
     if scheme not in ("http", "https"):
         return JSONResponse({"ok": False, "error": "协议仅支持 http 或 https"}, status_code=400)
@@ -5196,6 +8029,9 @@ async def api_nodes_create(request: Request, user: str = Depends(require_login))
     display_name = name or extract_ip_for_display(base_url)
     role = "website" if bool(is_website) else "normal"
     root_base = website_root_base.strip()
+    if system_type == "macos":
+        role = "normal"
+        root_base = ""
     if role == "website" and not root_base:
         root_base = "/www"
     if role != "website":
@@ -5209,6 +8045,23 @@ async def api_nodes_create(request: Request, user: str = Depends(require_login))
         group_name=group_name,
         role=role,
         website_root_base=root_base,
+        system_type=system_type,
+    )
+
+    _audit_log_node_action(
+        action="node.create",
+        user=user,
+        node_id=int(node_id),
+        node_name=str(display_name or ""),
+        detail={
+            "base_url": str(base_url),
+            "group_name": str(group_name),
+            "is_private": bool(is_private),
+            "role": str(role),
+            "website_root_base": str(root_base or ""),
+            "system_type": str(system_type),
+        },
+        request=request,
     )
 
     # 创建完成后，进入节点详情页时自动弹出“接入命令”窗口
@@ -5236,6 +8089,7 @@ async def api_nodes_update(node_id: int, request: Request, user: str = Depends(r
     ip_in = data.get("ip_address", None)
     scheme_in = data.get("scheme", None)
     group_in = data.get("group_name", None)
+    system_type_in = data.get("system_type", None)
 
     # is_private: only update when provided
     if "is_private" in data:
@@ -5263,16 +8117,28 @@ async def api_nodes_update(node_id: int, request: Request, user: str = Depends(r
     else:
         website_root_base = str(node.get("website_root_base") or "").strip()
 
-    if role == "website" and not website_root_base:
-        website_root_base = "/www"
-    if role != "website":
-        website_root_base = ""
-
     # group name
     if group_in is None:
         group_name = str(node.get("group_name") or "默认分组").strip() or "默认分组"
     else:
         group_name = str(group_in or "").strip() or "默认分组"
+
+    # system type
+    if system_type_in is None:
+        system_type = None
+    else:
+        system_type = normalize_node_system_type(system_type_in, default="auto")
+    effective_system_type = normalize_node_system_type(
+        system_type if system_type is not None else node.get("system_type"),
+        default="auto",
+    )
+    if effective_system_type == "macos":
+        role = "normal"
+        website_root_base = ""
+    elif role == "website" and not website_root_base:
+        website_root_base = "/www"
+    elif role != "website":
+        website_root_base = ""
 
     policy_has_any, policy_in = _normalize_auto_restart_policy_from_payload(data, node)
     policy_apply = False
@@ -5290,11 +8156,23 @@ async def api_nodes_update(node_id: int, request: Request, user: str = Depends(r
     if "://" not in raw_old:
         raw_old = "http://" + raw_old
 
-    parsed_old = urlparse(raw_old)
-    old_scheme = (parsed_old.scheme or "http").lower()
-    old_host = parsed_old.hostname or ""
-    old_port = parsed_old.port
-    old_has_port = parsed_old.port is not None
+    try:
+        parsed_old = urlparse(raw_old)
+        old_scheme = str(parsed_old.scheme or "http").strip().lower()
+    except Exception:
+        old_scheme = "http"
+    if old_scheme not in ("http", "https"):
+        old_scheme = "http"
+
+    old_host, old_port_parsed, old_has_port, parsed_old_scheme = split_host_and_port(raw_old, DEFAULT_AGENT_PORT)
+    if parsed_old_scheme in ("http", "https"):
+        old_scheme = parsed_old_scheme
+    old_host = str(old_host or "").strip()
+    if old_host.startswith("[") and not old_host.endswith("]"):
+        old_host = old_host.lstrip("[")
+    if old_host.endswith("]") and not old_host.startswith("["):
+        old_host = old_host.rstrip("]")
+    old_port = int(old_port_parsed) if old_has_port else None
 
     scheme = str(scheme_in or old_scheme).strip().lower() or "http"
     if scheme not in ("http", "https"):
@@ -5336,6 +8214,9 @@ async def api_nodes_update(node_id: int, request: Request, user: str = Depends(r
                 port_value = None
                 has_port = False
 
+    if not str(host or "").strip():
+        return JSONResponse({"ok": False, "error": "节点地址不能为空"}, status_code=400)
+
     base_url = f"{scheme}://{format_host_for_url(host)}"
     if has_port and port_value:
         base_url += f":{int(port_value)}"
@@ -5361,6 +8242,7 @@ async def api_nodes_update(node_id: int, request: Request, user: str = Depends(r
         group_name=group_name,
         role=role,
         website_root_base=website_root_base,
+        system_type=system_type,
     )
 
     policy_ver = int(node.get("desired_auto_restart_policy_version") or 0)
@@ -5382,6 +8264,37 @@ async def api_nodes_update(node_id: int, request: Request, user: str = Depends(r
     policy_out = node_auto_restart_policy_from_row(updated if isinstance(updated, dict) else node)
     if policy_apply:
         policy_out["desired_version"] = int(policy_ver)
+    dt_relay_id = int(((updated.get("direct_tunnel") if isinstance(updated, dict) else {}) or {}).get("relay_node_id") or 0)
+    dt_relay = get_node(dt_relay_id) if dt_relay_id > 0 else None
+    direct_tunnel_out = _node_direct_tunnel_view(updated if isinstance(updated, dict) else node, relay=dt_relay)
+
+    _audit_log_node_action(
+        action="node.update",
+        user=user,
+        node_id=int(node_id),
+        node_name=str(updated.get("name") or name),
+        detail={
+            "old_name": str(node.get("name") or ""),
+            "new_name": str(updated.get("name") or name),
+            "old_base_url": str(node.get("base_url") or ""),
+            "new_base_url": str(updated.get("base_url") or base_url),
+            "old_group_name": str(node.get("group_name") or ""),
+            "new_group_name": str(updated.get("group_name") or group_name),
+            "old_verify_tls": bool(node.get("verify_tls") or 0),
+            "new_verify_tls": bool(updated.get("verify_tls") or verify_tls),
+            "old_is_private": bool(node.get("is_private") or 0),
+            "new_is_private": bool(updated.get("is_private") or is_private),
+            "old_role": str(node.get("role") or "normal"),
+            "new_role": str(updated.get("role") or role),
+            "old_system_type": normalize_node_system_type(node.get("system_type"), default="auto"),
+            "new_system_type": normalize_node_system_type(
+                updated.get("system_type"),
+                default=system_type if system_type is not None else normalize_node_system_type(node.get("system_type"), default="auto"),
+            ),
+            "policy_changed": bool(policy_apply),
+        },
+        request=request,
+    )
 
     return JSONResponse(
         {
@@ -5396,7 +8309,12 @@ async def api_nodes_update(node_id: int, request: Request, user: str = Depends(r
                 "is_private": bool(updated.get("is_private") or is_private),
                 "role": str(updated.get("role") or role),
                 "website_root_base": str(updated.get("website_root_base") or website_root_base),
+                "system_type": normalize_node_system_type(
+                    updated.get("system_type"),
+                    default=system_type if system_type is not None else normalize_node_system_type(node.get("system_type"), default="auto"),
+                ),
                 "auto_restart_policy": policy_out,
+                "direct_tunnel": direct_tunnel_out,
             },
         }
     )
@@ -5407,16 +8325,23 @@ async def api_nodes_list(user: str = Depends(require_login)):
     out = []
     for n in filter_nodes_for_user(user, list_nodes()):
         pol = node_auto_restart_policy_from_row(n if isinstance(n, dict) else {})
+        online = bool(is_report_fresh(n if isinstance(n, dict) else {}))
         out.append(
             {
                 "id": int(n["id"]),
                 "name": n["name"],
                 "base_url": n["base_url"],
+                "display_ip": extract_ip_for_display(str(n.get("base_url") or "")),
                 "group_name": n.get("group_name"),
                 "is_private": bool(n.get("is_private") or 0),
+                "online": online,
+                "is_online": online,
+                "last_seen_at": str(n.get("last_seen_at") or ""),
                 "role": n.get("role") or "normal",
                 "website_root_base": n.get("website_root_base") or "",
+                "system_type": normalize_node_system_type(n.get("system_type"), default="auto"),
                 "auto_restart_policy": pol,
+                "direct_tunnel": _node_direct_tunnel_view(n if isinstance(n, dict) else {}, relay=None),
             }
         )
     return {"ok": True, "nodes": out}
@@ -5427,16 +8352,33 @@ async def api_apply(request: Request, node_id: int, user: str = Depends(require_
     node = get_node(node_id)
     if not node:
         return JSONResponse({"ok": False, "error": "节点不存在"}, status_code=404)
+    target_base_url, target_verify_tls, target_route = node_agent_request_target(node)
     try:
-        data = await agent_post(node["base_url"], node["api_key"], "/api/v1/apply", {}, node_verify_tls(node))
+        data = await agent_post(target_base_url, node["api_key"], "/api/v1/apply", {}, target_verify_tls)
         if not data.get("ok", True):
             return JSONResponse({"ok": False, "error": data.get("error", "Agent 应用配置失败")}, status_code=502)
+        _audit_log_node_action(
+            action="pool.apply",
+            user=user,
+            node_id=int(node_id),
+            node_name=str(node.get("name") or ""),
+            detail={"queued": False, "mode": str(target_route or "direct")},
+            request=request,
+        )
         return data
     except Exception:
         # Push-report fallback: bump desired version to trigger a re-sync/apply on agent
         desired_ver, desired_pool = get_desired_pool(node_id)
         if isinstance(desired_pool, dict):
             new_ver, _ = set_desired_pool(node_id, desired_pool)
+            _audit_log_node_action(
+                action="pool.apply_queued",
+                user=user,
+                node_id=int(node_id),
+                node_name=str(node.get("name") or ""),
+                detail={"queued": True, "mode": "fallback", "desired_version": int(new_ver)},
+                request=request,
+            )
             return {"ok": True, "queued": True, "desired_version": new_ver}
         return {"ok": False, "error": "Agent 无法访问，且面板无缓存规则（请检查网络或等待 Agent 上报）"}
 
@@ -5448,20 +8390,38 @@ async def api_reset_traffic(request: Request, node_id: int, user: str = Depends(
     node = get_node(node_id)
     if not node:
         return JSONResponse({"ok": False, "error": "节点不存在"}, status_code=404)
+    target_base_url, target_verify_tls, target_route = node_agent_request_target(node)
     try:
         data = await agent_post(
-            node["base_url"],
+            target_base_url,
             node["api_key"],
             "/api/v1/traffic/reset",
             {},
-            node_verify_tls(node),
+            target_verify_tls,
             timeout=10.0,
         )
+        if isinstance(data, dict) and bool(data.get("ok", False)):
+            _audit_log_node_action(
+                action="traffic.reset",
+                user=user,
+                node_id=int(node_id),
+                node_name=str(node.get("name") or ""),
+                detail={"queued": False, "mode": str(target_route or "direct")},
+                request=request,
+            )
         return data
     except Exception as exc:
         # Fallback: queue via agent push-report (works for private/unreachable nodes)
         try:
             new_ver = bump_traffic_reset_version(int(node_id))
+            _audit_log_node_action(
+                action="traffic.reset_queued",
+                user=user,
+                node_id=int(node_id),
+                node_name=str(node.get("name") or ""),
+                detail={"queued": True, "mode": "fallback", "desired_reset_version": int(new_ver)},
+                request=request,
+            )
             return {
                 "ok": True,
                 "queued": True,
@@ -5484,43 +8444,54 @@ async def api_stats(request: Request, node_id: int, force: int = 0, user: str = 
 
     pool_for_scope: Optional[Dict[str, Any]] = None
     scoped_rule_view = is_rule_owner_scoped(user)
-    # Push-report cache (unless forced)
-    if not force and is_report_fresh(node):
-        rep = get_last_report(node_id)
-        if isinstance(rep, dict) and isinstance(rep.get("stats"), dict):
-            out = dict(rep["stats"])
-            out["source"] = "report"
-            # Use report receive time as series timestamp.
-            # If we always use "now" here, repeated reads of an unchanged cached report
-            # will create artificial zero/peak alternation in rate charts.
+    fresh = bool(is_report_fresh(node))
+    rep_cache: Optional[Dict[str, Any]] = None
+    prefer_pull = bool(force) or (node_info_fetch_order() == FETCH_ORDER_PULL_FIRST)
+
+    async def _report_stats_payload(rep_obj: Any, stale: bool) -> Optional[Dict[str, Any]]:
+        nonlocal pool_for_scope
+        if not (isinstance(rep_obj, dict) and isinstance(rep_obj.get("stats"), dict)):
+            return None
+        out = dict(rep_obj["stats"])
+        out["source"] = "report"
+        out["stale"] = bool(stale)
+        # Use report receive time as series timestamp.
+        # If we always use "now" here, repeated reads of an unchanged cached report
+        # will create artificial zero/peak alternation in rate charts.
+        try:
+            ts_ms = int(out.get("ts_ms") or 0)
+        except Exception:
+            ts_ms = 0
+        if ts_ms <= 0:
             try:
-                ts_ms = int(out.get("ts_ms") or 0)
+                seen = str(node.get("last_seen_at") or "").strip()
+                dt = datetime.strptime(seen, "%Y-%m-%d %H:%M:%S")
+                ts_ms = int(dt.timestamp() * 1000)
             except Exception:
                 ts_ms = 0
-            if ts_ms <= 0:
-                try:
-                    seen = str(node.get("last_seen_at") or "").strip()
-                    dt = datetime.strptime(seen, "%Y-%m-%d %H:%M:%S")
-                    ts_ms = int(dt.timestamp() * 1000)
-                except Exception:
-                    ts_ms = 0
-            if ts_ms <= 0:
-                try:
-                    ts_ms = int(time.time() * 1000)
-                except Exception:
-                    ts_ms = 0
-            if ts_ms > 0:
-                out["ts_ms"] = ts_ms
-            if scoped_rule_view:
+        if ts_ms <= 0:
+            try:
+                ts_ms = int(time.time() * 1000)
+            except Exception:
+                ts_ms = 0
+        if ts_ms > 0:
+            out["ts_ms"] = ts_ms
+        if scoped_rule_view:
+            if pool_for_scope is None:
                 try:
                     pool_for_scope = await load_pool_for_node(node)
                 except Exception:
                     pool_for_scope = {}
-                out = _filter_stats_payload_for_user(user, _normalize_pool_dict(pool_for_scope), out)
-            return out
+            out = _filter_stats_payload_for_user(user, _normalize_pool_dict(pool_for_scope), out)
+        return out
 
-    try:
-        data = await agent_get(node["base_url"], node["api_key"], "/api/v1/stats", node_verify_tls(node))
+    async def _pull_stats_payload() -> Tuple[Optional[Dict[str, Any]], str]:
+        nonlocal pool_for_scope
+        try:
+            target_base_url, target_verify_tls, _target_route = node_agent_request_target(node)
+            data = await agent_get(target_base_url, node["api_key"], "/api/v1/stats", target_verify_tls)
+        except Exception as exc:
+            return None, str(exc)
 
         # Provide a stable server-side timestamp for frontend history alignment.
         try:
@@ -5534,6 +8505,7 @@ async def api_stats(request: Request, node_id: int, force: int = 0, user: str = 
         # Best-effort: never fail the request.
         try:
             if isinstance(data, dict) and data.get("ok") is True:
+                _touch_node_last_seen_safe(node_id, node)
                 ingest_stats_snapshot(node_id=node_id, stats=data)
         except Exception:
             pass
@@ -5545,11 +8517,42 @@ async def api_stats(request: Request, node_id: int, force: int = 0, user: str = 
                 except Exception:
                     pool_for_scope = {}
             data = _filter_stats_payload_for_user(user, _normalize_pool_dict(pool_for_scope), data)
+        return data if isinstance(data, dict) else {"ok": False, "error": "响应格式异常", "rules": []}, ""
 
-        return data
-    except Exception as exc:
-        # Return 200 with ok=false to keep frontend error message stable.
-        return {"ok": False, "error": str(exc), "rules": []}
+    if (not force) and (not prefer_pull) and fresh:
+        rep_cache = get_last_report(node_id)
+        report_payload = await _report_stats_payload(rep_cache, stale=False)
+        if isinstance(report_payload, dict):
+            return report_payload
+
+    last_direct_err = ""
+    if prefer_pull:
+        pulled, err = await _pull_stats_payload()
+        if isinstance(pulled, dict) and bool(pulled.get("ok", True)):
+            return pulled
+        if isinstance(pulled, dict):
+            last_direct_err = str(pulled.get("error") or err or "")
+        else:
+            last_direct_err = str(err or "")
+
+    if not force:
+        if rep_cache is None:
+            rep_cache = get_last_report(node_id)
+        report_payload = await _report_stats_payload(rep_cache, stale=(not fresh))
+        if isinstance(report_payload, dict):
+            return report_payload
+
+    if not prefer_pull:
+        pulled, err = await _pull_stats_payload()
+        if isinstance(pulled, dict) and bool(pulled.get("ok", True)):
+            return pulled
+        if isinstance(pulled, dict):
+            last_direct_err = str(pulled.get("error") or err or "")
+        else:
+            last_direct_err = str(err or "")
+
+    # Return 200 with ok=false to keep frontend error message stable.
+    return {"ok": False, "error": (last_direct_err or "暂无可用统计数据"), "rules": []}
 
 
 @router.get("/api/nodes/{node_id}/stats_history")
@@ -5725,93 +8728,286 @@ async def api_stats_history_clear(
     }
 
 
-@router.get("/api/nodes/{node_id}/sys")
-async def api_sys(request: Request, node_id: int, cached: int = 0, user: str = Depends(require_login)):
-    """节点系统信息：CPU/内存/硬盘/交换/在线时长/流量/实时速率。"""
-    node = get_node(node_id)
-    if not node:
-        return JSONResponse({"ok": False, "error": "节点不存在"}, status_code=404)
+def _sys_snapshot_cache_key(node_id: int, cached: bool) -> str:
+    return f"{int(node_id)}:{1 if bool(cached) else 0}"
 
-    sys_data = None
-    source = None
-    rep_cache: Optional[Dict[str, Any]] = None
-    auto_restart_data: Optional[Dict[str, Any]] = None
 
-    # 1) Push-report cache（更快、更稳定）
-    if cached:
-        rep_cache = get_last_report(node_id)
-        if isinstance(rep_cache, dict) and isinstance(rep_cache.get("sys"), dict):
-            sys_data = dict(rep_cache["sys"])  # copy
-            sys_data["stale"] = not is_report_fresh(node)
-            source = "report"
-        if isinstance(rep_cache, dict) and isinstance(rep_cache.get("auto_restart"), dict):
-            auto_restart_data = dict(rep_cache["auto_restart"])  # copy
-            auto_restart_data["stale"] = not is_report_fresh(node)
-            auto_restart_data["source"] = "report"
-    else:
-        if is_report_fresh(node):
-            rep_cache = get_last_report(node_id)
-            if isinstance(rep_cache, dict) and isinstance(rep_cache.get("sys"), dict):
-                sys_data = dict(rep_cache["sys"])  # copy
-                source = "report"
-            if isinstance(rep_cache, dict) and isinstance(rep_cache.get("auto_restart"), dict):
-                auto_restart_data = dict(rep_cache["auto_restart"])  # copy
-                auto_restart_data["source"] = "report"
+def _sys_snapshot_cache_ttl(payload: Any) -> float:
+    if not isinstance(payload, dict):
+        return float(_SYS_SNAPSHOT_ERROR_CACHE_TTL_SEC)
+    if not bool(payload.get("ok")):
+        return float(_SYS_SNAPSHOT_ERROR_CACHE_TTL_SEC)
+    sys_data = payload.get("sys")
+    if isinstance(sys_data, dict):
+        if sys_data.get("ok") is False:
+            return float(_SYS_SNAPSHOT_ERROR_CACHE_TTL_SEC)
+        if str(sys_data.get("error") or "").strip():
+            return float(_SYS_SNAPSHOT_ERROR_CACHE_TTL_SEC)
+    return float(_SYS_SNAPSHOT_CACHE_TTL_SEC)
 
-    # 2) Fallback：直连 Agent
-    if sys_data is None:
-        if cached:
-            if auto_restart_data is None:
-                auto_restart_data = node_auto_restart_policy_from_row(node if isinstance(node, dict) else {})
-                auto_restart_data["source"] = "panel"
-                auto_restart_data["stale"] = not is_report_fresh(node)
-            return {
-                "ok": True,
-                "sys": {
-                    "ok": False,
-                    "error": "Agent 尚未上报系统信息（请升级 Agent 或稍后重试）",
-                    "source": "report",
-                },
-                "auto_restart": auto_restart_data,
-            }
 
+def _sys_snapshot_cache_cleanup_locked(now_ts: float) -> None:
+    global _SYS_SNAPSHOT_CACHE_NEXT_CLEANUP_AT
+    if now_ts < float(_SYS_SNAPSHOT_CACHE_NEXT_CLEANUP_AT) and len(_SYS_SNAPSHOT_CACHE) <= int(_SYS_SNAPSHOT_CACHE_MAX_ITEMS):
+        return
+    _SYS_SNAPSHOT_CACHE_NEXT_CLEANUP_AT = now_ts + float(_SYS_SNAPSHOT_CACHE_CLEANUP_INTERVAL_SEC)
+
+    for key, row in list(_SYS_SNAPSHOT_CACHE.items()):
+        if not isinstance(row, dict):
+            _SYS_SNAPSHOT_CACHE.pop(key, None)
+            continue
+        expire_at = float(row.get("expire_at") or 0)
+        if expire_at > 0 and now_ts >= expire_at:
+            _SYS_SNAPSHOT_CACHE.pop(key, None)
+
+    overflow = len(_SYS_SNAPSHOT_CACHE) - int(_SYS_SNAPSHOT_CACHE_MAX_ITEMS)
+    if overflow > 0:
+        ordered = sorted(
+            _SYS_SNAPSHOT_CACHE.items(),
+            key=lambda kv: float((kv[1] or {}).get("updated_at") or 0),
+        )
+        for idx in range(min(overflow, len(ordered))):
+            _SYS_SNAPSHOT_CACHE.pop(str(ordered[idx][0]), None)
+
+
+def _sys_snapshot_cache_get(node_id: int, cached: bool, last_seen_at: Any = "") -> Optional[Dict[str, Any]]:
+    if (not _SYS_SNAPSHOT_CACHE_ENABLED) or (not bool(cached)):
+        return None
+    key = _sys_snapshot_cache_key(int(node_id), bool(cached))
+    marker = str(last_seen_at or "").strip()
+    now_ts = time.time()
+    with _SYS_SNAPSHOT_CACHE_LOCK:
+        _sys_snapshot_cache_cleanup_locked(now_ts)
+        row = _SYS_SNAPSHOT_CACHE.get(key)
+        if not isinstance(row, dict):
+            return None
+        if marker and str(row.get("last_seen_at") or "").strip() != marker:
+            return None
+        expire_at = float(row.get("expire_at") or 0)
+        if expire_at > 0 and now_ts >= expire_at:
+            _SYS_SNAPSHOT_CACHE.pop(key, None)
+            return None
+        payload = row.get("payload")
+        if not isinstance(payload, dict):
+            return None
+        row["updated_at"] = now_ts
+        _SYS_SNAPSHOT_CACHE[key] = dict(row)
+        return copy.deepcopy(payload)
+
+
+def _sys_snapshot_cache_put(node_id: int, cached: bool, last_seen_at: Any, payload: Dict[str, Any]) -> None:
+    if (not _SYS_SNAPSHOT_CACHE_ENABLED) or (not bool(cached)) or (not isinstance(payload, dict)):
+        return
+    key = _sys_snapshot_cache_key(int(node_id), bool(cached))
+    marker = str(last_seen_at or "").strip()
+    now_ts = time.time()
+    ttl = _sys_snapshot_cache_ttl(payload)
+    with _SYS_SNAPSHOT_CACHE_LOCK:
+        _SYS_SNAPSHOT_CACHE[key] = {
+            "payload": copy.deepcopy(payload),
+            "last_seen_at": marker,
+            "updated_at": now_ts,
+            "expire_at": now_ts + float(ttl),
+        }
+        _sys_snapshot_cache_cleanup_locked(now_ts)
+
+
+def _parse_node_ids_csv(raw: Any, limit: int = 300) -> List[int]:
+    out: List[int] = []
+    seen: set[int] = set()
+    text = str(raw or "").strip()
+    if not text:
+        return out
+    for chunk in text.replace(";", ",").replace(" ", ",").split(","):
+        part = str(chunk or "").strip()
+        if not part:
+            continue
         try:
-            data = await agent_get(node["base_url"], node["api_key"], "/api/v1/sys", node_verify_tls(node))
-            if isinstance(data, dict) and data.get("ok") is True:
-                sys_data = dict(data)  # copy
-                source = "agent"
-            else:
-                if auto_restart_data is None:
-                    auto_restart_data = node_auto_restart_policy_from_row(node if isinstance(node, dict) else {})
-                    auto_restart_data["source"] = "panel"
-                    auto_restart_data["stale"] = not is_report_fresh(node)
-                return {
-                    "ok": False,
-                    "error": (data.get("error") if isinstance(data, dict) else "响应格式异常"),
-                    "auto_restart": auto_restart_data,
-                }
-        except Exception as exc:
-            if auto_restart_data is None:
-                auto_restart_data = node_auto_restart_policy_from_row(node if isinstance(node, dict) else {})
-                auto_restart_data["source"] = "panel"
-                auto_restart_data["stale"] = not is_report_fresh(node)
-            return {"ok": False, "error": str(exc), "auto_restart": auto_restart_data}
+            nid = int(part)
+        except Exception:
+            continue
+        if nid <= 0 or nid in seen:
+            continue
+        seen.add(nid)
+        out.append(nid)
+        if len(out) >= int(limit):
+            break
+    return out
 
-    if auto_restart_data is None:
+
+async def _build_api_sys_payload(
+    node_id: int,
+    node: Dict[str, Any],
+    cached: bool,
+    report_cache: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    sys_data: Optional[Dict[str, Any]] = None
+    rep_cache: Optional[Dict[str, Any]] = report_cache if isinstance(report_cache, dict) else None
+    auto_restart_data: Optional[Dict[str, Any]] = None
+    fresh = bool(is_report_fresh(node))
+    source_order = ("report", "pull") if bool(cached) else node_info_sources_order(force_pull=False)
+    last_pull_err = ""
+
+    def _ensure_auto_restart_from_report() -> None:
+        nonlocal rep_cache, auto_restart_data
+        if isinstance(auto_restart_data, dict):
+            return
         if not isinstance(rep_cache, dict):
             rep_cache = get_last_report(node_id)
         if isinstance(rep_cache, dict) and isinstance(rep_cache.get("auto_restart"), dict):
-            auto_restart_data = dict(rep_cache["auto_restart"])  # copy
+            auto_restart_data = dict(rep_cache["auto_restart"])
             auto_restart_data["source"] = "report"
-            if source == "agent":
-                auto_restart_data["stale"] = not is_report_fresh(node)
-    if auto_restart_data is None:
+            auto_restart_data["stale"] = not fresh
+
+    def _ensure_auto_restart_fallback() -> Dict[str, Any]:
+        nonlocal auto_restart_data
+        if isinstance(auto_restart_data, dict):
+            return auto_restart_data
         auto_restart_data = node_auto_restart_policy_from_row(node if isinstance(node, dict) else {})
         auto_restart_data["source"] = "panel"
-        auto_restart_data["stale"] = not is_report_fresh(node)
+        auto_restart_data["stale"] = not fresh
+        return auto_restart_data
 
-    sys_data["source"] = source or "unknown"
-    return {"ok": True, "sys": sys_data, "auto_restart": auto_restart_data}
+    _ensure_auto_restart_from_report()
+
+    for idx, source in enumerate(source_order):
+        if source == "report":
+            if not isinstance(rep_cache, dict):
+                rep_cache = get_last_report(node_id)
+            if not (isinstance(rep_cache, dict) and isinstance(rep_cache.get("sys"), dict)):
+                continue
+            allow_stale = bool(cached) or (idx > 0)
+            if (not allow_stale) and (not fresh):
+                continue
+            sys_data = dict(rep_cache["sys"])
+            sys_data["source"] = "report"
+            sys_data["stale"] = not fresh
+            return {"ok": True, "sys": sys_data, "auto_restart": _ensure_auto_restart_fallback()}
+
+        try:
+            target_base_url, target_verify_tls, _target_route = node_agent_request_target(node)
+            data = await agent_get(target_base_url, node["api_key"], "/api/v1/sys", target_verify_tls)
+        except Exception as exc:
+            last_pull_err = str(exc)
+            continue
+        if isinstance(data, dict) and data.get("ok") is True:
+            sys_data = dict(data)
+            sys_data["source"] = "agent"
+            _touch_node_last_seen_safe(node_id, node)
+            return {"ok": True, "sys": sys_data, "auto_restart": _ensure_auto_restart_fallback()}
+        if isinstance(data, dict):
+            last_pull_err = str(data.get("error") or "响应格式异常")
+        else:
+            last_pull_err = "响应格式异常"
+
+    auto_restart_final = _ensure_auto_restart_fallback()
+    if cached:
+        err = last_pull_err or "Agent 尚未上报系统信息（请升级 Agent 或稍后重试）"
+        return {
+            "ok": True,
+            "sys": {
+                "ok": False,
+                "error": err,
+                "source": "report",
+            },
+            "auto_restart": auto_restart_final,
+        }
+    return {"ok": False, "error": (last_pull_err or "暂无可用系统信息"), "auto_restart": auto_restart_final}
+
+
+@router.get("/api/nodes/{node_id}/sys")
+async def api_sys(request: Request, node_id: int, cached: int = 0, user: str = Depends(require_login)):
+    """节点系统信息：CPU/内存/硬盘/交换/在线时长/流量/实时速率。"""
+    _ = request
+    _ = user
+    # 高频接口（仪表盘会按节点轮询），避免读取 nodes 大字段（last_report_json/desired_pool_json）。
+    node = get_node_runtime(node_id)
+    if not node:
+        return JSONResponse({"ok": False, "error": "节点不存在"}, status_code=404)
+
+    use_cached = bool(cached)
+    last_seen_marker = str((node or {}).get("last_seen_at") or "")
+    if use_cached:
+        hit = _sys_snapshot_cache_get(node_id, use_cached, last_seen_marker)
+        if isinstance(hit, dict):
+            return hit
+
+    payload = await _build_api_sys_payload(node_id, node, use_cached)
+    if use_cached and isinstance(payload, dict):
+        _sys_snapshot_cache_put(node_id, use_cached, last_seen_marker, payload)
+    return payload
+
+
+@router.get("/api/nodes/sys_batch")
+async def api_sys_batch(
+    request: Request,
+    ids: str = "",
+    cached: int = 1,
+    user: str = Depends(require_login),
+):
+    """Batch node system snapshots for dashboard tiles.
+
+    Use push-report cache by default to avoid many per-node requests.
+    """
+    _ = request
+    use_cached = bool(cached)
+    rows = filter_nodes_for_user(user, list_nodes_runtime())
+    node_map: Dict[int, Dict[str, Any]] = {}
+    for row in rows:
+        try:
+            nid = int((row or {}).get("id") or 0)
+        except Exception:
+            nid = 0
+        if nid > 0:
+            node_map[nid] = row
+
+    want_ids = _parse_node_ids_csv(ids, limit=300)
+    if not want_ids:
+        want_ids = list(node_map.keys())
+        want_ids.sort()
+        if len(want_ids) > 300:
+            want_ids = want_ids[:300]
+
+    if not want_ids:
+        return {"ok": True, "items": {}, "cached": use_cached}
+
+    out: Dict[str, Any] = {}
+    miss_ids: List[int] = []
+    report_map: Dict[int, Dict[str, Any]] = {}
+
+    if use_cached:
+        for nid in want_ids:
+            node = node_map.get(int(nid))
+            if not isinstance(node, dict):
+                continue
+            marker = str((node or {}).get("last_seen_at") or "")
+            hit = _sys_snapshot_cache_get(int(nid), use_cached, marker)
+            if isinstance(hit, dict):
+                out[str(int(nid))] = hit
+            else:
+                miss_ids.append(int(nid))
+        if miss_ids:
+            try:
+                report_map = get_last_reports(miss_ids)
+            except Exception:
+                report_map = {}
+
+    for nid in want_ids:
+        key = str(int(nid))
+        if key in out:
+            continue
+        node = node_map.get(int(nid))
+        if not isinstance(node, dict):
+            out[key] = {"ok": False, "error": "节点不存在或无权限"}
+            continue
+        marker = str((node or {}).get("last_seen_at") or "")
+        rep_cache = report_map.get(int(nid)) if use_cached else None
+        payload = await _build_api_sys_payload(int(nid), node, use_cached, report_cache=rep_cache)
+        out[key] = payload
+        if use_cached and isinstance(payload, dict):
+            _sys_snapshot_cache_put(int(nid), use_cached, marker, payload)
+
+    return {"ok": True, "items": out, "cached": use_cached}
 
 
 @router.get("/api/nodes/{node_id}/graph")
@@ -5822,17 +9018,39 @@ async def api_graph(request: Request, node_id: int, user: str = Depends(require_
     desired_ver, desired_pool = get_desired_pool(node_id)
     pool = desired_pool if isinstance(desired_pool, dict) else None
 
-    if pool is None and is_report_fresh(node):
-        rep = get_last_report(node_id)
-        if isinstance(rep, dict) and isinstance(rep.get("pool"), dict):
-            pool = rep["pool"]
+    rep_cache: Optional[Dict[str, Any]] = None
+    last_pull_err = ""
+    if pool is None:
+        fresh = bool(is_report_fresh(node))
+        for idx, source in enumerate(node_info_sources_order(force_pull=False)):
+            if source == "report":
+                if rep_cache is None:
+                    rep_cache = get_last_report(node_id)
+                if not (isinstance(rep_cache, dict) and isinstance(rep_cache.get("pool"), dict)):
+                    continue
+                allow_stale = idx > 0
+                if fresh or allow_stale:
+                    pool = rep_cache["pool"]
+                    break
+                continue
+            try:
+                target_base_url, target_verify_tls, _target_route = node_agent_request_target(node)
+                data = await agent_get(target_base_url, node["api_key"], "/api/v1/pool", target_verify_tls)
+                if isinstance(data, dict) and isinstance(data.get("pool"), dict):
+                    pool = data.get("pool")
+                    break
+                if isinstance(data, dict):
+                    last_pull_err = str(data.get("error") or "响应格式异常")
+                else:
+                    last_pull_err = "响应格式异常"
+            except Exception as exc:
+                last_pull_err = str(exc)
+
+    if pool is None and isinstance(rep_cache, dict) and isinstance(rep_cache.get("pool"), dict):
+        pool = rep_cache.get("pool")
 
     if pool is None:
-        try:
-            data = await agent_get(node["base_url"], node["api_key"], "/api/v1/pool", node_verify_tls(node))
-            pool = data.get("pool") if isinstance(data, dict) else None
-        except Exception as exc:
-            return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
+        return JSONResponse({"ok": False, "error": last_pull_err or "暂无可用规则快照"}, status_code=502)
 
     if not isinstance(pool, dict):
         pool = {}
@@ -5888,9 +9106,8 @@ async def api_reset_all_traffic(request: Request, user: str = Depends(require_lo
     async def _direct(n: Dict[str, Any]) -> Dict[str, Any]:
         nid = int(n.get("id") or 0)
         name = n.get("name") or f"Node-{nid}"
-        base_url = n.get("base_url", "")
+        base_url, verify_tls, route = node_agent_request_target(n)
         api_key = n.get("api_key", "")
-        verify_tls = node_verify_tls(n)
 
         # 1) Try direct reset (retry once)
         last_err: str = ""
@@ -5911,6 +9128,7 @@ async def api_reset_all_traffic(request: Request, user: str = Depends(require_lo
                         "name": name,
                         "ok": ok,
                         "queued": False,
+                        "route": str(route or "base_url"),
                         "detail": data if isinstance(data, dict) else {},
                     }
                 except Exception as exc:

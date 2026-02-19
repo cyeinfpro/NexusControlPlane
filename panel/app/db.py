@@ -4,6 +4,8 @@ import json
 import hashlib
 import secrets
 import string
+import threading
+from datetime import datetime, timezone
 from contextlib import contextmanager
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -72,6 +74,35 @@ def _resolve_default_db_path() -> str:
 
 
 DEFAULT_DB_PATH = _resolve_default_db_path()
+_RUNTIME_PRAGMAS_READY = False
+_RUNTIME_PRAGMAS_LOCK = threading.Lock()
+
+NODE_SYSTEM_TYPES: Tuple[str, ...] = ("auto", "linux", "macos", "windows")
+_NODE_SYSTEM_TYPE_ALIASES: Dict[str, str] = {
+    "auto": "auto",
+    "linux": "linux",
+    "unix": "linux",
+    "mac": "macos",
+    "macos": "macos",
+    "darwin": "macos",
+    "osx": "macos",
+    "windows": "windows",
+    "win": "windows",
+    "win32": "windows",
+}
+
+
+def normalize_node_system_type(raw: Any, default: str = "auto") -> str:
+    base = str(default or "auto").strip().lower() or "auto"
+    if base not in NODE_SYSTEM_TYPES:
+        base = "auto"
+    v = str(raw or "").strip().lower()
+    if not v:
+        return base
+    mapped = _NODE_SYSTEM_TYPE_ALIASES.get(v, v)
+    if mapped in NODE_SYSTEM_TYPES:
+        return mapped
+    return base
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS nodes (
@@ -87,6 +118,16 @@ CREATE TABLE IF NOT EXISTS nodes (
   role TEXT NOT NULL DEFAULT 'normal',
   capabilities_json TEXT NOT NULL DEFAULT '{}',
   website_root_base TEXT NOT NULL DEFAULT '',
+  system_type TEXT NOT NULL DEFAULT 'auto',
+  -- Private-node direct management tunnel (panel direct path over intranet sync tunnel)
+  direct_tunnel_enabled INTEGER NOT NULL DEFAULT 0,
+  direct_tunnel_sync_id TEXT NOT NULL DEFAULT '',
+  direct_tunnel_relay_node_id INTEGER NOT NULL DEFAULT 0,
+  direct_tunnel_listen_port INTEGER NOT NULL DEFAULT 0,
+  direct_tunnel_public_host TEXT NOT NULL DEFAULT '',
+  direct_tunnel_scheme TEXT NOT NULL DEFAULT '',
+  direct_tunnel_verify_tls INTEGER NOT NULL DEFAULT 0,
+  direct_tunnel_updated_at TEXT,
   -- Agent push-report state (agent -> panel)
   last_seen_at TEXT,
   last_report_json TEXT,
@@ -175,6 +216,21 @@ CREATE TABLE IF NOT EXISTS site_events (
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_site_events_site_ts ON site_events(site_id, created_at DESC);
+
+-- Operation audit logs (who did what to which node, and when)
+CREATE TABLE IF NOT EXISTS audit_logs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  actor TEXT NOT NULL DEFAULT '',
+  action TEXT NOT NULL,
+  node_id INTEGER NOT NULL DEFAULT 0,
+  node_name TEXT NOT NULL DEFAULT '',
+  source_ip TEXT NOT NULL DEFAULT '',
+  detail_json TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at ON audit_logs(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_actor_created ON audit_logs(actor, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_node_created ON audit_logs(node_id, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS site_checks (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -416,6 +472,7 @@ BUILTIN_ROLE_DEFS: Dict[str, Dict[str, Any]] = {
             "nodes.read",
             "publish.apply",
             "sync.wss",
+            "sync.mptcp",
             "sync.intranet",
             "sync.delete",
             "sync.job.read",
@@ -488,6 +545,24 @@ def ensure_db(db_path: str = DEFAULT_DB_PATH) -> None:
             conn.execute("ALTER TABLE nodes ADD COLUMN capabilities_json TEXT NOT NULL DEFAULT '{}'")
         if "website_root_base" not in columns:
             conn.execute("ALTER TABLE nodes ADD COLUMN website_root_base TEXT NOT NULL DEFAULT ''")
+        if "system_type" not in columns:
+            conn.execute("ALTER TABLE nodes ADD COLUMN system_type TEXT NOT NULL DEFAULT 'auto'")
+        if "direct_tunnel_enabled" not in columns:
+            conn.execute("ALTER TABLE nodes ADD COLUMN direct_tunnel_enabled INTEGER NOT NULL DEFAULT 0")
+        if "direct_tunnel_sync_id" not in columns:
+            conn.execute("ALTER TABLE nodes ADD COLUMN direct_tunnel_sync_id TEXT NOT NULL DEFAULT ''")
+        if "direct_tunnel_relay_node_id" not in columns:
+            conn.execute("ALTER TABLE nodes ADD COLUMN direct_tunnel_relay_node_id INTEGER NOT NULL DEFAULT 0")
+        if "direct_tunnel_listen_port" not in columns:
+            conn.execute("ALTER TABLE nodes ADD COLUMN direct_tunnel_listen_port INTEGER NOT NULL DEFAULT 0")
+        if "direct_tunnel_public_host" not in columns:
+            conn.execute("ALTER TABLE nodes ADD COLUMN direct_tunnel_public_host TEXT NOT NULL DEFAULT ''")
+        if "direct_tunnel_scheme" not in columns:
+            conn.execute("ALTER TABLE nodes ADD COLUMN direct_tunnel_scheme TEXT NOT NULL DEFAULT ''")
+        if "direct_tunnel_verify_tls" not in columns:
+            conn.execute("ALTER TABLE nodes ADD COLUMN direct_tunnel_verify_tls INTEGER NOT NULL DEFAULT 0")
+        if "direct_tunnel_updated_at" not in columns:
+            conn.execute("ALTER TABLE nodes ADD COLUMN direct_tunnel_updated_at TEXT")
         if "last_seen_at" not in columns:
             conn.execute("ALTER TABLE nodes ADD COLUMN last_seen_at TEXT")
         if "last_report_json" not in columns:
@@ -640,6 +715,39 @@ def ensure_db(db_path: str = DEFAULT_DB_PATH) -> None:
                 ")"
             )
             conn.execute("CREATE INDEX IF NOT EXISTS idx_site_checks_site_ts ON site_checks(site_id, checked_at DESC)")
+        except Exception:
+            pass
+        try:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS audit_logs ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                "actor TEXT NOT NULL DEFAULT '',"
+                "action TEXT NOT NULL,"
+                "node_id INTEGER NOT NULL DEFAULT 0,"
+                "node_name TEXT NOT NULL DEFAULT '',"
+                "source_ip TEXT NOT NULL DEFAULT '',"
+                "detail_json TEXT NOT NULL DEFAULT '{}',"
+                "created_at TEXT NOT NULL DEFAULT (datetime('now'))"
+                ")"
+            )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at ON audit_logs(created_at DESC)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_logs_actor_created ON audit_logs(actor, created_at DESC)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_logs_node_created ON audit_logs(node_id, created_at DESC)")
+
+            acols = {row[1] for row in conn.execute("PRAGMA table_info(audit_logs)").fetchall()}
+            if acols:
+                if "actor" not in acols:
+                    conn.execute("ALTER TABLE audit_logs ADD COLUMN actor TEXT NOT NULL DEFAULT ''")
+                if "action" not in acols:
+                    conn.execute("ALTER TABLE audit_logs ADD COLUMN action TEXT NOT NULL DEFAULT ''")
+                if "node_id" not in acols:
+                    conn.execute("ALTER TABLE audit_logs ADD COLUMN node_id INTEGER NOT NULL DEFAULT 0")
+                if "node_name" not in acols:
+                    conn.execute("ALTER TABLE audit_logs ADD COLUMN node_name TEXT NOT NULL DEFAULT ''")
+                if "source_ip" not in acols:
+                    conn.execute("ALTER TABLE audit_logs ADD COLUMN source_ip TEXT NOT NULL DEFAULT ''")
+                if "detail_json" not in acols:
+                    conn.execute("ALTER TABLE audit_logs ADD COLUMN detail_json TEXT NOT NULL DEFAULT '{}'")
         except Exception:
             pass
         try:
@@ -929,6 +1037,17 @@ def update_node_report(
         conn.commit()
 
 
+def touch_node_last_seen(
+    node_id: int,
+    last_seen_at: Optional[str] = None,
+    db_path: str = DEFAULT_DB_PATH,
+) -> None:
+    ts = str(last_seen_at or "").strip() or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with connect(db_path) as conn:
+        conn.execute("UPDATE nodes SET last_seen_at=? WHERE id=?", (ts, int(node_id)))
+        conn.commit()
+
+
 def get_last_report(node_id: int, db_path: str = DEFAULT_DB_PATH) -> Optional[Dict[str, Any]]:
     with connect(db_path) as conn:
         row = conn.execute("SELECT last_report_json FROM nodes WHERE id=?", (int(node_id),)).fetchone()
@@ -941,6 +1060,51 @@ def get_last_report(node_id: int, db_path: str = DEFAULT_DB_PATH) -> Optional[Di
         return json.loads(raw)
     except Exception:
         return None
+
+
+def get_last_reports(node_ids: List[int], db_path: str = DEFAULT_DB_PATH) -> Dict[int, Dict[str, Any]]:
+    """Batch-load last_report_json for multiple nodes.
+
+    This avoids opening N sqlite connections when dashboard/system panels need
+    snapshots from many nodes at once.
+    """
+    ids: List[int] = []
+    seen: set[int] = set()
+    for x in (node_ids or []):
+        try:
+            nid = int(x)
+        except Exception:
+            continue
+        if nid <= 0 or nid in seen:
+            continue
+        seen.add(nid)
+        ids.append(nid)
+    if not ids:
+        return {}
+
+    placeholders = ",".join(["?"] * len(ids))
+    sql = f"SELECT id, last_report_json FROM nodes WHERE id IN ({placeholders})"
+    with connect(db_path) as conn:
+        rows = conn.execute(sql, tuple(ids)).fetchall()
+
+    out: Dict[int, Dict[str, Any]] = {}
+    for row in rows:
+        try:
+            nid = int(row["id"] or 0)
+        except Exception:
+            nid = 0
+        if nid <= 0:
+            continue
+        raw = row["last_report_json"]
+        if not raw:
+            continue
+        try:
+            data = json.loads(raw)
+        except Exception:
+            continue
+        if isinstance(data, dict):
+            out[nid] = data
+    return out
 
 
 def set_node_auto_restart_policy(
@@ -1175,15 +1339,8 @@ def connect(db_path: str = DEFAULT_DB_PATH):
     ensure_parent_dir(db_path)
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
-    # Best-effort PRAGMAs for better concurrency / less "database is locked" in background sampling.
-    try:
-        conn.execute("PRAGMA journal_mode=WAL")
-    except Exception:
-        pass
-    try:
-        conn.execute("PRAGMA synchronous=NORMAL")
-    except Exception:
-        pass
+    # Persistent PRAGMAs only need to be applied once per process for this DB file.
+    _ensure_runtime_pragmas(conn)
     try:
         conn.execute("PRAGMA busy_timeout=5000")
     except Exception:
@@ -1196,6 +1353,25 @@ def connect(db_path: str = DEFAULT_DB_PATH):
         yield conn
     finally:
         conn.close()
+
+
+def _ensure_runtime_pragmas(conn: sqlite3.Connection) -> None:
+    global _RUNTIME_PRAGMAS_READY
+    if _RUNTIME_PRAGMAS_READY:
+        return
+    with _RUNTIME_PRAGMAS_LOCK:
+        if _RUNTIME_PRAGMAS_READY:
+            return
+        # Best-effort: if unsupported/readonly, skip and avoid repeated overhead on every query.
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+        except Exception:
+            pass
+        try:
+            conn.execute("PRAGMA synchronous=NORMAL")
+        except Exception:
+            pass
+        _RUNTIME_PRAGMAS_READY = True
 
 
 def _json_loads(raw: str, default: Any) -> Any:
@@ -1279,8 +1455,37 @@ def node_auto_restart_policy_from_row(row: Dict[str, Any]) -> Dict[str, Any]:
     return _node_auto_restart_policy_from_row_dict(d)
 
 
+def _node_direct_tunnel_from_row_dict(d: Dict[str, Any]) -> Dict[str, Any]:
+    def _to_int(v: Any, default: int = 0) -> int:
+        try:
+            return int(v)
+        except Exception:
+            try:
+                return int(float(str(v).strip()))
+            except Exception:
+                return int(default)
+
+    listen_port = _to_int(d.get("direct_tunnel_listen_port"), 0)
+    if listen_port < 1 or listen_port > 65535:
+        listen_port = 0
+    scheme = str(d.get("direct_tunnel_scheme") or "").strip().lower()
+    if scheme not in ("http", "https"):
+        scheme = ""
+    return {
+        "enabled": bool(_to_int(d.get("direct_tunnel_enabled"), 0)),
+        "sync_id": str(d.get("direct_tunnel_sync_id") or "").strip(),
+        "relay_node_id": max(0, _to_int(d.get("direct_tunnel_relay_node_id"), 0)),
+        "listen_port": int(listen_port),
+        "public_host": str(d.get("direct_tunnel_public_host") or "").strip(),
+        "scheme": scheme,
+        "verify_tls": bool(_to_int(d.get("direct_tunnel_verify_tls"), 0)),
+        "updated_at": str(d.get("direct_tunnel_updated_at") or ""),
+    }
+
+
 def _parse_node_row(row: sqlite3.Row) -> Dict[str, Any]:
     d = dict(row)
+    d["system_type"] = normalize_node_system_type(d.get("system_type"), default="auto")
     caps = _json_loads(str(d.get("capabilities_json") or "{}"), {})
     if not isinstance(caps, dict):
         caps = {}
@@ -1290,6 +1495,7 @@ def _parse_node_row(row: sqlite3.Row) -> Dict[str, Any]:
         agent_caps = {}
     d["agent_capabilities"] = agent_caps
     d["auto_restart_policy"] = _node_auto_restart_policy_from_row_dict(d)
+    d["direct_tunnel"] = _node_direct_tunnel_from_row_dict(d)
     return d
 
 
@@ -1300,7 +1506,10 @@ def list_nodes(db_path: str = DEFAULT_DB_PATH) -> List[Dict[str, Any]]:
     sql = (
         "SELECT "
         "id, name, base_url, api_key, verify_tls, is_private, group_name, role, "
-        "capabilities_json, website_root_base, "
+        "capabilities_json, website_root_base, system_type, "
+        "direct_tunnel_enabled, direct_tunnel_sync_id, direct_tunnel_relay_node_id, "
+        "direct_tunnel_listen_port, direct_tunnel_public_host, direct_tunnel_scheme, "
+        "direct_tunnel_verify_tls, direct_tunnel_updated_at, "
         "last_seen_at, desired_pool_version, agent_ack_version, "
         "desired_traffic_reset_version, agent_traffic_reset_ack_version, "
         "traffic_reset_at, traffic_reset_msg, "
@@ -1319,6 +1528,26 @@ def list_nodes(db_path: str = DEFAULT_DB_PATH) -> List[Dict[str, Any]]:
     with connect(db_path) as conn:
         rows = conn.execute(sql).fetchall()
     return [_parse_node_row(r) for r in rows]
+
+
+def list_nodes_runtime(db_path: str = DEFAULT_DB_PATH) -> List[Dict[str, Any]]:
+    """Return minimal node fields for background workers."""
+    sql = (
+        "SELECT "
+        "id, name, base_url, api_key, verify_tls, is_private, "
+        "website_root_base, last_seen_at "
+        "FROM nodes ORDER BY id DESC"
+    )
+    with connect(db_path) as conn:
+        rows = conn.execute(sql).fetchall()
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        d = dict(r)
+        d["verify_tls"] = bool(d.get("verify_tls") or 0)
+        d["is_private"] = bool(d.get("is_private") or 0)
+        d["website_root_base"] = str(d.get("website_root_base") or "")
+        out.append(d)
+    return out
 
 
 def get_group_orders(db_path: str = DEFAULT_DB_PATH) -> Dict[str, int]:
@@ -1412,7 +1641,10 @@ def get_node_runtime(node_id: int, db_path: str = DEFAULT_DB_PATH) -> Optional[D
     sql = (
         "SELECT "
         "id, name, base_url, api_key, verify_tls, is_private, group_name, role, "
-        "capabilities_json, website_root_base, "
+        "capabilities_json, website_root_base, system_type, "
+        "direct_tunnel_enabled, direct_tunnel_sync_id, direct_tunnel_relay_node_id, "
+        "direct_tunnel_listen_port, direct_tunnel_public_host, direct_tunnel_scheme, "
+        "direct_tunnel_verify_tls, direct_tunnel_updated_at, "
         "last_seen_at, desired_pool_version, agent_ack_version, "
         "desired_traffic_reset_version, agent_traffic_reset_ack_version, "
         "traffic_reset_at, traffic_reset_msg, "
@@ -1464,6 +1696,7 @@ def update_node_basic(
     capabilities: Optional[Dict[str, Any]] = None,
     website_root_base: Optional[str] = None,
     db_path: str = DEFAULT_DB_PATH,
+    system_type: Optional[str] = None,
 ) -> None:
     """Update basic node fields without touching reports/pools."""
     fields = [
@@ -1502,11 +1735,73 @@ def update_node_basic(
         fields.append("website_root_base=?")
         params.append((website_root_base or "").strip())
 
+    if system_type is not None:
+        fields.append("system_type=?")
+        params.append(normalize_node_system_type(system_type, default="auto"))
+
     with connect(db_path) as conn:
         sql = f"UPDATE nodes SET {', '.join(fields)} WHERE id=?"
         params.append(int(node_id))
         conn.execute(sql, params)
         conn.commit()
+
+
+def set_node_direct_tunnel(
+    node_id: int,
+    *,
+    enabled: bool,
+    sync_id: str = "",
+    relay_node_id: int = 0,
+    listen_port: int = 0,
+    public_host: str = "",
+    scheme: str = "",
+    verify_tls: bool = False,
+    updated_at: Optional[str] = None,
+    db_path: str = DEFAULT_DB_PATH,
+) -> None:
+    listen = int(listen_port or 0)
+    if listen < 1 or listen > 65535:
+        listen = 0
+    sch = str(scheme or "").strip().lower()
+    if sch not in ("http", "https"):
+        sch = ""
+    ts = str(updated_at or "").strip() or datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    with connect(db_path) as conn:
+        conn.execute(
+            (
+                "UPDATE nodes SET "
+                "direct_tunnel_enabled=?, direct_tunnel_sync_id=?, direct_tunnel_relay_node_id=?, "
+                "direct_tunnel_listen_port=?, direct_tunnel_public_host=?, direct_tunnel_scheme=?, "
+                "direct_tunnel_verify_tls=?, direct_tunnel_updated_at=? "
+                "WHERE id=?"
+            ),
+            (
+                1 if enabled else 0,
+                str(sync_id or "").strip(),
+                max(0, int(relay_node_id or 0)),
+                int(listen),
+                str(public_host or "").strip(),
+                sch,
+                1 if verify_tls else 0,
+                ts,
+                int(node_id),
+            ),
+        )
+        conn.commit()
+
+
+def clear_node_direct_tunnel(node_id: int, db_path: str = DEFAULT_DB_PATH) -> None:
+    set_node_direct_tunnel(
+        int(node_id),
+        enabled=False,
+        sync_id="",
+        relay_node_id=0,
+        listen_port=0,
+        public_host="",
+        scheme="",
+        verify_tls=False,
+        db_path=db_path,
+    )
 
 
 def add_node(
@@ -1521,6 +1816,7 @@ def add_node(
     website_root_base: str = '',
     preferred_id: Optional[int] = None,
     db_path: str = DEFAULT_DB_PATH,
+    system_type: str = 'auto',
 ) -> int:
     role_val = (role or "").strip().lower() or "normal"
     if role_val not in ("normal", "website"):
@@ -1534,11 +1830,12 @@ def add_node(
         pref_id = int(preferred_id or 0)
     except Exception:
         pref_id = 0
+    system_type_val = normalize_node_system_type(system_type, default="auto")
     with connect(db_path) as conn:
         if pref_id > 0:
             cur = conn.execute(
-                "INSERT INTO nodes(id, name, base_url, api_key, verify_tls, is_private, group_name, role, capabilities_json, website_root_base) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO nodes(id, name, base_url, api_key, verify_tls, is_private, group_name, role, capabilities_json, website_root_base, system_type) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     int(pref_id),
                     name.strip(),
@@ -1550,11 +1847,12 @@ def add_node(
                     role_val,
                     caps_json,
                     (website_root_base or "").strip(),
+                    system_type_val,
                 ),
             )
         else:
             cur = conn.execute(
-                "INSERT INTO nodes(name, base_url, api_key, verify_tls, is_private, group_name, role, capabilities_json, website_root_base) VALUES(?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO nodes(name, base_url, api_key, verify_tls, is_private, group_name, role, capabilities_json, website_root_base, system_type) VALUES(?,?,?,?,?,?,?,?,?,?)",
                 (
                     name.strip(),
                     base_url.strip().rstrip('/'),
@@ -1565,6 +1863,7 @@ def add_node(
                     role_val,
                     caps_json,
                     (website_root_base or "").strip(),
+                    system_type_val,
                 ),
             )
         conn.commit()
@@ -1883,6 +2182,7 @@ def insert_netmon_samples(
 def list_netmon_samples(
     monitor_ids: List[int],
     since_ts_ms: int,
+    limit: int = 0,
     db_path: str = DEFAULT_DB_PATH,
 ) -> List[Dict[str, Any]]:
     mids = []
@@ -1899,12 +2199,25 @@ def list_netmon_samples(
         since = int(since_ts_ms)
     except Exception:
         since = 0
+    try:
+        lim = int(limit or 0)
+    except Exception:
+        lim = 0
+    if lim < 0:
+        lim = 0
 
     # Build dynamic IN clause safely
     placeholders = ",".join(["?"] * len(mids))
-    sql = f"SELECT monitor_id, node_id, ts_ms, ok, latency_ms, error FROM netmon_samples WHERE monitor_id IN ({placeholders}) AND ts_ms>=? ORDER BY ts_ms ASC"
+    sql = (
+        f"SELECT monitor_id, node_id, ts_ms, ok, latency_ms, error "
+        f"FROM netmon_samples WHERE monitor_id IN ({placeholders}) AND ts_ms>=? ORDER BY ts_ms ASC"
+    )
+    params: List[Any] = list(mids) + [since]
+    if lim > 0:
+        sql += " LIMIT ?"
+        params.append(lim)
     with connect(db_path) as conn:
-        rows = conn.execute(sql, tuple(mids + [since])).fetchall()
+        rows = conn.execute(sql, tuple(params)).fetchall()
     return [dict(r) for r in rows]
 
 
@@ -2041,10 +2354,24 @@ def prune_netmon_samples(before_ts_ms: int, db_path: str = DEFAULT_DB_PATH) -> i
         cutoff = 0
     if cutoff <= 0:
         return 0
+    batch_size = 5000
+    max_batches = 20
+    total = 0
     with connect(db_path) as conn:
-        cur = conn.execute("DELETE FROM netmon_samples WHERE ts_ms < ?", (cutoff,))
-        conn.commit()
-        return int(cur.rowcount or 0)
+        for _ in range(max_batches):
+            cur = conn.execute(
+                "DELETE FROM netmon_samples "
+                "WHERE rowid IN (SELECT rowid FROM netmon_samples WHERE ts_ms < ? LIMIT ?)",
+                (cutoff, batch_size),
+            )
+            deleted = int(cur.rowcount or 0)
+            if deleted <= 0:
+                break
+            total += deleted
+            conn.commit()
+            if deleted < batch_size:
+                break
+    return int(total)
 
 
 # ---------------- Rule stats history (persistent time-series) ----------------
@@ -2197,10 +2524,24 @@ def prune_rule_stats_samples(before_ts_ms: int, db_path: str = DEFAULT_DB_PATH) 
         cutoff = 0
     if cutoff <= 0:
         return 0
+    batch_size = 5000
+    max_batches = 20
+    total = 0
     with connect(db_path) as conn:
-        cur = conn.execute("DELETE FROM rule_stats_samples WHERE ts_ms < ?", (cutoff,))
-        conn.commit()
-        return int(cur.rowcount or 0)
+        for _ in range(max_batches):
+            cur = conn.execute(
+                "DELETE FROM rule_stats_samples "
+                "WHERE rowid IN (SELECT rowid FROM rule_stats_samples WHERE ts_ms < ? LIMIT ?)",
+                (cutoff, batch_size),
+            )
+            deleted = int(cur.rowcount or 0)
+            if deleted <= 0:
+                break
+            total += deleted
+            conn.commit()
+            if deleted < batch_size:
+                break
+    return int(total)
 
 
 # =========================
@@ -2236,6 +2577,31 @@ def list_sites(node_id: Optional[int] = None, db_path: str = DEFAULT_DB_PATH) ->
         d["health_code"] = int(d.get("health_code") or 0)
         d["health_latency_ms"] = int(d.get("health_latency_ms") or 0)
         d["health_error"] = str(d.get("health_error") or "").strip()
+        out.append(d)
+    return out
+
+
+def list_sites_runtime(node_id: Optional[int] = None, db_path: str = DEFAULT_DB_PATH) -> List[Dict[str, Any]]:
+    """Return minimal site fields for background workers."""
+    sql = (
+        "SELECT id, node_id, domains_json, type, root_path, proxy_target, health_status "
+        "FROM sites"
+    )
+    params: Tuple[Any, ...] = ()
+    if node_id is not None:
+        sql += " WHERE node_id=?"
+        params = (int(node_id),)
+    sql += " ORDER BY id DESC"
+    with connect(db_path) as conn:
+        rows = conn.execute(sql, params).fetchall()
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        d = dict(r)
+        domains = _json_loads(str(d.get("domains_json") or "[]"), [])
+        if not isinstance(domains, list):
+            domains = []
+        d["domains"] = domains
+        d["health_status"] = str(d.get("health_status") or "").strip()
         out.append(d)
     return out
 
@@ -2428,6 +2794,129 @@ def list_site_events(site_id: int, limit: int = 100, db_path: str = DEFAULT_DB_P
         d["result"] = _json_loads(str(d.get("result_json") or "{}"), {})
         out.append(d)
     return out
+
+
+def add_audit_log(
+    action: str,
+    actor: str = "",
+    node_id: Optional[int] = None,
+    node_name: str = "",
+    detail: Optional[Dict[str, Any]] = None,
+    source_ip: str = "",
+    db_path: str = DEFAULT_DB_PATH,
+) -> int:
+    act = str(action or "").strip() or "unknown"
+    usr = str(actor or "").strip()
+    nid = 0
+    if node_id is not None:
+        try:
+            nid = int(node_id)
+        except Exception:
+            nid = 0
+    if nid < 0:
+        nid = 0
+    nname = str(node_name or "").strip()
+    ip = str(source_ip or "").strip()
+    if len(ip) > 255:
+        ip = ip[:255]
+    try:
+        payload = detail if isinstance(detail, dict) else {}
+    except Exception:
+        payload = {}
+
+    with connect(db_path) as conn:
+        cur = conn.execute(
+            "INSERT INTO audit_logs(actor, action, node_id, node_name, source_ip, detail_json, created_at) "
+            "VALUES(?,?,?,?,?,?,datetime('now'))",
+            (
+                usr,
+                act,
+                int(nid),
+                nname,
+                ip,
+                _json_dumps(payload, default="{}"),
+            ),
+        )
+        conn.commit()
+        return int(cur.lastrowid or 0)
+
+
+def list_audit_logs(
+    limit: int = 200,
+    offset: int = 0,
+    actor: str = "",
+    action: str = "",
+    query: str = "",
+    node_id: Optional[int] = None,
+    start_at: str = "",
+    end_at: str = "",
+    db_path: str = DEFAULT_DB_PATH,
+) -> Tuple[int, List[Dict[str, Any]]]:
+    n = int(limit or 200)
+    if n < 1:
+        n = 1
+    if n > 1000:
+        n = 1000
+    off = int(offset or 0)
+    if off < 0:
+        off = 0
+    if off > 1000000:
+        off = 1000000
+
+    actor_key = str(actor or "").strip()
+    action_key = str(action or "").strip()
+    query_key = str(query or "").strip()
+    start_key = str(start_at or "").strip()
+    end_key = str(end_at or "").strip()
+
+    clauses: List[str] = []
+    params: List[Any] = []
+    if actor_key:
+        clauses.append("actor LIKE ?")
+        params.append(f"%{actor_key}%")
+    if action_key:
+        clauses.append("action=?")
+        params.append(action_key)
+    if node_id is not None:
+        try:
+            nid = int(node_id)
+        except Exception:
+            nid = 0
+        if nid > 0:
+            clauses.append("node_id=?")
+            params.append(nid)
+    if query_key:
+        clauses.append("(detail_json LIKE ? OR node_name LIKE ? OR source_ip LIKE ?)")
+        key = f"%{query_key}%"
+        params.extend([key, key, key])
+    if start_key:
+        clauses.append("created_at >= ?")
+        params.append(start_key)
+    if end_key:
+        clauses.append("created_at <= ?")
+        params.append(end_key)
+
+    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+    with connect(db_path) as conn:
+        total_row = conn.execute(
+            f"SELECT COUNT(1) AS c FROM audit_logs{where}",
+            tuple(params),
+        ).fetchone()
+        rows = conn.execute(
+            f"SELECT * FROM audit_logs{where} ORDER BY id DESC LIMIT ? OFFSET ?",
+            tuple(params + [int(n), int(off)]),
+        ).fetchall()
+
+    total = int(total_row["c"] if total_row and ("c" in total_row.keys()) else 0)
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        d = dict(r)
+        detail_obj = _json_loads(str(d.get("detail_json") or "{}"), {})
+        if not isinstance(detail_obj, dict):
+            detail_obj = {"value": detail_obj}
+        d["detail"] = detail_obj
+        out.append(d)
+    return total, out
 
 
 def add_site_check(
@@ -2739,10 +3228,28 @@ def prune_site_checks(days: int = 7, db_path: str = DEFAULT_DB_PATH) -> int:
     if d > 365:
         d = 365
     cutoff = f"-{d} days"
+    batch_size = 5000
+    max_batches = 20
+    total = 0
     with connect(db_path) as conn:
-        cur = conn.execute("DELETE FROM site_checks WHERE checked_at < datetime('now', ?)", (cutoff,))
-        conn.commit()
-        return int(cur.rowcount or 0)
+        for _ in range(max_batches):
+            cur = conn.execute(
+                "DELETE FROM site_checks "
+                "WHERE rowid IN ("
+                "  SELECT rowid FROM site_checks "
+                "  WHERE checked_at < datetime('now', ?) "
+                "  LIMIT ?"
+                ")",
+                (cutoff, batch_size),
+            )
+            deleted = int(cur.rowcount or 0)
+            if deleted <= 0:
+                break
+            total += deleted
+            conn.commit()
+            if deleted < batch_size:
+                break
+    return int(total)
 
 
 def delete_site(site_id: int, db_path: str = DEFAULT_DB_PATH) -> None:

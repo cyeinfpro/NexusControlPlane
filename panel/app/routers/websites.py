@@ -12,8 +12,9 @@ import threading
 import time
 import uuid
 import zipfile
+from collections import deque
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
-from urllib.parse import parse_qs, quote, urlencode, urlparse
+from urllib.parse import parse_qs, quote, urlencode, urlparse, urlsplit
 
 from fastapi import APIRouter, Depends, File, Form, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
@@ -29,16 +30,15 @@ from ..db import (
     add_site_check,
     add_site_event,
     add_task,
+    connect,
     create_site_file_share_short_link,
     delete_site_file_favorite,
     delete_site_file_share_short_links,
     delete_certificates_by_node,
     delete_certificates_by_site,
     delete_site,
-    delete_site_checks,
-    delete_site_events,
-    delete_sites_by_node,
     get_node,
+    get_panel_setting,
     get_site,
     list_certificates,
     list_site_checks,
@@ -60,6 +60,7 @@ from ..db import (
 )
 from ..services.apply import node_verify_tls
 from ..services.assets import panel_public_base_url
+from ..utils.normalize import format_host_for_url
 try:
     from ..services.panel_config import setting_bool, setting_float, setting_int
 except Exception:
@@ -121,7 +122,25 @@ except Exception:
         return float(v)
 
 router = APIRouter()
-UPLOAD_CHUNK_SIZE = 1024 * 512
+
+
+def _parse_upload_chunk_size() -> int:
+    raw = (os.getenv("REALM_WEBSITE_UPLOAD_CHUNK_SIZE") or "").strip()
+    default = 1024 * 1024 * 2
+    lo = 256 * 1024
+    hi = 1024 * 1024 * 8
+    try:
+        v = int(float(raw if raw else default))
+    except Exception:
+        v = int(default)
+    if v < lo:
+        v = lo
+    if v > hi:
+        v = hi
+    return int(v)
+
+
+UPLOAD_CHUNK_SIZE = _parse_upload_chunk_size()
 
 
 def _parse_upload_max_bytes() -> int:
@@ -144,6 +163,26 @@ def _parse_upload_max_bytes() -> int:
 
 
 UPLOAD_MAX_BYTES = _parse_upload_max_bytes()
+
+
+def _parse_upload_chunk_sha256_max_file_size() -> int:
+    raw_b = (os.getenv("REALM_WEBSITE_UPLOAD_CHUNK_SHA256_MAX_FILE_SIZE") or "").strip()
+    raw_mb = (os.getenv("REALM_WEBSITE_UPLOAD_CHUNK_SHA256_MAX_FILE_MB") or "").strip()
+    default = 256 * 1024 * 1024
+    try:
+        if raw_b:
+            return max(0, int(float(raw_b)))
+    except Exception:
+        pass
+    try:
+        if raw_mb:
+            return max(0, int(float(raw_mb)) * 1024 * 1024)
+    except Exception:
+        pass
+    return int(default)
+
+
+UPLOAD_CHUNK_SHA256_MAX_FILE_SIZE = _parse_upload_chunk_sha256_max_file_size()
 
 
 def _parse_upload_compat_concurrency() -> int:
@@ -180,6 +219,73 @@ def _parse_float_env(name: str, default: float) -> float:
         return float(default)
 
 
+DOWNLOAD_STREAM_CHUNK_SIZE = max(
+    128 * 1024,
+    min(2 * 1024 * 1024, _parse_int_env("REALM_WEBSITE_DOWNLOAD_STREAM_CHUNK_SIZE", 512 * 1024)),
+)
+DOWNLOAD_STREAM_RETRY_MAX = max(0, min(20, _parse_int_env("REALM_WEBSITE_DOWNLOAD_RETRY_MAX", 4)))
+DOWNLOAD_STREAM_RETRY_BASE_SEC = max(0.1, min(10.0, _parse_float_env("REALM_WEBSITE_DOWNLOAD_RETRY_BASE_SEC", 0.8)))
+DOWNLOAD_STREAM_RETRY_MAX_SEC = max(
+    DOWNLOAD_STREAM_RETRY_BASE_SEC,
+    min(30.0, _parse_float_env("REALM_WEBSITE_DOWNLOAD_RETRY_MAX_SEC", 6.0)),
+)
+DOWNLOAD_STREAM_QUEUE_MAX_CHUNKS = max(
+    4,
+    min(256, _parse_int_env("REALM_WEBSITE_DOWNLOAD_STREAM_QUEUE_MAX_CHUNKS", 24)),
+)
+DOWNLOAD_ZIP_COMPRESSLEVEL = max(0, min(9, _parse_int_env("REALM_WEBSITE_DOWNLOAD_ZIP_COMPRESSLEVEL", 4)))
+_CONTENT_RANGE_RE = re.compile(r"^\s*bytes\s+(\d+)-(\d+)/(\d+|\*)\s*$", re.IGNORECASE)
+_DOWNLOAD_STABLE_CACHE_TTL_SEC = max(300, _parse_int_env("REALM_WEBSITE_DOWNLOAD_CACHE_TTL_SEC", 6 * 3600))
+_DOWNLOAD_STABLE_CACHE_MAX_ITEMS = max(20, _parse_int_env("REALM_WEBSITE_DOWNLOAD_CACHE_MAX_ITEMS", 200))
+_DOWNLOAD_STABLE_CACHE_CLEANUP_INTERVAL_SEC = max(
+    5,
+    min(600, _parse_int_env("REALM_WEBSITE_DOWNLOAD_CACHE_CLEANUP_INTERVAL_SEC", 30)),
+)
+_DOWNLOAD_STABLE_CACHE_ORPHAN_KEEP_SEC = max(
+    30,
+    min(6 * 3600, _parse_int_env("REALM_WEBSITE_DOWNLOAD_CACHE_ORPHAN_KEEP_SEC", 180)),
+)
+_DOWNLOAD_STABLE_CACHE: Dict[str, Dict[str, Any]] = {}
+_DOWNLOAD_STABLE_CACHE_ORPHANS: Dict[str, float] = {}
+_DOWNLOAD_STABLE_CACHE_NEXT_CLEANUP_AT = 0.0
+_DOWNLOAD_STABLE_CACHE_LOCK = threading.Lock()
+_ZIP_STORE_EXTS = {
+    ".7z",
+    ".apk",
+    ".avi",
+    ".bz2",
+    ".cab",
+    ".deb",
+    ".dmg",
+    ".flac",
+    ".gif",
+    ".gz",
+    ".iso",
+    ".jar",
+    ".jpeg",
+    ".jpg",
+    ".m4a",
+    ".m4v",
+    ".mkv",
+    ".mov",
+    ".mp3",
+    ".mp4",
+    ".ogg",
+    ".pdf",
+    ".png",
+    ".rar",
+    ".tbz",
+    ".tbz2",
+    ".tgz",
+    ".txz",
+    ".wav",
+    ".webm",
+    ".webp",
+    ".xz",
+    ".zip",
+}
+
+
 FILE_SHARE_MIN_TTL_SEC = max(300, _parse_int_env("REALM_WEBSITE_FILE_SHARE_MIN_TTL_SEC", 300))
 FILE_SHARE_MAX_TTL_SEC = max(FILE_SHARE_MIN_TTL_SEC, _parse_int_env("REALM_WEBSITE_FILE_SHARE_MAX_TTL_SEC", 30 * 86400))
 FILE_SHARE_DEFAULT_TTL_SEC = _parse_int_env("REALM_WEBSITE_FILE_SHARE_DEFAULT_TTL_SEC", 86400)
@@ -190,6 +296,10 @@ if FILE_SHARE_DEFAULT_TTL_SEC > FILE_SHARE_MAX_TTL_SEC:
 FILE_SHARE_MAX_ITEMS = max(1, _parse_int_env("REALM_WEBSITE_FILE_SHARE_MAX_ITEMS", 200))
 _SHORT_SHARE_CODE_RE = re.compile(r"^[A-Za-z0-9]{6,24}$")
 _SHARE_ZIP_JOB_TTL_SEC = max(300, _parse_int_env("REALM_WEBSITE_SHARE_ZIP_JOB_TTL_SEC", 3600))
+_SHARE_ZIP_ACTIVE_MAX_SEC = max(
+    float(_SHARE_ZIP_JOB_TTL_SEC),
+    float(_parse_int_env("REALM_WEBSITE_SHARE_ZIP_ACTIVE_MAX_SEC", 6 * 3600)),
+)
 _SHARE_ZIP_MAX_JOBS = max(20, _parse_int_env("REALM_WEBSITE_SHARE_ZIP_MAX_JOBS", 200))
 _SHARE_ZIP_JOBS: Dict[str, Dict[str, Any]] = {}
 _SHARE_ZIP_JOBS_LOCK = threading.Lock()
@@ -198,10 +308,17 @@ _SITE_OP_MAX_ATTEMPTS = max(1, min(30, _parse_int_env("REALM_WEBSITE_OP_MAX_ATTE
 _SITE_OP_RETRY_BASE_SEC = max(1.0, min(120.0, _parse_float_env("REALM_WEBSITE_OP_RETRY_BASE_SEC", 3.0)))
 _SITE_OP_RETRY_MAX_SEC = max(_SITE_OP_RETRY_BASE_SEC, min(600.0, _parse_float_env("REALM_WEBSITE_OP_RETRY_MAX_SEC", 60.0)))
 _SITE_OP_MAX_CONCURRENT = max(1, min(8, _parse_int_env("REALM_WEBSITE_OP_MAX_CONCURRENT", 2)))
+_SITE_FILE_PUSH_MAX_BYTES = max(
+    64 * 1024,
+    min(256 * 1024 * 1024, _parse_int_env("REALM_WEBSITE_FILE_PUSH_MAX_BYTES", 64 * 1024 * 1024)),
+)
 _SITE_OP_SEM: Optional[asyncio.Semaphore] = None
 _SITE_OP_SEM_LOCK = threading.Lock()
 _SITE_BG_TASKS: set[asyncio.Task[Any]] = set()
 _SITE_BG_TASKS_LOCK = threading.Lock()
+_REMOTE_STORAGE_PROFILE_SETTING_KEY = "remote_storage_profiles"
+_REMOTE_STORAGE_SITE_DOMAIN_PREFIX = "__remote_storage__:"
+_REMOTE_PROFILE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
 def _ssl_direct_strategy() -> Dict[str, Any]:
@@ -274,6 +391,95 @@ def _to_flag(value: Any) -> bool:
     return s in ("1", "true", "yes", "on", "y")
 
 
+def _normalize_remote_profile_id(raw: Any) -> str:
+    s = str(raw or "").strip()
+    if not s:
+        return ""
+    if not _REMOTE_PROFILE_ID_RE.match(s):
+        return ""
+    return s
+
+
+def _storage_mount_meta_for_site(site: Any) -> Dict[str, Any]:
+    meta: Dict[str, Any] = {
+        "is_storage_mount": False,
+        "profile_id": "",
+        "profile_name": "",
+        "read_only": False,
+    }
+    if not isinstance(site, dict):
+        return meta
+    if str(site.get("type") or "").strip().lower() != "storage_mount":
+        return meta
+    meta["is_storage_mount"] = True
+
+    domains = site.get("domains") if isinstance(site.get("domains"), list) else []
+    profile_id = ""
+    for domain in domains:
+        text = str(domain or "").strip()
+        if not text.startswith(_REMOTE_STORAGE_SITE_DOMAIN_PREFIX):
+            continue
+        candidate = _normalize_remote_profile_id(text[len(_REMOTE_STORAGE_SITE_DOMAIN_PREFIX) :])
+        if candidate:
+            profile_id = candidate
+            break
+    if not profile_id:
+        return meta
+    meta["profile_id"] = profile_id
+
+    raw = str(get_panel_setting(_REMOTE_STORAGE_PROFILE_SETTING_KEY, "") or "").strip()
+    if not raw:
+        return meta
+    try:
+        rows = json.loads(raw)
+    except Exception:
+        return meta
+    if not isinstance(rows, list):
+        return meta
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if _normalize_remote_profile_id(row.get("id")) != profile_id:
+            continue
+        meta["profile_name"] = str(row.get("name") or "").strip()
+        meta["read_only"] = bool(row.get("read_only"))
+        break
+    return meta
+
+
+def _is_read_only_storage_mount(site: Any) -> Tuple[bool, Dict[str, Any]]:
+    meta = _storage_mount_meta_for_site(site)
+    return bool(meta.get("read_only")), meta
+
+
+def _read_only_storage_mount_message(meta: Optional[Dict[str, Any]]) -> str:
+    name = str((meta or {}).get("profile_name") or "").strip()
+    if name:
+        return f"远程存储挂载「{name}」为只读模式，不支持写入操作"
+    return "当前远程存储挂载为只读模式，不支持写入操作"
+
+
+def _deny_read_only_storage_mount_json(meta: Optional[Dict[str, Any]]) -> JSONResponse:
+    return JSONResponse(
+        {"ok": False, "error": _read_only_storage_mount_message(meta)},
+        status_code=403,
+    )
+
+
+def _deny_read_only_storage_mount_page(
+    request: Request,
+    site_id: int,
+    path: str,
+    modal_flag: bool,
+    meta: Optional[Dict[str, Any]],
+) -> RedirectResponse:
+    set_flash(request, _read_only_storage_mount_message(meta))
+    return RedirectResponse(
+        url=_append_modal_query(f"/websites/{site_id}/files?path={path}", modal_flag),
+        status_code=303,
+    )
+
+
 def _append_modal_query(url: str, enabled: bool) -> str:
     if not enabled:
         return str(url or "")
@@ -288,7 +494,23 @@ def _site_node_id(site: Any) -> int:
         return 0
 
 
+def _is_storage_mount_site(site: Any) -> bool:
+    return str((site or {}).get("type") or "").strip().lower() == "storage_mount"
+
+
 def _can_access_site(user: str, site: Any) -> bool:
+    if _is_storage_mount_site(site):
+        return False
+    nid = _site_node_id(site)
+    if nid <= 0:
+        return False
+    try:
+        return bool(can_access_node(str(user or ""), int(nid)))
+    except Exception:
+        return False
+
+
+def _can_access_site_files(user: str, site: Any) -> bool:
     nid = _site_node_id(site)
     if nid <= 0:
         return False
@@ -370,6 +592,276 @@ def _normalize_rel_path(raw: Any) -> str:
     return "/".join(segs)
 
 
+def _normalize_rel_path_soft(raw: Any) -> str:
+    try:
+        return _normalize_rel_path(raw)
+    except Exception:
+        return ""
+
+
+def _join_rel_path(a: Any, b: Any) -> str:
+    aa = _normalize_rel_path_soft(a)
+    bb_raw = os.path.basename(str(b or "").replace("\\", "/").strip())
+    bb = _normalize_rel_path_soft(bb_raw)
+    if not aa:
+        return bb
+    if not bb:
+        return aa
+    return f"{aa}/{bb}"
+
+
+def _rel_parent_path(rel: str) -> str:
+    t = _normalize_rel_path_soft(rel)
+    if not t:
+        return ""
+    return t.rsplit("/", 1)[0] if "/" in t else ""
+
+
+def _b64_estimated_size_from_len(raw_len: Any) -> int:
+    try:
+        n = int(raw_len or 0)
+    except Exception:
+        n = 0
+    if n <= 0:
+        return 0
+    # Padding is unknown without the tail; keep a safe estimate.
+    return max(0, (n * 3) // 4)
+
+
+def _site_file_action_label(action: Any) -> str:
+    a = str(action or "").strip().lower()
+    if a == "upload":
+        return "上传"
+    if a == "write":
+        return "保存"
+    if a == "mkdir":
+        return "新建"
+    if a == "delete":
+        return "删除"
+    if a == "unzip":
+        return "解压"
+    return "任务"
+
+
+def _site_file_status_label(status: Any) -> str:
+    s = str(status or "").strip().lower()
+    if s == "queued":
+        return "排队中"
+    if s == "running":
+        return "执行中"
+    if s == "success":
+        return "成功"
+    if s == "failed":
+        return "失败"
+    return "未知"
+
+
+def _site_file_status_class(status: Any) -> str:
+    s = str(status or "").strip().lower()
+    if s == "success":
+        return "ok"
+    if s == "failed":
+        return "bad"
+    if s == "running":
+        return "warn"
+    return "ghost"
+
+
+def _site_file_status_text(status: Any, action: Any) -> str:
+    s = str(status or "").strip().lower()
+    if not s:
+        return ""
+    return f"{_site_file_action_label(action)} · {_site_file_status_label(s)}"
+
+
+def _private_site_file_items_from_tasks(site: Dict[str, Any], path: str = "") -> List[Dict[str, Any]]:
+    site_id = int(site.get("id") or 0)
+    node_id = int(site.get("node_id") or 0)
+    if site_id <= 0 or node_id <= 0:
+        return []
+
+    try:
+        with connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                  id,
+                  status,
+                  created_at,
+                  updated_at,
+                  json_extract(payload_json, '$.site_id') AS site_id,
+                  lower(coalesce(json_extract(payload_json, '$.action'), '')) AS action,
+                  json_extract(payload_json, '$.request.path') AS req_path,
+                  json_extract(payload_json, '$.request.name') AS req_name,
+                  json_extract(payload_json, '$.request.filename') AS req_filename,
+                  json_extract(payload_json, '$.request.dest') AS req_dest,
+                  length(json_extract(payload_json, '$.request.content')) AS req_content_len,
+                  length(json_extract(payload_json, '$.request.content_b64')) AS req_content_b64_len
+                FROM tasks
+                WHERE node_id=?
+                  AND type='site_file_op'
+                  AND status IN ('queued', 'running', 'success', 'failed')
+                ORDER BY id ASC
+                LIMIT 6000
+                """,
+                (int(node_id),),
+            ).fetchall()
+    except Exception:
+        rows = []
+    if not rows:
+        return []
+
+    # Build a lightweight "projected" file tree from queued/running/success file-op tasks.
+    shadow: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            try:
+                row = dict(row)
+            except Exception:
+                continue
+        status = str((row or {}).get("status") or "").strip().lower()
+        if int((row or {}).get("site_id") or 0) != int(site_id):
+            continue
+        action = str((row or {}).get("action") or "").strip().lower()
+        req_path = (row or {}).get("req_path")
+        req_name = (row or {}).get("req_name")
+        req_filename = (row or {}).get("req_filename")
+        req_dest = (row or {}).get("req_dest")
+        req_content_len = (row or {}).get("req_content_len")
+        req_content_b64_len = (row or {}).get("req_content_b64_len")
+        ts = str((row or {}).get("updated_at") or (row or {}).get("created_at") or "").strip()
+        tid = int((row or {}).get("id") or 0)
+
+        if action == "mkdir":
+            rel = _join_rel_path(req_path, req_name)
+            if rel:
+                shadow[rel] = {
+                    "name": rel.rsplit("/", 1)[-1] if "/" in rel else rel,
+                    "path": rel,
+                    "is_dir": True,
+                    "size": 0,
+                    "mtime": ts,
+                    "task_status": status,
+                    "task_action": action,
+                    "task_id": tid,
+                }
+            continue
+
+        if action == "upload":
+            rel = _join_rel_path(req_path, req_filename)
+            if rel:
+                shadow[rel] = {
+                    "name": rel.rsplit("/", 1)[-1] if "/" in rel else rel,
+                    "path": rel,
+                    "is_dir": False,
+                    "size": _b64_estimated_size_from_len(req_content_b64_len),
+                    "mtime": ts,
+                    "task_status": status,
+                    "task_action": action,
+                    "task_id": tid,
+                }
+            continue
+
+        if action == "write":
+            rel = _normalize_rel_path_soft(req_path)
+            if rel:
+                shadow[rel] = {
+                    "name": rel.rsplit("/", 1)[-1] if "/" in rel else rel,
+                    "path": rel,
+                    "is_dir": False,
+                    "size": max(0, int(req_content_len or 0)),
+                    "mtime": ts,
+                    "task_status": status,
+                    "task_action": action,
+                    "task_id": tid,
+                }
+            continue
+
+        if action == "unzip":
+            rel = _normalize_rel_path_soft(req_dest)
+            if rel:
+                shadow[rel] = {
+                    "name": rel.rsplit("/", 1)[-1] if "/" in rel else rel,
+                    "path": rel,
+                    "is_dir": True,
+                    "size": 0,
+                    "mtime": ts,
+                    "task_status": status,
+                    "task_action": action,
+                    "task_id": tid,
+                }
+            continue
+
+        if action == "delete":
+            # Delete only when task succeeded; queued/running delete should not hide files early.
+            if status != "success":
+                rel_pending = _normalize_rel_path_soft(req_path)
+                if rel_pending and rel_pending in shadow:
+                    shadow[rel_pending]["task_status"] = status
+                    shadow[rel_pending]["task_action"] = action
+                    shadow[rel_pending]["task_id"] = tid
+                    shadow[rel_pending]["mtime"] = ts
+                continue
+            rel = _normalize_rel_path_soft(req_path)
+            if not rel:
+                continue
+            to_del: List[str] = []
+            prefix = rel + "/"
+            for rp in shadow.keys():
+                if rp == rel or rp.startswith(prefix):
+                    to_del.append(rp)
+            for rp in to_del:
+                shadow.pop(rp, None)
+            continue
+
+    # Ensure directory entries are visible for nested files.
+    for rel, item in list(shadow.items()):
+        if not rel:
+            continue
+        segs = [s for s in rel.split("/") if s]
+        if len(segs) <= 1:
+            continue
+        parent = ""
+        for seg in segs[:-1]:
+            parent = seg if not parent else f"{parent}/{seg}"
+            if parent in shadow:
+                continue
+            shadow[parent] = {
+                "name": seg,
+                "path": parent,
+                "is_dir": True,
+                "size": 0,
+                "mtime": str(item.get("mtime") or ""),
+                "task_status": "",
+                "task_action": "",
+                "task_id": 0,
+            }
+
+    cur = _normalize_rel_path_soft(path)
+    out: List[Dict[str, Any]] = []
+    for rel, item in shadow.items():
+        if _rel_parent_path(rel) != cur:
+            continue
+        row = dict(item)
+        row["name"] = str(row.get("name") or (rel.rsplit("/", 1)[-1] if "/" in rel else rel))
+        row["path"] = rel
+        row["is_dir"] = bool(row.get("is_dir"))
+        row["size"] = int(row.get("size") or 0)
+        row["mtime"] = str(row.get("mtime") or "")
+        row["task_status"] = str(row.get("task_status") or "").strip().lower()
+        row["task_action"] = str(row.get("task_action") or "").strip().lower()
+        try:
+            row["task_id"] = int(row.get("task_id") or 0)
+        except Exception:
+            row["task_id"] = 0
+        row["task_status_text"] = _site_file_status_text(row.get("task_status"), row.get("task_action"))
+        row["task_status_class"] = _site_file_status_class(row.get("task_status"))
+        out.append(row)
+
+    out.sort(key=lambda x: (0 if bool(x.get("is_dir")) else 1, str(x.get("name") or "").lower()))
+    return out
+
+
 def _parse_share_items(raw: Any) -> List[Dict[str, Any]]:
     rows = raw
     if isinstance(rows, dict):
@@ -429,12 +921,166 @@ def _zip_arcname(raw: Any) -> str:
     return "/".join(segs)
 
 
+def _zip_entry_compress_type(rel_path: Any) -> int:
+    text = str(rel_path or "").replace("\\", "/").strip().lower()
+    if not text:
+        return zipfile.ZIP_DEFLATED
+    leaf = text.rsplit("/", 1)[-1]
+    dot = leaf.rfind(".")
+    if dot <= 0:
+        return zipfile.ZIP_DEFLATED
+    if leaf[dot:] in _ZIP_STORE_EXTS:
+        return zipfile.ZIP_STORED
+    return zipfile.ZIP_DEFLATED
+
+
+def _zip_entry_info(arc: str, rel_path: Any) -> zipfile.ZipInfo:
+    now = time.localtime()[:6]
+    info = zipfile.ZipInfo(filename=str(arc or ""), date_time=now)
+    info.compress_type = _zip_entry_compress_type(rel_path)
+    info.external_attr = 0o100644 << 16
+    return info
+
+
 def _remove_file_quiet(path: str) -> None:
     try:
         if path and os.path.exists(path):
             os.remove(path)
     except Exception:
         pass
+
+
+def _stable_download_flag(raw: Any, default: bool = True) -> bool:
+    text = str(raw or "").strip().lower()
+    if not text:
+        return bool(default)
+    if text in ("1", "true", "yes", "on", "y"):
+        return True
+    if text in ("0", "false", "no", "off", "n"):
+        return False
+    return bool(default)
+
+
+def _stable_download_cache_key(site_id: int, node_id: int, root: str, rel_path: str, is_dir: bool) -> str:
+    mark = "dir" if is_dir else "file"
+    raw = f"{mark}|{int(site_id)}|{int(node_id)}|{str(root or '')}|{str(rel_path or '')}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _mark_stable_download_orphan_locked(path: str, now_ts: float) -> None:
+    p = str(path or "").strip()
+    if not p:
+        return
+    keep_until = float(now_ts) + float(_DOWNLOAD_STABLE_CACHE_ORPHAN_KEEP_SEC)
+    prev = float(_DOWNLOAD_STABLE_CACHE_ORPHANS.get(p) or 0)
+    if keep_until > prev:
+        _DOWNLOAD_STABLE_CACHE_ORPHANS[p] = keep_until
+
+
+def _cleanup_stable_download_cache(force: bool = False) -> None:
+    global _DOWNLOAD_STABLE_CACHE_NEXT_CLEANUP_AT
+    now_ts = time.time()
+    remove_keys: List[str] = []
+    remove_paths: List[str] = []
+
+    with _DOWNLOAD_STABLE_CACHE_LOCK:
+        if (not force) and now_ts < float(_DOWNLOAD_STABLE_CACHE_NEXT_CLEANUP_AT):
+            return
+        _DOWNLOAD_STABLE_CACHE_NEXT_CLEANUP_AT = now_ts + float(_DOWNLOAD_STABLE_CACHE_CLEANUP_INTERVAL_SEC)
+        for key, row in list(_DOWNLOAD_STABLE_CACHE.items()):
+            if not isinstance(row, dict):
+                remove_keys.append(str(key))
+                continue
+            path = str(row.get("path") or "")
+            expire_at = float(row.get("expire_at") or 0)
+            if (not path) or (not os.path.exists(path)) or (expire_at > 0 and now_ts >= expire_at):
+                remove_keys.append(str(key))
+
+        if remove_keys:
+            for key in remove_keys:
+                row = _DOWNLOAD_STABLE_CACHE.pop(key, None)
+                if isinstance(row, dict):
+                    _mark_stable_download_orphan_locked(str(row.get("path") or ""), now_ts)
+
+        overflow = len(_DOWNLOAD_STABLE_CACHE) - int(_DOWNLOAD_STABLE_CACHE_MAX_ITEMS)
+        if overflow > 0:
+            keep_rows: List[Tuple[str, Dict[str, Any]]] = []
+            for key, row in _DOWNLOAD_STABLE_CACHE.items():
+                if isinstance(row, dict):
+                    keep_rows.append((str(key), row))
+            keep_rows.sort(key=lambda kv: float((kv[1] or {}).get("updated_at") or 0))
+            for idx in range(min(overflow, len(keep_rows))):
+                key = str(keep_rows[idx][0])
+                row = _DOWNLOAD_STABLE_CACHE.pop(key, None)
+                if isinstance(row, dict):
+                    _mark_stable_download_orphan_locked(str(row.get("path") or ""), now_ts)
+
+        active_paths = set()
+        for row in _DOWNLOAD_STABLE_CACHE.values():
+            if not isinstance(row, dict):
+                continue
+            p = str(row.get("path") or "").strip()
+            if p:
+                active_paths.add(p)
+        for p, expire_at in list(_DOWNLOAD_STABLE_CACHE_ORPHANS.items()):
+            path = str(p or "").strip()
+            if not path:
+                _DOWNLOAD_STABLE_CACHE_ORPHANS.pop(p, None)
+                continue
+            if path in active_paths:
+                continue
+            if float(expire_at or 0) <= 0 or now_ts >= float(expire_at):
+                _DOWNLOAD_STABLE_CACHE_ORPHANS.pop(p, None)
+                remove_paths.append(path)
+
+    for path in remove_paths:
+        _remove_file_quiet(path)
+
+
+def _get_stable_download_cache_entry(cache_key: str) -> Optional[Dict[str, Any]]:
+    _cleanup_stable_download_cache()
+    key = str(cache_key or "").strip()
+    if not key:
+        return None
+    now_ts = time.time()
+    with _DOWNLOAD_STABLE_CACHE_LOCK:
+        row = _DOWNLOAD_STABLE_CACHE.get(key)
+        if not isinstance(row, dict):
+            return None
+        path = str(row.get("path") or "")
+        if not path or not os.path.exists(path):
+            _DOWNLOAD_STABLE_CACHE.pop(key, None)
+            return None
+        row["updated_at"] = now_ts
+        row["expire_at"] = now_ts + float(_DOWNLOAD_STABLE_CACHE_TTL_SEC)
+        _DOWNLOAD_STABLE_CACHE[key] = dict(row)
+        return dict(row)
+
+
+def _put_stable_download_cache_entry(cache_key: str, path: str, filename: str, media_type: str) -> None:
+    _cleanup_stable_download_cache()
+    key = str(cache_key or "").strip()
+    file_path = str(path or "").strip()
+    if not key or not file_path:
+        return
+
+    now_ts = time.time()
+    old_path = ""
+    with _DOWNLOAD_STABLE_CACHE_LOCK:
+        old = _DOWNLOAD_STABLE_CACHE.get(key)
+        if isinstance(old, dict):
+            old_path = str(old.get("path") or "")
+        _DOWNLOAD_STABLE_CACHE[key] = {
+            "path": file_path,
+            "filename": str(filename or ""),
+            "media_type": str(media_type or ""),
+            "updated_at": now_ts,
+            "expire_at": now_ts + float(_DOWNLOAD_STABLE_CACHE_TTL_SEC),
+        }
+        if old_path and old_path != file_path:
+            _mark_stable_download_orphan_locked(old_path, now_ts)
+
+    _cleanup_stable_download_cache()
 
 
 def _share_items_signature(share_items: List[Dict[str, Any]]) -> str:
@@ -459,7 +1105,19 @@ def _cleanup_share_zip_jobs() -> None:
     with _SHARE_ZIP_JOBS_LOCK:
         for jid, job in list(_SHARE_ZIP_JOBS.items()):
             expire_at = float(job.get("expire_at") or 0)
-            if expire_at > 0 and now_ts >= expire_at:
+            if expire_at <= 0:
+                continue
+            status = str((job or {}).get("status") or "").strip().lower()
+            # Keep active jobs alive while they are still being produced.
+            if status in ("queued", "running"):
+                created_at = float((job or {}).get("created_at") or 0)
+                if created_at > 0 and (now_ts - created_at) > float(_SHARE_ZIP_ACTIVE_MAX_SEC):
+                    to_remove.append(jid)
+                    continue
+                if now_ts >= expire_at:
+                    job["expire_at"] = now_ts + float(_SHARE_ZIP_JOB_TTL_SEC)
+                continue
+            if now_ts >= expire_at:
                 to_remove.append(jid)
 
         if len(_SHARE_ZIP_JOBS) - len(to_remove) > _SHARE_ZIP_MAX_JOBS:
@@ -654,12 +1312,21 @@ async def _iter_share_zip_stream(
     root: str,
     share_items: List[Dict[str, Any]],
 ):
-    queue: "asyncio.Queue[Optional[bytes]]" = asyncio.Queue()
-    state: Dict[str, Any] = {"error": None, "started": False}
+    queue: "asyncio.Queue[Optional[bytes]]" = asyncio.Queue(maxsize=int(DOWNLOAD_STREAM_QUEUE_MAX_CHUNKS))
+    state: Dict[str, Any] = {"error": None}
 
     class _QueueWriter:
         def __init__(self, out_queue: "asyncio.Queue[Optional[bytes]]") -> None:
             self._queue = out_queue
+            self._buf = bytearray()
+            self._flush_bytes = int(DOWNLOAD_STREAM_CHUNK_SIZE)
+            self._pending: "deque[bytes]" = deque()
+
+        def _emit(self) -> None:
+            if not self._buf:
+                return
+            self._pending.append(bytes(self._buf))
+            self._buf.clear()
 
         def write(self, data: Any) -> int:
             if not data:
@@ -667,14 +1334,27 @@ async def _iter_share_zip_stream(
             chunk = bytes(data)
             if not chunk:
                 return 0
-            self._queue.put_nowait(chunk)
+            self._buf.extend(chunk)
+            if len(self._buf) >= self._flush_bytes:
+                self._emit()
             return len(chunk)
 
         def flush(self) -> None:
+            self._emit()
             return None
+
+        async def drain(self, force: bool = False) -> None:
+            if force:
+                self._emit()
+            while self._pending:
+                await self._queue.put(self._pending.popleft())
 
     async def _producer() -> None:
         errors: List[str] = []
+        writer = _QueueWriter(queue)
+
+        async def _drain_writer(force: bool = False) -> None:
+            await writer.drain(force=force)
 
         async def _add_entry(zf: zipfile.ZipFile, rel_path: str, arc_path: str, is_dir: bool) -> None:
             arc = _zip_arcname(arc_path)
@@ -688,6 +1368,7 @@ async def _iter_share_zip_stream(
                     return
                 if not rows:
                     zf.writestr(f"{arc.rstrip('/')}/", b"")
+                    await _drain_writer()
                     return
                 for row in rows:
                     child_arc = _zip_arcname(f"{arc}/{row.get('name') or ''}")
@@ -699,10 +1380,12 @@ async def _iter_share_zip_stream(
                 errors.append(f"{rel_path}: HTTP {status_code}")
                 return
             try:
-                with zf.open(arc, mode="w", force_zip64=True) as dst:
-                    async for chunk in upstream.aiter_bytes():
+                with zf.open(_zip_entry_info(arc, rel_path), mode="w", force_zip64=True) as dst:
+                    async for chunk in upstream.aiter_raw(chunk_size=DOWNLOAD_STREAM_CHUNK_SIZE):
                         if chunk:
                             dst.write(chunk)
+                            await _drain_writer()
+                await _drain_writer()
             finally:
                 try:
                     await upstream.aclose()
@@ -710,16 +1393,25 @@ async def _iter_share_zip_stream(
                     pass
 
         try:
-            writer = _QueueWriter(queue)
-            with zipfile.ZipFile(writer, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True) as zf:
+            with zipfile.ZipFile(
+                writer,
+                "w",
+                compression=zipfile.ZIP_DEFLATED,
+                compresslevel=DOWNLOAD_ZIP_COMPRESSLEVEL,
+                allowZip64=True,
+            ) as zf:
                 # Emit first bytes immediately to avoid proxy first-byte timeout.
                 zf.writestr(".nexus-share.keep", b"")
-                state["started"] = True
+                await _drain_writer()
                 for item in share_items:
                     rel = str(item.get("path") or "")
-                    await _add_entry(zf, rel, rel, bool(item.get("is_dir")))
+                    arc_path = str(item.get("arc_path") or rel)
+                    await _add_entry(zf, rel, arc_path, bool(item.get("is_dir")))
                 if errors:
                     zf.writestr(".nexus-share-errors.txt", "\n".join(errors).encode("utf-8"))
+                    await _drain_writer()
+            writer.flush()
+            await _drain_writer(force=True)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -736,7 +1428,7 @@ async def _iter_share_zip_stream(
             if chunk:
                 yield chunk
         err = state.get("error")
-        if err is not None and not bool(state.get("started")):
+        if err is not None:
             raise err
     finally:
         if not producer_task.done():
@@ -760,7 +1452,68 @@ def _download_content_disposition(filename: str) -> str:
     ).strip("._")
     if not ascii_name:
         ascii_name = "download.bin"
-    return f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(raw)}"
+    try:
+        encoded = quote(raw, safe="")
+    except Exception:
+        try:
+            raw = raw.encode("utf-8", "ignore").decode("utf-8")
+        except Exception:
+            raw = ""
+        if not raw:
+            raw = ascii_name
+        encoded = quote(raw, safe="")
+    value = f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{encoded}"
+    try:
+        value.encode("latin-1")
+    except Exception:
+        value = f"attachment; filename=\"{ascii_name}\""
+    return value
+
+
+def _download_response_headers(filename: str, content_length: str = "") -> Dict[str, str]:
+    # Large binary responses should not be gzip-compressed again by panel middleware/proxy.
+    headers = {
+        "Content-Disposition": _download_content_disposition(filename),
+        "Content-Encoding": "identity",
+        "Cache-Control": "private, no-transform",
+        "X-Accel-Buffering": "no",
+        "Vary": "Accept-Encoding",
+    }
+    clen = str(content_length or "").strip()
+    if clen.isdigit():
+        headers["Content-Length"] = clen
+    return headers
+
+
+def _download_retry_backoff_sec(attempt_no: int) -> float:
+    n = max(1, int(attempt_no or 1))
+    return float(min(DOWNLOAD_STREAM_RETRY_MAX_SEC, DOWNLOAD_STREAM_RETRY_BASE_SEC * (2 ** (n - 1))))
+
+
+def _parse_content_range_bounds(raw: Any) -> Tuple[Optional[int], Optional[int]]:
+    text = str(raw or "").strip()
+    if not text:
+        return None, None
+    m = _CONTENT_RANGE_RE.match(text)
+    if not m:
+        return None, None
+    try:
+        start = int(m.group(1))
+        end = int(m.group(2))
+    except Exception:
+        return None, None
+    if start < 0 or end < start:
+        return None, None
+    return int(start), int(end)
+
+
+def _forward_download_request_headers(request: Request) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    for key in ("range", "if-range"):
+        value = str(request.headers.get(key) or "").strip()
+        if value:
+            out[key] = value
+    return out
 
 
 async def _open_agent_file_stream(
@@ -768,17 +1521,20 @@ async def _open_agent_file_stream(
     root: str,
     rel_path: str,
     timeout: float,
+    request_headers: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Optional[Any], int, str]:
+    target_base_url, target_verify_tls = _direct_agent_request_target(node)
     resp = await agent_get_raw_stream(
-        node.get("base_url", ""),
+        target_base_url,
         node.get("api_key", ""),
         "/api/v1/website/files/raw",
-        node_verify_tls(node),
-        params={"root": root, "path": rel_path, "root_base": _node_root_base(node)},
+        target_verify_tls,
+        params={"root": root, "path": rel_path, "root_base": _node_root_base(node, root)},
         timeout=timeout,
+        headers_extra=request_headers,
     )
-    if resp.status_code == 200:
-        return resp, 200, ""
+    if resp.status_code in (200, 206):
+        return resp, int(resp.status_code), ""
     body_text = ""
     try:
         body = await resp.aread()
@@ -792,25 +1548,165 @@ async def _open_agent_file_stream(
     return None, int(resp.status_code or 500), body_text
 
 
-def _stream_file_download_response(upstream: Any, filename: str) -> StreamingResponse:
-    headers = {"Content-Disposition": _download_content_disposition(filename)}
-    content_len = str(upstream.headers.get("content-length") or "").strip()
-    if content_len.isdigit():
-        headers["Content-Length"] = content_len
+def _stream_file_download_response(
+    upstream: Any,
+    filename: str,
+    reopen_stream: Optional[Callable[[int, Optional[int]], Awaitable[Tuple[Optional[Any], int, str]]]] = None,
+) -> StreamingResponse:
+    content_len = str(upstream.headers.get("content-length") or "")
+    headers = _download_response_headers(filename, content_len)
+    passthrough = (
+        ("content-range", "Content-Range"),
+        ("accept-ranges", "Accept-Ranges"),
+        ("etag", "ETag"),
+        ("last-modified", "Last-Modified"),
+    )
+    for src, dst in passthrough:
+        v = str(upstream.headers.get(src) or "").strip()
+        if v:
+            headers[dst] = v
+    status_code = int(getattr(upstream, "status_code", 200) or 200)
+    range_start, range_end = _parse_content_range_bounds(upstream.headers.get("content-range"))
+    base_offset = int(range_start or 0)
     media_type = str(upstream.headers.get("content-type") or "application/octet-stream")
 
     async def _iter_bytes():
-        try:
-            async for chunk in upstream.aiter_bytes():
-                if chunk:
-                    yield chunk
-        finally:
+        current = upstream
+        delivered = 0
+        retries = 0
+        while True:
+            stream_err: Optional[Exception] = None
             try:
-                await upstream.aclose()
-            except Exception:
-                pass
+                async for chunk in current.aiter_raw(chunk_size=DOWNLOAD_STREAM_CHUNK_SIZE):
+                    if not chunk:
+                        continue
+                    delivered += len(chunk)
+                    yield chunk
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                stream_err = exc
+            finally:
+                try:
+                    await current.aclose()
+                except Exception:
+                    pass
 
-    return StreamingResponse(_iter_bytes(), media_type=media_type, headers=headers)
+            if stream_err is None:
+                return
+            if reopen_stream is None or retries >= int(DOWNLOAD_STREAM_RETRY_MAX):
+                raise stream_err
+
+            absolute_start = int(base_offset + max(0, delivered))
+            if range_end is not None and absolute_start > int(range_end):
+                return
+            attempt_no = retries + 1
+            await asyncio.sleep(_download_retry_backoff_sec(attempt_no))
+            nxt, next_status, _detail = await reopen_stream(absolute_start, range_end)
+            if nxt is None:
+                raise stream_err
+            resumed_start, _resumed_end = _parse_content_range_bounds(nxt.headers.get("content-range"))
+            if absolute_start > 0 and (
+                int(next_status or 0) != 206 or resumed_start is None or int(resumed_start) != absolute_start
+            ):
+                try:
+                    await nxt.aclose()
+                except Exception:
+                    pass
+                raise stream_err
+            current = nxt
+            retries = attempt_no
+
+    return StreamingResponse(_iter_bytes(), media_type=media_type, headers=headers, status_code=status_code)
+
+
+async def _download_file_to_local_cache(
+    node: Dict[str, Any],
+    root: str,
+    rel_path: str,
+    timeout: float = 600.0,
+) -> Tuple[str, int, str]:
+    fd, local_path = tempfile.mkstemp(prefix="nexus-file-cache-", suffix=".bin")
+    os.close(fd)
+    written = 0
+    retries = 0
+    mode = "wb"
+    media_type = "application/octet-stream"
+    try:
+        while True:
+            req_headers: Dict[str, str] = {}
+            if written > 0:
+                req_headers["range"] = f"bytes={written}-"
+            upstream, status_code, detail = await _open_agent_file_stream(
+                node,
+                root,
+                rel_path,
+                timeout=float(timeout),
+                request_headers=req_headers or None,
+            )
+            if upstream is None:
+                raise AgentError(f"下载失败：{detail or f'HTTP {status_code}'}")
+            ctype = str(upstream.headers.get("content-type") or "").strip()
+            if ctype:
+                media_type = ctype
+            if written > 0:
+                resume_start, _resume_end = _parse_content_range_bounds(upstream.headers.get("content-range"))
+                if int(status_code or 0) != 206 or resume_start is None or int(resume_start) != int(written):
+                    try:
+                        await upstream.aclose()
+                    except Exception:
+                        pass
+                    raise AgentError("下载续传失败：Range 不被支持或偏移不匹配")
+            try:
+                with open(local_path, mode) as out:
+                    async for chunk in upstream.aiter_raw(chunk_size=DOWNLOAD_STREAM_CHUNK_SIZE):
+                        if not chunk:
+                            continue
+                        out.write(chunk)
+                        written += len(chunk)
+                try:
+                    await upstream.aclose()
+                except Exception:
+                    pass
+                return local_path, int(written), str(media_type or "application/octet-stream")
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                try:
+                    await upstream.aclose()
+                except Exception:
+                    pass
+                if retries >= int(DOWNLOAD_STREAM_RETRY_MAX):
+                    raise
+                retries += 1
+                mode = "ab"
+                await asyncio.sleep(_download_retry_backoff_sec(retries))
+    except Exception:
+        _remove_file_quiet(local_path)
+        raise
+
+
+async def _build_share_zip_with_retry(
+    node: Dict[str, Any],
+    root: str,
+    share_items: List[Dict[str, Any]],
+) -> Tuple[str, int]:
+    last_exc: Optional[Exception] = None
+    max_attempts = max(1, int(DOWNLOAD_STREAM_RETRY_MAX) + 1)
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return await _build_share_zip(node, root, share_items)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            last_exc = exc
+            if attempt >= max_attempts:
+                break
+            await asyncio.sleep(_download_retry_backoff_sec(attempt))
+    if last_exc is None:
+        raise RuntimeError("打包失败")
+    raise last_exc
 
 
 def _share_token_sha256(token: str) -> str:
@@ -878,12 +1774,13 @@ def _resolve_share_token_input(raw: Any) -> str:
 
 
 async def _agent_list_files(node: Dict[str, Any], root: str, path: str) -> List[Dict[str, Any]]:
-    q = urlencode({"root": root, "path": path, "root_base": _node_root_base(node)})
+    target_base_url, target_verify_tls = _direct_agent_request_target(node)
+    q = urlencode({"root": root, "path": path, "root_base": _node_root_base(node, root)})
     data = await agent_get(
-        node["base_url"],
+        target_base_url,
         node["api_key"],
         f"/api/v1/website/files/list?{q}",
-        node_verify_tls(node),
+        target_verify_tls,
         timeout=20,
     )
     if not data.get("ok", True):
@@ -925,6 +1822,7 @@ async def _build_share_zip(
             rows = await _agent_list_files(node, root, rel_path)
             if not rows:
                 zf.writestr(f"{arc.rstrip('/')}/", b"")
+                file_count += 1
                 return
             for row in rows:
                 child_arc = _zip_arcname(f"{arc}/{row.get('name') or ''}")
@@ -935,8 +1833,8 @@ async def _build_share_zip(
         if upstream is None:
             raise AgentError(f"打包失败：{rel_path}（HTTP {status_code}）")
         try:
-            with zf.open(arc, mode="w", force_zip64=True) as dst:
-                async for chunk in upstream.aiter_bytes():
+            with zf.open(_zip_entry_info(arc, rel_path), mode="w", force_zip64=True) as dst:
+                async for chunk in upstream.aiter_raw(chunk_size=DOWNLOAD_STREAM_CHUNK_SIZE):
                     if chunk:
                         dst.write(chunk)
         finally:
@@ -947,10 +1845,10 @@ async def _build_share_zip(
         file_count += 1
 
     try:
-        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=DOWNLOAD_ZIP_COMPRESSLEVEL) as zf:
             for item in share_items:
                 rel = str(item.get("path") or "")
-                arc = rel
+                arc = str(item.get("arc_path") or rel)
                 await _add_entry(zf, rel, arc, bool(item.get("is_dir")))
     except Exception:
         _remove_file_quiet(zip_path)
@@ -1057,8 +1955,302 @@ def _agent_payload_root(site: Dict[str, Any], node: Dict[str, Any]) -> str:
     return root
 
 
-def _node_root_base(node: Dict[str, Any]) -> str:
-    return str(node.get("website_root_base") or "").strip()
+def _node_root_base(node: Dict[str, Any], root: str = "") -> str:
+    base = str(node.get("website_root_base") or "").strip()
+    root_path = str(root or "").strip()
+    if not root_path:
+        return base
+    b = base.rstrip("/")
+    if not b:
+        # 当节点未配置 website_root_base 时，回退为当前 root，
+        # 确保文件 API 仍被限制在目标根目录范围内。
+        return root_path
+    if root_path == b or root_path.startswith(b + "/"):
+        return base
+    # 允许“挂载类目录”使用自身作为 root_base，避免被 /www 默认范围拦截。
+    return root_path
+
+
+def _use_push_queue_for_node(node: Dict[str, Any]) -> bool:
+    return bool((node or {}).get("is_private") or False)
+
+
+def _is_loopback_agent_base_url(base_url: Any) -> bool:
+    raw = str(base_url or "").strip()
+    if not raw:
+        return False
+    if "://" not in raw:
+        raw = f"http://{raw}"
+    try:
+        host = str(urlsplit(raw).hostname or "").strip().lower()
+    except Exception:
+        return False
+    if not host:
+        return False
+    return host in ("127.0.0.1", "localhost", "::1")
+
+
+def _node_direct_tunnel_cfg(node: Dict[str, Any]) -> Dict[str, Any]:
+    dt = (node or {}).get("direct_tunnel")
+    if not isinstance(dt, dict):
+        return {}
+    listen_port = 0
+    try:
+        listen_port = int(dt.get("listen_port") or 0)
+    except Exception:
+        listen_port = 0
+    if listen_port < 1 or listen_port > 65535:
+        listen_port = 0
+    relay_node_id = 0
+    try:
+        relay_node_id = int(dt.get("relay_node_id") or 0)
+    except Exception:
+        relay_node_id = 0
+    scheme = str(dt.get("scheme") or "").strip().lower()
+    if scheme not in ("http", "https"):
+        scheme = ""
+    return {
+        "enabled": bool(dt.get("enabled")),
+        "relay_node_id": int(max(0, relay_node_id)),
+        "listen_port": int(listen_port),
+        "public_host": str(dt.get("public_host") or "").strip(),
+        "scheme": scheme,
+        "verify_tls": bool(dt.get("verify_tls")),
+    }
+
+
+def _direct_agent_request_target(node: Dict[str, Any]) -> Tuple[str, bool]:
+    dt = _node_direct_tunnel_cfg(node)
+    if bool(dt.get("enabled")):
+        relay_id = int(dt.get("relay_node_id") or 0)
+        listen_port = int(dt.get("listen_port") or 0)
+        if relay_id > 0 and 1 <= listen_port <= 65535:
+            host = str(dt.get("public_host") or "").strip()
+            if not host:
+                relay = get_node(relay_id)
+                if isinstance(relay, dict):
+                    relay_raw = str(relay.get("base_url") or "").strip()
+                    if relay_raw:
+                        if "://" not in relay_raw:
+                            relay_raw = f"http://{relay_raw}"
+                        try:
+                            host = str(urlsplit(relay_raw).hostname or "").strip()
+                        except Exception:
+                            host = ""
+            if host:
+                scheme = str(dt.get("scheme") or "").strip().lower()
+                if scheme not in ("http", "https"):
+                    node_raw = str((node or {}).get("base_url") or "").strip()
+                    if "://" not in node_raw:
+                        node_raw = f"http://{node_raw}" if node_raw else "http://"
+                    try:
+                        scheme = str(urlsplit(node_raw).scheme or "http").strip().lower()
+                    except Exception:
+                        scheme = "http"
+                    if scheme not in ("http", "https"):
+                        scheme = "http"
+                return f"{scheme}://{format_host_for_url(host)}:{int(listen_port)}", bool(dt.get("verify_tls"))
+    return str((node or {}).get("base_url") or "").strip(), bool(node_verify_tls(node))
+
+
+def _has_direct_agent_tunnel(node: Dict[str, Any]) -> bool:
+    base_url, _verify_tls = _direct_agent_request_target(node)
+    current = str((node or {}).get("base_url") or "").strip()
+    return bool(base_url and base_url != current)
+
+
+def _use_push_queue_for_site_files(node: Dict[str, Any]) -> bool:
+    # Keep queue mode for private nodes by default.
+    # If node base_url points to a loopback endpoint, assume panel-side tunnel is in place
+    # and allow direct file-manager requests.
+    if not _use_push_queue_for_node(node):
+        return False
+    if _has_direct_agent_tunnel(node):
+        return False
+    allow_loopback_direct = _to_flag(os.getenv("REALM_WEBSITE_PRIVATE_FILES_DIRECT_ALLOW_LOOPBACK", "1"))
+    if allow_loopback_direct and _is_loopback_agent_base_url((node or {}).get("base_url")):
+        return False
+    return True
+
+
+def _prefer_zip_stream_for_single_file_download(node: Dict[str, Any], stable_enabled: bool) -> bool:
+    # For private nodes with active direct tunnel, avoid long prefetch-to-disk waits.
+    # Stream a zip response so browser/proxy receives bytes immediately.
+    if not bool(stable_enabled):
+        return False
+    if not bool((node or {}).get("is_private") or False):
+        return False
+    if not _has_direct_agent_tunnel(node):
+        return False
+    return _to_flag(os.getenv("REALM_WEBSITE_PRIVATE_DIRECT_FILE_ZIP_STREAM", "1"))
+
+
+def _enqueue_site_file_op_task(
+    site: Dict[str, Any],
+    node: Dict[str, Any],
+    action: str,
+    request_payload: Dict[str, Any],
+    actor: str,
+) -> int:
+    site_id = int(site.get("id") or 0)
+    node_id = int(site.get("node_id") or node.get("id") or 0)
+    action_s = str(action or "").strip().lower()
+    req = dict(request_payload or {})
+    task_id = add_task(
+        node_id=int(node_id),
+        task_type="site_file_op",
+        payload={
+            "site_id": int(site_id),
+            "action": action_s,
+            "request": req,
+            "max_attempts": int(_SITE_OP_MAX_ATTEMPTS),
+        },
+        status="queued",
+        progress=0,
+        result={
+            "queued": True,
+            "op": "site_file_op",
+            "action": action_s,
+            "max_attempts": int(_SITE_OP_MAX_ATTEMPTS),
+            "attempt": 0,
+        },
+    )
+    add_site_event(
+        int(site_id),
+        f"site_file_{action_s}",
+        status="queued",
+        actor=str(actor or ""),
+        payload={
+            "task_id": int(task_id),
+            "path": str(req.get("path") or ""),
+            "filename": str(req.get("filename") or ""),
+        },
+    )
+    return int(task_id)
+
+
+async def _prepare_private_upload_queue_tasks(
+    *,
+    prep_task_id: int,
+    site: Dict[str, Any],
+    node: Dict[str, Any],
+    root: str,
+    uploads: List[Tuple[UploadFile, str, str]],
+    actor: str,
+    limit_bytes: int,
+) -> None:
+    site_id = int(site.get("id") or 0)
+    total_files = max(0, len(uploads))
+    queued_ids: List[int] = []
+    ok_count = 0
+    try:
+        for idx, (upload, target_path, base_name) in enumerate(uploads, start=1):
+            total = 0
+            chunks: List[bytes] = []
+            while True:
+                chunk = await upload.read(UPLOAD_CHUNK_SIZE)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > int(limit_bytes):
+                    raise RuntimeError(
+                        f"文件过大：{base_name}（私网队列上传限制 {_format_bytes(limit_bytes)}，请改用节点直连上传）"
+                    )
+                chunks.append(bytes(chunk))
+            raw = b"".join(chunks) if chunks else b""
+            req_payload = {
+                "root": root,
+                "path": target_path,
+                "filename": base_name,
+                "content_b64": base64.b64encode(raw).decode("ascii") if raw else "",
+                "allow_empty": True,
+                "root_base": _node_root_base(node, root),
+            }
+            file_task_id = _enqueue_site_file_op_task(site, node, "upload", req_payload, actor)
+            queued_ids.append(int(file_task_id))
+            ok_count += 1
+            progress = 10
+            if total_files > 0:
+                progress = max(10, min(95, int((idx / total_files) * 90.0) + 5))
+            update_task(
+                int(prep_task_id),
+                progress=int(progress),
+                result={
+                    "ok": True,
+                    "preparing": True,
+                    "processed_files": int(ok_count),
+                    "total_files": int(total_files),
+                    "queued_file_tasks": int(ok_count),
+                },
+            )
+
+        result_payload: Dict[str, Any] = {
+            "ok": True,
+            "queued": True,
+            "processed_files": int(ok_count),
+            "total_files": int(total_files),
+            "queued_file_tasks": int(ok_count),
+        }
+        if queued_ids:
+            result_payload["first_task_id"] = int(queued_ids[0])
+            result_payload["last_task_id"] = int(queued_ids[-1])
+        update_task(
+            int(prep_task_id),
+            status="success",
+            progress=100,
+            result=result_payload,
+        )
+        add_site_event(
+            int(site_id),
+            "site_file_upload_prepare",
+            status="success",
+            actor=str(actor or ""),
+            payload={
+                "prep_task_id": int(prep_task_id),
+                "processed_files": int(ok_count),
+                "total_files": int(total_files),
+                "queued_file_tasks": int(ok_count),
+                "first_task_id": int(queued_ids[0]) if queued_ids else 0,
+                "last_task_id": int(queued_ids[-1]) if queued_ids else 0,
+            },
+        )
+    except Exception as exc:
+        msg = str(exc or "后台预处理失败")
+        result_payload = {
+            "ok": False,
+            "processed_files": int(ok_count),
+            "total_files": int(total_files),
+            "queued_file_tasks": int(ok_count),
+        }
+        if queued_ids:
+            result_payload["first_task_id"] = int(queued_ids[0])
+            result_payload["last_task_id"] = int(queued_ids[-1])
+        update_task(
+            int(prep_task_id),
+            status="failed",
+            progress=100,
+            error=msg,
+            result=result_payload,
+        )
+        add_site_event(
+            int(site_id),
+            "site_file_upload_prepare",
+            status="failed",
+            actor=str(actor or ""),
+            error=msg,
+            payload={
+                "prep_task_id": int(prep_task_id),
+                "processed_files": int(ok_count),
+                "total_files": int(total_files),
+                "queued_file_tasks": int(ok_count),
+            },
+        )
+    finally:
+        for upload, _target_path, _base_name in uploads:
+            try:
+                await upload.close()
+            except Exception:
+                pass
 
 
 _ENV_CAP_ALIAS = {
@@ -1284,7 +2476,8 @@ async def _bg_website_env_uninstall(task_id: int, node_id: int, purge_data: bool
             node = get_node(int(node_id))
             if not node or str(node.get("role") or "") != "website":
                 raise _WebsiteTaskFatalError("节点不存在或不是网站机")
-            sites = list_sites(node_id=int(node_id))
+            all_sites = list_sites(node_id=int(node_id))
+            sites = [s for s in all_sites if isinstance(s, dict) and not _is_storage_mount_site(s)]
             payload = {
                 "purge_data": bool(purge_data),
                 "deep_uninstall": bool(deep_uninstall),
@@ -1309,7 +2502,14 @@ async def _bg_website_env_uninstall(task_id: int, node_id: int, purge_data: bool
                 raise AgentError(str(data.get("error") or "卸载失败"))
             if purge_data:
                 delete_certificates_by_node(int(node_id))
-                delete_sites_by_node(int(node_id))
+                for s in sites:
+                    sid = int(s.get("id") or 0)
+                    if sid <= 0:
+                        continue
+                    try:
+                        delete_site(int(sid))
+                    except Exception:
+                        pass
             return data
 
         data, attempts = await _run_site_task_with_retry(int(task_id), "website_env_uninstall", _runner)
@@ -1529,6 +2729,140 @@ async def _bg_website_ssl_task(
         add_site_event(int(site_id), event_action, status="failed", actor=str(actor or ""), error=err_text)
 
 
+async def _bg_site_create_task(task_id: int, site_id: int, actor: str) -> None:
+    site_id_i = int(site_id)
+    actor_s = str(actor or "")
+    try:
+        async def _runner() -> Dict[str, Any]:
+            site = get_site(int(site_id_i))
+            if not isinstance(site, dict):
+                raise _WebsiteTaskFatalError("站点不存在")
+            node_id = int(site.get("node_id") or 0)
+            node = get_node(node_id)
+            if not node or str(node.get("role") or "") != "website":
+                raise _WebsiteTaskFatalError("节点不存在或不是网站机")
+
+            domains = [str(x).strip().lower().strip(".") for x in (site.get("domains") or []) if str(x).strip()]
+            if not domains:
+                raise _WebsiteTaskFatalError("站点域名为空")
+
+            site_type = str(site.get("type") or "static").strip().lower()
+            if site_type not in ("static", "php", "reverse_proxy"):
+                site_type = "static"
+            root_path = str(site.get("root_path") or "").strip()
+            proxy_target = _normalize_proxy_target(site.get("proxy_target") or "")
+            if site_type == "reverse_proxy" and not proxy_target:
+                raise _WebsiteTaskFatalError("反向代理必须填写目标地址")
+
+            ensure_payload = {
+                "need_nginx": True,
+                "need_php": site_type == "php",
+                "need_acme": True,
+            }
+            ensure_data = await agent_post(
+                node["base_url"],
+                node["api_key"],
+                "/api/v1/website/env/ensure",
+                ensure_payload,
+                node_verify_tls(node),
+                timeout=300,
+            )
+            if not ensure_data.get("ok", True):
+                raise AgentError(str(ensure_data.get("error") or "环境安装失败"))
+            _merge_node_env_caps(node, ensure_data)
+
+            create_payload = {
+                "name": str(site.get("name") or domains[0]),
+                "domains": domains,
+                "root_path": root_path,
+                "type": site_type,
+                "web_server": str(site.get("web_server") or "nginx"),
+                "proxy_target": proxy_target,
+                "https_redirect": bool(site.get("https_redirect") or False),
+                "gzip_enabled": True if site.get("gzip_enabled") is None else bool(site.get("gzip_enabled")),
+                "nginx_tpl": str(site.get("nginx_tpl") or ""),
+                "root_base": _node_root_base(node),
+            }
+            data = await agent_post(
+                node["base_url"],
+                node["api_key"],
+                "/api/v1/website/site/create",
+                create_payload,
+                node_verify_tls(node),
+                timeout=45,
+            )
+            if not data.get("ok", True):
+                raise AgentError(str(data.get("error") or "创建站点失败"))
+            return {
+                "site": site,
+                "node": node,
+                "domains": domains,
+                "site_type": site_type,
+                "root_path": root_path,
+                "proxy_target": proxy_target,
+                "data": data,
+            }
+
+        ret, attempts = await _run_site_task_with_retry(int(task_id), "site_create", _runner)
+        site = ret.get("site") if isinstance(ret, dict) else {}
+        node = ret.get("node") if isinstance(ret, dict) else {}
+        domains = (ret.get("domains") if isinstance(ret, dict) else []) or []
+        site_type = str((ret.get("site_type") if isinstance(ret, dict) else "") or "static")
+        root_path = str((ret.get("root_path") if isinstance(ret, dict) else "") or "")
+        proxy_target = str((ret.get("proxy_target") if isinstance(ret, dict) else "") or "")
+        data = (ret.get("data") if isinstance(ret, dict) else {}) or {}
+
+        health_status = "unknown"
+        health_error = ""
+        health: Dict[str, Any] = {}
+        try:
+            health = await agent_post(
+                node.get("base_url", ""),
+                node.get("api_key", ""),
+                "/api/v1/website/health",
+                {
+                    "domains": domains,
+                    "type": site_type,
+                    "root_path": root_path,
+                    "proxy_target": proxy_target,
+                    "root_base": _node_root_base(node),
+                },
+                node_verify_tls(node),
+                timeout=10,
+            )
+            if isinstance(health, dict):
+                if health.get("ok"):
+                    health_status = "ok"
+                else:
+                    health_status = "fail"
+                    health_error = str(health.get("error") or "")
+        except Exception as exc:
+            health_error = str(exc)
+            health_status = "unknown" if _is_agent_unreachable_error(health_error) else "fail"
+
+        update_site(int(site_id_i), status="running" if health_status != "fail" else "error")
+        try:
+            update_site_health(
+                int(site_id_i),
+                health_status,
+                health_code=int(health.get("status_code") or 0) if isinstance(health, dict) else 0,
+                health_latency_ms=int(health.get("latency_ms") or 0) if isinstance(health, dict) else 0,
+                health_error=str(health.get("error") or "") if isinstance(health, dict) else health_error,
+            )
+        except Exception:
+            pass
+
+        result = dict(data) if isinstance(data, dict) else {}
+        result["attempts"] = int(attempts)
+        update_task(int(task_id), status="success", progress=100, error="", result=result)
+        add_site_event(int(site_id_i), "site_create", status="success", actor=actor_s, result=data)
+    except Exception as exc:
+        err_text = str(exc)
+        update_site(int(site_id_i), status="error")
+        update_task(int(task_id), status="failed", progress=100, error=err_text, result={"op": "site_create"})
+        add_site_event(int(site_id_i), "site_create", status="failed", actor=actor_s, error=err_text)
+
+
 def _default_nginx_template(site_type: str) -> str:
     st = str(site_type or "static").strip().lower()
     if st == "reverse_proxy":
@@ -1717,6 +3051,8 @@ async def websites_index(request: Request, user: str = Depends(require_login_pag
 
     visible_sites: List[Dict[str, Any]] = []
     for s in sites:
+        if str(s.get("type") or "").strip().lower() == "storage_mount":
+            continue
         nid = int(s.get("node_id") or 0)
         node = node_map.get(nid)
         if not node:
@@ -1861,28 +3197,6 @@ async def websites_new_action(
     gzip_flag = bool(gzip_enabled)
     tpl = (nginx_tpl or "").strip()
 
-    # Ensure environment before creating site
-    try:
-        ensure_payload = {
-            "need_nginx": True,
-            "need_php": site_type == "php",
-            "need_acme": True,
-        }
-        data = await agent_post(
-            node["base_url"],
-            node["api_key"],
-            "/api/v1/website/env/ensure",
-            ensure_payload,
-            node_verify_tls(node),
-            timeout=300,
-        )
-        if not data.get("ok", True):
-            raise AgentError(str(data.get("error") or "环境安装失败"))
-        _merge_node_env_caps(node, data)
-    except Exception as exc:
-        set_flash(request, f"环境安装失败：{exc}")
-        return RedirectResponse(url="/websites?create=1", status_code=303)
-
     display_name = (name or "").strip() or domains_list[0]
 
     site_id = add_site(
@@ -1901,7 +3215,7 @@ async def websites_new_action(
     add_site_event(
         site_id,
         "site_create",
-        status="running",
+        status="queued",
         actor=str(user or ""),
         payload={
             "node_id": int(node_id),
@@ -1927,88 +3241,17 @@ async def websites_new_action(
             "gzip_enabled": gzip_flag,
             "nginx_tpl": tpl,
         },
-        status="running",
-        progress=10,
+        status="queued",
+        progress=0,
+        result={
+            "queued": True,
+            "op": "site_create",
+            "max_attempts": int(_SITE_OP_MAX_ATTEMPTS),
+            "attempt": 0,
+        },
     )
-
-    try:
-        payload = {
-            "name": display_name,
-            "domains": domains_list,
-            "root_path": root_path,
-            "type": site_type,
-            "web_server": web_server,
-            "proxy_target": proxy_target,
-            "https_redirect": https_flag,
-            "gzip_enabled": gzip_flag,
-            "nginx_tpl": tpl,
-            "root_base": _node_root_base(node),
-        }
-        data = await agent_post(
-            node["base_url"],
-            node["api_key"],
-            "/api/v1/website/site/create",
-            payload,
-            node_verify_tls(node),
-            timeout=30,
-        )
-        if not data.get("ok", True):
-            raise AgentError(str(data.get("error") or "创建站点失败"))
-        # post-create health check
-        health_status = "unknown"
-        health_error = ""
-        try:
-            health = await agent_post(
-                node["base_url"],
-                node["api_key"],
-                "/api/v1/website/health",
-                {
-                    "domains": domains_list,
-                    "type": site_type,
-                    "root_path": root_path,
-                    "proxy_target": proxy_target,
-                    "root_base": _node_root_base(node),
-                },
-                node_verify_tls(node),
-                timeout=10,
-            )
-            if isinstance(health, dict):
-                if health.get("ok"):
-                    health_status = "ok"
-                else:
-                    health_status = "fail"
-                    health_error = str(health.get("error") or "")
-        except Exception as exc:
-            health_error = str(exc)
-            health_status = "unknown" if _is_agent_unreachable_error(health_error) else "fail"
-
-        update_site(site_id, status="running" if health_status != "fail" else "error")
-        try:
-            if health_status in ("ok", "fail", "unknown"):
-                update_site_health(
-                    site_id,
-                    health_status,
-                    health_code=int(health.get("status_code") or 0) if isinstance(health, dict) else 0,
-                    health_latency_ms=int(health.get("latency_ms") or 0) if isinstance(health, dict) else 0,
-                    health_error=str(health.get("error") or "") if isinstance(health, dict) else health_error,
-                )
-        except Exception:
-            pass
-        update_task(task_id, status="success", progress=100, result=data)
-        add_site_event(site_id, "site_create", status="success", actor=str(user or ""), result=data)
-        if health_status == "fail":
-            set_flash(request, f"站点创建成功，但健康检查失败：{health_error or 'HTTP 探测失败'}")
-        elif health_status == "unknown":
-            set_flash(request, f"站点创建成功，但暂时无法连到节点执行健康检查：{health_error or '等待节点连通'}")
-        else:
-            set_flash(request, "站点创建成功")
-        return RedirectResponse(url=f"/websites/{site_id}", status_code=303)
-    except Exception as exc:
-        update_site(site_id, status="error")
-        update_task(task_id, status="failed", progress=100, error=str(exc))
-        add_site_event(site_id, "site_create", status="failed", actor=str(user or ""), error=str(exc))
-        set_flash(request, f"站点创建失败：{exc}")
-        return RedirectResponse(url=f"/websites/{site_id}", status_code=303)
+    set_flash(request, f"已提交站点创建任务 #{task_id}，等待节点上报后自动执行（支持内网节点）。")
+    return RedirectResponse(url=f"/websites/{site_id}", status_code=303)
 
 
 @router.get("/websites/{site_id}", response_class=HTMLResponse)
@@ -2139,171 +3382,43 @@ async def website_edit_post(
         # don't hard-fail on domain collision checks
         pass
 
-    # -------- Apply on node --------
+    # -------- Queue task (supports private/intranet nodes) --------
     old_domains = site.get("domains") or []
-    old_primary = _norm_domain(old_domains[0]) if old_domains else ""
-    new_primary = _norm_domain(domains_list[0])
-
     task_id = add_task(
         node_id=int(site.get("node_id") or 0),
         task_type="site_update",
-        payload={"site_id": site_id, "old_domains": old_domains, "new_domains": domains_list},
-        status="running",
-        progress=5,
+        payload={
+            "site_id": int(site_id),
+            "name": (name or site.get("name") or domains_list[0]).strip(),
+            "domains": domains_list,
+            "site_type": site_type,
+            "root_path": root_path if site_type != "reverse_proxy" else (root_path or ""),
+            "proxy_target": proxy_target,
+            "https_redirect": bool(https_flag),
+            "gzip_enabled": bool(gzip_flag),
+            "nginx_tpl": tpl,
+            "old_domains": old_domains,
+            "old_root_path": str(site.get("root_path") or ""),
+            "max_attempts": int(_SITE_OP_MAX_ATTEMPTS),
+        },
+        status="queued",
+        progress=0,
+        result={
+            "queued": True,
+            "op": "site_update",
+            "max_attempts": int(_SITE_OP_MAX_ATTEMPTS),
+            "attempt": 0,
+        },
     )
     add_site_event(
         int(site_id),
         "site_update",
-        status="running",
+        status="queued",
         actor=str(user or ""),
-        payload={"old_domains": old_domains, "new_domains": domains_list, "type": site_type},
+        payload={"task_id": int(task_id), "old_domains": old_domains, "new_domains": domains_list, "type": site_type},
     )
-
-    try:
-        # Ensure required runtime (idempotent)
-        ensure = await agent_post(
-            node["base_url"],
-            node["api_key"],
-            "/api/v1/website/env/ensure",
-            {
-                "need_nginx": True,
-                "need_php": bool(site_type == "php"),
-                "need_acme": True,
-            },
-            node_verify_tls(node),
-            timeout=300,
-        )
-        if not ensure.get("ok", True):
-            raise AgentError(str(ensure.get("error") or "环境检查失败"))
-        _merge_node_env_caps(node, ensure)
-        update_task(task_id, progress=15)
-
-        # If primary domain changed, remove old nginx conf first (keep data/cert)
-        if old_primary and old_primary != new_primary:
-            await agent_post(
-                node["base_url"],
-                node["api_key"],
-                "/api/v1/website/site/delete",
-                {
-                    "domains": old_domains,
-                    "root_path": site.get("root_path") or "",
-                    "root_base": _node_root_base(node),
-                    "delete_root": False,
-                    "delete_cert": False,
-                },
-                node_verify_tls(node),
-                timeout=30,
-            )
-        update_task(task_id, progress=35)
-
-        payload = {
-            "domains": domains_list,
-            "type": site_type,
-            "web_server": "nginx",
-            "proxy_target": proxy_target,
-            "https_redirect": https_flag,
-            "gzip_enabled": gzip_flag,
-            "nginx_tpl": tpl,
-            "root_path": root_path,
-            "root_base": _node_root_base(node),
-        }
-        data = await agent_post(
-            node["base_url"],
-            node["api_key"],
-            "/api/v1/website/site/create",
-            payload,
-            node_verify_tls(node),
-            timeout=45,
-        )
-        if not data.get("ok", True):
-            raise AgentError(str(data.get("error") or "站点更新失败"))
-
-        update_task(task_id, progress=60)
-
-        # post-update health check
-        health_status = "unknown"
-        health_error = ""
-        health = {}
-        try:
-            health = await agent_post(
-                node["base_url"],
-                node["api_key"],
-                "/api/v1/website/health",
-                {
-                    "domains": domains_list,
-                    "type": site_type,
-                    "root_path": root_path,
-                    "proxy_target": proxy_target,
-                    "root_base": _node_root_base(node),
-                },
-                node_verify_tls(node),
-                timeout=10,
-            )
-            if isinstance(health, dict):
-                if health.get("ok"):
-                    health_status = "ok"
-                else:
-                    health_status = "fail"
-                    health_error = str(health.get("error") or "")
-        except Exception as exc:
-            health_error = str(exc)
-            health_status = "unknown" if _is_agent_unreachable_error(health_error) else "fail"
-
-        # Update DB
-        update_site(
-            int(site_id),
-            name=(name or site.get("name") or domains_list[0]).strip(),
-            domains=domains_list,
-            site_type=site_type,
-            root_path=root_path if site_type != "reverse_proxy" else (root_path or ""),
-            proxy_target=proxy_target,
-            https_redirect=1 if https_flag else 0,
-            gzip_enabled=1 if gzip_flag else 0,
-            nginx_tpl=tpl,
-            status="running" if health_status != "fail" else "error",
-        )
-        try:
-            if health_status in ("ok", "fail", "unknown"):
-                update_site_health(
-                    int(site_id),
-                    health_status,
-                    health_code=int(health.get("status_code") or 0) if isinstance(health, dict) else 0,
-                    health_latency_ms=int(health.get("latency_ms") or 0) if isinstance(health, dict) else 0,
-                    health_error=str(health.get("error") or "") if isinstance(health, dict) else health_error,
-                )
-        except Exception:
-            pass
-
-        # If domains changed, mark cert record as pending to nudge re-issue
-        try:
-            old_set = {_norm_domain(x) for x in old_domains if _norm_domain(x)}
-            new_set = {_norm_domain(x) for x in domains_list if _norm_domain(x)}
-            if old_set != new_set:
-                certs = list_certificates(site_id=int(site_id))
-                if certs:
-                    update_certificate(
-                        int(certs[0].get("id") or 0),
-                        domains=domains_list,
-                        status="pending",
-                        last_error="站点域名已变更，建议重新申请/续期 SSL 证书",
-                    )
-        except Exception:
-            pass
-
-        update_task(task_id, status="success", progress=100, result=data)
-        add_site_event(int(site_id), "site_update", status="success", actor=str(user or ""), result=data)
-        if health_status == "fail":
-            set_flash(request, f"站点更新成功，但健康检查失败：{health_error or 'HTTP 探测失败'}")
-        elif health_status == "unknown":
-            set_flash(request, f"站点更新成功，但暂时无法连到节点执行健康检查：{health_error or '等待节点连通'}")
-        else:
-            set_flash(request, "站点更新成功")
-        return RedirectResponse(url=f"/websites/{site_id}", status_code=303)
-    except Exception as exc:
-        update_task(task_id, status="failed", progress=100, error=str(exc))
-        add_site_event(int(site_id), "site_update", status="failed", actor=str(user or ""), error=str(exc))
-        set_flash(request, f"站点更新失败：{exc}")
-        return RedirectResponse(url=f"/websites/{site_id}/edit", status_code=303)
+    set_flash(request, f"已提交站点更新任务 #{task_id}，等待节点上报后自动执行（支持内网节点）。")
+    return RedirectResponse(url=f"/websites/{site_id}", status_code=303)
 
 
 @router.get("/websites/{site_id}/diagnose", response_class=HTMLResponse)
@@ -2409,6 +3524,18 @@ async def website_ssl_issue(request: Request, site_id: int, user: str = Depends(
         return RedirectResponse(url=f"/websites/{site_id}", status_code=303)
     cert_id = _ensure_certificate_pending(int(site_id), int(site.get("node_id") or 0), domains)
     strategy = _ssl_direct_strategy()
+    if _use_push_queue_for_node(node):
+        queued_task_id = _enqueue_website_ssl_task(
+            site_id=int(site_id),
+            node_id=int(site.get("node_id") or 0),
+            cert_id=int(cert_id),
+            domains=list(domains or []),
+            actor=str(user or ""),
+            action="issue",
+            fallback_reason="private_node_force_queue",
+        )
+        set_flash(request, f"私网节点已自动走队列模式，任务 #{queued_task_id}（节点上报后自动执行）。")
+        return RedirectResponse(url=f"/websites/{site_id}", status_code=303)
     if not bool(strategy.get("direct_first")):
         queued_task_id = _enqueue_website_ssl_task(
             site_id=int(site_id),
@@ -2513,6 +3640,18 @@ async def website_ssl_renew(request: Request, site_id: int, user: str = Depends(
         return RedirectResponse(url=f"/websites/{site_id}", status_code=303)
     cert_id = _ensure_certificate_pending(int(site_id), int(site.get("node_id") or 0), domains)
     strategy = _ssl_direct_strategy()
+    if _use_push_queue_for_node(node):
+        queued_task_id = _enqueue_website_ssl_task(
+            site_id=int(site_id),
+            node_id=int(site.get("node_id") or 0),
+            cert_id=int(cert_id),
+            domains=list(domains or []),
+            actor=str(user or ""),
+            action="renew",
+            fallback_reason="private_node_force_queue",
+        )
+        set_flash(request, f"私网节点已自动走队列模式，任务 #{queued_task_id}（节点上报后自动执行）。")
+        return RedirectResponse(url=f"/websites/{site_id}", status_code=303)
     if not bool(strategy.get("direct_first")):
         queued_task_id = _enqueue_website_ssl_task(
             site_id=int(site_id),
@@ -2623,56 +3762,58 @@ async def website_https_redirect_set(
 
     raw_flag = str(enabled or "").strip().lower()
     https_flag = raw_flag in ("1", "true", "yes", "y", "on")
-
+    site_type = str(site.get("type") or "static").strip().lower()
+    if site_type not in ("static", "php", "reverse_proxy"):
+        site_type = "static"
+    root_path = str(site.get("root_path") or "")
+    proxy_target = _normalize_proxy_target(site.get("proxy_target") or "")
+    gzip_flag = True if site.get("gzip_enabled") is None else bool(site.get("gzip_enabled"))
+    tpl = str(site.get("nginx_tpl") or "")
     task_id = add_task(
         node_id=int(site.get("node_id") or 0),
-        task_type="site_https_redirect",
-        payload={"site_id": site_id, "domains": domains, "https_redirect": https_flag},
-        status="running",
-        progress=10,
+        task_type="site_update",
+        payload={
+            "site_id": int(site_id),
+            "name": str(site.get("name") or domains[0]).strip(),
+            "domains": list(domains or []),
+            "site_type": site_type,
+            "root_path": root_path if site_type != "reverse_proxy" else (root_path or ""),
+            "proxy_target": proxy_target,
+            "https_redirect": bool(https_flag),
+            "gzip_enabled": bool(gzip_flag),
+            "nginx_tpl": tpl,
+            "old_domains": list(domains or []),
+            "old_root_path": root_path,
+            "max_attempts": int(_SITE_OP_MAX_ATTEMPTS),
+        },
+        status="queued",
+        progress=0,
+        result={
+            "queued": True,
+            "op": "site_update",
+            "max_attempts": int(_SITE_OP_MAX_ATTEMPTS),
+            "attempt": 0,
+        },
     )
     add_site_event(
         int(site_id),
-        "site_https_redirect",
-        status="running",
+        "site_update",
+        status="queued",
         actor=str(user or ""),
-        payload={"domains": domains, "https_redirect": https_flag},
+        payload={
+            "task_id": int(task_id),
+            "domains": list(domains or []),
+            "https_redirect": bool(https_flag),
+            "reason": "https_redirect_toggle",
+        },
     )
-
-    try:
-        payload = {
-            "domains": domains,
-            "type": site.get("type") or "static",
-            "web_server": site.get("web_server") or "nginx",
-            "proxy_target": _normalize_proxy_target(site.get("proxy_target") or ""),
-            "https_redirect": https_flag,
-            "gzip_enabled": True if site.get("gzip_enabled") is None else bool(site.get("gzip_enabled")),
-            "nginx_tpl": site.get("nginx_tpl") or "",
-            "root_path": site.get("root_path") or "",
-            "root_base": _node_root_base(node),
-        }
-
-        update_task(task_id, progress=45)
-        data = await agent_post(
-            node["base_url"],
-            node["api_key"],
-            "/api/v1/website/site/create",
-            payload,
-            node_verify_tls(node),
-            timeout=45,
-        )
-        if not data.get("ok", True):
-            raise AgentError(str(data.get("error") or "更新 HTTPS 跳转失败"))
-
-        update_site(int(site_id), https_redirect=https_flag)
-        update_task(task_id, status="success", progress=100, result=data)
-        add_site_event(int(site_id), "site_https_redirect", status="success", actor=str(user or ""), result=data)
-        set_flash(request, "已开启强制 HTTPS" if https_flag else "已关闭强制 HTTPS")
-    except Exception as exc:
-        update_task(task_id, status="failed", progress=100, error=str(exc))
-        add_site_event(int(site_id), "site_https_redirect", status="failed", actor=str(user or ""), error=str(exc))
-        set_flash(request, f"更新强制 HTTPS 失败：{exc}")
-
+    set_flash(
+        request,
+        (
+            f"已提交{'开启' if https_flag else '关闭'}强制 HTTPS 任务 #{task_id}，"
+            "等待节点上报后自动执行（支持内网节点）。"
+        ),
+    )
     return RedirectResponse(url=f"/websites/{site_id}", status_code=303)
 
 
@@ -2707,39 +3848,33 @@ async def website_delete(
         "delete_cert": bool(delete_cert),
         "root_base": _node_root_base(node),
     }
+    task_id = add_task(
+        node_id=int(site.get("node_id") or 0),
+        task_type="site_delete",
+        payload={
+            "site_id": int(site_id),
+            "delete_root": bool(delete_files),
+            "delete_cert": bool(delete_cert),
+            "max_attempts": int(_SITE_OP_MAX_ATTEMPTS),
+        },
+        status="queued",
+        progress=0,
+        result={
+            "queued": True,
+            "op": "site_delete",
+            "max_attempts": int(_SITE_OP_MAX_ATTEMPTS),
+            "attempt": 0,
+        },
+    )
     add_site_event(
         int(site_id),
         "site_delete",
-        status="running",
+        status="queued",
         actor=str(user or ""),
-        payload=payload,
+        payload={**payload, "task_id": int(task_id)},
     )
-    try:
-        data = await agent_post(
-            node["base_url"],
-            node["api_key"],
-            "/api/v1/website/site/delete",
-            payload,
-            node_verify_tls(node),
-            timeout=20,
-        )
-        if not data.get("ok", True):
-            raise AgentError(str(data.get("error") or "删除站点失败"))
-        delete_certificates_by_site(int(site_id))
-        delete_site_events(int(site_id))
-        delete_site_checks(int(site_id))
-        delete_site(int(site_id))
-        warn = data.get("warnings") if isinstance(data, dict) else None
-        add_site_event(int(site_id), "site_delete", status="success", actor=str(user or ""), result=data)
-        if isinstance(warn, list) and warn:
-            set_flash(request, f"站点已删除，但有警告：{'；'.join([str(x) for x in warn])}")
-        else:
-            set_flash(request, "站点已删除")
-        return RedirectResponse(url="/websites", status_code=303)
-    except Exception as exc:
-        add_site_event(int(site_id), "site_delete", status="failed", actor=str(user or ""), error=str(exc))
-        set_flash(request, f"删除站点失败：{exc}")
-        return RedirectResponse(url=f"/websites/{site_id}", status_code=303)
+    set_flash(request, f"已提交站点删除任务 #{task_id}，等待节点上报后自动执行（支持内网节点）。")
+    return RedirectResponse(url=f"/websites/{site_id}", status_code=303)
 
 
 @router.post("/websites/nodes/{node_id}/env/uninstall")
@@ -2825,35 +3960,48 @@ async def website_files(
     if not site:
         set_flash(request, "站点不存在")
         return RedirectResponse(url="/websites", status_code=303)
-    if not _can_access_site(user, site):
+    if not _can_access_site_files(user, site):
         set_flash(request, "无权访问该站点")
-        return RedirectResponse(url="/websites", status_code=303)
+        return RedirectResponse(url=("/remote-storage" if _is_storage_mount_site(site) else "/websites"), status_code=303)
+    storage_mount_meta = _storage_mount_meta_for_site(site)
+    is_storage_mount = bool(storage_mount_meta.get("is_storage_mount"))
+    site_back_href = "/remote-storage" if is_storage_mount else f"/websites/{site_id}"
+    site_back_text = "返回远程存储" if is_storage_mount else "返回站点"
+    show_site_nav = not is_storage_mount
     node = get_node(_site_node_id(site))
     if not node:
         set_flash(request, "节点不存在")
-        return RedirectResponse(url=f"/websites/{site_id}", status_code=303)
+        return RedirectResponse(url=site_back_href, status_code=303)
+    is_read_only_mount, storage_mount_meta = _is_read_only_storage_mount(site)
+    read_only_mount_label = str(storage_mount_meta.get("profile_name") or site.get("name") or "").strip()
 
     root = _agent_payload_root(site, node)
     if not root:
         set_flash(request, "该站点没有可管理的根目录")
-        return RedirectResponse(url=f"/websites/{site_id}", status_code=303)
+        return RedirectResponse(url=site_back_href, status_code=303)
 
     err_msg = ""
     items: List[Dict[str, Any]] = []
-    try:
-        q = urlencode({"root": root, "path": path, "root_base": _node_root_base(node)})
-        data = await agent_get(
-            node["base_url"],
-            node["api_key"],
-            f"/api/v1/website/files/list?{q}",
-            node_verify_tls(node),
-            timeout=10,
-        )
-        if not data.get("ok", True):
-            raise AgentError(str(data.get("error") or "读取目录失败"))
-        items = data.get("items") or []
-    except Exception as exc:
-        err_msg = str(exc)
+    private_queue_mode = _use_push_queue_for_site_files(node)
+    if private_queue_mode:
+        items = _private_site_file_items_from_tasks(site, path=path)
+    else:
+        list_timeout = 10.0
+        try:
+            target_base_url, target_verify_tls = _direct_agent_request_target(node)
+            q = urlencode({"root": root, "path": path, "root_base": _node_root_base(node, root)})
+            data = await agent_get(
+                target_base_url,
+                node["api_key"],
+                f"/api/v1/website/files/list?{q}",
+                target_verify_tls,
+                timeout=float(list_timeout),
+            )
+            if not data.get("ok", True):
+                raise AgentError(str(data.get("error") or "读取目录失败"))
+            items = data.get("items") or []
+        except Exception as exc:
+            err_msg = str(exc)
 
     favorite_paths: set[str] = set()
     try:
@@ -2902,11 +4050,18 @@ async def website_files(
             "error": err_msg,
             "upload_max_bytes": UPLOAD_MAX_BYTES,
             "upload_max_h": _format_bytes(UPLOAD_MAX_BYTES),
+            "is_private_node": private_queue_mode,
+            "file_push_max_bytes": _SITE_FILE_PUSH_MAX_BYTES,
             "file_share_default_ttl_sec": FILE_SHARE_DEFAULT_TTL_SEC,
             "file_share_min_ttl_sec": FILE_SHARE_MIN_TTL_SEC,
             "file_share_max_ttl_sec": FILE_SHARE_MAX_TTL_SEC,
             "file_share_max_items": FILE_SHARE_MAX_ITEMS,
+            "is_read_only_mount": bool(is_read_only_mount),
+            "read_only_mount_label": read_only_mount_label,
             "embed_mode": _to_flag(modal),
+            "show_site_nav": bool(show_site_nav),
+            "site_back_href": site_back_href,
+            "site_back_text": site_back_text,
         },
     )
 
@@ -2924,7 +4079,7 @@ async def website_files_favorite_toggle(
     site = get_site(int(site_id))
     if not site:
         return JSONResponse({"ok": False, "error": "站点不存在"}, status_code=404)
-    if not _can_access_site(user, site):
+    if not _can_access_site_files(user, site):
         return JSONResponse({"ok": False, "error": "无权访问该站点"}, status_code=403)
     node = get_node(_site_node_id(site))
 
@@ -2987,11 +4142,19 @@ async def website_files_upload_chunk(
     site = get_site(int(site_id))
     if not site:
         return JSONResponse({"ok": False, "error": "站点不存在"}, status_code=404)
-    if not _can_access_site(user, site):
+    if not _can_access_site_files(user, site):
         return JSONResponse({"ok": False, "error": "无权访问该站点"}, status_code=403)
+    is_read_only_mount, storage_mount_meta = _is_read_only_storage_mount(site)
+    if is_read_only_mount:
+        return _deny_read_only_storage_mount_json(storage_mount_meta)
     node = get_node(_site_node_id(site))
     if not node:
         return JSONResponse({"ok": False, "error": "节点不存在"}, status_code=404)
+    if _use_push_queue_for_site_files(node):
+        return {
+            "ok": False,
+            "error": "私网节点分片直传不可用，请使用兼容上传（队列模式）。",
+        }
 
     root = _agent_payload_root(site, node)
     if not root:
@@ -3015,15 +4178,16 @@ async def website_files_upload_chunk(
         "content_b64": str(data.get("content_b64") or ""),
         "chunk_sha256": str(data.get("chunk_sha256") or ""),
         "allow_empty": bool(data.get("allow_empty")),
-        "root_base": _node_root_base(node),
+        "root_base": _node_root_base(node, root),
     }
     try:
+        target_base_url, target_verify_tls = _direct_agent_request_target(node)
         resp = await agent_post(
-            node["base_url"],
+            target_base_url,
             node["api_key"],
             "/api/v1/website/files/upload_chunk",
             payload,
-            node_verify_tls(node),
+            target_verify_tls,
             timeout=90,
         )
         return resp
@@ -3044,11 +4208,19 @@ async def website_files_upload_status(
     site = get_site(int(site_id))
     if not site:
         return JSONResponse({"ok": False, "error": "站点不存在"}, status_code=404)
-    if not _can_access_site(user, site):
+    if not _can_access_site_files(user, site):
         return JSONResponse({"ok": False, "error": "无权访问该站点"}, status_code=403)
+    is_read_only_mount, storage_mount_meta = _is_read_only_storage_mount(site)
+    if is_read_only_mount:
+        return _deny_read_only_storage_mount_json(storage_mount_meta)
     node = get_node(_site_node_id(site))
     if not node:
         return JSONResponse({"ok": False, "error": "节点不存在"}, status_code=404)
+    if _use_push_queue_for_site_files(node):
+        return {
+            "ok": False,
+            "error": "私网节点分片续传状态不可用，请使用兼容上传（队列模式）。",
+        }
 
     root = _agent_payload_root(site, node)
     if not root:
@@ -3059,15 +4231,16 @@ async def website_files_upload_status(
         "path": str(data.get("path") or ""),
         "filename": str(data.get("filename") or "upload.bin"),
         "upload_id": str(data.get("upload_id") or ""),
-        "root_base": _node_root_base(node),
+        "root_base": _node_root_base(node, root),
     }
     try:
+        target_base_url, target_verify_tls = _direct_agent_request_target(node)
         resp = await agent_post(
-            node["base_url"],
+            target_base_url,
             node["api_key"],
             "/api/v1/website/files/upload_status",
             payload,
-            node_verify_tls(node),
+            target_verify_tls,
             timeout=10,
         )
         return resp
@@ -3089,9 +4262,18 @@ async def website_files_mkdir(
     if not site:
         set_flash(request, "站点不存在")
         return RedirectResponse(url="/websites", status_code=303)
-    if not _can_access_site(user, site):
+    if not _can_access_site_files(user, site):
         set_flash(request, "无权访问该站点")
         return RedirectResponse(url="/websites", status_code=303)
+    is_read_only_mount, storage_mount_meta = _is_read_only_storage_mount(site)
+    if is_read_only_mount:
+        return _deny_read_only_storage_mount_page(
+            request=request,
+            site_id=int(site_id),
+            path=path,
+            modal_flag=modal_flag,
+            meta=storage_mount_meta,
+        )
     node = get_node(_site_node_id(site))
     if not node:
         set_flash(request, "节点不存在")
@@ -3107,13 +4289,20 @@ async def website_files_mkdir(
         set_flash(request, "目录名不能为空")
         return RedirectResponse(url=_append_modal_query(f"/websites/{site_id}/files?path={path}", modal_flag), status_code=303)
 
+    req_payload = {"root": root, "path": path, "name": name, "root_base": _node_root_base(node, root)}
+    if _use_push_queue_for_site_files(node):
+        task_id = _enqueue_site_file_op_task(site, node, "mkdir", req_payload, str(user or ""))
+        set_flash(request, f"已提交目录创建任务 #{task_id}，等待节点上报后自动执行。")
+        return RedirectResponse(url=_append_modal_query(f"/websites/{site_id}/files?path={path}", modal_flag), status_code=303)
+
     try:
+        target_base_url, target_verify_tls = _direct_agent_request_target(node)
         await agent_post(
-            node["base_url"],
+            target_base_url,
             node["api_key"],
             "/api/v1/website/files/mkdir",
-            {"root": root, "path": path, "name": name, "root_base": _node_root_base(node)},
-            node_verify_tls(node),
+            req_payload,
+            target_verify_tls,
             timeout=10,
         )
         set_flash(request, "目录创建成功")
@@ -3138,9 +4327,18 @@ async def website_files_upload(
     if not site:
         set_flash(request, "站点不存在")
         return RedirectResponse(url="/websites", status_code=303)
-    if not _can_access_site(user, site):
+    if not _can_access_site_files(user, site):
         set_flash(request, "无权访问该站点")
         return RedirectResponse(url="/websites", status_code=303)
+    is_read_only_mount, storage_mount_meta = _is_read_only_storage_mount(site)
+    if is_read_only_mount:
+        return _deny_read_only_storage_mount_page(
+            request=request,
+            site_id=int(site_id),
+            path=path,
+            modal_flag=modal_flag,
+            meta=storage_mount_meta,
+        )
     node = get_node(_site_node_id(site))
     if not node:
         set_flash(request, "节点不存在")
@@ -3150,6 +4348,8 @@ async def website_files_upload(
     if not root:
         set_flash(request, "该站点没有可管理的根目录")
         return RedirectResponse(url=f"/websites/{site_id}", status_code=303)
+
+    target_base_url, target_verify_tls = _direct_agent_request_target(node)
 
     def _split_upload_name(raw: str) -> Tuple[str, str]:
         clean = (raw or "").replace("\\", "/").lstrip("/")
@@ -3185,14 +4385,14 @@ async def website_files_upload(
                 "offset": 0,
                 "done": True,
                 "allow_empty": True,
-                "root_base": _node_root_base(node),
+                "root_base": _node_root_base(node, root),
             }
             resp = await agent_post(
-                node["base_url"],
+                target_base_url,
                 node["api_key"],
                 "/api/v1/website/files/upload_chunk",
                 payload,
-                node_verify_tls(node),
+                target_verify_tls,
                 timeout=10,
             )
             if not resp.get("ok", True):
@@ -3213,14 +4413,14 @@ async def website_files_upload(
                 "done": done,
                 "content_b64": base64.b64encode(chunk).decode("ascii"),
                 "chunk_sha256": hashlib.sha256(chunk).hexdigest(),
-                "root_base": _node_root_base(node),
+                "root_base": _node_root_base(node, root),
             }
             resp = await agent_post(
-                node["base_url"],
+                target_base_url,
                 node["api_key"],
                 "/api/v1/website/files/upload_chunk",
                 payload,
-                node_verify_tls(node),
+                target_verify_tls,
                 timeout=90,
             )
             if not resp.get("ok", True):
@@ -3243,6 +4443,7 @@ async def website_files_upload(
         return RedirectResponse(url=_append_modal_query(f"/websites/{site_id}/files?path={path}", modal_flag), status_code=303)
 
     ok_count = 0
+    close_uploads_in_request = True
     try:
         prepared: List[Tuple[UploadFile, str, str]] = []
         for upload in uploads:
@@ -3257,6 +4458,76 @@ async def website_files_upload(
 
         if not prepared:
             raise RuntimeError("请选择文件或文件夹")
+
+        if _use_push_queue_for_site_files(node):
+            limit_bytes = min(int(UPLOAD_MAX_BYTES), int(_SITE_FILE_PUSH_MAX_BYTES))
+            prep_task_id = add_task(
+                node_id=int(site.get("node_id") or 0),
+                task_type="site_file_upload_prepare",
+                payload={
+                    "site_id": int(site_id),
+                    "path": str(path or ""),
+                    "file_count": int(len(prepared)),
+                    "max_file_bytes": int(limit_bytes),
+                },
+                status="running",
+                progress=1,
+                result={
+                    "ok": True,
+                    "queued": False,
+                    "preparing": True,
+                    "processed_files": 0,
+                    "total_files": int(len(prepared)),
+                    "queued_file_tasks": 0,
+                },
+            )
+            add_site_event(
+                int(site_id),
+                "site_file_upload_prepare",
+                status="running",
+                actor=str(user or ""),
+                payload={
+                    "prep_task_id": int(prep_task_id),
+                    "path": str(path or ""),
+                    "file_count": int(len(prepared)),
+                    "max_file_bytes": int(limit_bytes),
+                },
+            )
+            launched = _launch_site_bg_job(
+                _prepare_private_upload_queue_tasks(
+                    prep_task_id=int(prep_task_id),
+                    site=site,
+                    node=node,
+                    root=root,
+                    uploads=prepared,
+                    actor=str(user or ""),
+                    limit_bytes=int(limit_bytes),
+                )
+            )
+            if not launched:
+                update_task(
+                    int(prep_task_id),
+                    status="failed",
+                    progress=100,
+                    error="后台任务启动失败",
+                    result={
+                        "ok": False,
+                        "queued": False,
+                        "processed_files": 0,
+                        "total_files": int(len(prepared)),
+                        "queued_file_tasks": 0,
+                    },
+                )
+                raise RuntimeError("后台任务启动失败，请重试")
+            close_uploads_in_request = False
+            set_flash(
+                request,
+                (
+                    f"文件已接收，后台正在拆分并排队（任务 #{prep_task_id}）。"
+                    "你可以直接关闭弹窗，后续会自动下发到私网节点。"
+                ),
+            )
+            return RedirectResponse(url=_append_modal_query(f"/websites/{site_id}/files?path={path}", modal_flag), status_code=303)
 
         first_error: Optional[Exception] = None
         cursor = 0
@@ -3292,11 +4563,12 @@ async def website_files_upload(
             msg = f"部分上传成功（{ok_count} 个），{msg}"
         set_flash(request, msg)
     finally:
-        for upload in uploads:
-            try:
-                await upload.close()
-            except Exception:
-                pass
+        if close_uploads_in_request:
+            for upload in uploads:
+                try:
+                    await upload.close()
+                except Exception:
+                    pass
 
     return RedirectResponse(url=_append_modal_query(f"/websites/{site_id}/files?path={path}", modal_flag), status_code=303)
 
@@ -3313,9 +4585,11 @@ async def website_files_edit(
     if not site:
         set_flash(request, "站点不存在")
         return RedirectResponse(url="/websites", status_code=303)
-    if not _can_access_site(user, site):
+    if not _can_access_site_files(user, site):
         set_flash(request, "无权访问该站点")
         return RedirectResponse(url="/websites", status_code=303)
+    is_read_only_mount, storage_mount_meta = _is_read_only_storage_mount(site)
+    read_only_mount_label = str(storage_mount_meta.get("profile_name") or site.get("name") or "").strip()
     node = get_node(_site_node_id(site))
     if not node:
         set_flash(request, "节点不存在")
@@ -3329,12 +4603,13 @@ async def website_files_edit(
     content = ""
     error = ""
     try:
-        q = urlencode({"root": root, "path": path, "root_base": _node_root_base(node)})
+        target_base_url, target_verify_tls = _direct_agent_request_target(node)
+        q = urlencode({"root": root, "path": path, "root_base": _node_root_base(node, root)})
         data = await agent_get(
-            node["base_url"],
+            target_base_url,
             node["api_key"],
             f"/api/v1/website/files/read?{q}",
-            node_verify_tls(node),
+            target_verify_tls,
             timeout=10,
         )
         if not data.get("ok", True):
@@ -3349,12 +4624,14 @@ async def website_files_edit(
             "request": request,
             "user": user,
             "flash": flash(request),
-            "title": f"编辑文件 · {site.get('name')}",
+            "title": f"{'查看文件' if is_read_only_mount else '编辑文件'} · {site.get('name')}",
             "site": site,
             "node": node,
             "path": path,
             "content": content,
             "error": error,
+            "is_read_only_mount": bool(is_read_only_mount),
+            "read_only_mount_label": read_only_mount_label,
             "embed_mode": _to_flag(modal),
         },
     )
@@ -3374,9 +4651,19 @@ async def website_files_save(
     if not site:
         set_flash(request, "站点不存在")
         return RedirectResponse(url="/websites", status_code=303)
-    if not _can_access_site(user, site):
+    if not _can_access_site_files(user, site):
         set_flash(request, "无权访问该站点")
         return RedirectResponse(url="/websites", status_code=303)
+    parent_path = "/".join(str(path or "").split("/")[:-1])
+    is_read_only_mount, storage_mount_meta = _is_read_only_storage_mount(site)
+    if is_read_only_mount:
+        return _deny_read_only_storage_mount_page(
+            request=request,
+            site_id=int(site_id),
+            path=parent_path,
+            modal_flag=modal_flag,
+            meta=storage_mount_meta,
+        )
     node = get_node(_site_node_id(site))
     if not node:
         set_flash(request, "节点不存在")
@@ -3387,20 +4674,26 @@ async def website_files_save(
         set_flash(request, "该站点没有可管理的根目录")
         return RedirectResponse(url=f"/websites/{site_id}", status_code=303)
 
-    try:
-        await agent_post(
-            node["base_url"],
-            node["api_key"],
-            "/api/v1/website/files/write",
-            {"root": root, "path": path, "content": content, "root_base": _node_root_base(node)},
-            node_verify_tls(node),
-            timeout=10,
-        )
-        set_flash(request, "保存成功")
-    except Exception as exc:
-        set_flash(request, f"保存失败：{exc}")
+    req_payload = {"root": root, "path": path, "content": content, "root_base": _node_root_base(node, root)}
+    if _use_push_queue_for_site_files(node):
+        task_id = _enqueue_site_file_op_task(site, node, "write", req_payload, str(user or ""))
+        set_flash(request, f"已提交文件保存任务 #{task_id}，等待节点上报后自动执行。")
+    else:
+        try:
+            target_base_url, target_verify_tls = _direct_agent_request_target(node)
+            await agent_post(
+                target_base_url,
+                node["api_key"],
+                "/api/v1/website/files/write",
+                req_payload,
+                target_verify_tls,
+                timeout=10,
+            )
+            set_flash(request, "保存成功")
+        except Exception as exc:
+            set_flash(request, f"保存失败：{exc}")
     return RedirectResponse(
-        url=_append_modal_query(f"/websites/{site_id}/files?path={'/'.join(path.split('/')[:-1])}", modal_flag),
+        url=_append_modal_query(f"/websites/{site_id}/files?path={parent_path}", modal_flag),
         status_code=303,
     )
 
@@ -3418,7 +4711,183 @@ async def website_files_delete(
     if not site:
         set_flash(request, "站点不存在")
         return RedirectResponse(url="/websites", status_code=303)
-    if not _can_access_site(user, site):
+    if not _can_access_site_files(user, site):
+        set_flash(request, "无权访问该站点")
+        return RedirectResponse(url="/websites", status_code=303)
+    parent_path = "/".join(str(path or "").split("/")[:-1])
+    is_read_only_mount, storage_mount_meta = _is_read_only_storage_mount(site)
+    if is_read_only_mount:
+        return _deny_read_only_storage_mount_page(
+            request=request,
+            site_id=int(site_id),
+            path=parent_path,
+            modal_flag=modal_flag,
+            meta=storage_mount_meta,
+        )
+    node = get_node(_site_node_id(site))
+    if not node:
+        set_flash(request, "节点不存在")
+        return RedirectResponse(url=f"/websites/{site_id}", status_code=303)
+
+    root = _agent_payload_root(site, node)
+    if not root:
+        set_flash(request, "该站点没有可管理的根目录")
+        return RedirectResponse(url=f"/websites/{site_id}", status_code=303)
+
+    req_payload = {"root": root, "path": path, "root_base": _node_root_base(node, root)}
+    if _use_push_queue_for_site_files(node):
+        task_id = _enqueue_site_file_op_task(site, node, "delete", req_payload, str(user or ""))
+        set_flash(request, f"已提交删除任务 #{task_id}，等待节点上报后自动执行。")
+    else:
+        try:
+            target_base_url, target_verify_tls = _direct_agent_request_target(node)
+            await agent_post(
+                target_base_url,
+                node["api_key"],
+                "/api/v1/website/files/delete",
+                req_payload,
+                target_verify_tls,
+                timeout=10,
+            )
+            set_flash(request, "删除成功")
+        except Exception as exc:
+            set_flash(request, f"删除失败：{exc}")
+    return RedirectResponse(
+        url=_append_modal_query(f"/websites/{site_id}/files?path={parent_path}", modal_flag),
+        status_code=303,
+    )
+
+
+@router.post("/websites/{site_id}/files/delete_selected")
+async def website_files_delete_selected(
+    request: Request,
+    site_id: int,
+    items_json: str = Form(""),
+    path: str = Form(""),
+    modal: str = Form(""),
+    user: str = Depends(require_login_page),
+):
+    modal_flag = _to_flag(modal)
+    site = get_site(int(site_id))
+    if not site:
+        set_flash(request, "站点不存在")
+        return RedirectResponse(url="/websites", status_code=303)
+    if not _can_access_site_files(user, site):
+        set_flash(request, "无权访问该站点")
+        return RedirectResponse(url="/websites", status_code=303)
+    is_read_only_mount, storage_mount_meta = _is_read_only_storage_mount(site)
+    if is_read_only_mount:
+        return _deny_read_only_storage_mount_page(
+            request=request,
+            site_id=int(site_id),
+            path=path,
+            modal_flag=modal_flag,
+            meta=storage_mount_meta,
+        )
+    node = get_node(_site_node_id(site))
+    if not node:
+        set_flash(request, "节点不存在")
+        return RedirectResponse(url=f"/websites/{site_id}", status_code=303)
+
+    root = _agent_payload_root(site, node)
+    if not root:
+        set_flash(request, "该站点没有可管理的根目录")
+        return RedirectResponse(url=f"/websites/{site_id}", status_code=303)
+
+    try:
+        raw_items = json.loads(str(items_json or "[]"))
+    except Exception:
+        raw_items = []
+    try:
+        selected = _parse_share_items(raw_items)
+    except Exception:
+        selected = []
+    if not selected:
+        set_flash(request, "请先选择要删除的文件或目录")
+        return RedirectResponse(url=_append_modal_query(f"/websites/{site_id}/files?path={path}", modal_flag), status_code=303)
+
+    selected_paths = sorted(
+        {str(x.get("path") or "").strip() for x in selected if str(x.get("path") or "").strip()},
+        key=lambda p: (p.count("/"), len(p)),
+        reverse=True,
+    )
+    if not selected_paths:
+        set_flash(request, "请选择有效的删除路径")
+        return RedirectResponse(url=_append_modal_query(f"/websites/{site_id}/files?path={path}", modal_flag), status_code=303)
+
+    ok_count = 0
+    fail_count = 0
+    fail_samples: List[str] = []
+
+    if _use_push_queue_for_site_files(node):
+        first_task_id = 0
+        last_task_id = 0
+        for rel_path in selected_paths:
+            req_payload = {"root": root, "path": rel_path, "root_base": _node_root_base(node, root)}
+            tid = _enqueue_site_file_op_task(site, node, "delete", req_payload, str(user or ""))
+            if first_task_id <= 0:
+                first_task_id = int(tid)
+            last_task_id = int(tid)
+            ok_count += 1
+        if ok_count > 0:
+            if first_task_id == last_task_id:
+                set_flash(request, f"已提交批量删除任务 #{first_task_id}（共 {ok_count} 项），等待节点上报后自动执行。")
+            else:
+                set_flash(
+                    request,
+                    f"已提交批量删除任务 #{first_task_id} - #{last_task_id}（共 {ok_count} 项），等待节点上报后自动执行。",
+                )
+        else:
+            set_flash(request, "未提交任何删除任务")
+        return RedirectResponse(url=_append_modal_query(f"/websites/{site_id}/files?path={path}", modal_flag), status_code=303)
+
+    target_base_url, target_verify_tls = _direct_agent_request_target(node)
+    for rel_path in selected_paths:
+        req_payload = {"root": root, "path": rel_path, "root_base": _node_root_base(node, root)}
+        try:
+            data = await agent_post(
+                target_base_url,
+                node["api_key"],
+                "/api/v1/website/files/delete",
+                req_payload,
+                target_verify_tls,
+                timeout=15,
+            )
+            if not bool((data or {}).get("ok", True)):
+                raise AgentError(str((data or {}).get("error") or "删除失败"))
+            ok_count += 1
+        except Exception as exc:
+            fail_count += 1
+            if len(fail_samples) < 5:
+                fail_samples.append(f"{rel_path}: {exc}")
+
+    if fail_count <= 0:
+        set_flash(request, f"批量删除成功（{ok_count} 项）")
+    else:
+        detail = "；".join(fail_samples)
+        msg = f"批量删除完成：成功 {ok_count} 项，失败 {fail_count} 项"
+        if detail:
+            msg += f"。示例：{detail}"
+        set_flash(request, msg)
+    return RedirectResponse(url=_append_modal_query(f"/websites/{site_id}/files?path={path}", modal_flag), status_code=303)
+
+
+@router.post("/websites/{site_id}/files/download_selected")
+async def website_files_download_selected(
+    request: Request,
+    site_id: int,
+    items_json: str = Form(""),
+    path: str = Form(""),
+    modal: str = Form(""),
+    stable: str = Form("1"),
+    user: str = Depends(require_login_page),
+):
+    modal_flag = _to_flag(modal)
+    site = get_site(int(site_id))
+    if not site:
+        set_flash(request, "站点不存在")
+        return RedirectResponse(url="/websites", status_code=303)
+    if not _can_access_site_files(user, site):
         set_flash(request, "无权访问该站点")
         return RedirectResponse(url="/websites", status_code=303)
     node = get_node(_site_node_id(site))
@@ -3432,20 +4901,66 @@ async def website_files_delete(
         return RedirectResponse(url=f"/websites/{site_id}", status_code=303)
 
     try:
-        await agent_post(
-            node["base_url"],
-            node["api_key"],
-            "/api/v1/website/files/delete",
-            {"root": root, "path": path, "root_base": _node_root_base(node)},
-            node_verify_tls(node),
-            timeout=10,
+        raw_items = json.loads(str(items_json or "[]"))
+    except Exception:
+        raw_items = []
+    try:
+        share_items = _parse_share_items(raw_items)
+    except Exception:
+        share_items = []
+    if not share_items:
+        set_flash(request, "请先选择要下载的文件或目录")
+        return RedirectResponse(url=_append_modal_query(f"/websites/{site_id}/files?path={path}", modal_flag), status_code=303)
+    if len(share_items) > FILE_SHARE_MAX_ITEMS:
+        set_flash(request, f"一次最多下载 {FILE_SHARE_MAX_ITEMS} 项")
+        return RedirectResponse(url=_append_modal_query(f"/websites/{site_id}/files?path={path}", modal_flag), status_code=303)
+
+    stable_enabled = _stable_download_flag(stable, default=True)
+    filename = _build_stream_zip_filename(site_id, site.get("name"))
+    if stable_enabled:
+        sig = _share_items_signature(share_items)
+        cache_key = ""
+        if sig:
+            cache_key = _stable_download_cache_key(
+                site_id,
+                _site_node_id(site),
+                root,
+                f"__selected__:{sig}",
+                True,
+            )
+            cached = _get_stable_download_cache_entry(cache_key)
+            if cached:
+                cached_path = str(cached.get("path") or "")
+                if cached_path and os.path.exists(cached_path):
+                    return FileResponse(
+                        path=cached_path,
+                        filename=filename,
+                        media_type="application/zip",
+                        headers=_download_response_headers(filename),
+                    )
+        try:
+            zip_path, file_count = await _build_share_zip_with_retry(node, root, share_items)
+        except Exception as exc:
+            set_flash(request, f"批量下载失败：{exc}")
+            return RedirectResponse(url=_append_modal_query(f"/websites/{site_id}/files?path={path}", modal_flag), status_code=303)
+        if int(file_count or 0) <= 0:
+            _remove_file_quiet(zip_path)
+            set_flash(request, "批量下载失败：未找到可下载文件")
+            return RedirectResponse(url=_append_modal_query(f"/websites/{site_id}/files?path={path}", modal_flag), status_code=303)
+        if cache_key:
+            _put_stable_download_cache_entry(cache_key, zip_path, filename, "application/zip")
+        return FileResponse(
+            path=zip_path,
+            filename=filename,
+            media_type="application/zip",
+            headers=_download_response_headers(filename),
         )
-        set_flash(request, "删除成功")
-    except Exception as exc:
-        set_flash(request, f"删除失败：{exc}")
-    return RedirectResponse(
-        url=_append_modal_query(f"/websites/{site_id}/files?path={'/'.join(path.split('/')[:-1])}", modal_flag),
-        status_code=303,
+
+    headers = _download_response_headers(filename)
+    return StreamingResponse(
+        _iter_share_zip_stream(node, root, share_items),
+        media_type="application/zip",
+        headers=headers,
     )
 
 
@@ -3463,9 +4978,19 @@ async def website_files_unzip(
     if not site:
         set_flash(request, "站点不存在")
         return RedirectResponse(url="/websites", status_code=303)
-    if not _can_access_site(user, site):
+    if not _can_access_site_files(user, site):
         set_flash(request, "无权访问该站点")
         return RedirectResponse(url="/websites", status_code=303)
+    is_read_only_mount, storage_mount_meta = _is_read_only_storage_mount(site)
+    if is_read_only_mount:
+        redirect_path = str(dest or path or "")
+        return _deny_read_only_storage_mount_page(
+            request=request,
+            site_id=int(site_id),
+            path=redirect_path,
+            modal_flag=modal_flag,
+            meta=storage_mount_meta,
+        )
     node = get_node(_site_node_id(site))
     if not node:
         set_flash(request, "节点不存在")
@@ -3476,18 +5001,24 @@ async def website_files_unzip(
         set_flash(request, "该站点没有可管理的根目录")
         return RedirectResponse(url=f"/websites/{site_id}", status_code=303)
 
-    try:
-        await agent_post(
-            node["base_url"],
-            node["api_key"],
-            "/api/v1/website/files/unzip",
-            {"root": root, "path": path, "dest": dest, "root_base": _node_root_base(node)},
-            node_verify_tls(node),
-            timeout=60,
-        )
-        set_flash(request, "解压成功")
-    except Exception as exc:
-        set_flash(request, f"解压失败：{exc}")
+    req_payload = {"root": root, "path": path, "dest": dest, "root_base": _node_root_base(node, root)}
+    if _use_push_queue_for_site_files(node):
+        task_id = _enqueue_site_file_op_task(site, node, "unzip", req_payload, str(user or ""))
+        set_flash(request, f"已提交解压任务 #{task_id}，等待节点上报后自动执行。")
+    else:
+        try:
+            target_base_url, target_verify_tls = _direct_agent_request_target(node)
+            await agent_post(
+                target_base_url,
+                node["api_key"],
+                "/api/v1/website/files/unzip",
+                req_payload,
+                target_verify_tls,
+                timeout=60,
+            )
+            set_flash(request, "解压成功")
+        except Exception as exc:
+            set_flash(request, f"解压失败：{exc}")
     return RedirectResponse(url=_append_modal_query(f"/websites/{site_id}/files?path={dest}", modal_flag), status_code=303)
 
 
@@ -3503,7 +5034,7 @@ async def website_files_download(
     if not site:
         set_flash(request, "站点不存在")
         return RedirectResponse(url="/websites", status_code=303)
-    if not _can_access_site(user, site):
+    if not _can_access_site_files(user, site):
         set_flash(request, "无权访问该站点")
         return RedirectResponse(url="/websites", status_code=303)
     node = get_node(_site_node_id(site))
@@ -3519,6 +5050,7 @@ async def website_files_download(
     rel_path = str(path or "").replace("\\", "/").strip().lstrip("/")
     parent_path = "/".join(rel_path.split("/")[:-1]) if rel_path else ""
     modal_flag = _to_flag(modal)
+    stable_enabled = _stable_download_flag(request.query_params.get("stable"), default=True)
     if not rel_path:
         set_flash(request, "请选择要下载的文件或目录")
         return RedirectResponse(
@@ -3526,11 +5058,46 @@ async def website_files_download(
             status_code=303,
         )
 
-    # Directory download: stream as zip.
+    # Directory download.
     try:
         await _agent_list_files(node, root, rel_path)
         zip_name = _build_path_zip_filename(site_id, site.get("name"), rel_path)
-        headers = {"Content-Disposition": _download_content_disposition(zip_name)}
+        if stable_enabled:
+            cache_key = _stable_download_cache_key(site_id, _site_node_id(site), root, rel_path, True)
+            cached = _get_stable_download_cache_entry(cache_key)
+            if cached:
+                cached_path = str(cached.get("path") or "")
+                if cached_path and os.path.exists(cached_path):
+                    return FileResponse(
+                        path=cached_path,
+                        filename=zip_name,
+                        media_type="application/zip",
+                        headers=_download_response_headers(zip_name),
+                    )
+            try:
+                zip_path, file_count = await _build_share_zip_with_retry(node, root, [{"path": rel_path, "is_dir": True}])
+            except Exception as exc:
+                set_flash(request, f"下载失败：{exc}")
+                return RedirectResponse(
+                    url=_append_modal_query(f"/websites/{site_id}/files?path={parent_path}", modal_flag),
+                    status_code=303,
+                )
+            if int(file_count or 0) <= 0:
+                _remove_file_quiet(zip_path)
+                set_flash(request, "下载失败：目录为空或无可下载文件")
+                return RedirectResponse(
+                    url=_append_modal_query(f"/websites/{site_id}/files?path={parent_path}", modal_flag),
+                    status_code=303,
+                )
+            _put_stable_download_cache_entry(cache_key, zip_path, zip_name, "application/zip")
+            return FileResponse(
+                path=zip_path,
+                filename=zip_name,
+                media_type="application/zip",
+                headers=_download_response_headers(zip_name),
+            )
+
+        headers = _download_response_headers(zip_name)
         return StreamingResponse(
             _iter_share_zip_stream(node, root, [{"path": rel_path, "is_dir": True}]),
             media_type="application/zip",
@@ -3540,8 +5107,53 @@ async def website_files_download(
         pass
 
     filename = rel_path.split("/")[-1] or "download.bin"
+    if _prefer_zip_stream_for_single_file_download(node, stable_enabled):
+        zip_name = _build_path_zip_filename(site_id, site.get("name"), rel_path)
+        headers = _download_response_headers(zip_name)
+        return StreamingResponse(
+            _iter_share_zip_stream(node, root, [{"path": rel_path, "is_dir": False, "arc_path": filename}]),
+            media_type="application/zip",
+            headers=headers,
+        )
+
+    cache_key = _stable_download_cache_key(site_id, _site_node_id(site), root, rel_path, False)
+    if stable_enabled:
+        cached = _get_stable_download_cache_entry(cache_key)
+        if cached:
+            cached_path = str(cached.get("path") or "")
+            media_type = str(cached.get("media_type") or "application/octet-stream")
+            if cached_path and os.path.exists(cached_path):
+                return FileResponse(
+                    path=cached_path,
+                    filename=filename,
+                    media_type=media_type,
+                    headers=_download_response_headers(filename),
+                )
+        try:
+            local_path, _size, media_type = await _download_file_to_local_cache(node, root, rel_path, timeout=600.0)
+            _put_stable_download_cache_entry(cache_key, local_path, filename, media_type)
+            return FileResponse(
+                path=local_path,
+                filename=filename,
+                media_type=media_type,
+                headers=_download_response_headers(filename),
+            )
+        except Exception as exc:
+            set_flash(request, f"下载失败：{exc}")
+            return RedirectResponse(
+                url=_append_modal_query(f"/websites/{site_id}/files?path={parent_path}", modal_flag),
+                status_code=303,
+            )
+
+    request_forward_headers = _forward_download_request_headers(request)
     try:
-        upstream, status_code, _detail = await _open_agent_file_stream(node, root, rel_path, timeout=600)
+        upstream, status_code, _detail = await _open_agent_file_stream(
+            node,
+            root,
+            rel_path,
+            timeout=600,
+            request_headers=request_forward_headers or None,
+        )
     except Exception as exc:
         set_flash(request, f"下载失败：{exc}")
         return RedirectResponse(
@@ -3554,7 +5166,24 @@ async def website_files_download(
             url=_append_modal_query(f"/websites/{site_id}/files?path={parent_path}", modal_flag),
             status_code=303,
         )
-    return _stream_file_download_response(upstream, filename)
+
+    async def _reopen_from_offset(start: int, end: Optional[int]) -> Tuple[Optional[Any], int, str]:
+        hdrs: Dict[str, str] = {}
+        s = max(0, int(start or 0))
+        e = int(end) if end is not None else None
+        if e is not None and e >= s:
+            hdrs["range"] = f"bytes={s}-{e}"
+        elif s > 0:
+            hdrs["range"] = f"bytes={s}-"
+        return await _open_agent_file_stream(
+            node,
+            root,
+            rel_path,
+            timeout=600,
+            request_headers=hdrs or None,
+        )
+
+    return _stream_file_download_response(upstream, filename, _reopen_from_offset)
 
 @router.post("/websites/{site_id}/files/share")
 async def website_files_share_link(
@@ -3565,7 +5194,7 @@ async def website_files_share_link(
     site = get_site(int(site_id))
     if not site:
         return JSONResponse({"ok": False, "error": "站点不存在"}, status_code=404)
-    if not _can_access_site(user, site):
+    if not _can_access_site_files(user, site):
         return JSONResponse({"ok": False, "error": "无权访问该站点"}, status_code=403)
     node = get_node(_site_node_id(site))
     if not node:
@@ -3626,7 +5255,7 @@ async def website_files_share_list(
     site = get_site(int(site_id))
     if not site:
         return JSONResponse({"ok": False, "error": "站点不存在"}, status_code=404)
-    if not _can_access_site(user, site):
+    if not _can_access_site_files(user, site):
         return JSONResponse({"ok": False, "error": "无权访问该站点"}, status_code=403)
 
     # Auto-clean short links that have already been revoked.
@@ -3720,7 +5349,7 @@ async def website_files_share_revoke(
     site = get_site(int(site_id))
     if not site:
         return JSONResponse({"ok": False, "error": "站点不存在"}, status_code=404)
-    if not _can_access_site(user, site):
+    if not _can_access_site_files(user, site):
         return JSONResponse({"ok": False, "error": "无权访问该站点"}, status_code=403)
 
     try:
@@ -3777,7 +5406,6 @@ async def website_files_share_download_short(request: Request, code: str):
 
 @router.get("/share/site-files")
 async def website_files_share_download(request: Request, t: str = ""):
-    _ = request
     ctx, bad = _validate_site_files_share_token(t)
     if bad is not None:
         return bad
@@ -3805,21 +5433,45 @@ async def website_files_share_download(request: Request, t: str = ""):
     single = share_items[0] if len(share_items) == 1 else None
     if single and not bool(single.get("is_dir")):
         rel_path = str(single.get("path") or "")
+        request_forward_headers = _forward_download_request_headers(request)
         try:
-            upstream, status_code, _detail = await _open_agent_file_stream(node, root, rel_path, timeout=600)
+            upstream, status_code, _detail = await _open_agent_file_stream(
+                node,
+                root,
+                rel_path,
+                timeout=600,
+                request_headers=request_forward_headers or None,
+            )
         except Exception:
             return Response(content="文件不存在或无法下载", media_type="text/plain", status_code=404)
         if upstream is None:
             code = 404 if status_code == 404 else 502
             return Response(content="文件不存在或无法下载", media_type="text/plain", status_code=code)
         filename = rel_path.split("/")[-1] or "download.bin"
-        return _stream_file_download_response(upstream, filename)
+
+        async def _reopen_from_offset(start: int, end: Optional[int]) -> Tuple[Optional[Any], int, str]:
+            hdrs: Dict[str, str] = {}
+            s = max(0, int(start or 0))
+            e = int(end) if end is not None else None
+            if e is not None and e >= s:
+                hdrs["range"] = f"bytes={s}-{e}"
+            elif s > 0:
+                hdrs["range"] = f"bytes={s}-"
+            return await _open_agent_file_stream(
+                node,
+                root,
+                rel_path,
+                timeout=600,
+                request_headers=hdrs or None,
+            )
+
+        return _stream_file_download_response(upstream, filename, _reopen_from_offset)
 
     stream_raw = str(request.query_params.get("stream") or "1").strip().lower()
     stream_enabled = stream_raw not in ("0", "false", "no", "off")
     if stream_enabled:
         filename = _build_stream_zip_filename(site_id, site.get("name"))
-        headers = {"Content-Disposition": _download_content_disposition(filename)}
+        headers = _download_response_headers(filename)
         return StreamingResponse(
             _iter_share_zip_stream(node, root, share_items),
             media_type="application/zip",
@@ -3835,12 +5487,22 @@ async def website_files_share_download(request: Request, t: str = ""):
     if job and str(job.get("status") or "") == "done":
         zip_path = str(job.get("zip_path") or "")
         if zip_path and os.path.exists(zip_path):
-            return FileResponse(path=zip_path, filename=str(job.get("filename") or filename), media_type="application/zip")
+            dl_name = str(job.get("filename") or filename)
+            return FileResponse(
+                path=zip_path,
+                filename=dl_name,
+                media_type="application/zip",
+                headers=_download_response_headers(dl_name),
+            )
 
     if not job:
         job = _new_share_zip_job(site_id, digest, items_sig, filename=filename)
         _upsert_share_zip_job(job)
-        asyncio.create_task(_run_share_zip_job(str(job.get("id") or ""), node, root, list(share_items)))
+        if not _launch_site_bg_job(_run_share_zip_job(str(job.get("id") or ""), node, root, list(share_items))):
+            job["status"] = "error"
+            job["error"] = "后台任务启动失败，请稍后重试"
+            job["updated_at"] = time.time()
+            _upsert_share_zip_job(job)
 
     return HTMLResponse(content=_share_zip_wait_page_html(str(job.get("id") or ""), t), media_type="text/html")
 
@@ -3913,4 +5575,9 @@ async def website_files_share_download_job_download(request: Request, j: str = "
         return Response(content="打包结果已过期，请刷新链接重试", media_type="text/plain", status_code=404)
 
     filename = str(row.get("filename") or "download.zip")
-    return FileResponse(path=zip_path, filename=filename, media_type="application/zip")
+    return FileResponse(
+        path=zip_path,
+        filename=filename,
+        media_type="application/zip",
+        headers=_download_response_headers(filename),
+    )

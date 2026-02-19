@@ -4,7 +4,7 @@ from typing import Callable, List
 
 from fastapi import HTTPException, Request
 
-from ..auth import AuthUser, can_access_node, get_session_user, has_permission
+from ..auth import AuthUser, can_access_node, get_session_user, has_permission, normalize_user_policy
 from ..db import get_site
 
 
@@ -23,6 +23,9 @@ def _path_permissions(path: str, method: str) -> List[str]:
             return ["agents.read"]
         return ["agents.write"]
 
+    if p.startswith("/api/panel/"):
+        return ["users.manage"]
+
     if p.startswith("/api/netmon/"):
         if m == "GET":
             return ["netmon.read"]
@@ -35,6 +38,11 @@ def _path_permissions(path: str, method: str) -> List[str]:
         if "delete" in p:
             return ["publish.apply", "sync.wss", "sync.delete"]
         return ["publish.apply", "sync.wss"]
+
+    if p.startswith("/api/mptcp_tunnel/"):
+        if "delete" in p:
+            return ["publish.apply", "sync.mptcp", "sync.delete"]
+        return ["publish.apply", "sync.mptcp"]
 
     if p.startswith("/api/intranet_tunnel/"):
         if "delete" in p:
@@ -53,6 +61,11 @@ def _path_permissions(path: str, method: str) -> List[str]:
         return ["restore.manage"]
 
     if p.startswith("/api/traffic/reset_all"):
+        return ["nodes.write"]
+
+    if p.startswith("/remote-storage"):
+        if m == "GET":
+            return ["nodes.read"]
         return ["nodes.write"]
 
     if p.startswith("/api/nodes/"):
@@ -188,7 +201,7 @@ def _resolve_user(request: Request, page: bool, check_path_perms: bool = True) -
     request.session["user_id"] = int(user.id)
     request.session["user_role"] = str(user.role_name)
     request.session["user_permissions"] = sorted(list(user.permissions))
-    request.session["user_policy"] = dict(user.policy or {})
+    request.session["user_policy"] = dict(normalize_user_policy(user.policy))
 
     if check_path_perms:
         perms = _path_permissions(str(request.url.path or ""), str(request.method or "GET"))

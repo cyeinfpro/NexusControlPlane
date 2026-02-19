@@ -1,0 +1,1016 @@
+{% extends "base.html" %}
+{% block content %}
+<style>
+.rs-list-card{
+  margin-top:12px;
+}
+.rs-toolbar{
+  margin-top:10px;
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:10px;
+  flex-wrap:wrap;
+}
+.rs-sites{
+  margin-top:10px;
+  display:grid;
+  grid-template-columns:repeat(auto-fit, minmax(520px, 1fr));
+  gap:10px;
+}
+.rs-item{
+  position:relative;
+  border:1px solid rgba(148,163,184,0.16);
+  border-radius:16px;
+  background:rgba(var(--tone-3),0.22);
+  padding:10px 10px 10px 14px;
+  display:flex;
+  flex-direction:column;
+  gap:9px;
+  min-width:0;
+  overflow:hidden;
+  transition:transform .12s ease, border-color .12s ease, background .12s ease;
+}
+.rs-item::before{
+  content:"";
+  position:absolute;
+  left:0;
+  top:8px;
+  bottom:8px;
+  width:3px;
+  border-radius:999px;
+  background:rgba(148,163,184,0.28);
+}
+.rs-item[data-rs-status="ok"]::before{
+  background:linear-gradient(180deg, rgba(34,197,94,0.95), rgba(34,197,94,0.22));
+}
+.rs-item[data-rs-status="warn"]::before{
+  background:linear-gradient(180deg, rgba(245,158,11,0.95), rgba(245,158,11,0.24));
+}
+.rs-item[data-rs-status="bad"]::before{
+  background:linear-gradient(180deg, rgba(239,68,68,0.95), rgba(239,68,68,0.24));
+}
+.rs-item:hover{
+  transform:translateY(-1px);
+  border-color:rgba(34,211,238,0.30);
+  background:rgba(59,130,246,0.05);
+}
+.rs-item-top{
+  display:flex;
+  align-items:flex-start;
+  justify-content:space-between;
+  gap:10px;
+  flex-wrap:wrap;
+}
+.rs-item-main{
+  min-width:0;
+  flex:1 1 auto;
+}
+.rs-title-line{
+  display:flex;
+  align-items:center;
+  gap:8px;
+  flex-wrap:wrap;
+}
+.rs-name{
+  font-weight:950;
+  letter-spacing:0.2px;
+}
+.rs-endpoint{
+  margin-top:4px;
+  color:rgba(var(--tone-text-mid),0.80);
+  font-size:12px;
+  overflow-wrap:anywhere;
+}
+.rs-item-badges{
+  display:flex;
+  align-items:flex-start;
+  gap:8px;
+  flex-wrap:wrap;
+  justify-content:flex-end;
+}
+.rs-body{
+  display:block;
+}
+.rs-main{
+  min-width:0;
+}
+.rs-meta-grid{
+  display:grid;
+  grid-template-columns:repeat(3, minmax(0,1fr));
+  gap:8px;
+}
+.rs-meta-row{
+  border:1px solid rgba(var(--tone-line),0.12);
+  border-radius:11px;
+  background:rgba(var(--tone-0),0.15);
+  padding:7px 9px;
+  min-width:0;
+}
+.rs-meta-k{
+  font-size:11px;
+  color:var(--muted);
+}
+.rs-meta-v{
+  margin-top:3px;
+  font-size:12px;
+  color:rgba(var(--tone-text-mid),0.94);
+  overflow-wrap:anywhere;
+}
+.rs-note{
+  margin-top:2px;
+}
+.rs-side{
+  margin-top:9px;
+  border-top:1px dashed rgba(var(--tone-line),0.16);
+  padding-top:9px;
+  display:grid;
+  grid-template-columns:minmax(220px, 1fr) auto;
+  gap:8px 10px;
+  align-items:start;
+  min-width:0;
+}
+.rs-side .input{
+  width:100%;
+  min-width:0;
+}
+.rs-action-row{
+  display:flex;
+  justify-content:flex-end;
+  gap:8px;
+  flex-wrap:wrap;
+  min-width:0;
+}
+.rs-action-row form{
+  margin:0;
+}
+.rs-readonly-form{
+  display:grid;
+  grid-template-columns:minmax(0, 1fr) auto;
+  gap:8px;
+  align-items:center;
+}
+.rs-cmd-box{
+  margin-top:8px;
+  border:1px solid rgba(var(--tone-line),0.14);
+  border-radius:12px;
+  background:rgba(var(--tone-1),0.32);
+}
+.rs-cmd-box > summary{
+  list-style:none;
+  cursor:pointer;
+  padding:8px 10px;
+  color:rgba(var(--tone-text-mid),0.92);
+  font-size:12px;
+  font-weight:700;
+}
+.rs-cmd-box[open] > summary{
+  border-bottom:1px solid rgba(var(--tone-line),0.12);
+}
+.rs-cmd-box > summary::-webkit-details-marker{
+  display:none;
+}
+.rs-cmd-wrap{
+  padding:10px;
+}
+.rs-cmd-box textarea{
+  min-height:58px;
+  max-height:120px;
+}
+.rs-filter-empty{
+  display:none;
+  margin-top:8px;
+  border:1px dashed rgba(var(--tone-line),0.18);
+  border-radius:12px;
+  padding:10px;
+  color:var(--muted);
+  font-size:12px;
+}
+.rs-filter-empty.show{
+  display:block;
+}
+.rs-field-hidden{
+  display:none !important;
+}
+.rs-form-modal{
+  padding:14px;
+}
+.rs-form-modal-inner{
+  width:min(1280px, 100%);
+}
+.rs-form-modal .modal-body{
+  padding:10px 14px 14px;
+}
+.rs-form-modal-foot{
+  justify-content:flex-end;
+  gap:8px;
+}
+@media (max-width: 980px){
+  .rs-sites{
+    grid-template-columns:1fr;
+  }
+  .rs-meta-grid{
+    grid-template-columns:repeat(2, minmax(0,1fr));
+  }
+  .rs-side{
+    grid-template-columns:1fr;
+    gap:8px;
+  }
+  .rs-action-row{
+    justify-content:flex-start;
+  }
+}
+@media (max-width: 760px){
+  .rs-toolbar{
+    flex-direction:column;
+    align-items:stretch;
+  }
+  .rs-toolbar .dash-filters{
+    width:100%;
+    flex-wrap:nowrap;
+    overflow-x:auto;
+    padding-bottom:2px;
+    scrollbar-width:none;
+  }
+  .rs-toolbar .dash-filters::-webkit-scrollbar{
+    display:none;
+  }
+  .rs-toolbar .chip{
+    flex:0 0 auto;
+  }
+  .rs-toolbar .dash-search{
+    width:100%;
+    max-width:none;
+  }
+  .rs-meta-grid{
+    grid-template-columns:1fr;
+  }
+  .rs-action-row{
+    justify-content:flex-start;
+  }
+  .rs-action-row form,
+  .rs-action-row .btn{
+    flex:1 1 auto;
+  }
+  .rs-readonly-form{
+    grid-template-columns:1fr;
+  }
+}
+</style>
+
+<div class="page-head">
+  <div class="page-title">
+    <h1 class="h1">远程存储挂载</h1>
+    <div class="meta">
+      <span class="meta-item">统一管理 NAS / 网盘挂载方案，支持一键挂载、卸载与文件浏览。</span>
+      <span class="meta-item">· 方案 <strong>{{ (profiles or [])|length }}</strong></span>
+      <span class="meta-item">· 可用节点 <strong>{{ (nodes or [])|length }}</strong></span>
+    </div>
+  </div>
+  <div class="right">
+    {% if can_manage %}
+      <button class="btn sm secondary" type="button" id="rsNewBtn">新建挂载方案</button>
+    {% endif %}
+    <a class="btn sm ghost" href="/">返回控制台</a>
+  </div>
+</div>
+
+{% if can_manage %}
+<div id="rsFormModal" class="modal rs-form-modal" style="display:none;" aria-hidden="true">
+  <div class="modal-inner modal-pro rs-form-modal-inner" role="dialog" aria-modal="true" aria-labelledby="rsFormTitle">
+    <div class="modal-head">
+      <div class="title-wrap">
+        <div class="h2" id="rsFormTitle">新建挂载方案</div>
+        <div class="muted sm">保存后自动挂载到所选节点。账号密码默认不落库，请在节点侧预置凭据或通过免密方式连接。</div>
+      </div>
+      <button class="btn xs ghost" type="button" data-rs-modal-close>关闭</button>
+    </div>
+
+    <div class="modal-body">
+    <form id="rsProfileForm" method="post" action="/remote-storage/profiles" class="form">
+      <input type="hidden" name="profile_id" id="rsProfileId">
+
+      <div class="form-grid">
+        <div class="col">
+          <label class="label">方案名称</label>
+          <input class="input" id="rsName" name="name" maxlength="64" placeholder="例如：办公 NAS / 财务网盘" required>
+        </div>
+        <div class="col">
+          <label class="label">协议</label>
+          <select class="select" id="rsProtocol" name="protocol">
+            <option value="smb">SMB/CIFS（NAS 常用）</option>
+            <option value="nfs">NFS（Linux 常用）</option>
+            <option value="ftp">FTP</option>
+            <option value="sftp">SFTP / SSHFS</option>
+            <option value="webdav">WebDAV</option>
+            <option value="rclone">网盘 / Rclone Remote</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="form-grid">
+        <div class="col rs-host-group" id="rsHostGroup">
+          <label class="label">远程地址（IP/域名）</label>
+          <input class="input mono" id="rsHost" name="host" maxlength="128" placeholder="例如：10.0.0.8 / nas.example.com">
+        </div>
+        <div class="col rs-host-group" id="rsPortGroup">
+          <label class="label">端口（可选）</label>
+          <input class="input mono" id="rsPort" name="port" type="number" min="1" max="65535" placeholder="留空使用协议默认端口">
+        </div>
+      </div>
+
+      <div class="form-grid">
+        <div class="col rs-share-group" id="rsShareGroup">
+          <label class="label">共享路径 / 导出路径</label>
+          <input class="input mono" id="rsSharePath" name="share_path" maxlength="255" placeholder="SMB: data 或 NFS: /export/data">
+        </div>
+        <div class="col rs-remote-path-group" id="rsRemotePathGroup">
+          <label class="label">远端子路径</label>
+          <input class="input mono" id="rsRemotePath" name="remote_path" maxlength="255" placeholder="例如：/team/docs">
+        </div>
+      </div>
+
+      <div class="form-grid">
+        <div class="col rs-rclone-group rs-field-hidden" id="rsRcloneGroup">
+          <label class="label">Rclone Remote 名称</label>
+          <input class="input mono" id="rsRcloneRemote" name="rclone_remote" maxlength="96" placeholder="例如：onedrive-prod / alipan-team">
+        </div>
+        <div class="col">
+          <label class="label">本地挂载点（Linux/macOS）</label>
+          <input class="input mono" id="rsMountPoint" name="mount_point" maxlength="255" placeholder="例如：/mnt/team-share（macOS 自动：/Users/Shared/realm-mount/远端目录）" required>
+          <div class="help" id="rsMountHint">macOS 默认自动挂载到 `/Users/Shared/realm-mount/<远端目录名>`。</div>
+        </div>
+      </div>
+
+      <div class="form-grid">
+        <div class="col">
+          <label class="label">用户名（可选）</label>
+          <input class="input mono" id="rsUsername" name="username" maxlength="64" placeholder="例如：admin / service_account">
+        </div>
+        <div class="col">
+          <label class="label">连接密码（可选）</label>
+          <input class="input mono" id="rsPassword" name="password" type="password" maxlength="128" placeholder="可选：用于保存后自动挂载">
+        </div>
+      </div>
+
+      <div class="form-grid">
+        <div class="col">
+          <label class="help"><input type="checkbox" id="rsSavePassword" name="save_password" value="1"> 保存密码用于后续自动挂载</label>
+        </div>
+        <div class="col">
+          <label class="label">Windows 盘符</label>
+          <input class="input mono" id="rsDriveLetter" name="drive_letter" maxlength="2" value="Z" placeholder="例如：Z">
+        </div>
+      </div>
+
+      <div class="form-grid">
+        <div class="col">
+          <label class="label">平台偏好</label>
+          <select class="select" id="rsPlatform" name="platform">
+            <option value="auto">自动（按节点系统判断）</option>
+            <option value="linux">Linux</option>
+            <option value="macos">macOS</option>
+            <option value="windows">Windows</option>
+          </select>
+        </div>
+        <div class="col">
+          <label class="label">目标节点</label>
+          <select class="select" id="rsTargetNode" name="target_node_id" required>
+            <option value="0" disabled selected>请选择节点</option>
+            {% for n in (nodes or []) %}
+              <option value="{{ n.id }}" data-system-type="{{ n.system_type or 'auto' }}">#{{ n.id }} {{ n.name }} · {{ n.display_ip or '-' }}</option>
+            {% endfor %}
+          </select>
+        </div>
+      </div>
+
+      <label class="label">高级挂载参数（可选）</label>
+      <input class="input mono" id="rsOptions" name="options" maxlength="240" placeholder="例如：uid=1000,gid=1000,iocharset=utf8">
+
+      <label class="label">备注（可选）</label>
+      <input class="input" id="rsNote" name="note" maxlength="280" placeholder="例如：仅内网可达，建议配合 VPN">
+
+      <div class="row" style="gap:12px; flex-wrap:wrap;">
+        <label class="help"><input type="checkbox" id="rsReadOnly" name="read_only" value="1"> 只读挂载</label>
+        <label class="help"><input type="checkbox" id="rsAutoMount" name="auto_mount" value="1"> 开机自动挂载（仅记录策略）</label>
+      </div>
+
+      <div class="help">
+        默认不保存密码。仅在勾选“保存密码”后才会以加密密文写入配置用于后续自动挂载。
+      </div>
+
+      <div class="row rs-form-modal-foot">
+        <button class="btn xs ghost" type="button" data-rs-modal-close>取消</button>
+        <button class="btn xs ghost" type="button" id="rsResetBtn">清空</button>
+        <button class="btn xs" type="submit">保存方案</button>
+      </div>
+    </form>
+    </div>
+  </div>
+</div>
+{% else %}
+<section class="card">
+  <div class="card-title">只读模式</div>
+  <div class="card-sub">当前账号没有 `nodes.write` 权限，无法新增或编辑挂载方案。</div>
+</section>
+{% endif %}
+{% set total_profiles = (profiles or [])|length %}
+{% set mounted_profiles = (profiles or [])|selectattr('mount_status_class', 'equalto', 'ok')|list|length %}
+{% set unmounted_profiles = (profiles or [])|selectattr('mount_status_class', 'equalto', 'warn')|list|length %}
+{% set error_profiles = (profiles or [])|selectattr('mount_status_class', 'equalto', 'bad')|list|length %}
+
+<section class="card wm-card rs-list-card">
+  <div class="wm-card-head">
+    <div>
+      <div class="wm-card-title">挂载方案列表</div>
+      <div class="wm-card-sub">支持一键挂载/卸载，并可在远程存储模块内直接管理挂载目录。</div>
+    </div>
+    <div class="wm-card-tools">
+      <span class="pill xs ghost">共 {{ total_profiles }} 个</span>
+    </div>
+  </div>
+  {% if profiles and profiles|length > 0 %}
+    <div class="rs-toolbar" id="rsToolbar">
+      <div class="dash-filters" role="tablist" aria-label="挂载状态筛选">
+        <button class="chip active" type="button" data-rs-filter="all" aria-selected="true">全部 <strong>{{ total_profiles }}</strong></button>
+        <button class="chip" type="button" data-rs-filter="ok" aria-selected="false">已挂载 <strong>{{ mounted_profiles }}</strong></button>
+        <button class="chip" type="button" data-rs-filter="warn" aria-selected="false">未挂载 <strong>{{ unmounted_profiles }}</strong></button>
+        <button class="chip" type="button" data-rs-filter="bad" aria-selected="false">挂载异常 <strong>{{ error_profiles }}</strong></button>
+      </div>
+      <div class="dash-search" role="search">
+        <span class="dash-search-ico" aria-hidden="true">⌕</span>
+        <input id="rsSearchInput" class="dash-search-input" placeholder="搜索方案名 / 节点 / 地址 / 路径" autocomplete="off">
+        <button id="rsSearchClear" class="dash-search-clear" type="button" title="清空">×</button>
+      </div>
+    </div>
+    <div class="wm-countline" id="rsVisibleCount">显示 {{ total_profiles }} / {{ total_profiles }} 个方案</div>
+  {% endif %}
+
+  {% if profiles and profiles|length > 0 %}
+    <div class="rs-sites">
+      {% for p in profiles %}
+        <article
+          class="rs-item"
+          data-rs-item
+          data-rs-status="{{ p.mount_status_class or 'ghost' }}"
+          data-rs-search="{{ ((p.name or '') ~ ' ' ~ (p.host or '') ~ ' ' ~ (p.protocol_label or '') ~ ' ' ~ (p.platform_label or '') ~ ' ' ~ (p.target_node_name or '') ~ ' ' ~ (p.mount_point or '') ~ ' ' ~ (p.share_path or '') ~ ' ' ~ (p.remote_path or '') ~ ' ' ~ (p.note or ''))|lower|e }}"
+        >
+          <div class="rs-item-top">
+            <div class="rs-item-main">
+              <div class="rs-title-line">
+                <div class="rs-name">{{ p.name or ('方案-' ~ loop.index) }}</div>
+                <span class="pill xs ghost">{{ p.protocol_label }}</span>
+                <span class="pill xs ghost">{{ p.platform_label }}</span>
+                <span class="pill xs {{ p.mount_status_class or 'ghost' }}">{{ p.mount_status_label or '未知' }}</span>
+              </div>
+              <div class="rs-endpoint mono">{{ p.host or 'remote' }}{% if p.port and p.port > 0 %}:{{ p.port }}{% endif %}</div>
+            </div>
+            <div class="rs-item-badges">
+              {% if p.read_only %}
+                <span class="pill xs warn">只读</span>
+              {% endif %}
+              {% if p.has_saved_password %}
+                <span class="pill xs ghost">已保存密码</span>
+              {% endif %}
+              {% if p.auto_mount %}
+                <span class="pill xs ok">开机挂载</span>
+              {% endif %}
+            </div>
+          </div>
+
+          <div class="rs-body">
+            <div class="rs-main">
+              <div class="rs-meta-grid">
+                <div class="rs-meta-row">
+                  <div class="rs-meta-k">挂载点</div>
+                  <div class="rs-meta-v mono">{{ p.mount_point or '-' }}</div>
+                </div>
+                {% if p.share_path %}
+                  <div class="rs-meta-row">
+                    <div class="rs-meta-k">共享路径</div>
+                    <div class="rs-meta-v mono">{{ p.share_path }}</div>
+                  </div>
+                {% endif %}
+                {% if p.remote_path %}
+                  <div class="rs-meta-row">
+                    <div class="rs-meta-k">远端子路径</div>
+                    <div class="rs-meta-v mono">{{ p.remote_path }}</div>
+                  </div>
+                {% endif %}
+                {% if p.rclone_remote %}
+                  <div class="rs-meta-row">
+                    <div class="rs-meta-k">Rclone Remote</div>
+                    <div class="rs-meta-v mono">{{ p.rclone_remote }}</div>
+                  </div>
+                {% endif %}
+                {% if p.target_node_name %}
+                  <div class="rs-meta-row">
+                    <div class="rs-meta-k">目标节点</div>
+                    <div class="rs-meta-v mono">{{ p.target_node_name }}</div>
+                  </div>
+                {% endif %}
+                {% if p.mount_message %}
+                  <div class="rs-meta-row">
+                    <div class="rs-meta-k">最近结果</div>
+                    <div class="rs-meta-v">{{ p.mount_message }}</div>
+                  </div>
+                {% endif %}
+                {% if p.last_sync_at %}
+                  <div class="rs-meta-row">
+                    <div class="rs-meta-k">最近同步</div>
+                    <div class="rs-meta-v mono">{{ p.last_sync_at }}</div>
+                  </div>
+                {% endif %}
+                <div class="rs-meta-row">
+                  <div class="rs-meta-k">更新时间</div>
+                  <div class="rs-meta-v mono">{{ p.updated_at or '-' }}</div>
+                </div>
+              </div>
+              {% if p.note %}
+                <div class="muted sm rs-note">备注：{{ p.note }}</div>
+              {% endif %}
+
+              <details class="rs-cmd-box">
+                <summary>展开命令预览</summary>
+                <div class="rs-cmd-wrap form">
+                  <label class="label">Linux 挂载</label>
+                  <textarea class="textarea mono" id="rsLinuxMount{{ loop.index }}" readonly>{{ p.commands.linux_mount }}</textarea>
+                  <div class="row" style="justify-content:flex-end;">
+                    <button class="btn xs ghost" type="button" data-copy-target="rsLinuxMount{{ loop.index }}">复制</button>
+                  </div>
+
+                  <label class="label">Linux 卸载</label>
+                  <textarea class="textarea mono" id="rsLinuxUmount{{ loop.index }}" readonly>{{ p.commands.linux_unmount }}</textarea>
+                  <div class="row" style="justify-content:flex-end;">
+                    <button class="btn xs ghost" type="button" data-copy-target="rsLinuxUmount{{ loop.index }}">复制</button>
+                  </div>
+
+                  <label class="label">macOS 挂载</label>
+                  <textarea class="textarea mono" id="rsMacMount{{ loop.index }}" readonly>{{ p.commands.macos_mount }}</textarea>
+                  <div class="row" style="justify-content:flex-end;">
+                    <button class="btn xs ghost" type="button" data-copy-target="rsMacMount{{ loop.index }}">复制</button>
+                  </div>
+
+                  <label class="label">macOS 卸载</label>
+                  <textarea class="textarea mono" id="rsMacUmount{{ loop.index }}" readonly>{{ p.commands.macos_unmount }}</textarea>
+                  <div class="row" style="justify-content:flex-end;">
+                    <button class="btn xs ghost" type="button" data-copy-target="rsMacUmount{{ loop.index }}">复制</button>
+                  </div>
+
+                  <label class="label">Windows 挂载（PowerShell）</label>
+                  <textarea class="textarea mono" id="rsWinMount{{ loop.index }}" readonly>{{ p.commands.windows_mount }}</textarea>
+                  <div class="row" style="justify-content:flex-end;">
+                    <button class="btn xs ghost" type="button" data-copy-target="rsWinMount{{ loop.index }}">复制</button>
+                  </div>
+
+                  <label class="label">Windows 卸载（PowerShell）</label>
+                  <textarea class="textarea mono" id="rsWinUmount{{ loop.index }}" readonly>{{ p.commands.windows_unmount }}</textarea>
+                  <div class="row" style="justify-content:flex-end;">
+                    <button class="btn xs ghost" type="button" data-copy-target="rsWinUmount{{ loop.index }}">复制</button>
+                  </div>
+                </div>
+              </details>
+            </div>
+
+            <div class="rs-side">
+              {% if can_manage %}
+                <input
+                  class="input sm mono"
+                  id="rsActPwd{{ loop.index }}"
+                  type="password"
+                  maxlength="128"
+                  placeholder="本次操作密码（可选）"
+                >
+                <div class="rs-action-row">
+                  <form method="post" action="/remote-storage/profiles/{{ p.id|e }}/mount" data-password-id="rsActPwd{{ loop.index }}" class="rs-action-form">
+                    <input type="hidden" name="password" value="">
+                    <button class="btn xs ghost" type="submit">立即挂载</button>
+                  </form>
+                  <form method="post" action="/remote-storage/profiles/{{ p.id|e }}/unmount" data-password-id="rsActPwd{{ loop.index }}" class="rs-action-form">
+                    <input type="hidden" name="password" value="">
+                    <button class="btn xs ghost" type="submit">卸载</button>
+                  </form>
+                  <form method="post" action="/remote-storage/profiles/{{ p.id|e }}/files" data-password-id="rsActPwd{{ loop.index }}" class="rs-action-form">
+                    <input type="hidden" name="password" value="">
+                    <button class="btn xs secondary" type="submit">文件管理</button>
+                  </form>
+                  <button
+                    type="button"
+                    class="btn xs ghost rs-edit-btn"
+                    data-id="{{ p.id|e }}"
+                    data-name="{{ p.name|e }}"
+                    data-protocol="{{ p.protocol|e }}"
+                    data-host="{{ p.host|e }}"
+                    data-port="{{ p.port }}"
+                    data-share-path="{{ p.share_path|e }}"
+                    data-mount-point="{{ p.mount_point|e }}"
+                    data-username="{{ p.username|e }}"
+                    data-options="{{ p.options|e }}"
+                    data-rclone-remote="{{ p.rclone_remote|e }}"
+                    data-remote-path="{{ p.remote_path|e }}"
+                    data-drive-letter="{{ p.drive_letter|e }}"
+                    data-platform="{{ p.platform|e }}"
+                    data-target-node-id="{{ p.target_node_id }}"
+                    data-save-password="{{ '1' if p.save_password else '0' }}"
+                    data-read-only="{{ '1' if p.read_only else '0' }}"
+                    data-auto-mount="{{ '1' if p.auto_mount else '0' }}"
+                    data-note="{{ p.note|e }}"
+                  >编辑</button>
+                  <form method="post" action="/remote-storage/profiles/{{ p.id|e }}/delete" onsubmit="return confirm('确认删除该挂载方案？');">
+                    <button class="btn xs danger" type="submit">删除</button>
+                  </form>
+                </div>
+              {% else %}
+                <form method="post" action="/remote-storage/profiles/{{ p.id|e }}/files" data-password-id="rsActPwd{{ loop.index }}" class="rs-action-form rs-readonly-form">
+                  <input type="hidden" name="password" value="">
+                  <input
+                    class="input sm mono"
+                    id="rsActPwd{{ loop.index }}"
+                    type="password"
+                    maxlength="128"
+                    placeholder="本次操作密码（可选）"
+                  >
+                  <button class="btn xs secondary" type="submit">文件管理</button>
+                </form>
+              {% endif %}
+            </div>
+          </div>
+        </article>
+      {% endfor %}
+    </div>
+    <div class="rs-filter-empty" id="rsFilterEmpty">没有匹配的挂载方案，请尝试切换筛选或修改关键字。</div>
+  {% else %}
+    <div class="wm-card-sub">暂无挂载方案，先创建一条用于 NAS 或网盘接入。</div>
+  {% endif %}
+</section>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function(){
+  function copyById(id){
+    var el = document.getElementById(id);
+    if(!el) return;
+    var text = ('value' in el) ? (el.value || '') : (el.textContent || '');
+    if(!text) return;
+    if(navigator.clipboard && navigator.clipboard.writeText){
+      navigator.clipboard.writeText(text).catch(function(){});
+    }
+  }
+
+  document.querySelectorAll('[data-copy-target]').forEach(function(btn){
+    btn.addEventListener('click', function(){
+      copyById(btn.getAttribute('data-copy-target') || '');
+    });
+  });
+
+  document.querySelectorAll('.rs-action-form').forEach(function(formEl){
+    formEl.addEventListener('submit', function(){
+      var pwdInputId = formEl.getAttribute('data-password-id') || '';
+      if(!pwdInputId) return;
+      var src = document.getElementById(pwdInputId);
+      var hidden = formEl.querySelector('input[name=\"password\"]');
+      if(hidden){
+        hidden.value = src ? (src.value || '') : '';
+      }
+    });
+  });
+
+  function initListFilter(){
+    var toolbar = document.getElementById('rsToolbar');
+    var listWrap = document.querySelector('.rs-sites');
+    if(!toolbar || !listWrap) return;
+
+    var items = Array.prototype.slice.call(listWrap.querySelectorAll('[data-rs-item]'));
+    if(!items.length) return;
+
+    var chips = Array.prototype.slice.call(toolbar.querySelectorAll('[data-rs-filter]'));
+    var searchInput = document.getElementById('rsSearchInput');
+    var searchClear = document.getElementById('rsSearchClear');
+    var countEl = document.getElementById('rsVisibleCount');
+    var emptyEl = document.getElementById('rsFilterEmpty');
+    var activeFilter = 'all';
+
+    function setActiveFilter(next){
+      activeFilter = String(next || 'all');
+      chips.forEach(function(chip){
+        var v = chip.getAttribute('data-rs-filter') || 'all';
+        var on = v === activeFilter;
+        chip.classList.toggle('active', on);
+        chip.setAttribute('aria-selected', on ? 'true' : 'false');
+      });
+    }
+
+    function applyFilters(){
+      var keyword = searchInput ? String(searchInput.value || '').trim().toLowerCase() : '';
+      var visible = 0;
+
+      items.forEach(function(item){
+        var status = item.getAttribute('data-rs-status') || 'ghost';
+        var hay = item.getAttribute('data-rs-search') || '';
+        var passStatus = (activeFilter === 'all') || (status === activeFilter);
+        var passKeyword = !keyword || (hay.indexOf(keyword) >= 0);
+        var show = passStatus && passKeyword;
+        item.style.display = show ? '' : 'none';
+        if(show) visible += 1;
+      });
+
+      if(searchClear){
+        searchClear.style.visibility = keyword ? 'visible' : 'hidden';
+      }
+      if(countEl){
+        countEl.textContent = '显示 ' + visible + ' / ' + items.length + ' 个方案';
+      }
+      if(emptyEl){
+        emptyEl.classList.toggle('show', visible === 0);
+      }
+    }
+
+    chips.forEach(function(chip){
+      chip.addEventListener('click', function(){
+        setActiveFilter(chip.getAttribute('data-rs-filter') || 'all');
+        applyFilters();
+      });
+    });
+
+    if(searchInput){
+      searchInput.addEventListener('input', applyFilters);
+    }
+    if(searchClear){
+      searchClear.addEventListener('click', function(){
+        if(!searchInput) return;
+        searchInput.value = '';
+        applyFilters();
+        try{
+          searchInput.focus();
+        }catch(_e){}
+      });
+    }
+
+    setActiveFilter('all');
+    applyFilters();
+  }
+
+  initListFilter();
+
+  var form = document.getElementById('rsProfileForm');
+  if(!form) return;
+
+  var modal = document.getElementById('rsFormModal');
+  var modalCloseBtns = Array.prototype.slice.call(document.querySelectorAll('[data-rs-modal-close]'));
+  var formTitle = document.getElementById('rsFormTitle');
+  var MAC_MOUNT_ROOT = '/Users/Shared/realm-mount';
+  var els = {
+    profileId: document.getElementById('rsProfileId'),
+    name: document.getElementById('rsName'),
+    protocol: document.getElementById('rsProtocol'),
+    host: document.getElementById('rsHost'),
+    port: document.getElementById('rsPort'),
+    sharePath: document.getElementById('rsSharePath'),
+    mountPoint: document.getElementById('rsMountPoint'),
+    username: document.getElementById('rsUsername'),
+    options: document.getElementById('rsOptions'),
+    rcloneRemote: document.getElementById('rsRcloneRemote'),
+    remotePath: document.getElementById('rsRemotePath'),
+    driveLetter: document.getElementById('rsDriveLetter'),
+    password: document.getElementById('rsPassword'),
+    savePassword: document.getElementById('rsSavePassword'),
+    readOnly: document.getElementById('rsReadOnly'),
+    autoMount: document.getElementById('rsAutoMount'),
+    platform: document.getElementById('rsPlatform'),
+    targetNode: document.getElementById('rsTargetNode'),
+    mountHint: document.getElementById('rsMountHint'),
+    note: document.getElementById('rsNote'),
+    hostGroup: document.getElementById('rsHostGroup'),
+    portGroup: document.getElementById('rsPortGroup'),
+    shareGroup: document.getElementById('rsShareGroup'),
+    rcloneGroup: document.getElementById('rsRcloneGroup'),
+    remotePathGroup: document.getElementById('rsRemotePathGroup')
+  };
+
+  function isModalOpen(){
+    return !!(modal && modal.style.display !== 'none');
+  }
+
+  function hasVisibleModal(){
+    return Array.prototype.some.call(document.querySelectorAll('.modal'), function(el){
+      return !!(el && el.style.display !== 'none');
+    });
+  }
+
+  function openModal(){
+    if(!modal) return;
+    modal.style.display = 'flex';
+    modal.setAttribute('aria-hidden', 'false');
+    document.body.classList.add('modal-open');
+    try{
+      if(els.name) els.name.focus();
+    }catch(_e){}
+  }
+
+  function closeModal(){
+    if(!modal) return;
+    modal.style.display = 'none';
+    modal.setAttribute('aria-hidden', 'true');
+    if(!hasVisibleModal()){
+      document.body.classList.remove('modal-open');
+    }
+  }
+
+  function selectedNodeSystemType(){
+    if(!els.targetNode) return 'auto';
+    var idx = els.targetNode.selectedIndex;
+    var opt = (idx >= 0 && els.targetNode.options) ? els.targetNode.options[idx] : null;
+    var sys = ((opt && opt.dataset && opt.dataset.systemType) || '').toLowerCase();
+    if(sys === 'linux' || sys === 'macos' || sys === 'windows') return sys;
+    return 'auto';
+  }
+
+  function effectivePlatform(){
+    var p = ((els.platform && els.platform.value) || 'auto').toLowerCase();
+    if(p === 'linux' || p === 'macos' || p === 'windows') return p;
+    return selectedNodeSystemType();
+  }
+
+  function pathLeaf(raw){
+    var text = String(raw || '').trim().replace(/\\/g, '/');
+    if(!text) return '';
+    var parts = text.split('/').filter(function(seg){
+      var s = String(seg || '').trim();
+      return !!s && s !== '.' && s !== '..';
+    });
+    if(!parts.length) return '';
+    return parts[parts.length - 1];
+  }
+
+  function mountLeafName(){
+    var proto = ((els.protocol && els.protocol.value) || 'smb').toLowerCase();
+    var shareLeaf = pathLeaf(els.sharePath ? els.sharePath.value : '');
+    var remoteLeaf = pathLeaf(els.remotePath ? els.remotePath.value : '');
+    var rcloneName = '';
+    if(els.rcloneRemote){
+      rcloneName = String(els.rcloneRemote.value || '').split(':', 1)[0].trim();
+    }
+    var base = '';
+    if((proto === 'smb' || proto === 'nfs') && shareLeaf){
+      base = shareLeaf;
+    }else if(remoteLeaf){
+      base = remoteLeaf;
+    }else if(shareLeaf){
+      base = shareLeaf;
+    }else if(proto === 'rclone' && rcloneName){
+      base = rcloneName;
+    }else{
+      base = (els.name && els.name.value) ? els.name.value : 'remote-storage';
+    }
+    var safe = String(base || '')
+      .replace(/[\/\\:]/g, '_')
+      .replace(/[\x00-\x1f]/g, '')
+      .trim()
+      .replace(/\s+/g, '-')
+      .replace(/-+/g, '-')
+      .replace(/^\.+|\.+$/g, '')
+      .replace(/^-+|-+$/g, '');
+    if(!safe || safe === '.' || safe === '..') safe = 'remote-storage';
+    if(safe.length > 120){
+      safe = safe.slice(0, 120).replace(/-+$/g, '');
+    }
+    if(!safe) safe = 'remote-storage';
+    return safe;
+  }
+
+  function applyMountPointPolicy(){
+    if(!els.mountPoint) return;
+    var isMac = effectivePlatform() === 'macos';
+    if(isMac){
+      var autoPoint = MAC_MOUNT_ROOT + '/' + mountLeafName();
+      els.mountPoint.value = autoPoint;
+      els.mountPoint.readOnly = true;
+      if(els.mountHint){
+        els.mountHint.textContent = 'macOS 默认挂载点：' + autoPoint + '（自动生成）';
+      }
+      return;
+    }
+    els.mountPoint.readOnly = false;
+    if(els.mountHint){
+      els.mountHint.textContent = 'Linux/Windows 可自定义挂载点；macOS 默认自动使用 /Users/Shared/realm-mount/<远端目录名>。';
+    }
+  }
+
+  function toggleByProtocol(){
+    var proto = ((els.protocol && els.protocol.value) || 'smb').toLowerCase();
+    var isRclone = proto === 'rclone';
+    var needShare = (proto === 'smb' || proto === 'nfs');
+    var needRemotePath = (proto === 'ftp' || proto === 'sftp' || proto === 'webdav' || proto === 'rclone');
+
+    if(els.hostGroup) els.hostGroup.classList.toggle('rs-field-hidden', isRclone);
+    if(els.portGroup) els.portGroup.classList.toggle('rs-field-hidden', isRclone);
+    if(els.shareGroup) els.shareGroup.classList.toggle('rs-field-hidden', !needShare);
+    if(els.rcloneGroup) els.rcloneGroup.classList.toggle('rs-field-hidden', !isRclone);
+    if(els.remotePathGroup) els.remotePathGroup.classList.toggle('rs-field-hidden', !needRemotePath);
+
+    if(els.sharePath) els.sharePath.required = needShare;
+    if(els.host) els.host.required = !isRclone;
+    if(els.rcloneRemote) els.rcloneRemote.required = isRclone;
+    applyMountPointPolicy();
+  }
+
+  function resetForm(){
+    if(els.profileId) els.profileId.value = '';
+    if(els.name) els.name.value = '';
+    if(els.protocol) els.protocol.value = 'smb';
+    if(els.host) els.host.value = '';
+    if(els.port) els.port.value = '';
+    if(els.sharePath) els.sharePath.value = '';
+    if(els.mountPoint) els.mountPoint.value = '';
+    if(els.username) els.username.value = '';
+    if(els.options) els.options.value = '';
+    if(els.rcloneRemote) els.rcloneRemote.value = '';
+    if(els.remotePath) els.remotePath.value = '';
+    if(els.driveLetter) els.driveLetter.value = 'Z';
+    if(els.password) els.password.value = '';
+    if(els.savePassword) els.savePassword.checked = false;
+    if(els.readOnly) els.readOnly.checked = false;
+    if(els.autoMount) els.autoMount.checked = false;
+    if(els.platform) els.platform.value = 'auto';
+    if(els.targetNode) els.targetNode.value = '0';
+    if(els.note) els.note.value = '';
+    if(formTitle) formTitle.textContent = '新建挂载方案';
+    toggleByProtocol();
+  }
+
+  function fillFromButton(btn){
+    if(!btn) return;
+    if(els.profileId) els.profileId.value = btn.dataset.id || '';
+    if(els.name) els.name.value = btn.dataset.name || '';
+    if(els.protocol) els.protocol.value = btn.dataset.protocol || 'smb';
+    if(els.host) els.host.value = btn.dataset.host || '';
+    if(els.port) els.port.value = btn.dataset.port || '';
+    if(els.sharePath) els.sharePath.value = btn.dataset.sharePath || '';
+    if(els.mountPoint) els.mountPoint.value = btn.dataset.mountPoint || '';
+    if(els.username) els.username.value = btn.dataset.username || '';
+    if(els.options) els.options.value = btn.dataset.options || '';
+    if(els.rcloneRemote) els.rcloneRemote.value = btn.dataset.rcloneRemote || '';
+    if(els.remotePath) els.remotePath.value = btn.dataset.remotePath || '';
+    if(els.driveLetter) els.driveLetter.value = btn.dataset.driveLetter || 'Z';
+    if(els.password) els.password.value = '';
+    if(els.savePassword) els.savePassword.checked = (btn.dataset.savePassword === '1');
+    if(els.readOnly) els.readOnly.checked = (btn.dataset.readOnly === '1');
+    if(els.autoMount) els.autoMount.checked = (btn.dataset.autoMount === '1');
+    if(els.platform) els.platform.value = btn.dataset.platform || 'auto';
+    if(els.targetNode) els.targetNode.value = btn.dataset.targetNodeId || '0';
+    if(els.note) els.note.value = btn.dataset.note || '';
+    if(formTitle) formTitle.textContent = '编辑挂载方案';
+    toggleByProtocol();
+    openModal();
+  }
+
+  if(els.protocol){
+    els.protocol.addEventListener('change', toggleByProtocol);
+  }
+  if(els.platform){
+    els.platform.addEventListener('change', applyMountPointPolicy);
+  }
+  if(els.targetNode){
+    els.targetNode.addEventListener('change', applyMountPointPolicy);
+  }
+  [els.sharePath, els.remotePath, els.rcloneRemote, els.name].forEach(function(inputEl){
+    if(!inputEl) return;
+    inputEl.addEventListener('input', applyMountPointPolicy);
+  });
+  var resetBtn = document.getElementById('rsResetBtn');
+  if(resetBtn){
+    resetBtn.addEventListener('click', resetForm);
+  }
+  var newBtn = document.getElementById('rsNewBtn');
+  if(newBtn){
+    newBtn.addEventListener('click', function(){
+      resetForm();
+      openModal();
+    });
+  }
+
+  modalCloseBtns.forEach(function(btn){
+    btn.addEventListener('click', closeModal);
+  });
+
+  if(modal){
+    modal.addEventListener('click', function(e){
+      if(e.target === modal) closeModal();
+    });
+  }
+
+  document.addEventListener('keydown', function(e){
+    if(e.key === 'Escape' && isModalOpen()) closeModal();
+  });
+
+  document.querySelectorAll('.rs-edit-btn').forEach(function(btn){
+    btn.addEventListener('click', function(){
+      fillFromButton(btn);
+    });
+  });
+
+  resetForm();
+})();
+</script>
+{% endblock %}

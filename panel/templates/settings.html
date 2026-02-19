@@ -3,147 +3,496 @@
 <div class="page-head">
   <div class="page-title">
     <h1 class="h1">面板设置</h1>
-    <div class="meta">
-      <span class="meta-item">配置接入地址、SSL 执行策略与发布预检参数（优先级：面板设置 > 环境变量 > 内置默认）。</span>
-    </div>
   </div>
   <div class="right">
     <a href="/" class="btn sm ghost">返回控制台</a>
   </div>
 </div>
 
-<div class="center-wrap lg">
-  <div class="card center-card">
-    <form method="post" action="/settings" class="form">
-      <div class="h2" style="margin-bottom:6px;">接入与下载地址</div>
+<section class="card settings-hero">
+  <div class="settings-hero-left">
+    <div class="settings-hero-title">配置中心</div>
+    <div class="settings-hero-sub">统一管理接入地址、时间策略、SSL 执行、预检参数与自动备份策略，修改后即时生效。</div>
+  </div>
+  <div class="settings-hero-right">
+    <div class="settings-hero-stat">
+      <div class="k">配置模块</div>
+      <div class="v mono">6</div>
+    </div>
+    <div class="settings-hero-stat">
+      <div class="k">时间策略版本</div>
+      <div class="v mono">v{{ agent_time_sync_version }}</div>
+    </div>
+    <div class="settings-hero-stat">
+      <div class="k">当前资源来源</div>
+      <div class="v mono">{{ effective_asset_source or '-' }}</div>
+    </div>
+  </div>
+</section>
 
-      <label class="label">Agent 拉取地址（域名/IP + 端口）</label>
-      <input class="input mono" type="password" autocomplete="off" data-sensitive-input="1" name="agent_bootstrap_url" placeholder="例如：realm.infpro.me:443 或 https://realm.infpro.me:443" value="{{ agent_bootstrap_url or '' }}">
-      <div class="help">用于“接入命令”和 /join /uninstall 脚本入口地址。</div>
-
-      <label class="label">Bootstrap 默认协议（未写协议时）</label>
-      <select class="input" name="agent_bootstrap_default_scheme">
-        <option value="" {{ 'selected' if not agent_bootstrap_default_scheme else '' }}>自动（跟随请求）</option>
-        <option value="https" {{ 'selected' if agent_bootstrap_default_scheme == 'https' else '' }}>https</option>
-        <option value="http" {{ 'selected' if agent_bootstrap_default_scheme == 'http' else '' }}>http</option>
-      </select>
-
-      <label class="label">Agent 更新命令 IP 回退端口</label>
-      <input class="input mono" name="agent_panel_ip_fallback_port" placeholder="默认 6080" value="{{ agent_panel_ip_fallback_port or '' }}">
-      <div class="help">当节点上报入口与公网域名不一致时，作为 panel_ip_fallback_port 下发。</div>
-
-      <label class="label">HTTPS 证书校验</label>
-      <label class="help">
-        <input type="checkbox" name="agent_bootstrap_insecure_tls" value="1" {{ 'checked' if agent_bootstrap_insecure_tls else '' }} style="transform:translateY(1px);">
-        忽略 HTTPS 证书校验（curl 使用 -k）
-      </label>
-
-      <label class="label">面板对外地址（Public URL）</label>
-      <input class="input mono" type="password" autocomplete="off" data-sensitive-input="1" name="panel_public_url" placeholder="例如：https://realm.infpro.me:443" value="{{ panel_public_url or '' }}">
-      <div class="help">用于生成外部脚本链接、短链、更新地址。</div>
-
-      <label class="label">Agent 资源来源</label>
-      <select class="input" name="panel_asset_source">
-        <option value="panel" {{ 'selected' if (panel_asset_source or 'panel') == 'panel' else '' }}>panel（从 /static 拉取）</option>
-        <option value="github" {{ 'selected' if (panel_asset_source or '') == 'github' else '' }}>github（从 GitHub 拉取）</option>
-      </select>
-
-      <label class="label">覆盖 Agent 安装脚本 URL（可选）</label>
-      <input class="input mono" type="password" autocomplete="off" data-sensitive-input="1" name="panel_agent_sh_url" placeholder="例如：https://raw.githubusercontent.com/.../realm_agent.sh" value="{{ panel_agent_sh_url or '' }}">
-
-      <label class="label">覆盖 Agent ZIP URL（可选）</label>
-      <input class="input mono" type="password" autocomplete="off" data-sensitive-input="1" name="panel_agent_zip_url" placeholder="例如：https://github.com/.../main.zip" value="{{ panel_agent_zip_url or '' }}">
-
-      <div class="row" style="margin-top:6px;">
-        <button id="toggleSensitiveSettings" class="btn xs ghost" type="button">显示敏感地址</button>
+<div class="settings-console">
+  <aside class="card settings-side">
+    <div class="section-head">
+      <div>
+        <div class="section-title">快速导航</div>
+        <div class="section-sub">点击跳转到对应配置区块。</div>
       </div>
+    </div>
+    <nav class="settings-side-nav" aria-label="设置分区">
+      <a class="chip settings-nav-chip active" href="#sec-access" data-section-nav="sec-access">接入与下载地址</a>
+      <a class="chip settings-nav-chip" href="#sec-time-sync" data-section-nav="sec-time-sync">时间同步</a>
+      <a class="chip settings-nav-chip" href="#sec-ssl" data-section-nav="sec-ssl">SSL 申请策略</a>
+      <a class="chip settings-nav-chip" href="#sec-save-precheck" data-section-nav="sec-save-precheck">保存预检</a>
+      <a class="chip settings-nav-chip" href="#sec-sync-precheck" data-section-nav="sec-sync-precheck">同步预检</a>
+      <a class="chip settings-nav-chip" href="#sec-auto-backup" data-section-nav="sec-auto-backup">自动备份</a>
+    </nav>
 
-      <div class="help mono">当前生效 Bootstrap：{{ (effective_bootstrap_url|mask_url) if effective_bootstrap_url else '-' }}</div>
-      <div class="help mono">当前生效 Public URL：{{ (effective_public_url|mask_url) if effective_public_url else '-' }}</div>
-      <div class="help mono">当前生效资源来源：{{ effective_asset_source or '-' }} · fallback_port={{ effective_panel_ip_fallback_port }}</div>
+    <div class="settings-side-divider"></div>
 
-      <hr style="border:none;border-top:1px solid var(--line);margin:16px 0;">
-      <div class="h2" style="margin-bottom:6px;">SSL 申请/续期策略</div>
+    <div class="section-head">
+      <div>
+        <div class="section-title">当前生效值</div>
+        <div class="section-sub">便于快速核对关键入口。</div>
+      </div>
+    </div>
+    <div class="settings-side-kv">
+      <div class="kvline">
+        <span class="k">Bootstrap</span>
+        <span class="v mono wrap">{{ effective_bootstrap_url or '-' }}</span>
+      </div>
+      <div class="kvline">
+        <span class="k">Public URL</span>
+        <span class="v mono wrap">{{ effective_public_url or '-' }}</span>
+      </div>
+      <div class="kvline">
+        <span class="k">fallback_port</span>
+        <span class="v mono">{{ effective_panel_ip_fallback_port }}</span>
+      </div>
+      <div class="kvline">
+        <span class="k">节点信息链路</span>
+        <span class="v mono">
+          {% if (effective_node_info_fetch_order or 'push_first') == 'pull_first' %}
+            pull_first
+          {% else %}
+            push_first
+          {% endif %}
+        </span>
+      </div>
+      <div class="kvline">
+        <span class="k">SSL 直连</span>
+        <span class="v mono">{{ effective_ssl_direct_timeout }}s / {{ effective_ssl_direct_max_attempts }} 次</span>
+      </div>
+      <div class="kvline">
+        <span class="k">自动备份</span>
+        <span class="v mono">{{ 'enabled' if auto_backup_enabled else 'disabled' }}</span>
+      </div>
+      <div class="kvline">
+        <span class="k">备份目标</span>
+        <span class="v mono wrap">{% if auto_backup_target_node_name %}{{ auto_backup_target_node_name }}{% else %}-{% endif %}{% if auto_backup_target_path %} · {{ auto_backup_target_path }}{% endif %}</span>
+      </div>
+    </div>
+  </aside>
 
-      <label class="help">
-        <input type="checkbox" name="ssl_direct_first" value="1" {{ 'checked' if ssl_direct_first else '' }} style="transform:translateY(1px);">
-        优先走 panel -> agent 直连执行
-      </label>
+  <form id="panelSettingsForm" method="post" action="/settings" class="form settings-form settings-main">
+    <div class="dashboard-toolbar settings-toolbar" id="settingsToolbar">
+      <div class="dash-filters settings-filters" role="tablist" aria-label="设置分区导航">
+        <a class="chip settings-nav-chip active" href="#sec-access" data-section-nav="sec-access">接入</a>
+        <a class="chip settings-nav-chip" href="#sec-time-sync" data-section-nav="sec-time-sync">时间</a>
+        <a class="chip settings-nav-chip" href="#sec-ssl" data-section-nav="sec-ssl">SSL</a>
+        <a class="chip settings-nav-chip" href="#sec-save-precheck" data-section-nav="sec-save-precheck">保存预检</a>
+        <a class="chip settings-nav-chip" href="#sec-sync-precheck" data-section-nav="sec-sync-precheck">同步预检</a>
+        <a class="chip settings-nav-chip" href="#sec-auto-backup" data-section-nav="sec-auto-backup">自动备份</a>
+      </div>
+      <div class="muted sm">保存按钮固定在右下角，无需滚动到底部</div>
+    </div>
 
-      <label class="label">直连超时（秒）</label>
-      <input class="input mono" name="ssl_direct_timeout_sec" placeholder="默认 240" value="{{ ssl_direct_timeout_sec or '' }}">
-
-      <label class="label">直连最大尝试次数</label>
-      <input class="input mono" name="ssl_direct_max_attempts" placeholder="默认 1" value="{{ ssl_direct_max_attempts or '' }}">
-
-      <label class="help">
-        <input type="checkbox" name="ssl_fallback_to_queue" value="1" {{ 'checked' if ssl_fallback_to_queue else '' }} style="transform:translateY(1px);">
-        直连失败后自动回退到当前队列模式（节点上报后执行）
-      </label>
-
-      <div class="help mono">当前生效：timeout={{ effective_ssl_direct_timeout }}s · max_attempts={{ effective_ssl_direct_max_attempts }}</div>
-
-      <hr style="border:none;border-top:1px solid var(--line);margin:16px 0;">
-      <div class="h2" style="margin-bottom:6px;">保存预检（节点规则）</div>
-
-      <label class="help">
-        <input type="checkbox" name="save_precheck_enabled" value="1" {{ 'checked' if save_precheck_enabled else '' }} style="transform:translateY(1px);">
-        启用规则保存前运行时预检（agent /netprobe）
-      </label>
-      <label class="label">预检 HTTP 超时（秒）</label>
-      <input class="input mono" name="save_precheck_http_timeout" placeholder="默认 4.5" value="{{ save_precheck_http_timeout or '' }}">
-      <label class="label">预检探测超时（秒）</label>
-      <input class="input mono" name="save_precheck_probe_timeout" placeholder="默认 1.2" value="{{ save_precheck_probe_timeout or '' }}">
-      <label class="label">最多问题数</label>
-      <input class="input mono" name="save_precheck_max_issues" placeholder="默认 24" value="{{ save_precheck_max_issues or '' }}">
-
-      <hr style="border:none;border-top:1px solid var(--line);margin:16px 0;">
-      <div class="h2" style="margin-bottom:6px;">同步预检（WSS/内网）</div>
-
-      <label class="help">
-        <input type="checkbox" name="sync_precheck_enabled" value="1" {{ 'checked' if sync_precheck_enabled else '' }} style="transform:translateY(1px);">
-        启用同步保存前运行时预检
-      </label>
-      <label class="label">同步预检 HTTP 超时（秒）</label>
-      <input class="input mono" name="sync_precheck_http_timeout" placeholder="默认 4.5" value="{{ sync_precheck_http_timeout or '' }}">
-      <label class="label">同步预检探测超时（秒）</label>
-      <input class="input mono" name="sync_precheck_probe_timeout" placeholder="默认 1.2" value="{{ sync_precheck_probe_timeout or '' }}">
-      <label class="label">同步下发超时（秒）</label>
-      <input class="input mono" name="sync_apply_timeout" placeholder="默认 3" value="{{ sync_apply_timeout or '' }}">
-
-      <div class="row" style="margin-top:14px;">
-        <div class="col">
-          <a href="/" class="btn ghost">取消</a>
-        </div>
-        <div class="col right">
-          <button class="btn" type="submit">保存设置</button>
+    <section class="card settings-card settings-panel" id="sec-access" data-accent="1">
+      <div class="section-head">
+        <div>
+          <div class="section-title">接入与下载地址</div>
+          <div class="section-sub">统一配置 Agent 接入入口、Public URL 与资源来源。</div>
         </div>
       </div>
-    </form>
+
+      <div class="settings-field-grid">
+        <div class="settings-field full">
+          <label class="label">Agent 拉取地址（域名/IP + 端口）</label>
+          <input class="input mono" autocomplete="off" name="agent_bootstrap_url" placeholder="例如：gateway.example.com:443 或 https://gateway.example.com:443" value="{{ agent_bootstrap_url or '' }}">
+          <div class="help">用于“接入命令”和 /join /uninstall 脚本入口地址。</div>
+        </div>
+
+        <div class="settings-field">
+          <label class="label">Bootstrap 默认协议（未写协议时）</label>
+          <select class="input" name="agent_bootstrap_default_scheme">
+            <option value="" {{ 'selected' if not agent_bootstrap_default_scheme else '' }}>自动（跟随请求）</option>
+            <option value="https" {{ 'selected' if agent_bootstrap_default_scheme == 'https' else '' }}>https</option>
+            <option value="http" {{ 'selected' if agent_bootstrap_default_scheme == 'http' else '' }}>http</option>
+          </select>
+        </div>
+
+        <div class="settings-field">
+          <label class="label">Agent 更新命令 IP 回退端口</label>
+          <input class="input mono" name="agent_panel_ip_fallback_port" placeholder="默认 6080" value="{{ agent_panel_ip_fallback_port or '' }}">
+          <div class="help">当节点上报入口与公网域名不一致时，作为 panel_ip_fallback_port 下发。</div>
+        </div>
+
+        <div class="settings-field">
+          <label class="label">节点信息读取顺序</label>
+          <select class="input" name="node_info_fetch_order">
+            <option value="push_first" {{ 'selected' if (node_info_fetch_order or 'push_first') == 'push_first' else '' }}>上报优先（Agent -&gt; Panel）</option>
+            <option value="pull_first" {{ 'selected' if (node_info_fetch_order or '') == 'pull_first' else '' }}>直连优先（Panel -&gt; Agent）</option>
+          </select>
+          <div class="help">两条链路会同时保留，首选失败后自动回退到另一条链路。</div>
+        </div>
+
+        <div class="settings-field full">
+          <label class="settings-check">
+            <input type="checkbox" name="agent_bootstrap_insecure_tls" value="1" {{ 'checked' if agent_bootstrap_insecure_tls else '' }}>
+            <span>忽略 HTTPS 证书校验（curl 使用 -k）</span>
+          </label>
+        </div>
+
+        <div class="settings-field full">
+          <label class="label">面板对外地址（Public URL）</label>
+          <input class="input mono" autocomplete="off" name="panel_public_url" placeholder="例如：https://panel.example.com:443" value="{{ panel_public_url or '' }}">
+          <div class="help">用于生成外部脚本链接、短链、更新地址。</div>
+        </div>
+
+        <div class="settings-field">
+          <label class="label">Agent 资源来源</label>
+          <select class="input" name="panel_asset_source">
+            <option value="panel" {{ 'selected' if (panel_asset_source or 'panel') == 'panel' else '' }}>panel（从 /static 拉取）</option>
+            <option value="github" {{ 'selected' if (panel_asset_source or '') == 'github' else '' }}>github（从 GitHub 拉取）</option>
+          </select>
+        </div>
+
+        <div class="settings-field"></div>
+
+        <div class="settings-field full">
+          <label class="label">覆盖 Agent 安装脚本 URL（可选）</label>
+          <input class="input mono" autocomplete="off" name="panel_agent_sh_url" placeholder="例如：https://raw.githubusercontent.com/example-org/example-repo/main/realm_agent.sh" value="{{ panel_agent_sh_url or '' }}">
+        </div>
+
+        <div class="settings-field full">
+          <label class="label">覆盖 Agent ZIP URL（可选）</label>
+          <input class="input mono" autocomplete="off" name="panel_agent_zip_url" placeholder="例如：https://github.com/example-org/example-repo/archive/refs/heads/main.zip" value="{{ panel_agent_zip_url or '' }}">
+        </div>
+      </div>
+    </section>
+
+    <section class="card settings-card settings-panel" id="sec-time-sync" data-accent="2">
+      <div class="section-head">
+        <div>
+          <div class="section-title">时间同步（Panel -&gt; Agent）</div>
+          <div class="section-sub">控制 Agent 的时区与对时行为。</div>
+        </div>
+      </div>
+
+      <div class="settings-field-grid">
+        <div class="settings-field full">
+          <label class="settings-check">
+            <input type="checkbox" name="agent_time_sync_enabled" value="1" {{ 'checked' if agent_time_sync_enabled else '' }}>
+            <span>启用 Agent 时间同步</span>
+          </label>
+        </div>
+
+        <div class="settings-field full">
+          <label class="label">目标时区</label>
+          <input class="input mono" autocomplete="off" name="agent_time_sync_timezone" placeholder="例如：Asia/Shanghai" value="{{ agent_time_sync_timezone or 'Asia/Shanghai' }}">
+          <div class="help">建议使用 IANA 时区名，例如 Asia/Shanghai、UTC、America/Los_Angeles。</div>
+        </div>
+
+        <div class="settings-field">
+          <label class="settings-check">
+            <input type="checkbox" name="agent_time_sync_set_timezone" value="1" {{ 'checked' if agent_time_sync_set_timezone else '' }}>
+            <span>同步系统时区</span>
+          </label>
+        </div>
+
+        <div class="settings-field">
+          <label class="settings-check">
+            <input type="checkbox" name="agent_time_sync_enable_ntp" value="1" {{ 'checked' if agent_time_sync_enable_ntp else '' }}>
+            <span>启用 NTP 自动对时</span>
+          </label>
+        </div>
+
+        <div class="settings-field full">
+          <label class="settings-check">
+            <input type="checkbox" name="agent_time_sync_set_clock" value="1" {{ 'checked' if agent_time_sync_set_clock else '' }}>
+            <span>立即校时到面板当前时间（谨慎）</span>
+          </label>
+        </div>
+      </div>
+    </section>
+
+    <section class="card settings-card settings-panel" id="sec-ssl" data-accent="3">
+      <div class="section-head">
+        <div>
+          <div class="section-title">SSL 申请/续期策略</div>
+          <div class="section-sub">设置直连优先策略和失败回退行为。</div>
+        </div>
+      </div>
+
+      <div class="settings-field-grid">
+        <div class="settings-field full">
+          <label class="settings-check">
+            <input type="checkbox" name="ssl_direct_first" value="1" {{ 'checked' if ssl_direct_first else '' }}>
+            <span>优先走 panel -&gt; agent 直连执行</span>
+          </label>
+        </div>
+
+        <div class="settings-field">
+          <label class="label">直连超时（秒）</label>
+          <input class="input mono" name="ssl_direct_timeout_sec" placeholder="默认 240" value="{{ ssl_direct_timeout_sec or '' }}">
+        </div>
+
+        <div class="settings-field">
+          <label class="label">直连最大尝试次数</label>
+          <input class="input mono" name="ssl_direct_max_attempts" placeholder="默认 1" value="{{ ssl_direct_max_attempts or '' }}">
+        </div>
+
+        <div class="settings-field full">
+          <label class="settings-check">
+            <input type="checkbox" name="ssl_fallback_to_queue" value="1" {{ 'checked' if ssl_fallback_to_queue else '' }}>
+            <span>直连失败后自动回退到当前队列模式（节点上报后执行）</span>
+          </label>
+        </div>
+      </div>
+    </section>
+
+    <section class="card settings-card settings-panel" id="sec-save-precheck" data-accent="4">
+      <div class="section-head">
+        <div>
+          <div class="section-title">保存预检（节点规则）</div>
+          <div class="section-sub">规则保存前运行时探测参数。</div>
+        </div>
+      </div>
+
+      <div class="settings-field-grid">
+        <div class="settings-field full">
+          <label class="settings-check">
+            <input type="checkbox" name="save_precheck_enabled" value="1" {{ 'checked' if save_precheck_enabled else '' }}>
+            <span>启用规则保存前运行时预检（agent /netprobe）</span>
+          </label>
+        </div>
+
+        <div class="settings-field">
+          <label class="label">预检 HTTP 超时（秒）</label>
+          <input class="input mono" name="save_precheck_http_timeout" placeholder="默认 4.5" value="{{ save_precheck_http_timeout or '' }}">
+        </div>
+
+        <div class="settings-field">
+          <label class="label">预检探测超时（秒）</label>
+          <input class="input mono" name="save_precheck_probe_timeout" placeholder="默认 1.2" value="{{ save_precheck_probe_timeout or '' }}">
+        </div>
+
+        <div class="settings-field full">
+          <label class="label">最多问题数</label>
+          <input class="input mono" name="save_precheck_max_issues" placeholder="默认 24" value="{{ save_precheck_max_issues or '' }}">
+        </div>
+      </div>
+    </section>
+
+    <section class="card settings-card settings-panel" id="sec-sync-precheck" data-accent="5">
+      <div class="section-head">
+        <div>
+          <div class="section-title">同步预检（WSS/内网）</div>
+          <div class="section-sub">同步保存前检查与下发超时参数。</div>
+        </div>
+      </div>
+
+      <div class="settings-field-grid">
+        <div class="settings-field full">
+          <label class="settings-check">
+            <input type="checkbox" name="sync_precheck_enabled" value="1" {{ 'checked' if sync_precheck_enabled else '' }}>
+            <span>启用同步保存前运行时预检</span>
+          </label>
+        </div>
+
+        <div class="settings-field">
+          <label class="label">同步预检 HTTP 超时（秒）</label>
+          <input class="input mono" name="sync_precheck_http_timeout" placeholder="默认 4.5" value="{{ sync_precheck_http_timeout or '' }}">
+        </div>
+
+        <div class="settings-field">
+          <label class="label">同步预检探测超时（秒）</label>
+          <input class="input mono" name="sync_precheck_probe_timeout" placeholder="默认 1.2" value="{{ sync_precheck_probe_timeout or '' }}">
+        </div>
+
+        <div class="settings-field full">
+          <label class="label">同步下发超时（秒）</label>
+          <input class="input mono" name="sync_apply_timeout" placeholder="默认 3" value="{{ sync_apply_timeout or '' }}">
+        </div>
+      </div>
+    </section>
+
+    <section class="card settings-card settings-panel" id="sec-auto-backup" data-accent="6">
+      <div class="section-head">
+        <div>
+          <div class="section-title">自动备份</div>
+          <div class="section-sub">按计划自动生成全量备份并上传到指定节点目录，同时清理旧备份。</div>
+        </div>
+      </div>
+
+      <div class="settings-field-grid">
+        <div class="settings-field full">
+          <label class="settings-check">
+            <input type="checkbox" name="auto_backup_enabled" value="1" {{ 'checked' if auto_backup_enabled else '' }}>
+            <span>启用自动全量备份（备份包上传到目标节点）</span>
+          </label>
+        </div>
+
+        <div class="settings-field">
+          <label class="label">备份目标节点</label>
+          <select class="input" name="auto_backup_target_node_id">
+            <option value="0" {{ 'selected' if (auto_backup_target_node_id|int) <= 0 else '' }}>请选择节点</option>
+            {% for n in (backup_nodes or []) %}
+              <option value="{{ n.id }}" {{ 'selected' if (auto_backup_target_node_id|int) == (n.id|int) else '' }}>#{{ n.id }} {{ n.name }} · {{ n.display_ip or '-' }}</option>
+            {% endfor %}
+          </select>
+        </div>
+
+        <div class="settings-field">
+          <label class="label">目标目录（绝对路径）</label>
+          <input class="input mono" name="auto_backup_target_path" placeholder="/var/backups/nexus 或 C:\\backup\\nexus" value="{{ auto_backup_target_path or '' }}">
+          <div class="help">备份文件命名：<span class="mono">nexus-auto-backup-YYYYMMDD-HHMMSS.zip</span></div>
+        </div>
+
+        <div class="settings-field">
+          <label class="label">备份间隔（小时）</label>
+          <input class="input mono" name="auto_backup_interval_hours" type="number" min="1" max="720" value="{{ auto_backup_interval_hours or 24 }}">
+        </div>
+
+        <div class="settings-field">
+          <label class="label">自动删除多久之前（天）</label>
+          <input class="input mono" name="auto_backup_retention_days" type="number" min="0" max="3650" value="{{ auto_backup_retention_days or 30 }}">
+          <div class="help">0 表示不按时间删除。</div>
+        </div>
+
+        <div class="settings-field">
+          <label class="label">最多保留份数</label>
+          <input class="input mono" name="auto_backup_keep_count" type="number" min="0" max="2000" value="{{ auto_backup_keep_count or 30 }}">
+          <div class="help">0 表示不按份数限制。</div>
+        </div>
+
+        <div class="settings-field">
+          <label class="label">下次计划执行</label>
+          <input class="input mono" value="{{ auto_backup_next_run_at or '-' }}" readonly>
+        </div>
+
+        <div class="settings-field full">
+          <div class="help">最近执行：<span class="mono">{{ auto_backup_last_trigger_at or '-' }}</span> · 最近成功：<span class="mono">{{ auto_backup_last_success_at or '-' }}</span></div>
+          <div class="help">最近状态：<span class="mono">{{ auto_backup_last_status or '-' }}</span>{% if auto_backup_last_message %} · {{ auto_backup_last_message }}{% endif %}</div>
+          <div class="help">最近备份：<span class="mono">{{ auto_backup_last_filename or '-' }}</span>{% if auto_backup_last_size_bytes and auto_backup_last_size_bytes > 0 %} · <span class="mono">{{ auto_backup_last_size_bytes }} bytes</span>{% endif %}</div>
+        </div>
+      </div>
+    </section>
+
+    <div class="settings-bottom-pad" aria-hidden="true"></div>
+  </form>
+</div>
+
+<div class="settings-action-dock" id="settingsActionDock">
+  <div class="settings-action-inner">
+    <div class="settings-action-meta">
+      <div class="settings-action-title">配置变更</div>
+      <div class="settings-action-sub muted sm" id="settingsDirtyState">尚未修改</div>
+    </div>
+    <div class="settings-action-buttons">
+      <a href="/" class="btn ghost">取消</a>
+      <button class="btn" id="settingsSaveBtn" type="submit" form="panelSettingsForm">保存配置</button>
+    </div>
   </div>
 </div>
+
 <script>
 (function(){
-  var btn = document.getElementById('toggleSensitiveSettings');
-  if(!btn) return;
-  var fields = Array.prototype.slice.call(document.querySelectorAll('input[data-sensitive-input="1"]'));
-  if(!fields.length) return;
-  var reveal = false;
+  var form = document.getElementById('panelSettingsForm');
+  if(!form) return;
 
-  function applyState(){
-    fields.forEach(function(el){
-      var t = reveal ? 'text' : 'password';
-      if(el.type !== t) el.type = t;
+  var navLinks = Array.prototype.slice.call(document.querySelectorAll('[data-section-nav]'));
+  var sections = Array.prototype.slice.call(document.querySelectorAll('.settings-panel[id]'));
+  var dirtyHint = document.getElementById('settingsDirtyState');
+  var saveBtn = document.getElementById('settingsSaveBtn');
+  var dirty = false;
+
+  function setActiveNav(id){
+    navLinks.forEach(function(link){
+      var active = (link.getAttribute('data-section-nav') || '') === id;
+      link.classList.toggle('active', active);
+      link.setAttribute('aria-selected', active ? 'true' : 'false');
     });
-    btn.textContent = reveal ? '隐藏敏感地址' : '显示敏感地址';
   }
 
-  btn.addEventListener('click', function(){
-    reveal = !reveal;
-    applyState();
+  function markDirty(){
+    if(dirty) return;
+    dirty = true;
+    if(dirtyHint) dirtyHint.textContent = '有未保存的修改';
+  }
+
+  navLinks.forEach(function(link){
+    link.addEventListener('click', function(ev){
+      var id = link.getAttribute('data-section-nav') || '';
+      var target = id ? document.getElementById(id) : null;
+      if(!target) return;
+      ev.preventDefault();
+      target.scrollIntoView({behavior:'smooth', block:'start'});
+      setActiveNav(id);
+      try{ history.replaceState(null, '', '#' + id); }catch(_e){}
+    });
   });
 
-  applyState();
+  function getStickyTopPx(){
+    try{
+      var raw = getComputedStyle(document.documentElement).getPropertyValue('--sticky-top') || '0';
+      var v = parseFloat(String(raw).trim());
+      return Number.isFinite(v) ? v : 0;
+    }catch(_e){
+      return 0;
+    }
+  }
+
+  function syncActiveByScroll(){
+    if(!sections.length) return;
+    var anchorY = window.scrollY + getStickyTopPx() + 120;
+    var currentId = sections[0].id;
+    sections.forEach(function(section){
+      if((section.offsetTop || 0) <= anchorY){
+        currentId = section.id;
+      }
+    });
+    setActiveNav(currentId);
+  }
+
+  var ticking = false;
+  function onScrollSync(){
+    if(ticking) return;
+    ticking = true;
+    requestAnimationFrame(function(){
+      ticking = false;
+      syncActiveByScroll();
+    });
+  }
+
+  window.addEventListener('scroll', onScrollSync, {passive:true});
+  window.addEventListener('resize', onScrollSync);
+
+  var hashId = String((window.location && window.location.hash) || '').replace(/^#/, '').trim();
+  if(hashId && document.getElementById(hashId)){
+    setActiveNav(hashId);
+  }else{
+    syncActiveByScroll();
+  }
+
+  form.addEventListener('input', markDirty);
+  form.addEventListener('change', markDirty);
+  form.addEventListener('submit', function(){
+    if(dirtyHint) dirtyHint.textContent = '正在保存...';
+    if(saveBtn){
+      saveBtn.disabled = true;
+      saveBtn.textContent = '保存中...';
+    }
+  });
 })();
 </script>
 {% endblock %}

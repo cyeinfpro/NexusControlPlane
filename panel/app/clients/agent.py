@@ -16,7 +16,7 @@ from ..core.settings import DEFAULT_AGENT_PORT
 DEFAULT_TIMEOUT = 6.0
 TCPING_TIMEOUT = 3.0
 _HTTP_LIMITS = httpx.Limits(max_connections=200, max_keepalive_connections=80, keepalive_expiry=20.0)
-_CLIENTS: Dict[bool, httpx.AsyncClient] = {}
+_CLIENTS: Dict[Tuple[bool, asyncio.AbstractEventLoop], httpx.AsyncClient] = {}
 _CLIENTS_LOCK = threading.Lock()
 _TRANSPORT_RETRY_COUNT = 3
 _TRANSPORT_RETRY_BACKOFF_BASE_SEC = 0.35
@@ -26,26 +26,42 @@ class AgentError(RuntimeError):
     """Raised when panel <-> agent request failed."""
 
 
+def _client_pool_key(verify_tls: bool) -> Tuple[bool, asyncio.AbstractEventLoop]:
+    return bool(verify_tls), asyncio.get_running_loop()
+
+
 async def _get_client(verify_tls: bool) -> httpx.AsyncClient:
-    key = bool(verify_tls)
-    cli = _CLIENTS.get(key)
-    if cli is not None and not cli.is_closed:
-        return cli
+    key = _client_pool_key(verify_tls)
+    stale_clients: list[httpx.AsyncClient] = []
     with _CLIENTS_LOCK:
+        for k, old_cli in list(_CLIENTS.items()):
+            loop = k[1]
+            if old_cli.is_closed or loop.is_closed():
+                _CLIENTS.pop(k, None)
+                stale_clients.append(old_cli)
         cli = _CLIENTS.get(key)
         if cli is not None and not cli.is_closed:
-            return cli
-        cli = httpx.AsyncClient(
-            verify=key,
-            limits=_HTTP_LIMITS,
-            timeout=DEFAULT_TIMEOUT,
-        )
-        _CLIENTS[key] = cli
-        return cli
+            out = cli
+        else:
+            out = httpx.AsyncClient(
+                verify=bool(verify_tls),
+                limits=_HTTP_LIMITS,
+                timeout=DEFAULT_TIMEOUT,
+            )
+            _CLIENTS[key] = out
+    for old_cli in stale_clients:
+        try:
+            await old_cli.aclose()
+        except Exception:
+            pass
+    return out
 
 
 async def _drop_client(verify_tls: bool) -> None:
-    key = bool(verify_tls)
+    try:
+        key = _client_pool_key(verify_tls)
+    except RuntimeError:
+        return
     cli: Optional[httpx.AsyncClient] = None
     with _CLIENTS_LOCK:
         cli = _CLIENTS.pop(key, None)
@@ -73,6 +89,24 @@ def _retry_backoff_sec(attempt_no: int) -> float:
     return min(2.5, _TRANSPORT_RETRY_BACKOFF_BASE_SEC * (2 ** (n - 1)))
 
 
+def _is_retriable_transport_exc(exc: Exception) -> bool:
+    if isinstance(exc, httpx.TransportError):
+        return True
+    if isinstance(exc, RuntimeError):
+        msg = str(exc or "").strip().lower()
+        if "client has been closed" in msg:
+            return True
+    return False
+
+
+def _raise_transport_exc_for_agent_request(exc: Exception) -> None:
+    if isinstance(exc, RuntimeError):
+        msg = str(exc or "").strip().lower()
+        if "client has been closed" in msg:
+            raise AgentError("Agent 请求失败：HTTP 客户端连接已重置，请稍后重试")
+    raise exc
+
+
 def _normalize_base_url(base_url: str) -> str:
     raw = (base_url or "").strip()
     if not raw:
@@ -91,15 +125,26 @@ def _base_url_with_port(base_url: str, target_port: int) -> str:
     except Exception:
         return target
 
-    host = parsed.hostname or ""
+    try:
+        host = str(parsed.hostname or "").strip()
+    except Exception:
+        host = ""
     if not host:
         return target
 
     userinfo = ""
-    if parsed.username:
-        userinfo = parsed.username
-        if parsed.password:
-            userinfo += f":{parsed.password}"
+    try:
+        parsed_username = parsed.username
+    except Exception:
+        parsed_username = None
+    try:
+        parsed_password = parsed.password
+    except Exception:
+        parsed_password = None
+    if parsed_username:
+        userinfo = parsed_username
+        if parsed_password:
+            userinfo += f":{parsed_password}"
         userinfo += "@"
 
     host_for_url = f"[{host}]" if ":" in host else host
@@ -108,10 +153,22 @@ def _base_url_with_port(base_url: str, target_port: int) -> str:
     return with_port.rstrip("/")
 
 
-def _looks_like_nginx_html_404(response: httpx.Response) -> bool:
-    raw_text = (response.text or "").lower()
+def _looks_like_nginx_html_404(response: httpx.Response, *, allow_html_404_without_server: bool = False) -> bool:
+    raw_text = ""
+    try:
+        raw_text = (response.text or "").lower()
+    except Exception:
+        # For stream=True responses, body is unread at this point.
+        raw_text = ""
     content_type = str(response.headers.get("content-type") or "").lower()
-    return int(response.status_code or 0) == 404 and ("<html" in raw_text or "text/html" in content_type) and "nginx" in raw_text
+    server = str(response.headers.get("server") or "").lower()
+    is_html_404 = int(response.status_code or 0) == 404 and ("<html" in raw_text or "text/html" in content_type)
+    if not is_html_404:
+        return False
+    if "nginx" in raw_text or "nginx" in server:
+        return True
+    # stream=True responses may not expose body text yet; use looser HTML-404 heuristic as fallback.
+    return bool(allow_html_404_without_server and "text/html" in content_type)
 
 
 def _build_request_urls(base_url: str, path: str) -> Tuple[str, str]:
@@ -163,22 +220,32 @@ async def _agent_request(
                 r = await client.get(url, headers=headers, timeout=req_timeout)
             else:
                 r = await client.post(url, headers=headers, json=data, timeout=req_timeout)
-        except httpx.TransportError as exc:
-            primary_transport_exc = exc
+        except Exception as exc:
+            if _is_retriable_transport_exc(exc):
+                primary_transport_exc = exc
+            else:
+                raise
 
         # Compat fallback:
         # Some older node records may miss ":18700" and accidentally hit website nginx on 80/443.
         # Retry once against default agent port when primary transport failed or nginx html 404 is detected.
-        if fallback_url and (r is None or _looks_like_nginx_html_404(r)):
+        if fallback_url and (r is None or _looks_like_nginx_html_404(r, allow_html_404_without_server=True)):
             try:
                 if method_u == "GET":
                     r2 = await client.get(fallback_url, headers=headers, timeout=req_timeout)
                 else:
                     r2 = await client.post(fallback_url, headers=headers, json=data, timeout=req_timeout)
+                if r is not None:
+                    try:
+                        await r.aclose()
+                    except Exception:
+                        pass
                 if 200 <= r2.status_code < 300:
                     return _parse_agent_json(r2)
                 r = r2
-            except httpx.TransportError:
+            except Exception as exc:
+                if not _is_retriable_transport_exc(exc):
+                    raise
                 # Keep original nginx-404 response if present (more actionable than a generic transport error).
                 if r is None:
                     if attempt + 1 < _TRANSPORT_RETRY_COUNT:
@@ -186,7 +253,7 @@ async def _agent_request(
                         await asyncio.sleep(_retry_backoff_sec(attempt + 1))
                         continue
                     if primary_transport_exc is not None:
-                        raise primary_transport_exc
+                        _raise_transport_exc_for_agent_request(primary_transport_exc)
                     raise
 
         if r is None:
@@ -195,7 +262,7 @@ async def _agent_request(
                 await asyncio.sleep(_retry_backoff_sec(attempt + 1))
                 continue
             if primary_transport_exc is not None:
-                raise primary_transport_exc
+                _raise_transport_exc_for_agent_request(primary_transport_exc)
             raise AgentError("Agent 请求失败：节点不可达")
 
         if not (200 <= r.status_code < 300):
@@ -226,14 +293,24 @@ async def agent_get_raw(
         r: Optional[httpx.Response] = None
         try:
             r = await client.get(url, params=query, headers=headers, timeout=req_timeout)
-        except httpx.TransportError as exc:
-            primary_transport_exc = exc
+        except Exception as exc:
+            if _is_retriable_transport_exc(exc):
+                primary_transport_exc = exc
+            else:
+                raise
 
-        if fallback_url and (r is None or _looks_like_nginx_html_404(r)):
+        if fallback_url and (r is None or _looks_like_nginx_html_404(r, allow_html_404_without_server=True)):
             try:
                 r2 = await client.get(fallback_url, params=query, headers=headers, timeout=req_timeout)
+                if r is not None:
+                    try:
+                        await r.aclose()
+                    except Exception:
+                        pass
                 r = r2
-            except httpx.TransportError:
+            except Exception as exc:
+                if not _is_retriable_transport_exc(exc):
+                    raise
                 if r is None:
                     if attempt + 1 < _TRANSPORT_RETRY_COUNT:
                         await _drop_client(verify_tls)
@@ -261,8 +338,18 @@ async def agent_get_raw_stream(
     verify_tls: bool,
     params: Optional[Dict[str, Any]] = None,
     timeout: Optional[float] = None,
+    headers_extra: Optional[Dict[str, Any]] = None,
 ) -> httpx.Response:
-    headers = {"X-API-Key": api_key}
+    headers: Dict[str, str] = {"X-API-Key": api_key}
+    if isinstance(headers_extra, dict):
+        for k, v in headers_extra.items():
+            name = str(k or "").strip()
+            if not name:
+                continue
+            value = str(v or "").strip()
+            if not value:
+                continue
+            headers[name] = value
     url, fallback_url = _build_request_urls(base_url, path)
     if not url:
         raise RuntimeError("Agent raw stream request failed: empty base_url")
@@ -276,15 +363,25 @@ async def agent_get_raw_stream(
         try:
             req = client.build_request("GET", url, params=query, headers=headers, timeout=req_timeout)
             r = await client.send(req, stream=True)
-        except httpx.TransportError as exc:
-            primary_transport_exc = exc
+        except Exception as exc:
+            if _is_retriable_transport_exc(exc):
+                primary_transport_exc = exc
+            else:
+                raise
 
-        if fallback_url and (r is None or _looks_like_nginx_html_404(r)):
+        if fallback_url and (r is None or _looks_like_nginx_html_404(r, allow_html_404_without_server=True)):
             try:
                 req2 = client.build_request("GET", fallback_url, params=query, headers=headers, timeout=req_timeout)
                 r2 = await client.send(req2, stream=True)
+                if r is not None:
+                    try:
+                        await r.aclose()
+                    except Exception:
+                        pass
                 r = r2
-            except httpx.TransportError:
+            except Exception as exc:
+                if not _is_retriable_transport_exc(exc):
+                    raise
                 if r is None:
                     if attempt + 1 < _TRANSPORT_RETRY_COUNT:
                         await _drop_client(verify_tls)
@@ -449,13 +546,32 @@ def _format_agent_error(response: httpx.Response) -> str:
 
 def _extract_host_port(base_url: str, fallback_port: int) -> Tuple[str, int]:
     target = (base_url or "").strip()
+    try:
+        fallback = int(float(fallback_port))
+    except Exception:
+        fallback = int(DEFAULT_AGENT_PORT)
+    if fallback < 1 or fallback > 65535:
+        fallback = int(DEFAULT_AGENT_PORT)
     if not target:
-        return "", int(fallback_port)
+        return "", fallback
     if "://" not in target:
         target = f"http://{target}"
-    parsed = urlparse(target)
-    host = parsed.hostname or ""
-    port = parsed.port or int(fallback_port)
+    try:
+        parsed = urlparse(target)
+    except Exception:
+        return "", fallback
+    try:
+        host = str(parsed.hostname or "").strip()
+    except Exception:
+        host = ""
+    try:
+        parsed_port = parsed.port
+    except Exception:
+        parsed_port = None
+    if parsed_port is not None and 1 <= int(parsed_port) <= 65535:
+        port = int(parsed_port)
+    else:
+        port = fallback
     return host, port
 
 

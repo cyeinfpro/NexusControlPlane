@@ -17,7 +17,6 @@ from ..db import (
     delete_netmon_monitor,
     get_netmon_monitor,
     get_node,
-    insert_netmon_samples,
     list_netmon_monitors,
     list_netmon_samples,
     list_netmon_samples_range,
@@ -79,6 +78,16 @@ def _monitor_visible_node_ids(mon: Dict[str, Any], allowed: Optional[Set[int]]) 
         if nid > 0 and nid in allowed and nid not in out:
             out.append(nid)
     return out
+
+
+def _as_int(v: Any, default: int = 0) -> int:
+    try:
+        return int(v)
+    except Exception:
+        try:
+            return int(float(str(v).strip()))
+        except Exception:
+            return int(default)
 
 
 @router.get("/api/netmon/snapshot")
@@ -206,7 +215,7 @@ async def api_netmon_snapshot(request: Request, user: str = Depends(require_logi
 
     monitors_raw = list_netmon_monitors()
     if only_mid is not None:
-        monitors_raw = [m for m in monitors_raw if int(m.get("id") or 0) == int(only_mid)]
+        monitors_raw = [m for m in monitors_raw if _as_int((m or {}).get("id"), 0) == int(only_mid)]
     monitors: List[Dict[str, Any]] = []
     for m in monitors_raw:
         node_ids_visible = _monitor_visible_node_ids(m, allowed_node_set)
@@ -215,14 +224,18 @@ async def api_netmon_snapshot(request: Request, user: str = Depends(require_logi
         m2 = dict(m)
         m2["node_ids"] = node_ids_visible
         monitors.append(m2)
-    monitor_ids = [int(m.get("id") or 0) for m in monitors if int(m.get("id") or 0) > 0]
+    monitor_ids: List[int] = []
+    for m in monitors:
+        mid = _as_int((m or {}).get("id"), 0)
+        if mid > 0:
+            monitor_ids.append(mid)
 
     # Node metadata (for legend)
     nodes_raw = list_nodes()
     nodes = filter_nodes_for_user(user, nodes_raw) if allowed_node_set is not None else nodes_raw
     nodes_meta: Dict[str, Any] = {}
     for n in nodes:
-        nid = int(n.get("id") or 0)
+        nid = _as_int((n or {}).get("id"), 0)
         if nid <= 0:
             continue
         nodes_meta[str(nid)] = {
@@ -244,7 +257,7 @@ async def api_netmon_snapshot(request: Request, user: str = Depends(require_logi
 
     series: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
     for m in monitors:
-        mid = int(m.get("id") or 0)
+        mid = _as_int((m or {}).get("id"), 0)
         if mid <= 0:
             continue
         mid_s = str(mid)
@@ -335,10 +348,7 @@ async def api_netmon_snapshot(request: Request, user: str = Depends(require_logi
 
     monitors_out: List[Dict[str, Any]] = []
     for m in monitors:
-        try:
-            mid = int(m.get("id") or 0)
-        except Exception:
-            continue
+        mid = _as_int((m or {}).get("id"), 0)
         if mid <= 0:
             continue
         monitors_out.append(
@@ -346,17 +356,13 @@ async def api_netmon_snapshot(request: Request, user: str = Depends(require_logi
                 "id": mid,
                 "target": str(m.get("target") or ""),
                 "mode": str(m.get("mode") or "ping"),
-                "tcp_port": int(m.get("tcp_port") or 443),
-                "interval_sec": int(m.get("interval_sec") or 5),
-                "warn_ms": int(m.get("warn_ms") or 0),
-                "crit_ms": int(m.get("crit_ms") or 0),
+                "tcp_port": _as_int(m.get("tcp_port"), 443),
+                "interval_sec": _as_int(m.get("interval_sec"), 5),
+                "warn_ms": _as_int(m.get("warn_ms"), 0),
+                "crit_ms": _as_int(m.get("crit_ms"), 0),
                 "enabled": bool(m.get("enabled") or 0),
-                "node_ids": [
-                    int(x)
-                    for x in (m.get("node_ids") or [])
-                    if isinstance(x, int) or str(x).isdigit()
-                ],
-                "last_run_ts_ms": int(m.get("last_run_ts_ms") or 0),
+                "node_ids": [v for v in (_as_int(x, 0) for x in (m.get("node_ids") or [])) if v > 0],
+                "last_run_ts_ms": _as_int(m.get("last_run_ts_ms"), 0),
                 "last_run_msg": str(m.get("last_run_msg") or ""),
             }
         )
@@ -461,7 +467,7 @@ async def api_netmon_range(request: Request, user: str = Depends(require_login_o
     nodes = filter_nodes_for_user(user, nodes_raw) if allowed_node_set is not None else nodes_raw
     nodes_meta: Dict[str, Any] = {}
     for n in nodes:
-        nid = int(n.get("id") or 0)
+        nid = _as_int((n or {}).get("id"), 0)
         if nid <= 0:
             continue
         nodes_meta[str(nid)] = {
@@ -518,13 +524,13 @@ async def api_netmon_range(request: Request, user: str = Depends(require_login_o
         "ok": True,
         "ts": now_ms,
         "monitor": {
-            "id": int(mon.get("id") or 0),
+            "id": _as_int(mon.get("id"), 0),
             "target": str(mon.get("target") or ""),
             "mode": str(mon.get("mode") or "ping"),
-            "tcp_port": int(mon.get("tcp_port") or 443),
-            "interval_sec": int(mon.get("interval_sec") or 5),
-            "warn_ms": int(mon.get("warn_ms") or 0),
-            "crit_ms": int(mon.get("crit_ms") or 0),
+            "tcp_port": _as_int(mon.get("tcp_port"), 443),
+            "interval_sec": _as_int(mon.get("interval_sec"), 5),
+            "warn_ms": _as_int(mon.get("warn_ms"), 0),
+            "crit_ms": _as_int(mon.get("crit_ms"), 0),
             "enabled": bool(mon.get("enabled") or 0),
             "node_ids": visible_node_ids,
         },
@@ -672,10 +678,7 @@ async def api_netmon_monitors_list(user: str = Depends(require_login)):
     monitors = list_netmon_monitors()
     out: List[Dict[str, Any]] = []
     for m in monitors:
-        try:
-            mid = int(m.get("id") or 0)
-        except Exception:
-            continue
+        mid = _as_int((m or {}).get("id"), 0)
         if mid <= 0:
             continue
         node_ids_visible = _monitor_visible_node_ids(m, allowed_node_set)
@@ -686,13 +689,13 @@ async def api_netmon_monitors_list(user: str = Depends(require_login)):
                 "id": mid,
                 "target": str(m.get("target") or ""),
                 "mode": str(m.get("mode") or "ping"),
-                "tcp_port": int(m.get("tcp_port") or 443),
-                "interval_sec": int(m.get("interval_sec") or 5),
-                "warn_ms": int(m.get("warn_ms") or 0),
-                "crit_ms": int(m.get("crit_ms") or 0),
+                "tcp_port": _as_int(m.get("tcp_port"), 443),
+                "interval_sec": _as_int(m.get("interval_sec"), 5),
+                "warn_ms": _as_int(m.get("warn_ms"), 0),
+                "crit_ms": _as_int(m.get("crit_ms"), 0),
                 "enabled": bool(m.get("enabled") or 0),
                 "node_ids": node_ids_visible,
-                "last_run_ts_ms": int(m.get("last_run_ts_ms") or 0),
+                "last_run_ts_ms": _as_int(m.get("last_run_ts_ms"), 0),
                 "last_run_msg": str(m.get("last_run_msg") or ""),
             }
         )
@@ -796,12 +799,12 @@ async def api_netmon_monitors_create(request: Request, user: str = Depends(requi
             "id": mid,
             "target": str(mon.get("target") or target),
             "mode": str(mon.get("mode") or mode),
-            "tcp_port": int(mon.get("tcp_port") or tcp_port_i),
-            "interval_sec": int(mon.get("interval_sec") or interval_i),
-            "warn_ms": int(mon.get("warn_ms") or warn_i),
-            "crit_ms": int(mon.get("crit_ms") or crit_i),
+            "tcp_port": _as_int(mon.get("tcp_port"), tcp_port_i),
+            "interval_sec": _as_int(mon.get("interval_sec"), interval_i),
+            "warn_ms": _as_int(mon.get("warn_ms"), warn_i),
+            "crit_ms": _as_int(mon.get("crit_ms"), crit_i),
             "enabled": bool(mon.get("enabled") or enabled),
-            "node_ids": [int(x) for x in (mon.get("node_ids") or cleaned) if int(x) > 0],
+            "node_ids": [v for v in (_as_int(x, 0) for x in (mon.get("node_ids") or cleaned)) if v > 0],
         },
     }
 
@@ -925,13 +928,13 @@ async def api_netmon_monitors_update(monitor_id: int, request: Request, user: st
             "id": int(monitor_id),
             "target": str(mon2.get("target") or ""),
             "mode": str(mon2.get("mode") or "ping"),
-            "tcp_port": int(mon2.get("tcp_port") or 443),
-            "interval_sec": int(mon2.get("interval_sec") or 5),
-            "warn_ms": int(mon2.get("warn_ms") or 0),
-            "crit_ms": int(mon2.get("crit_ms") or 0),
+            "tcp_port": _as_int(mon2.get("tcp_port"), 443),
+            "interval_sec": _as_int(mon2.get("interval_sec"), 5),
+            "warn_ms": _as_int(mon2.get("warn_ms"), 0),
+            "crit_ms": _as_int(mon2.get("crit_ms"), 0),
             "enabled": bool(mon2.get("enabled") or 0),
             "node_ids": node_ids_visible,
-            "last_run_ts_ms": int(mon2.get("last_run_ts_ms") or 0),
+            "last_run_ts_ms": _as_int(mon2.get("last_run_ts_ms"), 0),
             "last_run_msg": str(mon2.get("last_run_msg") or ""),
         },
     }
@@ -1029,7 +1032,7 @@ async def api_netmon_probe(request: Request, user: str = Depends(require_login))
     body = {"mode": mode, "targets": targets, "tcp_port": tcp_port_i, "timeout": timeout_f}
 
     async def _call_one(n: Dict[str, Any]):
-        nid = int(n.get("id") or 0)
+        nid = _as_int((n or {}).get("id"), 0)
         try:
             http_timeout = max(2.5, timeout_f + 1.0)
             data = await agent_post(
@@ -1078,7 +1081,7 @@ async def api_netmon_probe(request: Request, user: str = Depends(require_login))
     for n in nodes:
         nodes_meta.append(
             {
-                "id": int(n.get("id") or 0),
+                "id": _as_int((n or {}).get("id"), 0),
                 "name": n.get("name") or extract_ip_for_display(n.get("base_url", "")),
                 "group_name": str(n.get("group_name") or "").strip() or "默认分组",
             }

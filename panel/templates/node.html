@@ -20,10 +20,12 @@
 {% set can_restore = ('*' in perms) or ('restore.manage' in perms) %}
 {% set can_mode_wss_perm = ('*' in perms) or ('sync.wss' in perms) or ('sync.*' in perms) %}
 {% set can_mode_intranet_perm = ('*' in perms) or ('sync.intranet' in perms) or ('sync.*' in perms) %}
+{% set can_mode_mptcp_perm = ('*' in perms) or ('sync.mptcp' in perms) or ('sync.*' in perms) %}
 {% set tunnel_no_limit = not tunnel_limit_enabled %}
 {% set can_mode_tcp = can_publish and (tunnel_no_limit or ('direct' in allowed_tunnels) or ('tcp' in allowed_tunnels)) %}
 {% set can_mode_wss = can_publish and can_mode_wss_perm and (tunnel_no_limit or ('wss' in allowed_tunnels)) %}
 {% set can_mode_intranet = can_publish and can_mode_intranet_perm and (tunnel_no_limit or ('intranet' in allowed_tunnels)) %}
+{% set can_mode_mptcp = can_publish and can_mode_mptcp_perm and (tunnel_no_limit or ('mptcp' in allowed_tunnels)) %}
 <div id="toast" class="toast"></div>
 
 <div class="split-layout">
@@ -53,7 +55,7 @@
           </div>
           <div class="node-group-items">
             {% for n in (g.nodes or []) %}
-            <div class="node-item-row{% if n.id == node.id %} active{% endif %}"
+            <div class="node-item-row{% if n.id == node.id %} active{% endif %}{% if n.direct_tunnel and n.direct_tunnel.enabled %} direct-enabled{% endif %}"
                  data-node-id="{{ n.id }}"
                  data-node-name="{{ (n.name or '')|e }}"
                  data-node-base-url="{{ (n.base_url or '')|e }}"
@@ -62,6 +64,14 @@
                  data-node-is-private="{{ 1 if n.is_private else 0 }}"
                  data-node-role="{{ (n.role or 'normal')|e }}"
                  data-node-website-root="{{ (n.website_root_base or '')|e }}"
+                 data-node-system-type="{{ (n.system_type or 'auto')|e }}"
+                 data-node-direct-enabled="{{ 1 if (n.direct_tunnel.enabled if n.direct_tunnel else 0) else 0 }}"
+                 data-node-direct-sync-id="{{ ((n.direct_tunnel.sync_id if n.direct_tunnel else '') or '')|e }}"
+                 data-node-direct-relay-id="{{ (n.direct_tunnel.relay_node_id if n.direct_tunnel else 0) }}"
+                 data-node-direct-listen-port="{{ (n.direct_tunnel.listen_port if n.direct_tunnel else 0) }}"
+                 data-node-direct-public-host="{{ ((n.direct_tunnel.public_host if n.direct_tunnel else '') or '')|e }}"
+                 data-node-direct-scheme="{{ ((n.direct_tunnel.scheme if n.direct_tunnel else '') or '')|e }}"
+                 data-node-direct-verify-tls="{{ 1 if (n.direct_tunnel.verify_tls if n.direct_tunnel else 0) else 0 }}"
                  data-node-ar-enabled="{{ 1 if (n.auto_restart_policy.enabled if n.auto_restart_policy else 1) else 0 }}"
                  data-node-ar-schedule="{{ (n.auto_restart_policy.schedule_type if n.auto_restart_policy else 'daily')|e }}"
                  data-node-ar-interval="{{ (n.auto_restart_policy.interval if n.auto_restart_policy else 1) }}"
@@ -73,7 +83,10 @@
               <a class="node-item{% if n.id == node.id %} active{% endif %}" href="/nodes/{{ n.id }}">
                 <span class="dot {% if n.online %}online{% else %}offline{% endif %}"></span>
                 <div class="node-info">
-                  <div class="node-name">{{ n.name or n.display_ip or ('节点-' ~ n.id) }}</div>
+                  <div class="node-name">
+                    <span class="node-name-text">{{ n.name or n.display_ip or ('节点-' ~ n.id) }}</span>
+                    <span class="pill xs ok node-direct-pill"{% if not (n.direct_tunnel and n.direct_tunnel.enabled) %} style="display:none;"{% endif %}>直连通道</span>
+                  </div>
                   <div class="node-meta mono">{{ n.display_ip or '-' }}</div>
                   <div class="muted sm">{{ n.group_name or '默认分组' }}</div>
                 </div>
@@ -98,6 +111,7 @@
             <div class="card-title">
               <span class="node-title">{{ node.name or node.display_ip }}</span>
               <span class="pill xs {% if node.online %}ok{% else %}ghost{% endif %}">{% if node.online %}在线{% else %}离线{% endif %}</span>
+              <span id="nodeDirectTunnelBadge" class="pill xs ok node-direct-badge"{% if not (node.direct_tunnel and node.direct_tunnel.enabled) %} style="display:none;"{% endif %}>直连通道已开启</span>
               <span id="nodeDisplayIp" class="muted sm">· {{ node.display_ip or '-' }}</span>
             </div>
             <div class="meta" style="margin-top:6px;">
@@ -105,7 +119,13 @@
               <span class="meta-item">心跳 <span id="nodeLastSeen" class="mono" data-last-seen-mode="full" data-last-seen="{{ node.last_seen_at or '' }}" >{{ node.last_seen_at or "-" }}</span></span>
               <span class="meta-item">分组 <span id="nodeGroupPill" class="pill xs ghost">{{ node.group_name or '默认分组' }}</span></span>
             </div>
-            <div class="card-sub" style="margin-top:8px;">支持 TCP/UDP/WSS · WSS 自动同步（生成规则锁定）</div>
+            <div class="card-sub" style="margin-top:8px;">
+              {% if (node.system_type or 'auto') == 'macos' %}
+              macOS 节点：保留节点监控与内网穿透
+              {% else %}
+              支持 TCP/UDP/隧道转发 · 隧道自动同步（生成规则锁定）
+              {% endif %}
+            </div>
           </div>
           <div class="right node-tools node-head-right" style="gap:8px; flex:0 0 auto; flex-wrap:nowrap; justify-content:flex-end;">
             <details class="menu toolbar-mini toolbar-mini-search">
@@ -113,7 +133,7 @@
               <div class="menu-pop">
                 <div class="toolbar-mini-form">
                   <label class="label">搜索规则</label>
-                  <input class="input sm toolbar-mini-search-input" id="ruleSearch" placeholder="监听/目标/备注…（支持 type:wss status:running fav）" oninput="setRuleFilter(this.value)">
+                  <input class="input sm toolbar-mini-search-input" id="ruleSearch" placeholder="监听/目标/备注…（支持 type:relay status:running fav）" oninput="setRuleFilter(this.value)">
                 </div>
               </div>
             </details>
@@ -129,8 +149,11 @@
                     <option value="running">运行中</option>
                     <option value="disabled">已暂停</option>
                     <option value="tcp">TCP/UDP</option>
+                    {% if can_mode_mptcp %}
+                    <option value="mptcp">多链路聚合</option>
+                    {% endif %}
                     {% if can_mode_wss %}
-                    <option value="wss">WSS 隧道</option>
+                    <option value="wss">隧道转发</option>
                     {% endif %}
                     {% if can_mode_intranet %}
                     <option value="intranet">内网穿透</option>
@@ -155,6 +178,12 @@
             {% if can_publish %}
             <button class="btn sm primary toolbar-main-cta" type="button" onclick="newRule()">+ 创建转发</button>
             {% endif %}
+            {% if can_publish %}
+            <button class="btn sm ghost" type="button" onclick="openOverlayQuickCreateModal()">⚡ 快速复用</button>
+            {% endif %}
+            {% if can_mode_mptcp %}
+            <button class="btn sm ghost" type="button" onclick="openMptcpGroupModal()">MPTCP 隧道组</button>
+            {% endif %}
             {% if can_nodes_write %}
             <button class="btn sm ghost toolbar-command" type="button" onclick="openCommandModal('一键接入命令', window.__INSTALL_CMD__)">接入命令</button>
             {% endif %}
@@ -165,7 +194,7 @@
                 <a class="menu-item" href="/api/nodes/{{ node.id }}/backup">备份规则 <span class="muted sm">下载</span></a>
                 {% endif %}
                 {% if can_restore %}
-                <button class="menu-item" type="button" id="restoreRulesBtn" onclick="triggerRestore()">恢复规则 <span class="muted sm">粘贴</span></button>
+                <button class="menu-item" type="button" id="restoreRulesBtn" onclick="triggerRestore()">恢复规则 <span class="muted sm">上传</span></button>
                 {% endif %}
                 {% if can_publish %}
                 <div class="menu-sep"></div>
@@ -181,6 +210,12 @@
               <div class="menu-pop">
                 {% if can_nodes_write %}
                 <button class="menu-item" type="button" onclick="openEditNodeModal()">编辑节点</button>
+                <button class="menu-item" type="button" onclick="openDirectTunnelModal()">
+                  文件管理直连
+                  <span id="directTunnelMenuHint" class="muted sm">
+                    {% if node.direct_tunnel and node.direct_tunnel.enabled %}已开启{% else %}未开启{% endif %}
+                  </span>
+                </button>
                 {% endif %}
                 <button class="menu-item" type="button" onclick="promptTraceRouteTarget()">
                   路由追踪 <span class="muted sm">mtr / traceroute</span>
@@ -363,6 +398,45 @@
   </main>
 </div>
 
+<!-- Direct Tunnel Modal -->
+<div id="directTunnelModal" class="modal" style="display:none;">
+  <div class="modal-inner" style="max-width:560px;">
+    <div class="row" style="align-items:center;">
+      <div class="col"><div class="h2">Agent 直连通道</div></div>
+      <div class="col right"><button class="btn xs ghost" type="button" onclick="closeDirectTunnelModal()">关闭</button></div>
+    </div>
+    <div class="help" style="margin-top:8px;">用于文件管理直连，也用于规则下发/预检等 Agent 管理请求优先走直连通道。</div>
+
+    <div class="form" style="margin-top:10px;">
+      <label class="label">中继节点（中转机 / 公网入口 A）</label>
+      <select class="select" id="directTunnelRelayNode"></select>
+      <div class="help">选择面板可访问、且内网机可回连的中继节点。</div>
+
+      <label class="label" style="margin-top:10px;">中继端口（A 侧监听）</label>
+      <div class="row" style="gap:10px; align-items:center;">
+        <input class="input" id="directTunnelListenPort" type="number" min="1" max="65535" placeholder="留空自动分配">
+        <button class="btn xs ghost" id="directTunnelSuggestBtn" type="button" onclick="suggestDirectTunnelPort()">自动选择</button>
+      </div>
+      <div class="help">留空或点击“自动选择”会分配不冲突端口。</div>
+
+      <div class="row" style="gap:12px;align-items:center;margin-top:8px;">
+        <div class="col">
+          <label class="help"><input type="checkbox" id="directTunnelVerifyTls" style="transform:translateY(1px);"> 使用 HTTPS 时验证 TLS 证书</label>
+        </div>
+      </div>
+
+      <div id="directTunnelCurrent" class="help mono" style="margin-top:8px;"></div>
+      <div id="directTunnelError" class="muted" style="margin-top:8px;color:var(--bad);"></div>
+
+      <div class="row" style="gap:10px; justify-content:flex-end; margin-top:14px;">
+        <button class="btn xs ghost" type="button" onclick="closeDirectTunnelModal()">取消</button>
+        <button class="btn xs ghost" id="directTunnelDisableBtn" type="button" onclick="disableDirectTunnelConfig()">关闭直连</button>
+        <button class="btn xs" id="directTunnelSubmit" type="button" onclick="saveDirectTunnelConfig()">保存并开启</button>
+      </div>
+    </div>
+  </div>
+</div>
+
 <!-- Add Node Modal (for quick switching / onboarding) -->
 <!-- Add Node Modal -->
 <div id="addNodeModal" class="modal" style="display:none;">
@@ -400,6 +474,15 @@
               <label class="help"><input type="checkbox" id="addNodeIsPrivate" style="transform:translateY(1px);"> 内网机器（用于内网穿透出口）</label>
             </div>
           </div>
+
+          <label class="label">系统类型</label>
+          <select class="select" id="addNodeSystemType">
+            <option value="auto" selected>自动检测（推荐）</option>
+            <option value="linux">Linux</option>
+            <option value="macos">macOS</option>
+            <option value="windows">Windows</option>
+          </select>
+          <div class="help">用于记录节点系统类型（默认自动检测）。</div>
         </div>
       </details>
 
@@ -451,20 +534,22 @@
         <div class="col">
           <label class="help"><input type="checkbox" id="editNodeIsPrivate" style="transform:translateY(1px);"> 内网机器（用于内网穿透出口）</label>
         </div>
-        <div class="col">
+        <div class="col" id="editNodeWebsiteRoleBox">
           <label class="help"><input type="checkbox" id="editNodeIsWebsite" style="transform:translateY(1px);"> 网站机（可管理站点/SSL/文件）</label>
         </div>
       </div>
 
-      <label class="label" style="margin-top:8px;">网站根目录</label>
-      <input class="input" id="editNodeWebsiteRoot" placeholder="/www">
-      <div class="help">仅对网站机生效，用于文件管理根目录限制。</div>
+      <div id="editNodeWebsiteRootBox">
+        <label class="label" style="margin-top:8px;">网站根目录</label>
+        <input class="input" id="editNodeWebsiteRoot" placeholder="/www">
+        <div class="help">仅对网站机生效，用于文件管理根目录限制。</div>
+      </div>
 
       <details class="advanced-details" style="margin-top:10px;" open>
         <summary>
           <div class="adv-summary-left">
             <div class="adv-title">自动重启策略</div>
-            <div class="adv-hint">按节点独立设置（每日/每周/每月）</div>
+            <div class="adv-hint">按节点独立设置（每天/每周/每月智能选低负载时段）</div>
           </div>
           <div class="adv-summary-right">
             <span class="pill xs ghost">可选</span>
@@ -477,9 +562,9 @@
             <div class="col" style="max-width:160px;">
               <label class="label">周期</label>
               <select class="select" id="editNodeAutoRestartSchedule" onchange="toggleAutoRestartEditor()">
-                <option value="daily">每天</option>
-                <option value="weekly">每周</option>
-                <option value="monthly">每月</option>
+                <option value="daily">每天（智能）</option>
+                <option value="weekly">每周（智能）</option>
+                <option value="monthly">每月（智能）</option>
               </select>
             </div>
             <div class="col" style="max-width:130px;">
@@ -488,8 +573,9 @@
               <div class="help">每 N 个周期</div>
             </div>
             <div class="col" style="max-width:160px;">
-              <label class="label">时间</label>
+              <label class="label">基准时间</label>
               <input class="input" id="editNodeAutoRestartTime" type="time" value="04:08">
+              <div class="help">用于样本不足时兜底，正常会自动选择低负载时段</div>
             </div>
           </div>
 
@@ -536,8 +622,11 @@
 	      <!-- 保留原 select（JS/接口依赖 #f_type），仅隐藏不展示 -->
 	      <select class="select" id="f_type" style="display:none;">
 	        <option value="tcp">TCP/UDP</option>
+	        {% if can_mode_mptcp %}
+	        <option value="mptcp">多链路聚合</option>
+	        {% endif %}
 	        {% if can_mode_wss %}
-	        <option value="wss">WSS 隧道</option>
+	        <option value="wss">隧道转发</option>
 	        {% endif %}
 	        {% if can_mode_intranet %}
 	        <option value="intranet">内网穿透</option>
@@ -566,12 +655,12 @@
 	            <div class="mode-card-head">
 	              <div class="mode-ico">🛡️</div>
 	              <div class="mode-card-txt">
-	                <div class="mode-title">WSS 隧道</div>
-	                <div class="mode-sub">发送机 ↔ 接收机（自动同步）</div>
+	                <div class="mode-title">隧道转发</div>
+	                <div class="mode-sub">本机监听 ↔ 出口转发（自动同步）</div>
 	              </div>
 	            </div>
 	            <div class="mode-tags">
-	              <span class="mode-tag">伪装</span>
+	              <span class="mode-tag">固定端口</span>
 	              <span class="mode-tag">双端</span>
 	            </div>
 	          </button>
@@ -589,6 +678,22 @@
 	            <div class="mode-tags">
 	              <span class="mode-tag">暴露内网</span>
 	              <span class="mode-tag">双端</span>
+	            </div>
+	          </button>
+	          {% endif %}
+
+	          {% if can_mode_mptcp %}
+	          <button class="mode-card" type="button" data-mode="mptcp" role="tab" aria-selected="false">
+	            <div class="mode-card-head">
+	              <div class="mode-ico">🧩</div>
+	              <div class="mode-card-txt">
+	                <div class="mode-title">多链路聚合</div>
+	                <div class="mode-sub">A 入口 → B 多链路 → C 汇聚转发</div>
+	              </div>
+	            </div>
+	            <div class="mode-tags">
+	              <span class="mode-tag">MPTCP</span>
+	              <span class="mode-tag">连接迁移</span>
 	            </div>
 	          </button>
 	          {% endif %}
@@ -631,15 +736,16 @@
             <select class="select" id="f_forward_tool">
               <option value="iptables">iptables（默认）</option>
               <option value="realm">realm</option>
+              <option value="overlay">overlay（复用 MPTCP 隧道组）</option>
             </select>
-            <div class="help">仅普通转发生效；WSS/内网穿透不使用该选项。</div>
+            <div class="help">仅普通转发生效；隧道转发/内网穿透不使用该选项。</div>
           </div>
 
-	          <!-- WSS: 接收机节点 -->
+	          <!-- Relay tunnel: 出口节点 -->
 	          <div class="col peer-col" id="wssBox" style="display:none;">
-	            <label class="label">接收机节点 <span class="muted sm">（自动同步）</span></label>
+	            <label class="label">出口节点 <span class="muted sm">（自动同步）</span></label>
 	            <select class="select" id="f_wss_receiver_node">
-	              <option value="">（不选择=手动配对码模式）</option>
+	              <option value="">请选择出口节点…</option>
 	            </select>
 	          </div>
 
@@ -650,6 +756,41 @@
 	              <option value="">请选择内网节点…</option>
 	            </select>
 	          </div>
+
+            <div class="col peer-col" id="mptcpMembersBox" style="display:none;">
+              <label class="label">成员链路节点（B，可多选）</label>
+              <div class="row mptcp-member-tools">
+                <input class="input" id="f_mptcp_member_filter" placeholder="搜索节点名 / IP">
+                <button class="btn xs ghost" type="button" id="btnMptcpMembersToggleOffline" data-mode="all">显示全部</button>
+                <button class="btn xs ghost" type="button" id="btnMptcpMembersOnline">仅选在线</button>
+                <button class="btn xs ghost" type="button" id="btnMptcpMembersAll">全选可见</button>
+                <button class="btn xs ghost" type="button" id="btnMptcpMembersClear">清空</button>
+              </div>
+              <select class="select" id="f_mptcp_member_nodes" multiple size="4" style="display:none;">
+              </select>
+              <div class="mptcp-picker-shell" id="mptcpMemberPicker">
+                <div id="mptcpMemberCards" class="mptcp-node-cards"></div>
+              </div>
+              <div class="mptcp-selected-shell">
+                <div class="mptcp-selected-title">已选成员链路</div>
+                <div id="mptcpMemberChips" class="mptcp-member-chips"></div>
+              </div>
+              <div class="help"><span id="mptcpMembersCount">已选 0 个</span>；点击卡片可加入/移除，建议至少 2 条链路。</div>
+            </div>
+
+            <div class="col peer-col" id="mptcpAggregatorBox" style="display:none;">
+              <label class="label">汇聚节点（C）</label>
+              <div class="row mptcp-member-tools" style="margin-bottom:6px;">
+                <input class="input" id="f_mptcp_aggregator_filter" placeholder="搜索汇聚节点名 / IP">
+              </div>
+              <select class="select" id="f_mptcp_aggregator_node" style="display:none;">
+                <option value="">请选择汇聚节点…</option>
+              </select>
+              <div class="mptcp-picker-shell">
+                <div id="mptcpAggregatorCards" class="mptcp-node-cards single"></div>
+              </div>
+              <div class="help">C 节点统一接收多链路并再转发到目标。</div>
+            </div>
 	        </div>
 
 	        <div class="help compact" id="baseHelp"></div>
@@ -660,7 +801,7 @@
 		        <textarea class="textarea" id="f_remotes" rows="4" placeholder="203.0.113.10:443\n198.51.100.8:443"></textarea>
 		        <div class="help" id="remoteHelp"></div>
 
-		        <div class="row" style="gap:12px; align-items:flex-end;">
+		        <div class="row" id="adaptiveLbRow" style="gap:12px; align-items:flex-end;">
 		          <div class="col" style="max-width:360px;">
 		            <label class="label">自适应负载均衡</label>
 		            <label class="help" style="margin:0;">
@@ -742,16 +883,20 @@
                     <div class="col" style="max-width:240px;">
                       <label class="label">策略</label>
                       <select class="select" id="f_balance">
-                        <option value="roundrobin">轮询</option>
+                        <option value="roundrobin">轮询（可权重）</option>
+                        <option value="random_weight">加权随机（可权重）</option>
                         <option value="iphash">IP Hash</option>
+                        <option value="least_conn">最少连接</option>
+                        <option value="least_latency">最低延迟</option>
+                        <option value="consistent_hash">一致性哈希</option>
                       </select>
-                      <div class="help">多目标时生效：轮询 / 按来源 IP 固定落点。</div>
+                      <div class="help">多目标时生效；权重仅 roundrobin / random_weight 支持。</div>
                     </div>
 
                     <div class="col">
                       <label class="label">权重（与 Remote 行数一致，逗号分隔，可空）</label>
                       <input class="input" id="f_weights" placeholder="1,1,2">
-                      <div class="help">仅轮询生效；IP Hash 会忽略权重。权重数量必须与 Remote 行数一致。</div>
+                      <div class="help">仅 roundrobin / random_weight 生效；其它算法会忽略或校验报错。</div>
                     </div>
 
 	                  </div>
@@ -879,53 +1024,79 @@
                     </div>
                   </div>
 
+                  <div id="overlayAdvancedBox" style="display:none;">
+                    <div class="adv-subtitle">复用隧道组（Route B：Overlay）</div>
+                    <div class="help" style="margin-top:6px;">
+                      适用于“普通转发”：Remote 仍是最终目标，但数据将通过某个固定隧道组 A→B→C 转出去。
+                      <b>你只需要选一个隧道组</b>，入口/SyncID/Token 会自动填好（默认隐藏高级参数）。
+                    </div>
+
+                    <div class="adv-grid" style="margin-top:10px;align-items:flex-end;">
+                      <div class="col" style="min-width:320px;">
+                        <label class="label">选择可复用隧道组</label>
+                        <select class="select" id="f_overlay_group_pick"></select>
+                        <div class="help">仅显示已开启 Overlay 的隧道组；会记住你最后一次选择（仅本浏览器）。</div>
+                      </div>
+                      <div class="col" style="max-width:320px;">
+                        <label class="label">快捷操作</label>
+                        <div class="row" style="gap:10px;flex-wrap:wrap;">
+                          <button class="btn xs ghost" type="button" onclick="refreshOverlayGroupsPick(true)">刷新列表</button>
+                          <button class="btn xs ghost" type="button" onclick="copyOverlayReuseParams3()">复制三行参数</button>
+                          <button class="btn xs" type="button" onclick="openOverlayQuickCreateModal()">⚡ 一键新建复用规则</button>
+                        </div>
+                      </div>
+                    </div>
+
+                    <div class="au-meta" style="margin-top:10px;">
+                      <div class="au-stats" id="overlaySummaryStats">
+                        <span class="pill-stat info" id="ovSumEntry" title="点击复制">入口 <strong class="mono" id="ovSumEntryVal">—</strong></span>
+                        <span class="pill-stat" id="ovSumSid" title="点击复制">Sync <strong class="mono" id="ovSumSidVal">—</strong></span>
+                        <span class="pill-stat" id="ovSumTok" title="点击复制">Token <strong class="mono" id="ovSumTokVal">—</strong></span>
+                      </div>
+                      <div class="right">
+                        <button class="btn xs ghost" type="button" onclick="probeOverlaySelectedGroup()">检测隧道组</button>
+                      </div>
+                    </div>
+
+                    <details id="overlayParamsDetails" style="margin-top:10px;">
+                      <summary class="btn xs ghost" style="display:inline-flex;">高级参数（可选）</summary>
+                      <div class="help" style="margin-top:8px;">一般无需填写；仅当你需要临时覆盖/粘贴参数时再展开。</div>
+                      <div class="adv-grid" style="margin-top:6px;">
+                        <div class="col">
+                          <label class="label">复用入口（A:端口）</label>
+                          <input class="input" id="f_overlay_entry" placeholder="例如：1.2.3.4:38443">
+                        </div>
+                        <div class="col">
+                          <label class="label">隧道组 Sync ID</label>
+                          <input class="input" id="f_overlay_sync_id" placeholder="从 MPTCP 隧道组复制">
+                        </div>
+                        <div class="col">
+                          <label class="label">Token</label>
+                          <input class="input" id="f_overlay_token" placeholder="从 MPTCP 隧道组复制">
+                        </div>
+                      </div>
+                      <div class="row" style="gap:10px;margin-top:8px;">
+                        <button class="btn xs ghost" type="button" onclick="pasteOverlayReuseParams()">从剪贴板粘贴</button>
+                        <button class="btn xs ghost" type="button" onclick="clearOverlayReuseParams()">清空</button>
+                      </div>
+                    </details>
+                  </div>
+
                   <div id="wssAdvancedBox" style="display:none;">
-                    <div class="adv-subtitle">WSS 隧道参数</div>
+                    <div class="adv-subtitle">隧道转发参数</div>
 
                     <div class="row" style="gap:12px;margin-top:6px;align-items:flex-end;">
                       <div class="col" style="max-width:260px;">
-                        <label class="label">接收机监听端口</label>
-                        <input class="input" id="f_wss_receiver_port" placeholder="留空 = 与发送机端口一致">
-                        <div class="help">留空=沿用发送机端口；如冲突自动避让。</div>
-                      </div>
-                      <div class="col right" style="flex:0 0 auto;">
-                        <button class="btn xs ghost" type="button" onclick="randomizeWss()">随机生成参数</button>
-                      </div>
-                    </div>
-
-                    <div class="row" style="gap:12px;margin-top:10px;">
-                      <div class="col">
-                        <label class="label">WSS Host <span class="muted sm">（留空自动生成）</span></label>
-                        <input class="input" id="f_wss_host" placeholder="留空自动生成，例如 cdn.jsdelivr.net">
+                        <label class="label">隧道端口（出口节点）</label>
+                        <input class="input" id="f_wss_receiver_port" placeholder="默认 28443">
+                        <div class="help">本机会通过该端口与出口节点建立隧道；留空使用默认值 28443。</div>
                       </div>
                       <div class="col">
-                        <label class="label">WSS Path <span class="muted sm">（留空自动生成）</span></label>
-                        <input class="input" id="f_wss_path" placeholder="留空自动生成，例如 /ws/xxxx">
+                        <label class="label">隧道出口 IP <span class="muted sm">（可选）</span></label>
+                        <input class="input" id="f_wss_receiver_host" placeholder="默认=出口节点 IP/域名">
+                        <div class="help">不填写时默认使用出口节点地址（自动解析节点 IP/域名）。</div>
                       </div>
                     </div>
-
-                    <div class="row" style="gap:12px;">
-                      <div class="col">
-                        <label class="label">SNI <span class="muted sm">（留空=同 Host）</span></label>
-                        <input class="input" id="f_wss_sni" placeholder="留空=同 Host，例如 cdn.jsdelivr.net">
-                      </div>
-                      <div class="col" style="max-width:220px;">
-                        <label class="label">TLS</label>
-                        <select class="select" id="f_wss_tls">
-                          <option value="1">启用</option>
-                          <option value="0">关闭</option>
-                        </select>
-                      </div>
-                      <div class="col" style="max-width:220px;">
-                        <label class="label" style="display:flex;align-items:center;gap:8px;">
-                          <input type="checkbox" id="f_wss_insecure" checked style="width:auto;margin:0;">
-                          跳过证书校验
-                        </label>
-                        <div class="help">兼容性更好，但安全性降低。</div>
-                      </div>
-                    </div>
-
-                    <div class="help" style="margin-top:6px;">Host/Path/SNI 建议与证书域名一致；留空会在保存时自动随机生成。</div>
                   </div>
 
                   <div id="intranetAdvancedBox" style="display:none;">
@@ -969,6 +1140,47 @@
                       </div>
                     </div>
                   </div>
+
+                  <div id="mptcpAdvancedBox" style="display:none;">
+                    <div class="adv-subtitle">多链路聚合参数</div>
+
+                    <div class="row" style="gap:12px;margin-top:6px;">
+                      <div class="col" style="max-width:260px;">
+                        <label class="label">聚合端口（C，可选）</label>
+                        <input class="input" id="f_mptcp_aggregator_port" placeholder="留空=固定 38443（推荐）">
+                        <div class="help">留空时默认使用固定隧道端口 38443（B/C 同端口）；填写后可覆盖为自定义端口。</div>
+                      </div>
+                      <div class="col">
+                        <label class="label">C 数据地址（可选）</label>
+                        <input class="input" id="f_mptcp_aggregator_host" placeholder="留空=使用 C 节点 base_url 主机名">
+                        <div class="help">当 C 节点的管理地址与数据转发地址不一致时填写（例如公网 IP / 独立域名）。</div>
+                      </div>
+                      <div class="col" style="max-width:240px;">
+                        <label class="label">调度策略</label>
+                        <select class="select" id="f_mptcp_scheduler">
+                          <option value="aggregate">带宽聚合</option>
+                          <option value="backup">主备切换</option>
+                          <option value="hybrid">混合策略</option>
+                        </select>
+                      </div>
+                    </div>
+
+                    <div class="adv-subtitle" style="margin-top:12px;">迁移阈值（可选）</div>
+                    <div class="adv-grid" style="margin-top:6px;">
+                      <div class="col" style="max-width:220px;">
+                        <label class="label">RTT 阈值（ms）</label>
+                        <input class="input" id="f_mptcp_failover_rtt_ms" type="number" step="1" min="0" placeholder="例如 220">
+                      </div>
+                      <div class="col" style="max-width:220px;">
+                        <label class="label">抖动阈值（ms）</label>
+                        <input class="input" id="f_mptcp_failover_jitter_ms" type="number" step="1" min="0" placeholder="例如 50">
+                      </div>
+                      <div class="col" style="max-width:220px;">
+                        <label class="label">丢包阈值（%）</label>
+                        <input class="input" id="f_mptcp_failover_loss_pct" type="number" step="0.1" min="0" max="100" placeholder="例如 2.0">
+                      </div>
+                    </div>
+                  </div>
                 </div>
               </details>
 
@@ -978,6 +1190,214 @@
               </div>
 
               <div id="modalMsg" class="form-error" style="margin-top:10px;"></div>
+</div>
+</div>
+</div>
+
+{% if can_mode_mptcp %}
+<div id="mptcpGroupModal" class="modal" style="display:none;">
+  <div class="modal-inner mptcp-group-modal-inner">
+    <div class="row" style="justify-content:space-between;align-items:flex-start;">
+      <div class="col">
+        <div class="h2">MPTCP 隧道组管理</div>
+        <div class="muted sm" id="mptcpGroupHint">固定隧道组端口 38443：A/B/C 同端口，可复用给其他转发链路。</div>
+      </div>
+      <div class="right mptcp-group-header-tools">
+        <label class="label mptcp-group-sender-filter">
+          查看入口 A
+          <select class="select" id="mptcpGroupSenderFilter" style="min-width:260px;margin-left:6px;">
+            <option value="">请选择入口节点（A）</option>
+          </select>
+        </label>
+        <button class="btn xs" type="button" onclick="openMptcpGroupCreate()">新建固定组</button>
+        <button class="btn xs ghost" type="button" onclick="loadMptcpTunnelGroups()">刷新</button>
+        <button class="btn xs ghost" type="button" onclick="closeMptcpGroupModal()">关闭</button>
+      </div>
+    </div>
+    <div class="form">
+      <div id="mptcpGroupMsg" class="muted sm">正在加载…</div>
+      <div id="mptcpGroupList" class="mptcp-group-list"></div>
+
+      <div id="mptcpGroupEditor" class="mptcp-group-editor" style="display:none;">
+        <div class="adv-subtitle">编辑隧道组 <span id="mg_sync_short" class="mono"></span></div>
+        <input type="hidden" id="mg_sync_id">
+        <input type="hidden" id="mg_old_sender_node_id">
+
+        <div class="adv-grid" style="margin-top:6px;">
+          <div class="col">
+            <label class="label">入口节点（A）</label>
+            <select class="select" id="mg_sender_node_id">
+              <option value="">请选择入口节点（A）</option>
+            </select>
+          </div>
+          <div class="col">
+            <label class="label">成员链路节点（B，可多选）</label>
+            <select class="select" id="mg_member_node_ids" multiple size="6"></select>
+            <div class="help">可在这里新增/移除 B 节点。</div>
+          </div>
+          <div class="col">
+            <label class="label">汇聚节点（C）</label>
+            <select class="select" id="mg_aggregator_node_id">
+              <option value="">请选择汇聚节点（C）</option>
+            </select>
+            <div class="help">可直接替换出口节点 C。</div>
+          </div>
+        </div>
+
+        <div class="adv-grid" style="margin-top:6px;">
+          <div class="col" style="max-width:260px;">
+            <label class="label">入口监听（A）</label>
+            <input class="input" id="mg_listen" placeholder="0.0.0.0:38443">
+            <div class="help">固定组模式下会自动锁定为 38443。</div>
+          </div>
+          <div class="col" style="max-width:220px;">
+            <label class="label">调度策略</label>
+            <select class="select" id="mg_scheduler">
+              <option value="aggregate">带宽聚合</option>
+              <option value="backup">主备切换</option>
+              <option value="hybrid">混合策略</option>
+            </select>
+          </div>
+          <div class="col">
+            <label class="label">C 数据地址（可选）</label>
+            <input class="input" id="mg_aggregator_host" placeholder="留空=使用 C 节点地址">
+          </div>
+          <div class="col" style="max-width:220px;">
+            <label class="label">C 端口</label>
+            <input class="input" id="mg_aggregator_port" placeholder="38443">
+          </div>
+        </div>
+
+        <div class="row" style="gap:10px;align-items:center;margin-top:10px;">
+          <label class="help" style="margin:0;">
+            <input type="checkbox" id="mg_overlay_enabled" style="transform:translateY(1px);">
+            <b>复用转发（Route B：动态目标 Overlay）</b>
+          </label>
+          <div class="muted sm">启用后：C 汇聚会转到本机 Overlay 出口代理，可被其它规则复用。</div>
+        </div>
+
+        <div id="mg_overlay_fields" style="display:none;">
+          <div class="help" style="margin-top:8px;">
+            已开启 Overlay：该隧道组将变为“可复用通道”。一般情况下 <b>不需要手动填写</b> 下面参数（留空会自动生成）。
+          </div>
+          <details id="mg_overlay_details" style="margin-top:8px;">
+            <summary class="btn xs ghost" style="display:inline-flex;">Overlay 高级参数（可选）</summary>
+            <div class="adv-grid" style="margin-top:8px;">
+              <div class="col" style="max-width:220px;">
+                <label class="label">Overlay 出口端口（C 本机）</label>
+                <input class="input" id="mg_overlay_exit_port" placeholder="默认 38444">
+                <div class="help">C 上将监听 127.0.0.1:该端口，供汇聚侧转入。</div>
+              </div>
+              <div class="col">
+                <label class="label">Overlay Token</label>
+                <input class="input" id="mg_overlay_token" placeholder="留空=自动生成">
+                <div class="help">用于复用入口认证（D 侧规则需要）。</div>
+              </div>
+            </div>
+          </details>
+        </div>
+
+        <label class="label" id="mg_remotes_label" style="margin-top:8px;">最终目标（每行一个 host:port）</label>
+        <textarea class="textarea" id="mg_remotes" rows="3" placeholder="203.0.113.10:443"></textarea>
+        <div class="help" id="mg_remotes_help">非 Overlay 模式：C 汇聚会转发到这些目标。</div>
+
+        <div class="adv-grid" style="margin-top:6px;">
+          <div class="col" style="max-width:220px;">
+            <label class="label">RTT 阈值（ms）</label>
+            <input class="input" id="mg_failover_rtt_ms" type="number" step="1" min="0" placeholder="例如 220">
+          </div>
+          <div class="col" style="max-width:220px;">
+            <label class="label">抖动阈值（ms）</label>
+            <input class="input" id="mg_failover_jitter_ms" type="number" step="1" min="0" placeholder="例如 50">
+          </div>
+          <div class="col" style="max-width:220px;">
+            <label class="label">丢包阈值（%）</label>
+            <input class="input" id="mg_failover_loss_pct" type="number" step="0.1" min="0" max="100" placeholder="例如 2.0">
+          </div>
+          <div class="col">
+            <label class="label">备注</label>
+            <input class="input" id="mg_remark" placeholder="例如：主干隧道组">
+          </div>
+          <div class="col" style="max-width:200px;">
+            <label class="help" style="margin-top:28px;">
+              <input type="checkbox" id="mg_favorite" style="transform:translateY(1px);">
+              收藏（★）
+            </label>
+          </div>
+        </div>
+
+        <div class="row" style="gap:10px; justify-content:flex-end; margin-top:8px;">
+          <button class="btn xs ghost" type="button" onclick="probeMptcpGroup()">检测 A→B→C→目标</button>
+          <button class="btn xs" type="button" id="btnMptcpGroupSave" onclick="saveMptcpGroup()">保存隧道组</button>
+        </div>
+        <div id="mptcpGroupProbe" class="mptcp-probe-box"></div>
+      </div>
+    </div>
+  </div>
+</div>
+{% endif %}
+
+<!-- Quick overlay (Route B) create modal -->
+<div id="overlayQuickModal" class="modal" style="display:none;">
+  <div class="modal-inner modal-pro" style="max-width:920px;">
+    <div class="modal-head">
+      <div class="title-wrap">
+        <div class="h2">⚡ 快速复用隧道组</div>
+        <div class="muted sm">极简：选隧道组 + 填目标地址，其他都自动（端口自动避开冲突，可复用）。</div>
+      </div>
+      <div class="right"><button class="btn xs ghost" type="button" onclick="closeOverlayQuickModal()">关闭</button></div>
+    </div>
+    <div class="modal-body">
+      <div class="au-callout">
+        <div class="au-callout-ico">⚡</div>
+        <div class="col">
+          <div class="au-callout-title">复用路径</div>
+          <div class="au-callout-sub">当前节点监听 → A:38443 → B… → C → 最终目标（Remote）。</div>
+        </div>
+      </div>
+
+      <div class="adv-grid" style="margin-top:12px;align-items:flex-end;">
+        <div class="col">
+          <label class="label">选择可复用隧道组（已启用 Overlay）</label>
+          <select class="select" id="oq_group"></select>
+          <div class="help">会记住你最后一次选择（仅本浏览器）。</div>
+        </div>
+        <div class="col" style="max-width:260px;">
+          <label class="label">监听端口</label>
+          <div class="row" style="gap:8px;align-items:center;">
+            <input class="input" id="oq_listen_port" type="number" min="1" max="65535" placeholder="自动">
+            <button class="btn xs ghost" type="button" onclick="overlayQuickPickPort()">自动</button>
+          </div>
+          <div class="help">默认自动挑选一个未占用端口。</div>
+        </div>
+      </div>
+
+      <label class="label" style="margin-top:10px;">最终目标（Remote，每行一个 host:port）</label>
+      <textarea class="textarea" id="oq_remotes" rows="3" placeholder="例如：example.com:443"></textarea>
+      <div class="help">支持多个目标；默认轮询。</div>
+
+      <div class="adv-grid" style="margin-top:10px;">
+        <div class="col">
+          <label class="label">备注（可选）</label>
+          <input class="input" id="oq_remark" placeholder="例如：通过主干隧道访问目标站">
+        </div>
+        <div class="col" style="max-width:220px;">
+          <label class="label">收藏</label>
+          <label class="help" style="margin-top:10px;">
+            <input type="checkbox" id="oq_fav" style="transform:translateY(1px);"> 收藏（★）
+          </label>
+        </div>
+      </div>
+
+      <div class="au-meta">
+        <div class="au-stats" id="oq_stats"></div>
+        <div class="right" style="display:flex;gap:10px;flex-wrap:wrap;">
+          <button class="btn xs ghost" type="button" onclick="overlayQuickTestGroup()">检测隧道组</button>
+          <button class="btn xs" type="button" id="oq_create_btn" onclick="overlayQuickCreateRule()">创建并保存</button>
+        </div>
+      </div>
+      <div id="oq_msg" class="muted sm" style="margin-top:10px;"></div>
+      <div id="oq_probe" class="mptcp-probe-box" style="margin-top:10px;"></div>
     </div>
   </div>
 </div>
@@ -989,16 +1409,12 @@
       <div class="right"><button class="btn xs ghost" type="button" onclick="closeRestoreModal()">关闭</button></div>
     </div>
     <div class="form">
-      <label class="label">粘贴备份文件内容（JSON）</label>
-      <textarea class="textarea" id="restoreText" rows="14" placeholder='{
-  "ok": true,
-  "pool": {
-    "endpoints": []
-  }
-}'></textarea>
+      <label class="label">选择备份节点导出的规则文件（JSON）</label>
+      <input class="input" type="file" id="restoreFile" accept=".json,application/json">
+      <div class="help" style="margin-top:6px;">上传后将创建后台恢复任务，可在页面顶部任务栏查看进度。</div>
       <div class="row" style="gap:10px;justify-content:flex-end;margin-top:12px;">
         <button class="btn xs ghost" type="button" onclick="closeRestoreModal()">取消</button>
-        <button class="btn xs" type="button" onclick="restoreFromText()">开始恢复</button>
+        <button class="btn xs" type="button" onclick="restoreFromFile()">开始恢复</button>
       </div>
     </div>
   </div>
@@ -1076,11 +1492,13 @@
 {% set can_publish2 = ('*' in perms2) or ('publish.apply' in perms2) %}
 {% set can_mode_wss_perm2 = ('*' in perms2) or ('sync.wss' in perms2) or ('sync.*' in perms2) %}
 {% set can_mode_intranet_perm2 = ('*' in perms2) or ('sync.intranet' in perms2) or ('sync.*' in perms2) %}
+{% set can_mode_mptcp_perm2 = ('*' in perms2) or ('sync.mptcp' in perms2) or ('sync.*' in perms2) %}
 {% set tunnel_no_limit2 = not tunnel_limit_enabled2 %}
 {% set can_mode_tcp2 = can_publish2 and (tunnel_no_limit2 or ('direct' in allowed_tunnels2) or ('tcp' in allowed_tunnels2)) %}
 {% set can_mode_wss2 = can_publish2 and can_mode_wss_perm2 and (tunnel_no_limit2 or ('wss' in allowed_tunnels2)) %}
 {% set can_mode_intranet2 = can_publish2 and can_mode_intranet_perm2 and (tunnel_no_limit2 or ('intranet' in allowed_tunnels2)) %}
-<script src="/static/app.js?v=100.0"></script>
+{% set can_mode_mptcp2 = can_publish2 and can_mode_mptcp_perm2 and (tunnel_no_limit2 or ('mptcp' in allowed_tunnels2)) %}
+<script src="/static/app.js?v=115.0"></script>
 <script>
 window.__NODE_ID__ = {{ node.id }};
 window.__NODE_IP__ = {{ (node.display_ip or node.name)|tojson }};
@@ -1090,6 +1508,8 @@ window.__NODE_VERIFY_TLS__ = {{ (1 if node.verify_tls else 0) }};
 window.__NODE_IS_PRIVATE__ = {{ (1 if node.is_private else 0) }};
 window.__NODE_ROLE__ = {{ (node.role or 'normal')|tojson }};
 window.__NODE_WEBSITE_ROOT__ = {{ (node.website_root_base or '')|tojson }};
+window.__NODE_SYSTEM_TYPE__ = {{ (node.system_type or 'auto')|tojson }};
+window.__NODE_DIRECT_TUNNEL__ = {{ (node.direct_tunnel or {})|tojson }};
 window.__NODE_GROUP__ = {{ (node.group_name or '默认分组')|tojson }};
 window.__NODE_AUTO_RESTART_ENABLED__ = {{ (1 if (node.auto_restart_policy.enabled if node.auto_restart_policy else 1) else 0) }};
 window.__NODE_AUTO_RESTART_SCHEDULE__ = {{ ((node.auto_restart_policy.schedule_type if node.auto_restart_policy else 'daily'))|tojson }};
@@ -1101,8 +1521,8 @@ window.__NODE_AUTO_RESTART_MONTHDAYS__ = {{ ((node.auto_restart_policy.monthdays
 window.__INSTALL_CMD__ = {{ install_cmd|tojson }};
 window.__UNINSTALL_CMD__ = {{ uninstall_cmd|tojson }};
 window.__AUTO_OPEN_EDIT_NODE__ = {{ (1 if show_edit_node else 0) }};
-window.__MODE_PERMS__ = {{ {"tcp": can_mode_tcp2, "wss": can_mode_wss2, "intranet": can_mode_intranet2}|tojson }};
-window.__ALLOWED_TUNNEL_MODES__ = {{ ((["tcp"] if can_mode_tcp2 else []) + (["wss"] if can_mode_wss2 else []) + (["intranet"] if can_mode_intranet2 else []))|tojson }};
+window.__MODE_PERMS__ = {{ {"tcp": can_mode_tcp2, "mptcp": can_mode_mptcp2, "wss": can_mode_wss2, "intranet": can_mode_intranet2}|tojson }};
+window.__ALLOWED_TUNNEL_MODES__ = {{ ((["tcp"] if can_mode_tcp2 else []) + (["mptcp"] if can_mode_mptcp2 else []) + (["wss"] if can_mode_wss2 else []) + (["intranet"] if can_mode_intranet2 else []))|tojson }};
 window.addEventListener('DOMContentLoaded', () => {
   initNodePage();
 });

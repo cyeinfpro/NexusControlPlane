@@ -90,7 +90,7 @@
               <td class="mono">{{ c.renew_at or '-' }}</td>
               <td>
                 {% if c.last_error %}
-                <details class="mono" style="max-width:460px;">
+                <details class="mono site-cert-error-details">
                   <summary style="cursor:pointer;">查看错误</summary>
                   <pre class="mono" style="white-space:pre-wrap;margin:8px 0 0;max-height:180px;overflow:auto;">{{ c.last_error }}</pre>
                 </details>

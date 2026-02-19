@@ -83,11 +83,22 @@ def _to_int(v: Any, default: int = 0) -> int:
         return int(default)
 
 
+_BALANCE_ALGO_MAP = {
+    "roundrobin": "roundrobin",
+    "iphash": "iphash",
+    "leastconn": "least_conn",
+    "leastlatency": "least_latency",
+    "consistenthash": "consistent_hash",
+    "randomweight": "random_weight",
+}
+_WEIGHTED_BALANCE_ALGOS = {"roundrobin", "random_weight"}
+
+
 def _norm_algo(raw: Any) -> str:
     s = str(raw or "").strip().lower()
     for ch in ("_", "-", " "):
         s = s.replace(ch, "")
-    return "iphash" if s == "iphash" else "roundrobin"
+    return str(_BALANCE_ALGO_MAP.get(s) or "roundrobin")
 
 
 def _parse_balance(balance: Any, remote_count: int) -> Tuple[str, List[int]]:
@@ -117,9 +128,11 @@ def _parse_balance(balance: Any, remote_count: int) -> Tuple[str, List[int]]:
     return algo, ws
 
 
-def _format_balance(weights: List[int]) -> str:
+def _format_balance(algo: str, weights: List[int]) -> str:
     ws = [max(1, int(x)) for x in weights]
-    return "roundrobin: " + ", ".join(str(x) for x in ws)
+    if str(algo or "") in _WEIGHTED_BALANCE_ALGOS:
+        return str(algo or "roundrobin") + ": " + ", ".join(str(x) for x in ws)
+    return str(algo or "roundrobin")
 
 
 def _collect_remotes(ep: Dict[str, Any]) -> List[str]:
@@ -459,7 +472,7 @@ def suggest_adaptive_pool_patch(
             continue
 
         algo, old_weights = _parse_balance(ep.get("balance"), len(remotes))
-        if algo != "roundrobin":
+        if algo not in _WEIGHTED_BALANCE_ALGOS:
             continue
         if len(old_weights) != len(remotes):
             old_weights = [1] * len(remotes)
@@ -503,7 +516,7 @@ def suggest_adaptive_pool_patch(
             continue
 
         old_balance = str(ep.get("balance") or "roundrobin").strip() or "roundrobin"
-        new_balance = _format_balance(new_weights)
+        new_balance = _format_balance(algo, new_weights)
         if old_balance == new_balance:
             continue
 

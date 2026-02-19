@@ -20,15 +20,30 @@ def split_host_and_port(value: str, fallback_port: int) -> Tuple[str, int, bool,
       - If port is missing, returns fallback_port.
     """
     raw = (value or "").strip()
+    try:
+        fallback = int(float(fallback_port))
+    except Exception:
+        fallback = 0
+    if fallback < 0 or fallback > 65535:
+        fallback = 0
     if not raw:
-        return "", int(fallback_port), False, "http"
+        return "", fallback, False, "http"
 
     if "://" in raw:
-        parsed = urlparse(raw)
-        host = parsed.hostname or ""
-        port = parsed.port or int(fallback_port)
-        scheme = (parsed.scheme or "http").lower()
-        return host, int(port), parsed.port is not None, scheme
+        try:
+            parsed = urlparse(raw)
+            host = parsed.hostname or ""
+            scheme = (parsed.scheme or "http").lower()
+            try:
+                parsed_port = parsed.port
+            except ValueError:
+                parsed_port = None
+            if parsed_port is not None and 1 <= int(parsed_port) <= 65535:
+                return host, int(parsed_port), True, scheme
+            return host, fallback, False, scheme
+        except Exception:
+            # Malformed URL input (e.g. invalid IPv6 bracket form) should not crash.
+            raw = raw.split("://", 1)[1].strip() if "://" in raw else raw
 
     # Bracketed IPv6 literal
     if raw.startswith("[") and "]" in raw:
@@ -36,15 +51,20 @@ def split_host_and_port(value: str, fallback_port: int) -> Tuple[str, int, bool,
         host = host_part[1:].strip()
         rest = rest.strip()
         if rest.startswith(":") and rest[1:].isdigit():
-            return host, int(rest[1:]), True, "http"
-        return host, int(fallback_port), False, "http"
+            p = int(rest[1:])
+            if 1 <= p <= 65535:
+                return host, p, True, "http"
+        return host, fallback, False, "http"
 
     # host:port (only one ':' so we don't break IPv6)
     if raw.count(":") == 1 and raw.rsplit(":", 1)[1].isdigit():
         host, port_s = raw.rsplit(":", 1)
-        return host.strip(), int(port_s), True, "http"
+        p = int(port_s)
+        if 1 <= p <= 65535:
+            return host.strip(), p, True, "http"
+        return host.strip(), fallback, False, "http"
 
-    return raw, int(fallback_port), False, "http"
+    return raw, fallback, False, "http"
 
 
 def format_host_for_url(host: str) -> str:
@@ -126,12 +146,47 @@ def split_host_port(addr: str) -> Tuple[str, Optional[int]]:
                     return host, None
             return host, None
         return addr, None
-    if ":" in addr:
+    if ":" not in addr:
+        return addr, None
+
+    # host:port (single colon)
+    if addr.count(":") == 1:
         host, p = addr.rsplit(":", 1)
         try:
             return host, int(p)
         except Exception:
             return addr, None
+
+    # Unbracketed IPv6 cases:
+    # 1) pure IPv6 literal: "2001:db8::1" -> (addr, None)
+    # 2) historical raw IPv6:port: "2001:db8::1:443" -> ("2001:db8::1", 443)
+    host_candidate, p = addr.rsplit(":", 1)
+    if p.isdigit():
+        try:
+            port = int(p)
+        except Exception:
+            port = -1
+        if 0 <= port <= 65535:
+            whole_is_ip = False
+            host_is_ip = False
+            try:
+                ipaddress.ip_address(addr.split("%", 1)[0])
+                whole_is_ip = True
+            except Exception:
+                whole_is_ip = False
+            try:
+                ipaddress.ip_address(host_candidate.split("%", 1)[0])
+                host_is_ip = True
+            except Exception:
+                host_is_ip = False
+
+            # Pure IPv6 literal where tail segment is numeric (e.g. ::1) should not
+            # be misread as host:port unless the prefix is itself a valid IP literal.
+            if whole_is_ip and not host_is_ip:
+                return addr, None
+            if host_is_ip or not whole_is_ip:
+                return host_candidate, port
+
     return addr, None
 
 

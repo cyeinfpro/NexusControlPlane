@@ -6,6 +6,7 @@
 {% set can_restore = ('*' in perms) or ('restore.manage' in perms) %}
 {% set can_reset_all = ('*' in perms) or ('nodes.write' in perms) or ('nodes.*' in perms) %}
 {% set can_update_agents = ('*' in perms) or ('agents.write' in perms) or ('agents.*' in perms) %}
+{% set can_update_panel = ('*' in perms) or ('users.manage' in perms) %}
 {% set can_add_node = ('*' in perms) or ('nodes.write' in perms) or ('nodes.*' in perms) %}
 {% set can_backup_restore = can_backup or can_restore %}
 
@@ -35,6 +36,9 @@
     {% endif %}
     {% if can_update_agents %}
       <button class="btn sm secondary" type="button" onclick="openAgentUpdateModal()">一键更新 Agent</button>
+    {% endif %}
+    {% if can_update_panel %}
+      <button class="btn sm secondary" type="button" onclick="openPanelUpdateModal()">一键更新面板</button>
     {% endif %}
     {% if can_add_node %}
       <button class="btn sm" type="button" onclick="openAddNodeModal()">接入节点</button>
@@ -81,6 +85,7 @@
       data-node-is-private="{{ '1' if n.is_private else '0' }}"
       data-node-role="{{ n.role or 'normal' }}"
       data-node-website-root="{{ n.website_root_base or '' }}"
+      data-node-system-type="{{ n.system_type or 'auto' }}"
       data-node-ar-enabled="{{ 1 if (n.auto_restart_policy.enabled if n.auto_restart_policy else 1) else 0 }}"
       data-node-ar-schedule="{{ (n.auto_restart_policy.schedule_type if n.auto_restart_policy else 'daily')|e }}"
       data-node-ar-interval="{{ (n.auto_restart_policy.interval if n.auto_restart_policy else 1) }}"
@@ -182,14 +187,25 @@
             <div class="col">
               <label class="help"><input type="checkbox" id="addNodeIsPrivate" style="transform:translateY(1px);"> 内网机器（用于内网穿透出口）</label>
             </div>
-            <div class="col">
+            <div class="col" id="addNodeWebsiteRoleBox">
               <label class="help"><input type="checkbox" id="addNodeIsWebsite" style="transform:translateY(1px);"> 网站机（可管理站点/SSL/文件）</label>
             </div>
           </div>
 
-          <label class="label">网站根目录</label>
-          <input class="input" id="addNodeWebsiteRoot" placeholder="/www" value="/www">
-          <div class="help">仅对网站机生效，用于文件管理根目录限制。</div>
+          <div id="addNodeWebsiteRootBox">
+            <label class="label">网站根目录</label>
+            <input class="input" id="addNodeWebsiteRoot" placeholder="/www" value="/www">
+            <div class="help">仅对网站机生效，用于文件管理根目录限制。</div>
+          </div>
+
+          <label class="label">系统类型</label>
+          <select class="select" id="addNodeSystemType">
+            <option value="auto" selected>自动检测（推荐）</option>
+            <option value="linux">Linux</option>
+            <option value="macos">macOS</option>
+            <option value="windows">Windows</option>
+          </select>
+          <div class="help">用于记录节点系统类型（默认自动检测）。</div>
         </div>
       </details>
 
@@ -240,20 +256,22 @@
         <div class="col">
           <label class="help"><input type="checkbox" id="editNodeIsPrivate" style="transform:translateY(1px);"> 内网机器（用于内网穿透出口）</label>
         </div>
-        <div class="col">
+        <div class="col" id="editNodeWebsiteRoleBox">
           <label class="help"><input type="checkbox" id="editNodeIsWebsite" style="transform:translateY(1px);"> 网站机（可管理站点/SSL/文件）</label>
         </div>
       </div>
 
-      <label class="label" style="margin-top:8px;">网站根目录</label>
-      <input class="input" id="editNodeWebsiteRoot" placeholder="/www">
-      <div class="help">仅对网站机生效，用于文件管理根目录限制。</div>
+      <div id="editNodeWebsiteRootBox">
+        <label class="label" style="margin-top:8px;">网站根目录</label>
+        <input class="input" id="editNodeWebsiteRoot" placeholder="/www">
+        <div class="help">仅对网站机生效，用于文件管理根目录限制。</div>
+      </div>
 
       <details class="advanced-details" style="margin-top:10px;" open>
         <summary>
           <div class="adv-summary-left">
             <div class="adv-title">自动重启策略</div>
-            <div class="adv-hint">按节点独立设置（每日/每周/每月）</div>
+            <div class="adv-hint">按节点独立设置（每天/每周/每月智能选低负载时段）</div>
           </div>
           <div class="adv-summary-right">
             <span class="pill xs ghost">可选</span>
@@ -266,9 +284,9 @@
             <div class="col" style="max-width:160px;">
               <label class="label">周期</label>
               <select class="select" id="editNodeAutoRestartSchedule" onchange="toggleAutoRestartEditor()">
-                <option value="daily">每天</option>
-                <option value="weekly">每周</option>
-                <option value="monthly">每月</option>
+                <option value="daily">每天（智能）</option>
+                <option value="weekly">每周（智能）</option>
+                <option value="monthly">每月（智能）</option>
               </select>
             </div>
             <div class="col" style="max-width:130px;">
@@ -277,8 +295,9 @@
               <div class="help">每 N 个周期</div>
             </div>
             <div class="col" style="max-width:160px;">
-              <label class="label">时间</label>
+              <label class="label">基准时间</label>
               <input class="input" id="editNodeAutoRestartTime" type="time" value="04:08">
+              <div class="help">用于样本不足时兜底，正常会自动选择低负载时段</div>
             </div>
           </div>
 
@@ -330,10 +349,13 @@
         <div class="au-hero-grid">
           <div class="au-hero-left">
             <div class="au-target">
-              <div class="muted sm">目标版本</div>
+              <div class="au-stage-line">
+                <div class="muted sm">目标版本</div>
+                <span class="panel-update-badge au-state-badge" id="agentUpdateStateBadge">待命</span>
+              </div>
               <div class="au-ver mono" id="agentUpdateTarget">—</div>
             </div>
-            <div class="au-summary muted sm" id="agentUpdateSummary">—</div>
+            <div class="au-summary muted sm" id="agentUpdateSummary">未开始</div>
           </div>
 
           <div class="au-hero-right">
@@ -346,6 +368,10 @@
           <div class="au-progress-fill" id="agentUpdateBar" style="width:0%"></div>
         </div>
         <div class="au-segbar" id="agentUpdateSegBar" aria-hidden="true"></div>
+        <div class="au-under">
+          <div class="au-status muted sm" id="agentUpdateStatusText">进度 0% · 状态 待命</div>
+          <div class="au-percent mono" id="agentUpdatePercent">0%</div>
+        </div>
 
         <div class="au-meta au-meta2">
           <div class="au-stats" id="agentUpdatePills"></div>
@@ -360,6 +386,58 @@
           <div class="au-col-r">心跳 / 备注</div>
         </div>
         <div class="au-list" id="agentUpdateList"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+
+<!-- Panel Update Modal -->
+<div id="panelUpdateModal" class="modal" style="display:none;">
+  <div class="modal-inner modal-pro panel-update-modal">
+    <div class="modal-head">
+      <div class="title-wrap">
+        <div class="h2">一键更新面板</div>
+        <div class="muted sm">后台异步执行，更新中可实时查看进度，完成后自动刷新控制台。</div>
+      </div>
+      <button class="btn xs ghost" type="button" onclick="closePanelUpdateModal()">关闭</button>
+    </div>
+
+    <div class="modal-body panel-update-body">
+      <div class="card compact panel-update-hero">
+        <div class="panel-update-hero-grid">
+          <div class="panel-update-main">
+            <div class="panel-update-stage-line">
+              <div class="h2" id="panelUpdateStage">等待开始</div>
+              <span class="panel-update-badge" id="panelUpdateStateBadge">待命</span>
+            </div>
+            <div class="panel-update-meta muted sm mono" id="panelUpdateMeta">未开始</div>
+            <div class="au-progress panel-update-track" style="margin-top:10px;">
+              <div class="au-progress-fill" id="panelUpdateBar" style="width:0%"></div>
+            </div>
+            <div class="panel-update-under">
+              <div class="panel-update-status muted sm" id="panelUpdateStatusText">进度 0%</div>
+              <div class="panel-update-percent mono" id="panelUpdatePercent">0%</div>
+            </div>
+            <div id="panelUpdateError" class="panel-update-error"></div>
+          </div>
+          <div class="panel-update-side">
+            <button class="btn sm" id="panelUpdateStartBtn" type="button" onclick="startPanelUpdate()">开始更新</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="card compact panel-update-log-card">
+        <div class="row" style="align-items:center;gap:10px;">
+          <div class="h2">执行日志</div>
+          <div class="col right panel-update-log-tools">
+            <button class="panel-update-view-btn active" id="panelUpdateViewPrettyBtn" type="button">关键日志</button>
+            <button class="panel-update-view-btn" id="panelUpdateViewRawBtn" type="button">原始输出</button>
+            <div class="muted sm mono" id="panelUpdateLogMeta">0/0 行</div>
+          </div>
+        </div>
+        <div class="panel-update-log-pretty" id="panelUpdateLogsPretty">等待任务启动…</div>
+        <pre class="panel-update-log mono" id="panelUpdateLogsRaw" style="display:none;">等待任务启动…</pre>
       </div>
     </div>
   </div>
@@ -403,6 +481,14 @@
         <div class="h2">执行步骤</div>
         <div class="backup-full-steps" id="backupFullSteps"></div>
       </div>
+
+      <div class="card compact" style="margin-top:10px;">
+        <div class="row" style="align-items:center;gap:10px;">
+          <div class="h2">过程详情</div>
+          <div class="col right muted sm" id="backupFullEventsMeta">0 条</div>
+        </div>
+        <div class="backup-full-events" id="backupFullEvents"></div>
+      </div>
     </div>
   </div>
 </div>
@@ -422,7 +508,7 @@
         <label class="label">选择全量备份包（zip）</label>
         <input class="input" type="file" id="restoreFullFile" accept=".zip,application/zip">
         <div class="muted sm" style="margin-top:8px;">
-          推荐上传 <span class="mono">nexus-backup-*.zip</span>（兼容旧版备份包）。
+          支持上传 <span class="mono">nexus-backup-*.zip</span> 或 <span class="mono">nexus-auto-backup-*.zip</span>。
         </div>
         <div id="restoreFullError" class="restore-full-error"></div>
         <div class="row" style="gap:10px; justify-content:flex-end; margin-top:14px;">
@@ -459,5 +545,5 @@
 {% endblock %}
 
 {% block scripts %}
-<script src="/static/app.js?v=100.0"></script>
+<script src="/static/app.js?v=106.5"></script>
 {% endblock %}

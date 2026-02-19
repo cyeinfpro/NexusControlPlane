@@ -7,6 +7,9 @@ main.container{max-width:none;padding:10px 12px 12px;}
 </style>
 {% endif %}
 {% if not embed_mode %}
+{% set _show_site_nav = show_site_nav if show_site_nav is defined else true %}
+{% set _site_back_href = site_back_href if site_back_href is defined else ('/websites/' ~ site.id) %}
+{% set _site_back_text = site_back_text if site_back_text is defined else '返回站点' %}
 <div class="page-head">
   <div class="page-title">
     <h1 class="h1">文件管理 · {{ site.name }}</h1>
@@ -16,16 +19,28 @@ main.container{max-width:none;padding:10px 12px 12px;}
     </div>
   </div>
   <div class="right">
-    <a class="btn sm ghost" href="/websites/{{ site.id }}">返回站点</a>
+    <a class="btn sm ghost" href="{{ _site_back_href }}">{{ _site_back_text }}</a>
   </div>
 </div>
 
+{% if _show_site_nav %}
 {% include "site_nav.html" %}
+{% endif %}
 {% endif %}
 
 {% if error %}
   <div class="flash" style="background:rgba(239,68,68,0.15);border-color:rgba(239,68,68,0.4);">
     {{ error }}
+  </div>
+{% endif %}
+{% if is_private_node %}
+  <div class="flash" style="background:rgba(59,130,246,0.12);border-color:rgba(59,130,246,0.35);">
+    私网节点已启用队列模式：目录列表来自任务投影（非直连实时目录）；上传/新建/保存/删除/解压会转为后台任务并在节点上报后执行。
+  </div>
+{% endif %}
+{% if is_read_only_mount %}
+  <div class="flash" style="background:rgba(245,158,11,0.16);border-color:rgba(245,158,11,0.45);">
+    <strong>只读挂载</strong>{% if read_only_mount_label %} · {{ read_only_mount_label }}{% endif %}：当前仅支持浏览、下载、分享与收藏，上传/新建/编辑保存/删除/解压已禁用。
   </div>
 {% endif %}
 
@@ -47,8 +62,15 @@ main.container{max-width:none;padding:10px 12px 12px;}
 
   <div class="fm-toolbar">
     <div class="fm-actions">
+      {% if not is_read_only_mount %}
       <button class="btn xs" type="button" id="fmPickFiles">上传文件</button>
+      {% endif %}
       <button class="btn xs ghost" type="button" id="fmShareBtn">分享选中</button>
+      <button class="btn xs ghost" type="button" id="fmBatchDownloadBtn" disabled>下载选中</button>
+      {% if not is_read_only_mount %}
+      <button class="btn xs ghost fm-act-danger" type="button" id="fmBatchDeleteBtn" disabled>删除选中</button>
+      {% endif %}
+      {% if not is_read_only_mount %}
       <div class="fm-divider"></div>
       <form method="post" action="/websites/{{ site.id }}/files/mkdir" class="fm-mkdir">
         <input type="hidden" name="path" value="{{ path }}">
@@ -56,6 +78,7 @@ main.container{max-width:none;padding:10px 12px 12px;}
         <input class="input sm" name="name" placeholder="新建目录">
         <button class="btn xs ghost" type="submit">创建</button>
       </form>
+      {% endif %}
     </div>
     <div class="fm-tools">
       <div class="fm-search">
@@ -64,6 +87,27 @@ main.container{max-width:none;padding:10px 12px 12px;}
       </div>
     </div>
   </div>
+
+  <form
+    id="fmBatchDownloadForm"
+    method="post"
+    action="/websites/{{ site.id }}/files/download_selected"
+    style="display:none;"
+    {% if embed_mode %}target="_blank"{% endif %}
+  >
+    <input type="hidden" name="path" value="{{ path }}">
+    <input type="hidden" name="items_json" id="fmBatchDownloadItems">
+    <input type="hidden" name="stable" value="1">
+    {% if embed_mode %}<input type="hidden" name="modal" value="1">{% endif %}
+  </form>
+
+  {% if not is_read_only_mount %}
+  <form id="fmBatchDeleteForm" method="post" action="/websites/{{ site.id }}/files/delete_selected" style="display:none;">
+    <input type="hidden" name="path" value="{{ path }}">
+    <input type="hidden" name="items_json" id="fmBatchDeleteItems">
+    {% if embed_mode %}<input type="hidden" name="modal" value="1">{% endif %}
+  </form>
+  {% endif %}
 
   <div class="fm-subbar">
     <div class="muted sm" id="fmStats"></div>
@@ -86,6 +130,7 @@ main.container{max-width:none;padding:10px 12px 12px;}
           <th>名称</th>
           <th>大小</th>
           <th>修改时间</th>
+          <th>任务状态</th>
           <th>操作</th>
         </tr>
       </thead>
@@ -119,14 +164,25 @@ main.container{max-width:none;padding:10px 12px 12px;}
           </td>
           <td class="mono">{{ it.size_h }}</td>
           <td class="mono">{{ it.mtime or "-" }}</td>
+          <td>
+            {% if is_private_node %}
+              {% if it.task_status_text %}
+                <span class="pill xs {{ it.task_status_class or 'ghost' }}" title="任务 #{{ it.task_id or 0 }}">{{ it.task_status_text }}</span>
+              {% else %}
+                <span class="muted sm">—</span>
+              {% endif %}
+            {% else %}
+              <span class="muted sm">—</span>
+            {% endif %}
+          </td>
           <td class="fm-actions-cell">
             <div class="fm-inline-actions">
               {% if it.is_dir %}
-                <a class="btn xs ghost fm-act-btn" href="/websites/{{ site.id }}/files/download?path={{ it.path }}{% if embed_mode %}&modal=1{% endif %}">下载</a>
+                <a class="btn xs ghost fm-act-btn" href="/websites/{{ site.id }}/files/download?path={{ it.path }}&stable=1{% if embed_mode %}&modal=1{% endif %}" {% if embed_mode %}target="_blank" rel="noopener"{% endif %}>下载</a>
               {% else %}
-                <a class="btn xs ghost fm-act-btn" href="/websites/{{ site.id }}/files/edit?path={{ it.path }}{% if embed_mode %}&modal=1{% endif %}">编辑</a>
-                <a class="btn xs ghost fm-act-btn" href="/websites/{{ site.id }}/files/download?path={{ it.path }}{% if embed_mode %}&modal=1{% endif %}">下载</a>
-                {% if it.name.endswith('.zip') %}
+                <a class="btn xs ghost fm-act-btn" href="/websites/{{ site.id }}/files/edit?path={{ it.path }}{% if embed_mode %}&modal=1{% endif %}">{{ '查看' if is_read_only_mount else '编辑' }}</a>
+                <a class="btn xs ghost fm-act-btn" href="/websites/{{ site.id }}/files/download?path={{ it.path }}&stable=1{% if embed_mode %}&modal=1{% endif %}" {% if embed_mode %}target="_blank" rel="noopener"{% endif %}>下载</a>
+                {% if (not is_read_only_mount) and it.name.endswith('.zip') %}
                   <form method="post" action="/websites/{{ site.id }}/files/unzip" class="fm-inline-form">
                     <input type="hidden" name="path" value="{{ it.path }}">
                     <input type="hidden" name="dest" value="{{ path }}">
@@ -151,23 +207,25 @@ main.container{max-width:none;padding:10px 12px 12px;}
                 data-name="{{ it.name }}"
                 data-type="{{ 'dir' if it.is_dir else 'file' }}"
               >分享</button>
+              {% if not is_read_only_mount %}
               <form method="post" action="/websites/{{ site.id }}/files/delete" class="fm-inline-form" onsubmit="return confirm('确定删除吗？');">
                 <input type="hidden" name="path" value="{{ it.path }}">
                 {% if embed_mode %}<input type="hidden" name="modal" value="1">{% endif %}
                 <button class="btn xs ghost fm-act-btn fm-act-danger" type="submit">删除</button>
               </form>
+              {% endif %}
             </div>
             <div class="fm-row-share-links" data-path="{{ it.path }}"></div>
           </td>
         </tr>
         {% else %}
         <tr id="fmEmptyRow">
-          <td colspan="5" class="muted">当前目录为空</td>
+          <td colspan="6" class="muted">当前目录为空</td>
         </tr>
         {% endfor %}
         {% if items %}
         <tr id="fmSearchEmptyRow" style="display:none;">
-          <td colspan="5" class="muted">没有匹配的文件或目录</td>
+          <td colspan="6" class="muted">没有匹配的文件或目录</td>
         </tr>
         {% endif %}
       </tbody>
@@ -175,6 +233,7 @@ main.container{max-width:none;padding:10px 12px 12px;}
   </div>
 </div>
 
+{% if not is_read_only_mount %}
 <div id="fmUploadModal" class="modal" style="display:none;">
   <div class="modal-inner modal-pro fm-upload-modal">
     <div class="modal-head">
@@ -211,6 +270,7 @@ main.container{max-width:none;padding:10px 12px 12px;}
     </div>
   </div>
 </div>
+{% endif %}
 
 <div id="fmShareModal" class="modal" style="display:none;">
   <div class="modal-inner modal-pro fm-share-modal">
@@ -262,6 +322,12 @@ const fmStats = document.getElementById('fmStats');
 const fmSelectInfo = document.getElementById('fmSelectInfo');
 const fmSelectAll = document.getElementById('fmSelectAll');
 const fmShareBtn = document.getElementById('fmShareBtn');
+const fmBatchDownloadBtn = document.getElementById('fmBatchDownloadBtn');
+const fmBatchDeleteBtn = document.getElementById('fmBatchDeleteBtn');
+const fmBatchDownloadForm = document.getElementById('fmBatchDownloadForm');
+const fmBatchDeleteForm = document.getElementById('fmBatchDeleteForm');
+const fmBatchDownloadItems = document.getElementById('fmBatchDownloadItems');
+const fmBatchDeleteItems = document.getElementById('fmBatchDeleteItems');
 const fmUploadModal = document.getElementById('fmUploadModal');
 const fmModalSub = document.getElementById('fmModalSub');
 const fmModalRepick = document.getElementById('fmModalRepick');
@@ -301,6 +367,8 @@ const SITE_NAME = {{ (site.name or '')|tojson }};
 const SITE_DOMAIN = {{ ((site.domains[0]) if site.domains and (site.domains|length > 0) else '')|tojson }};
 const CUR_PATH = {{ path|tojson }};
 const IS_EMBED_MODAL = {{ 1 if embed_mode else 0 }};
+const IS_PRIVATE_NODE = {{ 1 if is_private_node else 0 }};
+const FILE_PUSH_MAX_BYTES = {{ file_push_max_bytes }};
 const FILE_SHARE_DEFAULT_TTL_SEC = {{ file_share_default_ttl_sec }};
 const FILE_SHARE_MIN_TTL_SEC = {{ file_share_min_ttl_sec }};
 const FILE_SHARE_MAX_TTL_SEC = {{ file_share_max_ttl_sec }};
@@ -324,11 +392,17 @@ const UPLOAD_RETRY_MAX_DELAY_MS = 5000;
 const COMPAT_UPLOAD_MAX_RETRIES = 2;
 const UPLOAD_CONCURRENCY_KEY = `nexus_upload_concurrency_${SITE_ID}`;
 let modalFiles = [];
-let lastUploadMethod = 'chunked';
+let lastUploadMethod = IS_PRIVATE_NODE ? 'compat' : 'chunked';
 let shareItems = [];
 let shareHistoryRows = [];
 let currentShareUrl = '';
 let shareHistoryLoading = false;
+
+if(IS_PRIVATE_NODE){
+  if(fmModalStart){
+    fmModalStart.textContent = '开始上传（队列）';
+  }
+}
 
 function withModal(url){
   const base = String(url || '');
@@ -1309,6 +1383,16 @@ function updateSelectionInfo(){
     fmShareBtn.disabled = count === 0;
     fmShareBtn.textContent = count ? `分享选中 (${count})` : '分享选中';
   }
+  if(fmBatchDownloadBtn){
+    const count = selectedAll.length;
+    fmBatchDownloadBtn.disabled = count === 0;
+    fmBatchDownloadBtn.textContent = count ? `下载选中 (${count})` : '下载选中';
+  }
+  if(fmBatchDeleteBtn){
+    const count = selectedAll.length;
+    fmBatchDeleteBtn.disabled = count === 0;
+    fmBatchDeleteBtn.textContent = count ? `删除选中 (${count})` : '删除选中';
+  }
 }
 
 function applySearchFilter(){
@@ -1434,6 +1518,10 @@ async function uploadFile(file, uploadId, startOffset, path, filename, totalByte
 }
 
 async function startChunkedUpload(files, ui, resumeOnly){
+  if(IS_PRIVATE_NODE){
+    await startCompatUpload(files, ui);
+    return;
+  }
   lastUploadMethod = 'chunked';
   if(!files.length){
     alert('请选择文件或文件夹');
@@ -1564,6 +1652,7 @@ async function compatUploadOnce(files, ui){
   });
   return await new Promise((resolve, reject)=>{
     const xhr = new XMLHttpRequest();
+    let bodyUploaded = false;
     xhr.open('POST', `/websites/${SITE_ID}/files/upload`);
     xhr.upload.onprogress = (e)=>{
       if(!e.lengthComputable) return;
@@ -1571,6 +1660,24 @@ async function compatUploadOnce(files, ui){
       if(ui?.progressFill) ui.progressFill.style.width = pct + '%';
       if(ui?.status){
         ui.status.textContent = `兼容上传中：${bytesToHuman(e.loaded)} / ${bytesToHuman(e.total)} (${pct}%)`;
+      }
+      if(e.loaded >= e.total && !bodyUploaded){
+        bodyUploaded = true;
+        if(ui?.status){
+          ui.status.textContent = IS_PRIVATE_NODE
+            ? '文件已上传到面板，正在转为后台任务…'
+            : '文件已上传，服务器正在处理…';
+        }
+      }
+    };
+    xhr.upload.onload = ()=>{
+      if(bodyUploaded) return;
+      bodyUploaded = true;
+      if(ui?.progressFill) ui.progressFill.style.width = '100%';
+      if(ui?.status){
+        ui.status.textContent = IS_PRIVATE_NODE
+          ? '文件已上传到面板，正在转为后台任务…'
+          : '文件已上传，服务器正在处理…';
       }
     };
     xhr.onload = ()=>{
@@ -1593,9 +1700,14 @@ async function startCompatUpload(files, ui){
     alert('请选择文件或文件夹');
     return;
   }
+  const compatLimit = IS_PRIVATE_NODE ? Math.max(1, Math.min(UPLOAD_MAX_BYTES, FILE_PUSH_MAX_BYTES)) : UPLOAD_MAX_BYTES;
   for(const f of files){
-    if(UPLOAD_MAX_BYTES && f.size > UPLOAD_MAX_BYTES){
-      alert(`文件过大：${f.name}（${bytesToHuman(f.size)}），超过限制 ${bytesToHuman(UPLOAD_MAX_BYTES)}`);
+    if(compatLimit && f.size > compatLimit){
+      if(IS_PRIVATE_NODE){
+        alert(`文件过大：${f.name}（${bytesToHuman(f.size)}），私网队列上传限制 ${bytesToHuman(compatLimit)}`);
+      }else{
+        alert(`文件过大：${f.name}（${bytesToHuman(f.size)}），超过限制 ${bytesToHuman(compatLimit)}`);
+      }
       return;
     }
   }
@@ -1603,7 +1715,9 @@ async function startCompatUpload(files, ui){
   if(ui?.retry) ui.retry.style.display = 'none';
   if(ui?.button) ui.button.disabled = true;
   if(fmModalCompat) fmModalCompat.disabled = true;
-  if(ui?.status) ui.status.textContent = '兼容上传中…';
+  if(ui?.status){
+    ui.status.textContent = IS_PRIVATE_NODE ? '上传到面板中（完成后自动转后台任务）…' : '兼容上传中…';
+  }
   if(ui?.progressFill) ui.progressFill.style.width = '0%';
   try{
     const totalAttempts = Math.max(1, COMPAT_UPLOAD_MAX_RETRIES + 1);
@@ -1714,6 +1828,37 @@ fmShareModal?.addEventListener('click', (e)=>{
 
 fmShareBtn?.addEventListener('click', ()=>{
   openShareForItems(collectCheckedShareItems());
+});
+
+fmBatchDownloadBtn?.addEventListener('click', ()=>{
+  const items = collectCheckedShareItems();
+  if(!items.length){
+    alert('请先选择要下载的文件或目录');
+    return;
+  }
+  if(!fmBatchDownloadForm || !fmBatchDownloadItems){
+    alert('批量下载功能不可用');
+    return;
+  }
+  fmBatchDownloadItems.value = JSON.stringify(items);
+  fmBatchDownloadForm.submit();
+});
+
+fmBatchDeleteBtn?.addEventListener('click', ()=>{
+  const items = collectCheckedShareItems();
+  if(!items.length){
+    alert('请先选择要删除的文件或目录');
+    return;
+  }
+  if(!confirm(`确定删除选中的 ${items.length} 项吗？此操作不可恢复。`)){
+    return;
+  }
+  if(!fmBatchDeleteForm || !fmBatchDeleteItems){
+    alert('批量删除功能不可用');
+    return;
+  }
+  fmBatchDeleteItems.value = JSON.stringify(items);
+  fmBatchDeleteForm.submit();
 });
 
 document.querySelectorAll('.fm-share-one').forEach((btn)=>{

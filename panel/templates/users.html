@@ -609,6 +609,13 @@
               <div class="um-mode-sub">公网入口对接内网出口</div>
             </div>
           </label>
+          <label class="um-mode-card">
+            <input type="checkbox" id="umTunnelMptcp" checked>
+            <div>
+              <div class="um-mode-title">多链路聚合</div>
+              <div class="um-mode-sub">A 入口经 B 多链路到 C 汇聚转发</div>
+            </div>
+          </label>
         </div>
         <div class="help" style="margin-top:8px;">关闭限制时，账号可使用全部转发方式。</div>
       </div>
@@ -662,6 +669,7 @@
       <option value="direct">直接转发</option>
       <option value="wss">WSS 隧道</option>
       <option value="intranet">内网穿透</option>
+      <option value="mptcp">多链路聚合</option>
       <option value="none">已全部禁用</option>
     </select>
   </div>
@@ -694,9 +702,10 @@
   const TUNNEL_LABELS = {
     direct: '直接转发',
     wss: 'WSS 隧道',
-    intranet: '内网穿透'
+    intranet: '内网穿透',
+    mptcp: '多链路聚合'
   };
-  const TUNNEL_ORDER = ['direct', 'wss', 'intranet'];
+  const TUNNEL_ORDER = ['direct', 'wss', 'intranet', 'mptcp'];
 
   let ROLES = [];
   let USERS = [];
@@ -892,7 +901,7 @@
   function syncTunnelModeState(){
     const limitInput = q('umTunnelLimit');
     const enabled = !!(limitInput && limitInput.checked);
-    const ids = ['umTunnelDirect', 'umTunnelWss', 'umTunnelIntranet'];
+    const ids = ['umTunnelDirect', 'umTunnelWss', 'umTunnelIntranet', 'umTunnelMptcp'];
     for(const id of ids){
       const el = q(id);
       if(el) el.disabled = !enabled;
@@ -926,6 +935,7 @@
     if(q('umTunnelDirect')) q('umTunnelDirect').checked = true;
     if(q('umTunnelWss')) q('umTunnelWss').checked = true;
     if(q('umTunnelIntranet')) q('umTunnelIntranet').checked = true;
+    if(q('umTunnelMptcp')) q('umTunnelMptcp').checked = true;
     if(q('umQuotaGB')) q('umQuotaGB').value = '0';
     if(q('umRole') && q('umRole').options.length){
       const roleNames = ROLES.map(function(r){ return String(r.name || ''); });
@@ -958,10 +968,12 @@
       if(q('umTunnelDirect')) q('umTunnelDirect').checked = tunnels.includes('direct');
       if(q('umTunnelWss')) q('umTunnelWss').checked = tunnels.includes('wss');
       if(q('umTunnelIntranet')) q('umTunnelIntranet').checked = tunnels.includes('intranet');
+      if(q('umTunnelMptcp')) q('umTunnelMptcp').checked = tunnels.includes('mptcp');
     }else{
       if(q('umTunnelDirect')) q('umTunnelDirect').checked = true;
       if(q('umTunnelWss')) q('umTunnelWss').checked = true;
       if(q('umTunnelIntranet')) q('umTunnelIntranet').checked = true;
+      if(q('umTunnelMptcp')) q('umTunnelMptcp').checked = true;
     }
 
     const limit = Number(policy.max_monthly_traffic_bytes || 0);
@@ -1102,6 +1114,7 @@
     if(q('umTunnelDirect') && q('umTunnelDirect').checked) list.push('direct');
     if(q('umTunnelWss') && q('umTunnelWss').checked) list.push('wss');
     if(q('umTunnelIntranet') && q('umTunnelIntranet').checked) list.push('intranet');
+    if(q('umTunnelMptcp') && q('umTunnelMptcp').checked) list.push('mptcp');
     return list;
   }
 

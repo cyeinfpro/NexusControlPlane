@@ -42,17 +42,30 @@ def _format_proto(pset: Set[str]) -> str:
     return "TCP+UDP"
 
 
+_BALANCE_ALGO_MAP = {
+    "roundrobin": "roundrobin",
+    "iphash": "iphash",
+    "leastconn": "least_conn",
+    "leastlatency": "least_latency",
+    "consistenthash": "consistent_hash",
+    "randomweight": "random_weight",
+}
+_BALANCE_WEIGHTED_ALGOS = {"roundrobin", "random_weight"}
+_IPTABLES_BALANCE_ALGOS = {"roundrobin", "random_weight"}
+
+
 def _norm_algo(algo: str) -> str:
     a = (algo or "").strip().lower()
     for ch in ("_", "-", " "):
         a = a.replace(ch, "")
-    return "iphash" if a == "iphash" else "roundrobin"
+    return str(_BALANCE_ALGO_MAP.get(a) or "")
 
 
 def _parse_balance_weights(balance: Any) -> Tuple[str, List[str]]:
     """Parse balance string, returning (algo, weights).
 
-    - algo: 'roundrobin' or 'iphash'
+    - algo: one of roundrobin/iphash/least_conn/least_latency/consistent_hash/random_weight
+      Returns empty string when algorithm is invalid.
     - weights: only returned when balance contains an explicit ':' part.
     """
 
@@ -60,9 +73,12 @@ def _parse_balance_weights(balance: Any) -> Tuple[str, List[str]]:
     if not b:
         return "roundrobin", []
     if ":" not in b:
-        return _norm_algo(b), []
+        algo = _norm_algo(b)
+        return (algo, []) if algo else ("", [])
     left, right = b.split(":", 1)
     algo = _norm_algo(left)
+    if not algo:
+        return "", []
     raw = [x.strip() for x in right.replace("，", ",").split(",")]
     weights = [x for x in raw if x]
     return algo, weights
@@ -89,9 +105,9 @@ def _coerce_nonneg_int(raw: Any) -> Optional[int]:
     if isinstance(raw, float):
         if not (raw == raw):  # NaN
             return None
-        n = int(raw)
-        if n < 0:
+        if raw < 0:
             return None
+        n = int(raw)
         return n
     s = str(raw).strip()
     if not s:
@@ -100,7 +116,12 @@ def _coerce_nonneg_int(raw: Any) -> Optional[int]:
         if s.isdigit() or (s.startswith("-") and s[1:].isdigit()):
             n = int(s)
         else:
-            n = int(float(s))
+            f = float(s)
+            if not (f == f):  # NaN
+                return None
+            if f < 0:
+                return None
+            n = int(f)
         if n < 0:
             return None
         return n
@@ -178,6 +199,45 @@ def normalize_listen_str(value: Any, *, allow_zero_port: bool = False) -> Tuple[
     if p < 1 or p > 65535:
         raise ValueError("listen 端口范围必须是 1-65535")
     return format_addr(host, p), p
+
+
+def _listen_port_or_none(listen_value: Any) -> Optional[int]:
+    s = str(listen_value or "").strip()
+    if not s:
+        return None
+    _h, port = split_host_port(s)
+    if port is None:
+        return None
+    try:
+        return int(port)
+    except Exception:
+        return None
+
+
+def _is_unbound_placeholder_endpoint(ex: Any, listen_value: Any) -> bool:
+    """True when endpoint is a synced placeholder that does not actually bind."""
+
+    if not isinstance(ex, dict):
+        return False
+    if _listen_port_or_none(listen_value) != 0:
+        return False
+
+    intranet_role = str(ex.get("intranet_role") or "").strip().lower()
+    if intranet_role == "client":
+        # Backward compatibility for legacy intranet client placeholders.
+        return True
+
+    sync_role = str(ex.get("sync_role") or "").strip().lower()
+    if sync_role == "receiver":
+        return True
+    if (
+        (ex.get("sync_lock") is True or ex.get("intranet_lock") is True)
+        and str(ex.get("sync_id") or "").strip()
+    ):
+        # Legacy synced placeholders may miss explicit role.
+        return True
+
+    return False
 
 
 def _host_info(host: str) -> Tuple[str, bool, Optional[ipaddress._BaseAddress]]:
@@ -345,7 +405,7 @@ def validate_pool_inplace(pool: Dict[str, Any]) -> List[PoolValidationIssue]:
             ex = {}
             ep["extra_config"] = ex
 
-        # forward tool (normal forwarding): realm | iptables
+        # forward tool (normal forwarding): realm | iptables | overlay (Route B)
         fwd_raw = ex.get("forward_tool")
         if fwd_raw is None and ep.get("forward_tool") is not None:
             fwd_raw = ep.get("forward_tool")
@@ -355,32 +415,94 @@ def validate_pool_inplace(pool: Dict[str, Any]) -> List[PoolValidationIssue]:
                 ex["forward_tool"] = "realm"
             elif fwd in ("ipt", "iptables"):
                 ex["forward_tool"] = "iptables"
+            elif fwd in ("overlay", "mptcp_overlay", "mptcpoverlay"):
+                ex["forward_tool"] = "overlay"
             elif fwd:
                 issues.append(
                     PoolValidationIssue(
                         path=f"endpoints[{idx}].extra_config.forward_tool",
-                        message="forward_tool 仅支持 realm 或 iptables",
+                        message="forward_tool 仅支持 realm / iptables / overlay",
                     )
                 )
             else:
                 ex.pop("forward_tool", None)
 
+        bal_algo, bal_weights = _parse_balance_weights(ep.get("balance"))
+        if not bal_algo:
+            issues.append(
+                PoolValidationIssue(
+                    path=f"endpoints[{idx}].balance",
+                    message=(
+                        "balance 算法不支持，仅支持 "
+                        "roundrobin / iphash / least_conn / least_latency / consistent_hash / random_weight"
+                    ),
+                )
+            )
+            bal_algo, bal_weights = "roundrobin", []
+
         if str(ex.get("forward_tool") or "").strip().lower() == "iptables":
-            bal_head = str(ep.get("balance") or "").strip().lower()
-            if ":" in bal_head:
-                bal_head = bal_head.split(":", 1)[0].strip()
-            for ch in ("_", "-", " "):
-                bal_head = bal_head.replace(ch, "")
-            if bal_head == "iphash":
+            if bal_algo not in _IPTABLES_BALANCE_ALGOS:
                 issues.append(
                     PoolValidationIssue(
                         path=f"endpoints[{idx}].balance",
-                        message="iptables 工具不支持 IP Hash，请改用 roundrobin 或切换 realm 工具",
+                        message="iptables 工具仅支持 roundrobin / random_weight，请改用 realm 工具或调整算法",
                     )
                 )
 
-        intranet_role = str(ex.get("intranet_role") or "").strip()
-        allow_zero_listen = intranet_role == "client"
+        allow_zero_listen = _is_unbound_placeholder_endpoint(ex, ep.get("listen"))
+
+        # Route B overlay tool params
+        if str(ex.get("forward_tool") or "").strip().lower() == "overlay":
+            # overlay currently supports TCP only; auto-fix protocol to TCP and warn.
+            pset = _proto_set(ep.get("protocol"))
+            if "udp" in pset or "tcp" not in pset:
+                ep["protocol"] = "tcp"
+                warnings.append(
+                    _warn(
+                        f"endpoints[{idx}].protocol",
+                        f"Overlay 工具仅支持 TCP，已自动将协议修正为 TCP（第 {idx+1} 条规则）",
+                        "overlay_tcp_only",
+                    )
+                )
+
+            entry_raw = ex.get("overlay_entry")
+            if entry_raw is None and ep.get("overlay_entry") is not None:
+                entry_raw = ep.get("overlay_entry")
+            entry = str(entry_raw or "").strip()
+            if not entry:
+                issues.append(
+                    PoolValidationIssue(
+                        path=f"endpoints[{idx}].extra_config.overlay_entry",
+                        message=f"Overlay 参数缺失（第 {idx+1} 条规则）：overlay_entry 不能为空",
+                    )
+                )
+            else:
+                try:
+                    ex["overlay_entry"] = normalize_host_port_str(entry)
+                except Exception as exc:
+                    issues.append(
+                        PoolValidationIssue(
+                            path=f"endpoints[{idx}].extra_config.overlay_entry",
+                            message=f"Overlay 参数错误（第 {idx+1} 条规则）：overlay_entry 格式应为 host:port（{exc}）",
+                        )
+                    )
+
+            sid = str(ex.get("overlay_sync_id") or "").strip()
+            if not sid:
+                issues.append(
+                    PoolValidationIssue(
+                        path=f"endpoints[{idx}].extra_config.overlay_sync_id",
+                        message=f"Overlay 参数缺失（第 {idx+1} 条规则）：overlay_sync_id 不能为空",
+                    )
+                )
+            tok = str(ex.get("overlay_token") or "").strip()
+            if not tok:
+                issues.append(
+                    PoolValidationIssue(
+                        path=f"endpoints[{idx}].extra_config.overlay_token",
+                        message=f"Overlay 参数缺失（第 {idx+1} 条规则）：overlay_token 不能为空",
+                    )
+                )
 
         # listen
         try:
@@ -447,8 +569,7 @@ def validate_pool_inplace(pool: Dict[str, Any]) -> List[PoolValidationIssue]:
             tls = bool(ex.get("listen_tls_enabled")) or _transport_has_flag(listen_transport, "tls") or str(
                 listen_transport
             ).strip().lower().startswith("wss")
-            insecure = bool(ex.get("listen_tls_insecure")) or _transport_has_flag(listen_transport, "insecure")
-            sni = str(
+            servername = str(
                 ex.get("listen_tls_servername")
                 or _transport_param(listen_transport, "servername")
                 or _transport_param(listen_transport, "sni")
@@ -468,20 +589,12 @@ def validate_pool_inplace(pool: Dict[str, Any]) -> List[PoolValidationIssue]:
                         code="wss_param_missing",
                     )
                 )
-            if tls and insecure:
+            if tls and not servername and _looks_like_hostname(ws_host):
                 warnings.append(
                     _warn(
                         f"endpoints[{idx}].extra_config",
-                        f"TLS 校验已关闭（第 {idx+1} 条规则，listen 侧 insecure=true），存在中间人风险",
-                        "tls_insecure",
-                    )
-                )
-            if tls and not sni and _looks_like_hostname(ws_host):
-                warnings.append(
-                    _warn(
-                        f"endpoints[{idx}].extra_config",
-                        f"TLS 未设置 ServerName（第 {idx+1} 条规则，listen 侧），证书校验可能失败",
-                        "tls_sni_missing",
+                        f"TLS 未设置 ServerName（第 {idx+1} 条规则，listen 侧），服务端证书自动生成可能失败",
+                        "tls_servername_missing",
                     )
                 )
 
@@ -534,18 +647,32 @@ def validate_pool_inplace(pool: Dict[str, Any]) -> List[PoolValidationIssue]:
         # weights count check (only when balance explicitly provides weights)
         rems = _collect_endpoint_remotes(ep)
         n = len(rems)
+        if str(ex.get("forward_tool") or "").strip().lower() == "overlay" and (not bool(ep.get("disabled"))):
+            if n <= 0:
+                issues.append(
+                    PoolValidationIssue(
+                        path=f"endpoints[{idx}].remotes",
+                        message=f"Overlay 转发必须至少配置 1 个目标地址（第 {idx+1} 条规则）",
+                    )
+                )
         if n > 1:
-            algo, weights = _parse_balance_weights(ep.get("balance"))
-            if algo == "roundrobin" and weights:
-                if len(weights) != n:
+            if bal_weights:
+                if bal_algo not in _BALANCE_WEIGHTED_ALGOS:
                     issues.append(
                         PoolValidationIssue(
                             path=f"endpoints[{idx}].balance",
-                            message=f"权重数量必须与目标行数一致：目标 {n} 行，权重 {len(weights)} 个",
+                            message=f"{bal_algo} 不支持权重，请移除“: ...”部分",
+                        )
+                    )
+                elif len(bal_weights) != n:
+                    issues.append(
+                        PoolValidationIssue(
+                            path=f"endpoints[{idx}].balance",
+                            message=f"权重数量必须与目标行数一致：目标 {n} 行，权重 {len(bal_weights)} 个",
                         )
                     )
                 else:
-                    bad = [w for w in weights if not _is_positive_int(w)]
+                    bad = [w for w in bal_weights if not _is_positive_int(w)]
                     if bad:
                         issues.append(
                             PoolValidationIssue(
@@ -684,7 +811,7 @@ def validate_pool_inplace(pool: Dict[str, Any]) -> List[PoolValidationIssue]:
                 else:
                     ep.pop("network", None)
 
-        if not bool(ep.get("disabled")) and intranet_role != "client":
+        if (not bool(ep.get("disabled"))) and (not _is_unbound_placeholder_endpoint(ex, ep.get("listen"))):
             active_rule_count += 1
             total_remote_count += n
             if "udp" in proto:
@@ -704,8 +831,7 @@ def validate_pool_inplace(pool: Dict[str, Any]) -> List[PoolValidationIssue]:
         if not isinstance(ex, dict):
             ex = {}
 
-        intranet_role = str(ex.get("intranet_role") or "").strip()
-        if intranet_role == "client":
+        if _is_unbound_placeholder_endpoint(ex, ep.get("listen")):
             # placeholder listen 0.0.0.0:0, not bound
             continue
 

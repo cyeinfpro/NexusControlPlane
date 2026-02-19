@@ -6,15 +6,17 @@
 main.container{max-width:none;padding:10px 12px 12px;}
 </style>
 {% endif %}
+{% set files_base = files_base or ('/websites/' ~ site.id ~ '/files') %}
+{% set show_site_nav = true if show_site_nav is not defined else show_site_nav %}
 {% set parent_path = '/'.join(path.split('/')[:-1]) %}
-{% set back_href = '/websites/' ~ site.id ~ '/files?path=' ~ parent_path %}
+{% set back_href = files_base ~ '?path=' ~ parent_path %}
 {% if embed_mode %}
   {% set back_href = back_href ~ '&modal=1' %}
 {% endif %}
 {% if not embed_mode %}
 <div class="page-head">
   <div class="page-title">
-    <h1 class="h1">编辑文件 · {{ site.name }}</h1>
+    <h1 class="h1">{{ '查看文件' if is_read_only_mount else '编辑文件' }} · {{ site.name }}</h1>
     <div class="meta">
       <span class="meta-item">路径：<span class="mono" style="overflow-wrap:anywhere;">{{ path }}</span></span>
     </div>
@@ -24,7 +26,9 @@ main.container{max-width:none;padding:10px 12px 12px;}
   </div>
 </div>
 
+{% if show_site_nav %}
 {% include "site_nav.html" %}
+{% endif %}
 {% endif %}
 
 {% if error %}
@@ -32,19 +36,28 @@ main.container{max-width:none;padding:10px 12px 12px;}
     {{ error }}
   </div>
 {% endif %}
+{% if is_read_only_mount %}
+  <div class="flash" style="background:rgba(245,158,11,0.16);border-color:rgba(245,158,11,0.45);">
+    <strong>只读挂载</strong>{% if read_only_mount_label %} · {{ read_only_mount_label }}{% endif %}：当前文件仅可查看，不可保存修改。
+  </div>
+{% endif %}
 
 <div class="card" style="margin-top:12px;">
-  <form method="post" action="/websites/{{ site.id }}/files/save" class="form">
+  <form method="post" action="{{ files_base }}/save" class="form">
     <input type="hidden" name="path" value="{{ path }}">
     {% if embed_mode %}<input type="hidden" name="modal" value="1">{% endif %}
-    <label class="label">文件内容</label>
-    <textarea class="textarea mono" name="content" rows="22" style="min-height:60vh;">{{ content }}</textarea>
+    <label class="label">文件内容{% if is_read_only_mount %}（只读）{% endif %}</label>
+    <textarea class="textarea mono" name="content" rows="22" style="min-height:60vh;" {% if is_read_only_mount %}readonly{% endif %}>{{ content }}</textarea>
     <div class="row" style="margin-top:12px;">
       <div class="col">
         <a class="btn ghost" href="{{ back_href }}">取消</a>
       </div>
       <div class="col right">
+        {% if not is_read_only_mount %}
         <button class="btn" type="submit">保存</button>
+        {% else %}
+        <span class="pill xs warn">只读</span>
+        {% endif %}
       </div>
     </div>
   </form>

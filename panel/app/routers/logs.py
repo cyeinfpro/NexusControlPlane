@@ -1,15 +1,18 @@
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Depends, Query, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
+from ..auth import filter_nodes_for_user
 from ..core.deps import require_role, require_role_page
 from ..core.flash import flash
 from ..core.logging_setup import get_runtime_log_paths
 from ..core.templates import templates
+from ..db import list_audit_logs, list_nodes
 
 router = APIRouter()
 
@@ -77,10 +80,43 @@ def _tail_text(path: str, lines: int, max_bytes: int = 2 * 1024 * 1024) -> Tuple
     return text, truncated, size, mtime, ""
 
 
+def _parse_audit_time(raw: str, *, end: bool = False) -> str:
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    if text.endswith("Z"):
+        text = text[:-1]
+    text = text.replace("T", " ")
+    if len(text) == 16:
+        text = text + (":59" if bool(end) else ":00")
+    try:
+        dt = datetime.fromisoformat(text)
+    except Exception:
+        return ""
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+
 @router.get("/logs", response_class=HTMLResponse)
 async def logs_page(request: Request, user: str = Depends(require_role_page("panel.view"))):
-    _ = user
     src = _log_sources()
+    tab_raw = str(request.query_params.get("tab") or "").strip().lower()
+    default_tab = "audit" if tab_raw in ("audit", "审计") else "runtime"
+    nodes = filter_nodes_for_user(user, list_nodes())
+    node_options: List[Dict[str, object]] = []
+    for n in nodes:
+        try:
+            nid = int(n.get("id") or 0)
+        except Exception:
+            nid = 0
+        if nid <= 0:
+            continue
+        node_options.append(
+            {
+                "id": nid,
+                "name": str(n.get("name") or f"节点-{nid}"),
+            }
+        )
+    node_options.sort(key=lambda x: int(x.get("id") or 0))
     return templates.TemplateResponse(
         "logs.html",
         {
@@ -91,6 +127,8 @@ async def logs_page(request: Request, user: str = Depends(require_role_page("pan
             "log_sources": list(src.values()),
             "default_source": "panel",
             "default_lines": 300,
+            "default_log_tab": default_tab,
+            "audit_nodes": node_options,
         },
     )
 
@@ -123,4 +161,60 @@ async def api_logs_tail(
         "mtime": float(mtime or 0.0),
         "read_error": str(read_error or ""),
         "text": text,
+    }
+
+
+@router.get("/audit-logs", response_class=HTMLResponse)
+async def audit_logs_page(request: Request, user: str = Depends(require_role_page("panel.view"))):
+    _ = request
+    _ = user
+    return RedirectResponse(url="/logs?tab=audit", status_code=307)
+
+
+@router.get("/api/audit-logs")
+async def api_audit_logs(
+    request: Request,
+    start_at: str = Query(""),
+    end_at: str = Query(""),
+    actor: str = Query(""),
+    action: str = Query(""),
+    query: str = Query(""),
+    node_id: int = Query(0, ge=0),
+    limit: int = Query(200, ge=1, le=500),
+    offset: int = Query(0, ge=0, le=200000),
+    user: str = Depends(require_role("panel.view")),
+):
+    _ = request
+    _ = user
+    start_norm = _parse_audit_time(start_at, end=False)
+    end_norm = _parse_audit_time(end_at, end=True)
+    actor_key = str(actor or "").strip()
+    action_key = str(action or "").strip()
+    query_key = str(query or "").strip()
+    nid: Optional[int] = int(node_id) if int(node_id or 0) > 0 else None
+
+    total, rows = list_audit_logs(
+        limit=int(limit),
+        offset=int(offset),
+        actor=actor_key,
+        action=action_key,
+        query=query_key,
+        node_id=nid,
+        start_at=start_norm,
+        end_at=end_norm,
+    )
+    return {
+        "ok": True,
+        "filters": {
+            "start_at": start_norm,
+            "end_at": end_norm,
+            "actor": actor_key,
+            "action": action_key,
+            "query": query_key,
+            "node_id": int(nid or 0),
+            "limit": int(limit),
+            "offset": int(offset),
+        },
+        "total": int(total),
+        "items": rows,
     }

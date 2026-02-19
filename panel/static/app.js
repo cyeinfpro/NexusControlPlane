@@ -28,13 +28,329 @@ async function loadNodesList(){
     const data = await fetchJSON('/api/nodes');
     if(data && data.ok && Array.isArray(data.nodes)){
       NODES_LIST = data.nodes;
+      try{ window.NODES_LIST = data.nodes; }catch(_e){}
       populateReceiverSelect();
       populateIntranetReceiverSelect();
+      populateMptcpMembersSelect();
+      populateMptcpAggregatorSelect();
       try{ syncTunnelModeUI(); }catch(_e){}
     }
   }catch(e){
     // ignore
   }
+}
+
+function _formatNodeOptionText(n){
+  if(!n || n.id == null) return '';
+  const show = n.name ? n.name : ('Node #' + n.id);
+  let host = '';
+  try{
+    const base = String(n.base_url || '');
+    const u = new URL(base.includes('://') ? base : ('http://' + base));
+    host = u.hostname || '';
+  }catch(_e){}
+  const status = (n.online === true || n.is_online === true) ? '在线' : '离线';
+  return host ? `${show} (${host}) · ${status}` : `${show} · ${status}`;
+}
+
+function _mptcpCandidateNodes(){
+  const currentId = String(window.__NODE_ID__ || '');
+  const list = Array.isArray(NODES_LIST) ? NODES_LIST : [];
+  const out = [];
+  for(const n of list){
+    if(!n || n.id == null) continue;
+    if(String(n.id) === currentId) continue;
+    out.push(n);
+  }
+  out.sort((a, b)=>{
+    const ao = (a && (a.online === true || a.is_online === true)) ? 1 : 0;
+    const bo = (b && (b.online === true || b.is_online === true)) ? 1 : 0;
+    if(ao !== bo) return bo - ao;
+    const an = String((a && (a.name || a.display_ip || a.id)) || '').toLowerCase();
+    const bn = String((b && (b.name || b.display_ip || b.id)) || '').toLowerCase();
+    if(an < bn) return -1;
+    if(an > bn) return 1;
+    return parseInt(a.id || 0, 10) - parseInt(b.id || 0, 10);
+  });
+  return out;
+}
+
+function _mptcpFilterText(){
+  const el = document.getElementById('f_mptcp_member_filter');
+  return el ? String(el.value || '').trim().toLowerCase() : '';
+}
+
+function _mptcpAggregatorFilterText(){
+  const el = document.getElementById('f_mptcp_aggregator_filter');
+  return el ? String(el.value || '').trim().toLowerCase() : '';
+}
+
+function _mptcpShowOffline(){
+  const btn = document.getElementById('btnMptcpMembersToggleOffline');
+  if(!btn) return false;
+  return String(btn.dataset.mode || 'online').trim().toLowerCase() === 'all';
+}
+
+function _setMptcpShowOffline(showOffline){
+  const btn = document.getElementById('btnMptcpMembersToggleOffline');
+  if(!btn) return;
+  const on = !!showOffline;
+  btn.dataset.mode = on ? 'all' : 'online';
+  btn.textContent = on ? '显示全部' : '仅看在线';
+  btn.title = on ? '当前显示在线+离线节点（点击切换为仅看在线）' : '当前仅显示在线节点（点击切换为显示全部）';
+}
+
+function updateMptcpMembersCount(){
+  const sel = document.getElementById('f_mptcp_member_nodes');
+  const info = document.getElementById('mptcpMembersCount');
+  if(!info) return;
+  const count = sel ? getMultiSelectValues(sel).length : 0;
+  info.textContent = `已选 ${count} 个`;
+}
+
+function _mptcpNodeMetaById(id){
+  const rid = String(id || '').trim();
+  if(!rid) return null;
+  const currentId = String(window.__NODE_ID__ || '');
+  const list = Array.isArray(NODES_LIST) ? NODES_LIST : [];
+  for(const n of list){
+    if(!n || n.id == null) continue;
+    if(String(n.id) === currentId) continue;
+    if(String(n.id) !== rid) continue;
+    let host = '';
+    try{
+      const raw = String(n.base_url || '').trim();
+      if(raw){
+        const u = new URL(raw.includes('://') ? raw : ('http://' + raw));
+        host = String(u.hostname || '').trim();
+      }
+    }catch(_e){}
+    if(!host) host = String(n.display_ip || '').trim();
+    return {
+      id: rid,
+      name: String(n.name || `节点-${rid}`),
+      host,
+      online: !!(n.online === true || n.is_online === true),
+      is_private: !!(n.is_private === true || n.is_private === 1),
+    };
+  }
+  return null;
+}
+
+function _renderMptcpNodeCardLine(opt, selected, disabled, singleMode){
+  const meta = _mptcpNodeMetaById(String((opt && opt.value) || '').trim());
+  const card = document.createElement('button');
+  card.type = 'button';
+  card.className = `mptcp-node-card${selected ? ' selected' : ''}${disabled ? ' disabled' : ''}`;
+
+  const main = document.createElement('div');
+  main.className = 'mptcp-node-card-main';
+  const title = meta ? meta.name : String(opt.textContent || '').split(' (')[0];
+  main.textContent = title || String(opt.textContent || '未知节点');
+  card.appendChild(main);
+
+  const sub = document.createElement('div');
+  sub.className = 'mptcp-node-card-sub';
+  if(meta && meta.host){
+    sub.textContent = `${meta.host} · 节点#${meta.id}`;
+  }else{
+    sub.textContent = `节点#${String((opt && opt.value) || '').trim()}`;
+  }
+  card.appendChild(sub);
+
+  const tags = document.createElement('div');
+  tags.className = 'mptcp-node-card-tags';
+  const st = document.createElement('span');
+  st.className = `mptcp-tag ${meta && meta.online ? 'ok' : 'warn'}`;
+  st.textContent = meta && meta.online ? '在线' : '离线';
+  tags.appendChild(st);
+
+  const typeTag = document.createElement('span');
+  typeTag.className = 'mptcp-tag';
+  typeTag.textContent = meta && meta.is_private ? '内网' : '公网';
+  tags.appendChild(typeTag);
+
+  const act = document.createElement('span');
+  act.className = 'mptcp-tag';
+  if(singleMode){
+    act.textContent = selected ? '当前汇聚' : '设为汇聚';
+  }else{
+    act.textContent = selected ? '已加入' : '点击加入';
+  }
+  tags.appendChild(act);
+  card.appendChild(tags);
+  return card;
+}
+
+function renderMptcpMemberCards(){
+  const membersSel = document.getElementById('f_mptcp_member_nodes');
+  const box = document.getElementById('mptcpMemberCards');
+  if(!membersSel || !box) return;
+  box.innerHTML = '';
+  const rows = Array.from(membersSel.options || []).filter((opt)=>!opt.hidden);
+  if(!rows.length){
+    const empty = document.createElement('div');
+    empty.className = 'mptcp-empty';
+    empty.textContent = '没有可显示的成员节点，请调整筛选条件。';
+    box.appendChild(empty);
+    return;
+  }
+  for(const opt of rows){
+    const selected = !!opt.selected;
+    const disabled = !!opt.disabled;
+    const card = _renderMptcpNodeCardLine(opt, selected, disabled, false);
+    card.disabled = disabled;
+    card.addEventListener('click', ()=>{
+      if(disabled) return;
+      opt.selected = !opt.selected;
+      updateMptcpMembersCount();
+      renderMptcpMemberCards();
+      renderMptcpMemberChips();
+      try{ updateModePreview(); }catch(_e){}
+    });
+    box.appendChild(card);
+  }
+}
+
+function renderMptcpMemberChips(){
+  const membersSel = document.getElementById('f_mptcp_member_nodes');
+  const box = document.getElementById('mptcpMemberChips');
+  if(!membersSel || !box) return;
+  box.innerHTML = '';
+  const selected = Array.from(membersSel.options || []).filter((opt)=>!!opt.selected);
+  if(!selected.length){
+    const empty = document.createElement('div');
+    empty.className = 'mptcp-empty';
+    empty.textContent = '未选择成员链路。';
+    box.appendChild(empty);
+    return;
+  }
+  for(const opt of selected){
+    const chip = document.createElement('span');
+    chip.className = 'mptcp-chip';
+    const meta = _mptcpNodeMetaById(String(opt.value || '').trim());
+    chip.appendChild(document.createTextNode(meta ? meta.name : String(opt.textContent || '节点')));
+    const rm = document.createElement('button');
+    rm.type = 'button';
+    rm.textContent = '×';
+    rm.title = '移除';
+    rm.addEventListener('click', ()=>{
+      opt.selected = false;
+      updateMptcpMembersCount();
+      renderMptcpMemberCards();
+      renderMptcpMemberChips();
+      try{ updateModePreview(); }catch(_e){}
+    });
+    chip.appendChild(rm);
+    box.appendChild(chip);
+  }
+}
+
+function renderMptcpAggregatorCards(){
+  const sel = document.getElementById('f_mptcp_aggregator_node');
+  const box = document.getElementById('mptcpAggregatorCards');
+  if(!sel || !box) return;
+  const keyword = _mptcpAggregatorFilterText();
+  box.innerHTML = '';
+  const rows = Array.from(sel.options || [])
+    .filter((opt)=>String(opt.value || '').trim())
+    .filter((opt)=>{
+      if(!keyword) return true;
+      const meta = _mptcpNodeMetaById(String(opt.value || '').trim());
+      const search = `${String(opt.textContent || '')} ${meta ? (meta.name + ' ' + meta.host) : ''}`.toLowerCase();
+      return search.includes(keyword);
+    });
+  if(!rows.length){
+    const empty = document.createElement('div');
+    empty.className = 'mptcp-empty';
+    empty.textContent = '没有匹配的汇聚节点。';
+    box.appendChild(empty);
+    return;
+  }
+  const current = String(sel.value || '').trim();
+  for(const opt of rows){
+    const val = String(opt.value || '').trim();
+    const selected = val && current === val;
+    const card = _renderMptcpNodeCardLine(opt, selected, false, true);
+    card.addEventListener('click', ()=>{
+      sel.value = val;
+      try{
+        sel.dispatchEvent(new Event('change', {bubbles: true}));
+      }catch(_e){
+        try{ sel.dispatchEvent(new Event('change')); }catch(_e2){}
+      }
+    });
+    box.appendChild(card);
+  }
+}
+
+function syncMptcpMemberExclusions(){
+  const membersSel = document.getElementById('f_mptcp_member_nodes');
+  const aggSel = document.getElementById('f_mptcp_aggregator_node');
+  if(!membersSel || !aggSel) return;
+  const agg = String(aggSel.value || '').trim();
+  if(!agg){
+    Array.from(membersSel.options || []).forEach((opt)=>{ opt.disabled = false; });
+    renderMptcpMemberCards();
+    renderMptcpMemberChips();
+    return;
+  }
+  Array.from(membersSel.options || []).forEach((opt)=>{
+    const same = String(opt.value || '').trim() === agg;
+    opt.disabled = same;
+    if(same) opt.selected = false;
+  });
+  renderMptcpMemberCards();
+  renderMptcpMemberChips();
+}
+
+function applyMptcpMemberFilter(){
+  const membersSel = document.getElementById('f_mptcp_member_nodes');
+  if(!membersSel) return;
+  const keyword = _mptcpFilterText();
+  const showOffline = _mptcpShowOffline();
+  const aggSel = document.getElementById('f_mptcp_aggregator_node');
+  const agg = aggSel ? String(aggSel.value || '').trim() : '';
+  Array.from(membersSel.options || []).forEach((opt)=>{
+    const value = String(opt.value || '').trim();
+    const isOnline = String(opt.dataset.online || '0') === '1';
+    const keepByOnline = showOffline || isOnline || opt.selected || (agg && value === agg);
+    const search = String(opt.dataset.search || opt.textContent || '').toLowerCase();
+    const show = keepByOnline && (!keyword || search.includes(keyword));
+    opt.hidden = !show;
+  });
+  renderMptcpMemberCards();
+  renderMptcpMemberChips();
+}
+
+function selectVisibleMptcpMembers(mode){
+  const membersSel = document.getElementById('f_mptcp_member_nodes');
+  if(!membersSel) return;
+  const m = String(mode || '').trim();
+  Array.from(membersSel.options || []).forEach((opt)=>{
+    const hidden = !!opt.hidden;
+    const disabled = !!opt.disabled;
+    if(m === 'clear'){
+      opt.selected = false;
+      return;
+    }
+    if(hidden || disabled){
+      if(m !== 'online') return;
+      opt.selected = false;
+      return;
+    }
+    if(m === 'all'){
+      opt.selected = true;
+      return;
+    }
+    if(m === 'online'){
+      opt.selected = String(opt.dataset.online || '0') === '1';
+    }
+  });
+  updateMptcpMembersCount();
+  renderMptcpMemberCards();
+  renderMptcpMemberChips();
+  try{ updateModePreview(); }catch(_e){}
 }
 
 function populateIntranetReceiverSelect(){
@@ -49,13 +365,7 @@ function populateIntranetReceiverSelect(){
     if(!n.is_private) continue;
     const opt = document.createElement('option');
     opt.value = String(n.id);
-    const show = n.name ? n.name : ('Node #' + n.id);
-    let host = '';
-    try{
-      const u = new URL(n.base_url.includes('://') ? n.base_url : ('http://' + n.base_url));
-      host = u.hostname || '';
-    }catch(e){}
-    opt.textContent = host ? `${show} (${host})` : show;
+    opt.textContent = _formatNodeOptionText(n);
     sel.appendChild(opt);
   }
   if(keep) sel.value = keep;
@@ -66,22 +376,71 @@ function populateReceiverSelect(){
   if(!sel) return;
   const currentId = window.__NODE_ID__;
   const keep = sel.value;
-  sel.innerHTML = '<option value="">（不选择=手动配对码模式）</option>';
+  sel.innerHTML = '<option value="">请选择出口节点…</option>';
   for(const n of (NODES_LIST||[])){
     if(!n || n.id == null) continue;
     if(String(n.id) === String(currentId)) continue;
     const opt = document.createElement('option');
     opt.value = String(n.id);
-    const show = n.name ? n.name : ('Node #' + n.id);
-    let host = '';
-    try{
-      const u = new URL(n.base_url.includes('://') ? n.base_url : ('http://' + n.base_url));
-      host = u.hostname || '';
-    }catch(e){}
-    opt.textContent = host ? `${show} (${host})` : show;
+    opt.textContent = _formatNodeOptionText(n);
     sel.appendChild(opt);
   }
   if(keep) sel.value = keep;
+}
+
+function setMultiSelectValues(sel, values){
+  if(!sel) return;
+  const set = new Set((Array.isArray(values) ? values : []).map((v)=>String(v || '').trim()).filter(Boolean));
+  Array.from(sel.options || []).forEach((opt)=>{
+    opt.selected = set.has(String(opt.value || '').trim());
+  });
+}
+
+function getMultiSelectValues(sel){
+  if(!sel) return [];
+  return Array.from(sel.selectedOptions || [])
+    .map((opt)=>String(opt.value || '').trim())
+    .filter(Boolean);
+}
+
+function populateMptcpMembersSelect(){
+  const sel = document.getElementById('f_mptcp_member_nodes');
+  if(!sel) return;
+  const keep = getMultiSelectValues(sel);
+  sel.innerHTML = '';
+  for(const n of _mptcpCandidateNodes()){
+    const opt = document.createElement('option');
+    opt.value = String(n.id);
+    opt.textContent = _formatNodeOptionText(n);
+    opt.dataset.online = (n.online === true || n.is_online === true) ? '1' : '0';
+    opt.dataset.search = `${String(n.name || '')} ${String(n.display_ip || '')} ${String(n.base_url || '')} ${String(n.id || '')}`.toLowerCase();
+    sel.appendChild(opt);
+  }
+  setMultiSelectValues(sel, keep);
+  syncMptcpMemberExclusions();
+  applyMptcpMemberFilter();
+  updateMptcpMembersCount();
+  renderMptcpMemberCards();
+  renderMptcpMemberChips();
+}
+
+function populateMptcpAggregatorSelect(){
+  const sel = document.getElementById('f_mptcp_aggregator_node');
+  if(!sel) return;
+  const keep = String(sel.value || '').trim();
+  sel.innerHTML = '<option value="">请选择汇聚节点…</option>';
+  for(const n of _mptcpCandidateNodes()){
+    const nid = String(n.id || '').trim();
+    const opt = document.createElement('option');
+    opt.value = nid;
+    opt.textContent = _formatNodeOptionText(n);
+    sel.appendChild(opt);
+  }
+  if(keep) sel.value = keep;
+  syncMptcpMemberExclusions();
+  applyMptcpMemberFilter();
+  updateMptcpMembersCount();
+  renderMptcpAggregatorCards();
 }
 
 function q(id){ return document.getElementById(id); }
@@ -97,29 +456,103 @@ let TRACE_ROUTE_REQUEST_SEQ = 0;
 let SYNC_TASKS = new Map(); // job_id -> task status (sync + pool async jobs)
 let SYNC_PENDING_SUBMITS = new Map(); // kind:sync_id -> {kind,sync_id,created_at}
 const SYNC_TASK_DONE_KEEP_MS = 12000;
+let MPTCP_GROUP_STATE = {
+  loading: false,
+  sender_node: null,
+  sender_filter_node_id: 0,
+  groups: [],
+  defaults: {
+    fixed_tunnel_port_enabled: true,
+    tunnel_port: 38443,
+  },
+  active_sync_id: '',
+  editor_mode: 'edit',
+  last_probe: null,
+};
+
+// Global overlay groups list cache (used by Overlay rule editor dropdown)
+let OVERLAY_GROUPS_PICK_STATE = {
+  ts: 0,
+  inflight: null,
+  groups: [],
+};
+
+// LocalStorage keys (best-effort; failures are ignored)
+const LS_OVERLAY_LAST_GROUP_SID = 'nexus_overlay_last_group_sid';
+
+function _lsGet(key, defVal=''){
+  try{
+    const v = localStorage.getItem(String(key || ''));
+    return (v == null) ? String(defVal || '') : String(v);
+  }catch(_e){
+    return String(defVal || '');
+  }
+}
+
+function _lsSet(key, value){
+  try{
+    localStorage.setItem(String(key || ''), String(value == null ? '' : value));
+  }catch(_e){}
+}
 
 function _modePerms(){
   const raw = (window && window.__MODE_PERMS__ && typeof window.__MODE_PERMS__ === 'object') ? window.__MODE_PERMS__ : {};
   return {
     tcp: !!raw.tcp,
+    mptcp: !!raw.mptcp,
     wss: !!raw.wss,
     intranet: !!raw.intranet,
   };
 }
 
+function normalizeNodeSystemType(raw){
+  const v = String(raw || '').trim().toLowerCase();
+  if(v === 'linux' || v === 'macos' || v === 'windows') return v;
+  return 'auto';
+}
+
+function isMacNodeSystemType(raw){
+  return normalizeNodeSystemType(raw) === 'macos';
+}
+
+function currentNodeSystemType(){
+  return normalizeNodeSystemType(window.__NODE_SYSTEM_TYPE__ || 'auto');
+}
+
 function isModeAllowed(mode){
   const m = String(mode || '').trim().toLowerCase();
   const p = _modePerms();
+  if(m === 'mptcp') return !!p.mptcp;
   if(m === 'wss') return !!p.wss;
   if(m === 'intranet') return !!p.intranet;
   return !!p.tcp;
 }
 
+function modeVisibleForCurrentNode(mode){
+  const m = String(mode || '').trim().toLowerCase();
+  if(!isMacNodeSystemType(currentNodeSystemType())) return true;
+  return m === 'intranet';
+}
+
+function isModeVisible(mode){
+  return isModeAllowed(mode) && modeVisibleForCurrentNode(mode);
+}
+
 function allowedTunnelModes(){
   const out = [];
   if(isModeAllowed('tcp')) out.push('tcp');
+  if(isModeAllowed('mptcp')) out.push('mptcp');
   if(isModeAllowed('wss')) out.push('wss');
   if(isModeAllowed('intranet')) out.push('intranet');
+  return out;
+}
+
+function visibleTunnelModes(){
+  const out = [];
+  if(isModeVisible('tcp')) out.push('tcp');
+  if(isModeVisible('mptcp')) out.push('mptcp');
+  if(isModeVisible('wss')) out.push('wss');
+  if(isModeVisible('intranet')) out.push('intranet');
   return out;
 }
 
@@ -128,16 +561,32 @@ function defaultTunnelMode(){
   return arr.length ? arr[0] : 'tcp';
 }
 
+function defaultVisibleTunnelMode(){
+  const arr = visibleTunnelModes();
+  return arr.length ? arr[0] : defaultTunnelMode();
+}
+
+function modeVisibilityDenyReason(mode){
+  const m = String(mode || '').trim().toLowerCase();
+  if(isMacNodeSystemType(currentNodeSystemType()) && m !== 'intranet'){
+    return 'macOS 节点仅保留内网穿透';
+  }
+  return '';
+}
+
 function modeDenyReason(mode){
   const m = String(mode || '').trim().toLowerCase();
-  if(m === 'wss') return '当前账号无 WSS 隧道权限';
+  const nodeReason = modeVisibilityDenyReason(m);
+  if(nodeReason) return nodeReason;
+  if(m === 'mptcp') return '当前账号无多链路聚合权限';
+  if(m === 'wss') return '当前账号无隧道转发权限';
   if(m === 'intranet') return '当前账号无内网穿透权限';
   return '当前账号无普通转发权限';
 }
 
 function endpointMode(e){
   const m = wssMode(e);
-  if(m === 'wss' || m === 'intranet') return m;
+  if(m === 'wss' || m === 'intranet' || m === 'mptcp') return m;
   return 'tcp';
 }
 
@@ -151,11 +600,15 @@ function _nowTs(){
 
 function syncTaskKindLabel(kind){
   const k = String(kind || '').trim().toLowerCase();
-  if(k === 'wss_save') return 'WSS保存';
+  if(k === 'wss_save') return '隧道转发保存';
+  if(k === 'mptcp_save') return '多链路保存';
+  if(k === 'mptcp_group_update') return '隧道组更新';
   if(k === 'intranet_save') return '内网保存';
-  if(k === 'wss_delete') return 'WSS删除';
+  if(k === 'wss_delete') return '隧道转发删除';
+  if(k === 'mptcp_delete') return '多链路删除';
   if(k === 'intranet_delete') return '内网删除';
   if(k === 'pool_save') return '规则保存';
+  if(k === 'rule_restore') return '规则恢复';
   if(k === 'rule_delete') return '规则删除';
   return '任务';
 }
@@ -230,6 +683,9 @@ function _syncIdentityFromRule(e){
   const ex = (e && e.extra_config && typeof e.extra_config === 'object') ? e.extra_config : {};
   const sid = String(ex.sync_id || '').trim();
   if(!sid) return {kind:'', sync_id:''};
+  if(mptcpMode(e)){
+    return {kind:'mptcp', sync_id:sid};
+  }
   if(ex && (ex.intranet_role || ex.intranet_peer_node_id || ex.intranet_lock)){
     return {kind:'intranet', sync_id:sid};
   }
@@ -243,6 +699,7 @@ function _syncTaskMatchKind(taskKind, tunnelKind){
   const tk = String(taskKind || '').trim().toLowerCase();
   const kk = String(tunnelKind || '').trim().toLowerCase();
   if(kk === 'wss') return tk === 'wss_save' || tk === 'wss_delete';
+  if(kk === 'mptcp') return tk === 'mptcp_save' || tk === 'mptcp_delete' || tk === 'mptcp_group_update';
   if(kk === 'intranet') return tk === 'intranet_save' || tk === 'intranet_delete';
   return false;
 }
@@ -422,7 +879,15 @@ async function pollSyncTask(jobId){
     const st = String(task.status || '').trim().toLowerCase();
     if(st === 'success'){
       const result = (task.result && typeof task.result === 'object') ? task.result : {};
-      if(result.sender_pool && typeof result.sender_pool === 'object'){
+      const taskKind = String(task.kind || '').trim().toLowerCase();
+      const currentNodeId = parseInt(String(window.__NODE_ID__ || '0'), 10);
+      let applySenderPool = !!(result.sender_pool && typeof result.sender_pool === 'object');
+      if(applySenderPool && taskKind === 'mptcp_group_update'){
+        const gu = (result.group_update && typeof result.group_update === 'object') ? result.group_update : {};
+        const senderAfter = parseInt(String(result.sender_node_id || gu.sender_node_id || '0'), 10);
+        applySenderPool = !!(senderAfter > 0 && senderAfter === currentNodeId);
+      }
+      if(applySenderPool){
         CURRENT_POOL = result.sender_pool;
         if(!CURRENT_POOL.endpoints) CURRENT_POOL.endpoints = [];
       }else if(result.pool && typeof result.pool === 'object'){
@@ -433,6 +898,19 @@ async function pollSyncTask(jobId){
       }
       renderRules();
       toastWithPrecheck(result, task.ok_msg || '同步完成');
+      try{
+        const fb = (result && result.apply_fallback && typeof result.apply_fallback === 'object') ? result.apply_fallback : null;
+        const nodes = (fb && Array.isArray(fb.nodes)) ? fb.nodes : [];
+        if(nodes.length){
+          const picked = nodes.slice(0, 3).map((x)=>{
+            const name = String((x && x.node_name) || '').trim();
+            const nid = parseInt((x && x.node_id) || 0, 10);
+            return name || (nid > 0 ? (`节点#${nid}`) : '未知节点');
+          });
+          const more = nodes.length > picked.length ? ` 等 ${nodes.length} 个节点` : '';
+          toast(`部分私网节点直连失败，已改为等待 Agent 上报下发：${picked.join('、')}${more}`, false, 6200);
+        }
+      }catch(_e){}
       try{
         if(result && result.tls_verify_degraded){
           const reason = String(result.tls_verify_degraded_reason || '证书不可用，已自动降级为不校验证书').trim();
@@ -446,7 +924,7 @@ async function pollSyncTask(jobId){
       const reason = String(task.error || ((task.result && task.result.error) ? task.result.error : '同步失败')).trim();
       _setSyncTask(Object.assign({}, task, {error: reason}));
       const k = String(task.kind || '').trim().toLowerCase();
-      if(k === 'pool_save' || k === 'rule_delete'){
+      if(k === 'pool_save' || k === 'rule_restore' || k === 'rule_delete'){
         try{
           await loadPool();
           renderRules();
@@ -491,8 +969,12 @@ async function enqueueSyncTask(url, payload, options){
 
 async function enqueueSyncSaveTask(kind, payload, okMsg){
   const k = String(kind || '').trim().toLowerCase();
-  const url = (k === 'intranet') ? '/api/intranet_tunnel/save_async' : '/api/wss_tunnel/save_async';
-  const kk = (k === 'intranet') ? 'intranet_save' : 'wss_save';
+  const url = (k === 'intranet')
+    ? '/api/intranet_tunnel/save_async'
+    : ((k === 'mptcp') ? '/api/mptcp_tunnel/save_async' : '/api/wss_tunnel/save_async');
+  const kk = (k === 'intranet')
+    ? 'intranet_save'
+    : ((k === 'mptcp') ? 'mptcp_save' : 'wss_save');
   return await enqueueSyncTask(url, payload || {}, {
     kind: kk,
     ok_msg: String(okMsg || '').trim(),
@@ -504,8 +986,12 @@ async function enqueueSyncSaveTask(kind, payload, okMsg){
 
 async function enqueueSyncDeleteTask(kind, payload, okMsg){
   const k = String(kind || '').trim().toLowerCase();
-  const url = (k === 'intranet') ? '/api/intranet_tunnel/delete_async' : '/api/wss_tunnel/delete_async';
-  const kk = (k === 'intranet') ? 'intranet_delete' : 'wss_delete';
+  const url = (k === 'intranet')
+    ? '/api/intranet_tunnel/delete_async'
+    : ((k === 'mptcp') ? '/api/mptcp_tunnel/delete_async' : '/api/wss_tunnel/delete_async');
+  const kk = (k === 'intranet')
+    ? 'intranet_delete'
+    : ((k === 'mptcp') ? 'mptcp_delete' : 'wss_delete');
   return await enqueueSyncTask(url, payload || {}, {
     kind: kk,
     ok_msg: String(okMsg || '').trim(),
@@ -587,6 +1073,8 @@ let RULE_META_SAVING = false;
 let RULE_SELECTED_KEYS = new Set();
 let LAST_VISIBLE_RULE_KEYS = [];
 let BULK_ACTION_RUNNING = false;
+let RULE_RENDER_ORDER = new Map(); // rule_key -> stable render order
+let RULE_RENDER_ORDER_SEQ = 1;
 const RULE_TEMP_UNLOCK_TTL_MS = 45000;
 let RULE_TEMP_UNLOCK = new Map(); // key -> expire_at_ms
 let RULE_TEMP_UNLOCK_TIMER = 0;
@@ -648,8 +1136,16 @@ function collectUnlockSyncIds(){
   for(const [k, ts] of RULE_TEMP_UNLOCK.entries()){
     if(!k || !Number.isFinite(ts) || ts <= Date.now()) continue;
     const s = String(k);
-    if(!s.startsWith('wss:')) continue;
-    const sid = s.slice(4).trim();
+    let sid = '';
+    if(s.startsWith('wss:')){
+      sid = s.slice(4).trim();
+    }else if(s.startsWith('mptcp:')){
+      sid = s.slice(6).trim();
+    }else if(s.startsWith('intranet:')){
+      sid = s.slice(9).trim();
+    }else{
+      continue;
+    }
     if(sid) out.push(sid);
   }
   return Array.from(new Set(out));
@@ -658,6 +1154,10 @@ function collectUnlockSyncIds(){
 function getRuleKey(e){
   if(!e) return '';
   const ex = (e && e.extra_config) ? e.extra_config : {};
+  // MPTCP sync rules
+  if(ex && ex.sync_id && mptcpMode(e)){
+    return `mptcp:${String(ex.sync_id)}`;
+  }
   // WSS tunnel rules
   if(ex && ex.sync_id && (ex.sync_role || ex.sync_peer_node_id || ex.sync_lock)){
     return `wss:${String(ex.sync_id)}`;
@@ -670,6 +1170,24 @@ function getRuleKey(e){
   const listen = String(e.listen || '').trim();
   const proto = String(e.protocol || 'tcp+udp').trim().toLowerCase();
   return `tcp:${listen}|${proto}`;
+}
+
+function syncRuleRenderOrder(endpoints){
+  const eps = Array.isArray(endpoints) ? endpoints : [];
+  const alive = new Set();
+  for(let i=0; i<eps.length; i++){
+    const key = getRuleKey(eps[i]);
+    if(!key) continue;
+    alive.add(key);
+    if(!RULE_RENDER_ORDER.has(key)){
+      RULE_RENDER_ORDER.set(key, RULE_RENDER_ORDER_SEQ++);
+    }
+  }
+  for(const key of Array.from(RULE_RENDER_ORDER.keys())){
+    if(!alive.has(key)){
+      RULE_RENDER_ORDER.delete(key);
+    }
+  }
 }
 
 function getSelectedRuleItems(){
@@ -809,6 +1327,7 @@ function normalizeForwardTool(raw, fallback='realm'){
   const v = String(raw || '').trim().toLowerCase();
   if(v === 'ipt' || v === 'iptables') return 'iptables';
   if(v === 'realm') return 'realm';
+  if(v === 'overlay' || v === 'mptcp_overlay' || v === 'mptcpoverlay') return 'overlay';
   return fb;
 }
 
@@ -821,22 +1340,156 @@ function getForwardToolFromEndpoint(e, fallback='realm'){
   return normalizeForwardTool(raw, fb);
 }
 
+function isRelayTunnelRule(e){
+  const ex = (e && e.extra_config && typeof e.extra_config === 'object') ? e.extra_config : {};
+  const mode = String(ex.sync_tunnel_mode || ex.sync_tunnel_type || '').trim().toLowerCase();
+  return mode === 'relay' || mode === 'wss_relay';
+}
+
+function mptcpMode(e){
+  const ex = (e && e.extra_config && typeof e.extra_config === 'object') ? e.extra_config : {};
+  const fm = String(ex.forward_mode || '').trim().toLowerCase();
+  if(fm === 'mptcp') return true;
+  const members = Array.isArray(ex.mptcp_member_node_ids)
+    ? ex.mptcp_member_node_ids.filter((v)=>parseInt(v, 10) > 0)
+    : [];
+  const agg = parseInt(ex.mptcp_aggregator_node_id || 0, 10);
+  return members.length > 0 || agg > 0;
+}
+
 function wssMode(e){
   // intranet tunnels are handled separately
   if(intranetMode(e)) return 'intranet';
+  if(mptcpMode(e)) return 'mptcp';
   const ex = e.extra_config || {};
 
   // IMPORTANT:
   // WSS 隧道属于「双节点自动同步」功能，应当仅由 sync_* 元数据判定。
   // 如果用户在普通转发里手动配置了 ws/wss transport（listen_transport / remote_transport），
-  // 不能误判为隧道模式，否则会强制要求选择接收机节点并导致编辑/保存异常。
+  // 不能误判为隧道模式，否则会强制要求选择出口节点并导致编辑/保存异常。
   if(ex && (ex.sync_id || ex.sync_role || ex.sync_peer_node_id || ex.sync_lock)) return 'wss';
   return 'tcp';
 }
 
 function intranetMode(e){
   const ex = (e && e.extra_config) ? e.extra_config : {};
+  if(isRelayTunnelRule(e)) return false;
   return !!(ex && (ex.intranet_role || ex.intranet_peer_node_id || ex.intranet_token || ex.intranet_server_port));
+}
+
+function isIntranetSyncSenderRule(e){
+  const ex = (e && e.extra_config) ? e.extra_config : {};
+  if(!(ex && ex.sync_id)) return false;
+  if(ex.sync_role === 'sender') return true;
+  // legacy sender side
+  return !!(ex.intranet_role === 'server' && ex.intranet_lock !== true);
+}
+
+function isIntranetSyncReceiverRule(e){
+  const ex = (e && e.extra_config) ? e.extra_config : {};
+  if(!(ex && ex.sync_id)) return false;
+  if(ex.sync_role === 'receiver') return true;
+  // legacy receiver side
+  return !!(ex.intranet_lock === true || ex.intranet_role === 'client');
+}
+
+function getIntranetSenderListen(e){
+  const ex = (e && e.extra_config) ? e.extra_config : {};
+  return String((ex && (ex.sync_sender_listen || ex.intranet_sender_listen)) || (e && e.listen) || '').trim();
+}
+
+function _parseNodeIdList(raw){
+  const seq = Array.isArray(raw) ? raw : [];
+  const out = [];
+  const seen = new Set();
+  for(const item of seq){
+    const n = parseInt(item, 10);
+    if(!(n > 0) || seen.has(n)) continue;
+    seen.add(n);
+    out.push(n);
+  }
+  return out;
+}
+
+function _mptcpMemberIdsFromExtra(ex){
+  return _parseNodeIdList(ex && ex.mptcp_member_node_ids);
+}
+
+function isMptcpSyncRule(e){
+  const ex = (e && e.extra_config) ? e.extra_config : {};
+  if(!(ex && ex.sync_id)) return false;
+  if(mptcpMode(e)) return true;
+  const syncType = String(ex.sync_tunnel_mode || ex.sync_tunnel_type || '').trim().toLowerCase();
+  if(syncType === 'mptcp') return true;
+  return !!String(ex.mptcp_role || '').trim();
+}
+
+function isMptcpSyncSenderRule(e){
+  const ex = (e && e.extra_config) ? e.extra_config : {};
+  if(!isMptcpSyncRule(e)) return false;
+  const role = String(ex.mptcp_role || ex.sync_role || '').trim().toLowerCase();
+  return role === 'sender';
+}
+
+function buildMptcpSyncPayloadFromEndpoint(e, patch){
+  const ex = (e && e.extra_config && typeof e.extra_config === 'object') ? e.extra_config : {};
+  if(!isMptcpSyncSenderRule(e)){
+    return {ok:false, error:'当前规则不是可同步更新的 MPTCP 发送端规则'};
+  }
+  const syncId = String(ex.sync_id || '').trim();
+  if(!syncId){
+    return {ok:false, error:'缺少 sync_id，无法同步更新'};
+  }
+
+  const memberIds = _mptcpMemberIdsFromExtra(ex);
+  const aggregatorId = parseInt(ex.mptcp_aggregator_node_id || ex.sync_peer_node_id || 0, 10);
+  if(memberIds.length < 2){
+    return {ok:false, error:'缺少成员链路节点信息，无法同步更新'};
+  }
+  if(!(aggregatorId > 0)){
+    return {ok:false, error:'缺少汇聚节点信息，无法同步更新'};
+  }
+
+  const listen = String(ex.sync_sender_listen || e.listen || '').trim();
+  const remotes = Array.isArray(ex.sync_original_remotes)
+    ? ex.sync_original_remotes.map((x)=>String(x || '').trim()).filter(Boolean)
+    : (Array.isArray(e.remotes) ? e.remotes.map((x)=>String(x || '').trim()).filter(Boolean) : []);
+  if(!listen || !remotes.length){
+    return {ok:false, error:'缺少监听或目标地址信息，无法同步更新'};
+  }
+
+  const payload = {
+    sender_node_id: window.__NODE_ID__,
+    member_node_ids: memberIds,
+    aggregator_node_id: aggregatorId,
+    listen,
+    remotes,
+    disabled: !!e.disabled,
+    balance: e.balance || 'roundrobin',
+    protocol: 'tcp',
+    remark: getRuleRemark(e),
+    favorite: isRuleFavorite(e),
+    sync_id: syncId,
+  };
+
+  const aggPort = parseInt(ex.mptcp_aggregator_port || 0, 10);
+  if(aggPort > 0) payload.aggregator_port = aggPort;
+  const aggHost = String(ex.mptcp_aggregator_host || '').trim();
+  if(aggHost) payload.aggregator_host = aggHost;
+  const scheduler = String(ex.mptcp_scheduler || 'aggregate').trim().toLowerCase();
+  payload.scheduler = (scheduler === 'backup' || scheduler === 'hybrid') ? scheduler : 'aggregate';
+
+  const rtt = parseInt(ex.mptcp_failover_rtt_ms || 0, 10);
+  if(Number.isFinite(rtt) && rtt >= 0) payload.failover_rtt_ms = rtt;
+  const jitter = parseInt(ex.mptcp_failover_jitter_ms || 0, 10);
+  if(Number.isFinite(jitter) && jitter >= 0) payload.failover_jitter_ms = jitter;
+  const loss = Number(ex.mptcp_failover_loss_pct);
+  if(Number.isFinite(loss) && loss >= 0 && loss <= 100) payload.failover_loss_pct = Number(loss.toFixed(2));
+
+  if(patch && typeof patch === 'object'){
+    Object.assign(payload, patch);
+  }
+  return {ok:true, payload};
 }
 
 function tunnelMode(e){
@@ -845,15 +1498,17 @@ function tunnelMode(e){
 }
 
 function intranetIsLocked(e){
-  const ex = (e && e.extra_config) ? e.extra_config : {};
-  return !!(ex && (ex.intranet_lock === true || ex.intranet_role === 'client'));
+  if(isRelayTunnelRule(e)) return false;
+  return isIntranetSyncReceiverRule(e);
 }
 
 // Auto-sync rules are read-only on the generated side (receiver / intranet client)
 function getRuleLockInfo(e){
   const ex = (e && e.extra_config) ? e.extra_config : {};
-  // WSS: receiver side is generated by sender sync
-  if(ex && (ex.sync_lock === true || ex.sync_role === 'receiver')){
+  const tunnelName = mptcpMode(e) ? '多链路聚合' : '隧道转发';
+  const isIntr = intranetMode(e);
+  // Sender/receiver synced tunnel rule.
+  if(ex && (!isIntr) && (ex.sync_lock === true || ex.sync_role === 'receiver')){
     const leftSec = getRuleTempUnlockLeftSec(e);
     if(leftSec > 0){
       return {
@@ -861,22 +1516,33 @@ function getRuleLockInfo(e){
         kind: 'wss_receiver',
         temp_unlocked: true,
         unlock_left_sec: leftSec,
-        reason: `该规则由 WSS 自动同步生成，当前临时解锁中（约 ${leftSec} 秒后自动重新锁定）。`,
+        reason: `该规则由${tunnelName}自动同步生成，当前临时解锁中（约 ${leftSec} 秒后自动重新锁定）。`,
       };
     }
     return {
       locked: true,
       kind: 'wss_receiver',
       temp_unlocked: false,
-      reason: '该规则由 WSS 自动同步生成（接收机侧只读）。可点“锁定”按钮临时解锁。'
+      reason: `该规则由${tunnelName}自动同步生成（出口端只读）。可点“锁定”按钮临时解锁。`
     };
   }
-  // Intranet: client side is generated by server sync
+  // Intranet: receiver side is generated by sender sync
   if(ex && intranetIsLocked(e)){
+    const leftSec = getRuleTempUnlockLeftSec(e);
+    if(leftSec > 0){
+      return {
+        locked: false,
+        kind: 'intranet_client',
+        temp_unlocked: true,
+        unlock_left_sec: leftSec,
+        reason: `该规则由内网穿透自动同步生成，当前临时解锁中（约 ${leftSec} 秒后自动重新锁定）。`,
+      };
+    }
     return {
       locked: true,
       kind: 'intranet_client',
-      reason: '该规则由内网穿透自动同步生成（内网出口侧只读），请在公网入口侧编辑。'
+      temp_unlocked: false,
+      reason: '该规则由内网穿透自动同步生成（接收端只读）。可点“锁定”按钮临时解锁。'
     };
   }
   return { locked: false, kind: '', reason: '' };
@@ -884,9 +1550,11 @@ function getRuleLockInfo(e){
 
 function getWssReceiverSenderLabel(e){
   const ex = (e && e.extra_config) ? e.extra_config : {};
-  if(!(ex && ex.sync_role === 'receiver')) return '';
-  const name = String(ex.sync_from_node_name || '').trim();
-  const idRaw = parseInt(ex.sync_from_node_id || 0, 10);
+  if(!(ex && ex.sync_id)) return '';
+  const role = String(ex.sync_role || '').trim().toLowerCase();
+  if(role === 'sender') return '';
+  const name = String(ex.sync_from_node_name || ex.sync_peer_node_name || '').trim();
+  const idRaw = parseInt(ex.sync_from_node_id || ex.sync_peer_node_id || 0, 10);
   if(name && idRaw > 0) return `${name}（ID:${idRaw}）`;
   if(name) return name;
   if(idRaw > 0) return `ID:${idRaw}`;
@@ -903,7 +1571,7 @@ function renderRuleSourceInfo(e){
 
 function renderRuleLockBtn(e, idx, lockInfo){
   const li = lockInfo || getRuleLockInfo(e);
-  if(!(li && li.kind === 'wss_receiver')) return '';
+  if(!(li && (li.kind === 'wss_receiver' || li.kind === 'intranet_client'))) return '';
   if(li.locked){
     return `<button class="btn xs ghost" title="临时解锁 ${Math.ceil(RULE_TEMP_UNLOCK_TTL_MS/1000)} 秒" onclick="toggleRuleTempUnlock(${idx}, event)">🔒 已锁定</button>`;
   }
@@ -913,17 +1581,31 @@ function renderRuleLockBtn(e, idx, lockInfo){
 
 function endpointType(e){
   const ex = (e && e.extra_config) ? e.extra_config : {};
+  if(mptcpMode(e)){
+    const role = String(ex.mptcp_role || ex.sync_role || '').trim().toLowerCase();
+    if(role === 'sender') return '多链路聚合(发送·同步)';
+    if(role === 'member') return '多链路聚合(成员·同步)';
+    if(role === 'aggregator') return '多链路聚合(汇聚·同步)';
+    return '多链路聚合（MPTCP）';
+  }
+  if(isRelayTunnelRule(e) && ex && ex.sync_id){
+    if(ex.sync_role === 'receiver') return '隧道转发(接收·同步)';
+    if(ex.sync_role === 'sender') return '隧道转发(发送·同步)';
+    return '隧道转发';
+  }
   if(ex && ex.intranet_role){
-    if(ex.intranet_role === 'client') return '内网穿透(内网出口·同步)';
-    if(ex.intranet_role === 'server') return '内网穿透(公网入口)';
+    if(isIntranetSyncSenderRule(e)) return '内网穿透(发送·同步)';
+    if(isIntranetSyncReceiverRule(e)) return '内网穿透(接收·同步)';
+    if(ex.intranet_role === 'client') return '内网穿透(客户端)';
+    if(ex.intranet_role === 'server') return '内网穿透(服务端)';
     return '内网穿透';
   }
   if(ex && ex.sync_id){
-    if(ex.sync_role === 'receiver') return 'WSS隧道(接收·同步)';
-    if(ex.sync_role === 'sender') return 'WSS隧道(发送·同步)';
+    if(ex.sync_role === 'receiver') return '隧道转发(接收·同步)';
+    if(ex.sync_role === 'sender') return '隧道转发(发送·同步)';
   }
   const mode = wssMode(e);
-  if(mode === 'wss') return 'WSS隧道';
+  if(mode === 'wss') return '隧道转发';
   if(mode === 'intranet') return '内网穿透';
   const tool = getForwardToolFromEndpoint(e, 'realm');
   if(tool === 'iptables') return 'TCP/UDP（IPTables）';
@@ -933,6 +1615,18 @@ function endpointType(e){
 function displayListenText(e){
   const listen = String((e && e.listen) || '').trim();
   const ex = (e && e.extra_config) ? e.extra_config : {};
+  if(isRelayTunnelRule(e) && ex && ex.sync_role === 'sender'){
+    return String(ex.sync_sender_listen || ex.intranet_sender_listen || listen || '').trim();
+  }
+  if(isRelayTunnelRule(e) && ex && ex.sync_role === 'receiver'){
+    return listen || '0.0.0.0:0';
+  }
+  if(intranetMode(e) && isIntranetSyncSenderRule(e)){
+    return getIntranetSenderListen(e) || listen;
+  }
+  if(intranetMode(e) && isIntranetSyncReceiverRule(e)){
+    return listen || '0.0.0.0:0';
+  }
   if(ex && String(ex.intranet_role || '').trim() === 'client'){
     const peerHost = String(ex.intranet_peer_host || '').trim();
     let peerPort = parseInt(ex.intranet_server_port || 0, 10);
@@ -947,6 +1641,9 @@ function formatRemoteForInput(e){
   const ex = (e && e.extra_config) ? e.extra_config : {};
   if(ex && ex.sync_role === 'sender' && Array.isArray(ex.sync_original_remotes)){
     return ex.sync_original_remotes.join('\n');
+  }
+  if(isIntranetSyncSenderRule(e) && Array.isArray(ex.intranet_original_remotes)){
+    return ex.intranet_original_remotes.join('\n');
   }
   const rs = Array.isArray(e.remotes) ? e.remotes : (e.remote ? [e.remote] : []);
   return rs.join('\n');
@@ -973,7 +1670,7 @@ function getFinalTargets(e){
   if(ex && ex.sync_role === 'sender' && Array.isArray(ex.sync_original_remotes)){
     return ex.sync_original_remotes.map(x=>String(x||'').trim()).filter(Boolean);
   }
-  if(ex && ex.intranet_role === 'server' && Array.isArray(ex.intranet_original_remotes)){
+  if(isIntranetSyncSenderRule(e) && Array.isArray(ex.intranet_original_remotes)){
     return ex.intranet_original_remotes.map(x=>String(x||'').trim()).filter(Boolean);
   }
   const rs = Array.isArray(e.remotes) ? e.remotes : (e.remote ? [e.remote] : []);
@@ -1047,6 +1744,35 @@ function collectRuleRemotes(e){
   return dedup;
 }
 
+const BALANCE_ALGO_MAP = Object.freeze({
+  roundrobin: 'roundrobin',
+  iphash: 'iphash',
+  leastconn: 'least_conn',
+  leastlatency: 'least_latency',
+  consistenthash: 'consistent_hash',
+  randomweight: 'random_weight',
+});
+const WEIGHTED_BALANCE_ALGOS = new Set(['roundrobin', 'random_weight']);
+const IPTABLES_BALANCE_ALGOS = new Set(['roundrobin', 'random_weight']);
+
+function normalizeBalanceAlgo(raw){
+  let norm = String(raw || '').trim().toLowerCase();
+  if(!norm) return '';
+  norm = norm.replace(/[_\-\s]/g, '');
+  return BALANCE_ALGO_MAP[norm] || '';
+}
+
+function balanceAlgoLabel(algo){
+  const a = String(algo || '').trim();
+  if(a === 'roundrobin') return '轮询';
+  if(a === 'random_weight') return '加权随机';
+  if(a === 'iphash') return 'IP Hash';
+  if(a === 'least_conn') return '最少连接';
+  if(a === 'least_latency') return '最低延迟';
+  if(a === 'consistent_hash') return '一致性哈希';
+  return a || '轮询';
+}
+
 function parseRuleBalance(balance, remoteCount){
   const n = Math.max(0, parseInt(remoteCount || 0, 10));
   let raw = String(balance || 'roundrobin').trim();
@@ -1058,14 +1784,11 @@ function parseRuleBalance(balance, remoteCount){
     algo = String(arr.shift() || '');
     right = arr.join(':');
   }
-  let norm = algo.toLowerCase();
-  norm = norm.replace(/[_\-\s]/g, '');
-  if(norm === 'iphash'){
-    return {algo:'iphash', weights:[]};
-  }
+  let normalizedAlgo = normalizeBalanceAlgo(algo);
+  if(!normalizedAlgo) normalizedAlgo = 'roundrobin';
 
   let weights = [];
-  if(right){
+  if(right && WEIGHTED_BALANCE_ALGOS.has(normalizedAlgo)){
     weights = right
       .replace(/，/g, ',')
       .split(',')
@@ -1074,10 +1797,23 @@ function parseRuleBalance(balance, remoteCount){
       .map(x=>parseInt(x, 10))
       .filter(x=>Number.isFinite(x) && x > 0);
   }
-  if(n > 0 && weights.length !== n){
+  if(WEIGHTED_BALANCE_ALGOS.has(normalizedAlgo) && n > 0 && weights.length !== n){
     weights = Array(n).fill(1);
   }
-  return {algo:'roundrobin', weights};
+  return {algo: normalizedAlgo, weights};
+}
+
+function parseExplicitBalanceWeights(balance, algo){
+  const a = String(algo || '').trim();
+  if(!WEIGHTED_BALANCE_ALGOS.has(a)) return [];
+  const raw = String(balance || '').trim();
+  if(!raw || !raw.includes(':')) return [];
+  const right = raw.split(':').slice(1).join(':');
+  return right
+    .replace(/，/g, ',')
+    .split(',')
+    .map(x=>String(x || '').trim())
+    .filter(x=>/^\d+$/.test(x) && parseInt(x, 10) > 0);
 }
 
 function findHealthByTarget(healthList, target){
@@ -1109,6 +1845,89 @@ function formatHealthAvailability(item){
   return txt ? `可用率 ${txt}` : '';
 }
 
+function healthLatencyMs(item){
+  const raw = (item && item.latency_ms != null) ? item.latency_ms : ((item && item.latency != null) ? item.latency : null);
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : null;
+}
+
+function formatLatencyMsText(v){
+  const n = Number(v);
+  if(!Number.isFinite(n)) return '';
+  if(n >= 100) return `${n.toFixed(0)} ms`;
+  if(n >= 10) return `${n.toFixed(1)} ms`;
+  return `${n.toFixed(2)} ms`;
+}
+
+function healthStatusText(item){
+  const isUnknown = item && item.ok == null;
+  if(isUnknown){
+    return String((item && item.message) || '不可检测');
+  }
+  const ok = !!(item && item.ok);
+  if(ok){
+    return (item && item.kind === 'handshake') ? '已连接' : '在线';
+  }
+  return (item && item.kind === 'handshake') ? '未连接' : '离线';
+}
+
+function healthPreferredTargetMeta(item){
+  const kind = String((item && item.kind) || '').trim().toLowerCase();
+  const rawTarget = String((item && item.target) || '').trim();
+  let primaryText = rawTarget || '—';
+  let secondaryText = '';
+  let traceTarget = traceRouteTargetFromHealthItem(item);
+  let rttMs = healthLatencyMs(item);
+
+  if(kind === 'handshake'){
+    const cards = Array.isArray(item && item.route_cards) ? item.route_cards : [];
+    let selectedTarget = '';
+    let selectedRtt = null;
+    let fallbackTarget = '';
+    let fallbackRtt = null;
+
+    for(const card of cards){
+      if(!card || typeof card !== 'object') continue;
+      const lastTarget = String(card.last_selected_target || '').trim();
+      const remotes = Array.isArray(card.remotes) ? card.remotes : [];
+      for(const r of remotes){
+        if(!r || typeof r !== 'object') continue;
+        const t = String(r.target || '').trim();
+        if(!t) continue;
+        const latRaw = (r.latency_ms != null) ? r.latency_ms : r.latency;
+        const lat = Number.isFinite(Number(latRaw)) ? Number(latRaw) : null;
+        if(!fallbackTarget && lastTarget && t === lastTarget){
+          fallbackTarget = t;
+          fallbackRtt = lat;
+        }
+        if(r.selected){
+          selectedTarget = t;
+          selectedRtt = lat;
+          break;
+        }
+      }
+      if(selectedTarget) break;
+      if(!fallbackTarget && lastTarget){
+        fallbackTarget = lastTarget;
+      }
+    }
+
+    const finalTarget = selectedTarget || fallbackTarget;
+    if(finalTarget){
+      primaryText = `转发 → ${finalTarget}`;
+      secondaryText = rawTarget ? `通道 ${rawTarget}` : '';
+      traceTarget = finalTarget;
+      if(selectedRtt != null){
+        rttMs = selectedRtt;
+      }else if(fallbackRtt != null){
+        rttMs = fallbackRtt;
+      }
+    }
+  }
+
+  return {primaryText, secondaryText, traceTarget, rttMs};
+}
+
 function traceRouteTargetFromHealthItem(item){
   if(!item || typeof item !== 'object') return '';
   const kind = String(item.kind || '').trim().toLowerCase();
@@ -1121,20 +1940,32 @@ function traceRouteTargetFromHealthItem(item){
 }
 
 function renderHealthTargetMeta(item, mobile){
-  const t = (item && item.target != null) ? String(item.target) : '';
   const avail = formatHealthAvailability(item);
-  const traceTarget = traceRouteTargetFromHealthItem(item);
+  const meta = healthPreferredTargetMeta(item);
+  const mainText = String(meta.primaryText || '—');
+  const traceTarget = String(meta.traceTarget || '').trim();
   const targetHtml = traceTarget
-    ? `<button class="mono health-target trace-target-btn" type="button" data-target="${escapeHtml(traceTarget)}" title="点击发起路由追踪">${escapeHtml(t)}</button>`
-    : `<span class="mono health-target" title="${escapeHtml(t)}">${escapeHtml(t)}</span>`;
+    ? `<button class="mono health-target trace-target-btn" type="button" data-target="${escapeHtml(traceTarget)}" title="点击发起路由追踪">${escapeHtml(mainText)}</button>`
+    : `<span class="mono health-target" title="${escapeHtml(mainText)}">${escapeHtml(mainText)}</span>`;
+  const rttTxt = formatLatencyMsText(meta.rttMs);
+  const rttHtml = rttTxt ? `<span class="health-rtt">RTT ${escapeHtml(rttTxt)}</span>` : '';
+  const availHtml = avail ? `<span class="health-avail">${escapeHtml(avail)}</span>` : '';
+  const subTxt = String(meta.secondaryText || '').trim();
   if(mobile){
     return `<div class="health-target-line">
       ${targetHtml}
-      ${avail ? `<span class="health-avail">${escapeHtml(avail)}</span>` : ''}
-    </div>`;
+      ${rttHtml}
+      ${availHtml}
+    </div>${subTxt ? `<div class="health-sub">${escapeHtml(subTxt)}</div>` : ''}`;
   }
-  return `${targetHtml}
-    ${avail ? `<span class="health-avail">${escapeHtml(avail)}</span>` : ''}`;
+  return `<span class="health-meta-stack">
+    <span class="health-target-line">
+      ${targetHtml}
+      ${rttHtml}
+      ${availHtml}
+    </span>
+    ${subTxt ? `<span class="health-sub health-sub-line">${escapeHtml(subTxt)}</span>` : ''}
+  </span>`;
 }
 
 function renderAdaptiveInfo(e, stats, statsError){
@@ -1143,13 +1974,15 @@ function renderAdaptiveInfo(e, stats, statsError){
   if(remotes.length < 2) return '';
   const enabled = isAdaptiveLbEnabled(e);
   const b = parseRuleBalance(e && e.balance, remotes.length);
-  const weightsText = (b.algo === 'roundrobin')
+  const algoLabel = balanceAlgoLabel(b.algo);
+  const weightsText = (WEIGHTED_BALANCE_ALGOS.has(b.algo))
     ? ((Array.isArray(b.weights) && b.weights.length) ? b.weights.join(',') : Array(remotes.length).fill(1).join(','))
-    : 'IP Hash（无权重）';
+    : `${algoLabel}（无权重）`;
   const weightLabel = enabled ? '当前自动权重' : '当前权重';
 
   return `<div class="adaptive-info">
     <span class="pill xs ${enabled ? 'ok' : 'warn'}">自适应：${enabled ? '开' : '关'}</span>
+    <span class="pill xs ghost">算法：${escapeHtml(algoLabel)}</span>
     <span class="pill xs ghost">${escapeHtml(weightLabel)}：${escapeHtml(weightsText)}</span>
   </div>`;
 }
@@ -1168,6 +2001,8 @@ function getPeerText(e){
     if(ex.intranet_peer_node_name) parts.push(ex.intranet_peer_node_name);
     if(ex.intranet_peer_host) parts.push(ex.intranet_peer_host);
     if(ex.intranet_public_host) parts.push(ex.intranet_public_host);
+    if(ex.mptcp_aggregator_node_name) parts.push(ex.mptcp_aggregator_node_name);
+    if(Array.isArray(ex.mptcp_member_node_names)) parts.push(ex.mptcp_member_node_names.join(' '));
   }
   return parts.map(x=>String(x||'').trim()).filter(Boolean).join(' ');
 }
@@ -1301,7 +2136,9 @@ function parseRuleQuery(input){
     if(['remark','note','memo','备注'].includes(lower)){ addS('remark', '1'); continue; }
     if(['running','enabled','on','up','运行'].includes(lower)){ addS('status', 'running'); continue; }
     if(['disabled','paused','off','down','暂停'].includes(lower)){ addS('status', 'disabled'); continue; }
-    if(['wss','tcp','intranet'].includes(lower)){ addS('type', lower); continue; }
+    if(['wss','relay','tunnel','隧道'].includes(lower)){ addS('type', 'wss'); continue; }
+    if(['mptcp','聚合','多链路'].includes(lower)){ addS('type', 'mptcp'); continue; }
+    if(['tcp','intranet'].includes(lower)){ addS('type', lower); continue; }
     if(neg) q.negTerms.push(lower);
     else q.terms.push(lower);
   }
@@ -1360,6 +2197,8 @@ function matchRuleQuery(e, qobj){
     if(key === 'type'){
       // "tcp" matches the normal TCP/UDP rules (not wss/intranet)
       if(v === 'tcp' || v === 'normal') return getType() === 'tcp';
+      if(v === 'mptcp' || v === 'aggregate' || v === '聚合') return getType() === 'mptcp';
+      if(v === 'relay' || v === 'tunnel' || v === '隧道') return getType() === 'wss';
       if(v === 'wss') return getType() === 'wss';
       if(v === 'intranet') return getType() === 'intranet';
       return getType().includes(v);
@@ -1397,8 +2236,8 @@ function matchRuleQuery(e, qobj){
   return true;
 }
 
-function renderRemoteTargets(e, idx){
-  const rs = Array.isArray(e.remotes) ? e.remotes : (e.remote ? [e.remote] : []);
+function _renderRemoteTargetsByList(rawList, idx){
+  const rs = Array.isArray(rawList) ? rawList.map(x=>String(x||'').trim()).filter(Boolean) : [];
   if(!rs.length) return '<span class="muted">—</span>';
   const MAX = 2;
   const shown = rs.slice(0, MAX);
@@ -1411,12 +2250,21 @@ function renderRemoteTargets(e, idx){
   return `<div class="remote-wrap">${chips}${moreHtml}${extraHtml}</div>`;
 }
 
+function renderRemoteTargets(e, idx){
+  return _renderRemoteTargetsByList(getFinalTargets(e), idx);
+}
+
 // 表格视图：直接展开成多行（不再使用 +N）
 function renderRemoteTargetsExpanded(e){
-  const rs = Array.isArray(e.remotes) ? e.remotes : (e.remote ? [e.remote] : []);
+  const rs = getFinalTargets(e);
   if(!rs.length) return '<span class="muted">—</span>';
   const lines = rs.map(r=>`<div class="remote-line"><span class="remote-chip mono" title="${escapeHtml(r)}">${escapeHtml(r)}</span></div>`).join('');
   return `<div class="remote-wrap expanded">${lines}</div>`;
+}
+
+function renderForwardTargetsLine(e, idx, expanded){
+  // 用户要求：不在规则左侧显示“转发到：xxx”行。
+  return '';
 }
 
 // 表格视图：连通检测直接多行展示（不使用 +N）
@@ -1465,8 +2313,7 @@ function renderHealthExpanded(healthList, statsError){
   const lines = healthList.map((item)=>{
     const isUnknown = item && item.ok == null;
     const ok = !!item.ok;
-    const latencyMs = item && item.latency_ms != null ? item.latency_ms : item && item.latency != null ? item.latency : null;
-    const label = isUnknown ? (item.message || '不可检测') : (ok ? `${latencyMs != null ? latencyMs : '—'} ms` : ((item && item.kind === 'handshake') ? '未连接' : '离线'));
+    const label = healthStatusText(item);
     const reason = (!isUnknown && !ok) ? friendlyError(item.error || item.message) : '';
     const title = !isUnknown && !ok ? `${(item && item.kind === 'handshake') ? '未连接' : '离线'}原因：${String(item.error || item.message || '').trim()}` : '';
     return `<div class="health-item" title="${escapeHtml(title)}">
@@ -1587,6 +2434,12 @@ function formatDurationShort(sec){
 function parseDateTimeLocal(str){
   const t = String(str || '').trim();
   if(!t || t === '-') return null;
+  const isoLike = t.includes(' ') ? t.replace(' ', 'T') : t;
+  // If timestamp already contains timezone info, rely on native parser.
+  if(/[zZ]$|[+\-]\d{2}:?\d{2}$/.test(isoLike)){
+    const dtIso = new Date(isoLike);
+    if(!Number.isNaN(dtIso.getTime())) return dtIso;
+  }
   // Supports: YYYY-MM-DD HH:MM:SS / YYYY-MM-DDTHH:MM:SS / with optional ms
   const m = t.match(/(\d{4})-(\d{1,2})-(\d{1,2})[T\s](\d{1,2}):(\d{1,2})(?::(\d{1,2}))?/);
   if(!m) return null;
@@ -1596,9 +2449,32 @@ function parseDateTimeLocal(str){
   const hh = Number(m[4]);
   const mm = Number(m[5]);
   const ss = Number(m[6] || 0);
-  const dt = new Date(y, mo, d, hh, mm, ss);
-  if(Number.isNaN(dt.getTime())) return null;
-  return dt;
+  const dtLocal = new Date(y, mo, d, hh, mm, ss);
+  const dtUtc = new Date(Date.UTC(y, mo, d, hh, mm, ss));
+  const localMs = dtLocal.getTime();
+  const utcMs = dtUtc.getTime();
+  if(Number.isNaN(localMs) && Number.isNaN(utcMs)) return null;
+  if(Number.isNaN(localMs)) return dtUtc;
+  if(Number.isNaN(utcMs)) return dtLocal;
+  // Heuristic for mixed deployments:
+  // prefer the interpretation closer to current time (avoids +8h shift after restore/UTC strings).
+  const nowMs = Date.now();
+  const diffLocal = Math.abs(nowMs - localMs);
+  const diffUtc = Math.abs(nowMs - utcMs);
+  if(diffUtc + 5 * 60 * 1000 < diffLocal) return dtUtc;
+  return dtLocal;
+}
+
+function formatDateTimeLocal(dateStr){
+  const dt = parseDateTimeLocal(dateStr);
+  if(!dt) return (dateStr && String(dateStr).trim()) ? String(dateStr).trim() : '-';
+  const yyyy = dt.getFullYear();
+  const MM = String(dt.getMonth() + 1).padStart(2, '0');
+  const DD = String(dt.getDate()).padStart(2, '0');
+  const hh = String(dt.getHours()).padStart(2, '0');
+  const mm = String(dt.getMinutes()).padStart(2, '0');
+  const ss = String(dt.getSeconds()).padStart(2, '0');
+  return `${yyyy}-${MM}-${DD} ${hh}:${mm}:${ss}`;
 }
 
 // Compact "time ago" for dashboard tiles
@@ -1627,7 +2503,7 @@ function refreshDashboardLastSeenShort(){
     const mode = (el.getAttribute('data-last-seen-mode') || '').trim();
     // Keep full raw time on elements that explicitly request it
     if(mode === 'full' || mode === 'raw'){
-      const v = raw && raw.trim() ? raw.trim() : '-';
+      const v = (mode === 'full') ? formatDateTimeLocal(raw) : (raw && raw.trim() ? raw.trim() : '-');
       if(v !== '-') el.setAttribute('title', v);
       el.textContent = v;
       return;
@@ -1746,40 +2622,148 @@ async function fetchJSONTimeout(url, timeoutMs){
   }
 }
 
+let DASHBOARD_MINI_SYS_INFLIGHT = false;
+const DASHBOARD_MINI_SYS_CONCURRENCY = 4;
+const DASHBOARD_MINI_SYS_BATCH_CHUNK = 120;
+
+async function _forEachWithConcurrency(items, limit, worker){
+  const list = Array.isArray(items) ? items : [];
+  const cap = Math.max(1, Number(limit) || 1);
+  if(list.length === 0) return;
+  let cursor = 0;
+  const runOne = async () => {
+    while(true){
+      if(cursor >= list.length) return;
+      const idx = cursor;
+      cursor += 1;
+      await worker(list[idx], idx);
+    }
+  };
+  const workers = [];
+  const count = Math.min(cap, list.length);
+  for(let i = 0; i < count; i += 1){
+    workers.push(runOne());
+  }
+  await Promise.all(workers);
+}
+
+function dashboardMiniSysIntervalMs(cardCount){
+  const n = Number(cardCount) || 0;
+  if(n > 120) return 18000;
+  if(n > 60) return 14000;
+  if(n > 30) return 11000;
+  if(n > 15) return 8000;
+  return 6000;
+}
+
+function _chunkArray(arr, size){
+  const list = Array.isArray(arr) ? arr : [];
+  const cap = Math.max(1, Number(size) || 1);
+  if(list.length === 0) return [];
+  const out = [];
+  for(let i = 0; i < list.length; i += cap){
+    out.push(list.slice(i, i + cap));
+  }
+  return out;
+}
+
+function _renderDashboardMiniSysPayload(card, payload){
+  if(!card) return;
+  const row = (payload && typeof payload === 'object') ? payload : null;
+  if(row && row.ok && row.sys && typeof row.sys === 'object'){
+    renderSysMini(card, row.sys);
+    return;
+  }
+  if(row && row.sys && typeof row.sys === 'object'){
+    renderSysMini(card, row.sys);
+    return;
+  }
+  renderSysMini(card, { error: (row && row.error) ? row.error : 'no data' });
+}
+
+async function _fetchDashboardMiniSysBatch(nodeIds){
+  const ids = Array.isArray(nodeIds) ? nodeIds.filter(Boolean) : [];
+  if(ids.length === 0) return null;
+  try{
+    const q = encodeURIComponent(ids.join(','));
+    const res = await fetchJSONTimeout(`/api/nodes/sys_batch?cached=1&ids=${q}`, 2600);
+    if(res && res.ok && res.items && typeof res.items === 'object'){
+      return res.items;
+    }
+  }catch(_e){}
+  return null;
+}
+
 async function refreshDashboardMiniSys(){
+  if(DASHBOARD_MINI_SYS_INFLIGHT) return;
   const cards = Array.from(document.querySelectorAll('.node-card[data-node-id]'));
   if(cards.length === 0) return;
-  await Promise.all(cards.map(async (card)=>{
-    const nodeId = card.getAttribute('data-node-id');
-    const online = card.getAttribute('data-online') === '1';
-    if(!nodeId) return;
-    if(!online){
-      renderSysMini(card, { error: 'offline' });
-      return;
-    }
-    try{
-      // Dashboard: 优先读取 panel 的 push-report 缓存，避免直连 agent 卡住
-      const res = await fetchJSONTimeout(`/api/nodes/${nodeId}/sys?cached=1`, 3500);
-      if(res && res.ok){
-        renderSysMini(card, res.sys);
-      } else {
-        renderSysMini(card, { error: (res && res.error) || 'no data' });
+  DASHBOARD_MINI_SYS_INFLIGHT = true;
+  try{
+    const onlineCards = [];
+    cards.forEach((card)=>{
+      const nodeId = card.getAttribute('data-node-id');
+      const online = card.getAttribute('data-online') === '1';
+      if(!nodeId) return;
+      if(!online){
+        renderSysMini(card, { error: 'offline' });
+        return;
       }
-    } catch(e){
-      renderSysMini(card, { error: 'timeout' });
+      onlineCards.push(card);
+    });
+
+    if(onlineCards.length <= 0) return;
+
+    const chunks = _chunkArray(onlineCards, DASHBOARD_MINI_SYS_BATCH_CHUNK);
+    for(const chunk of chunks){
+      const ids = chunk.map((card)=>String(card.getAttribute('data-node-id') || '').trim()).filter(Boolean);
+      const items = await _fetchDashboardMiniSysBatch(ids);
+      if(items){
+        chunk.forEach((card)=>{
+          const id = String(card.getAttribute('data-node-id') || '').trim();
+          if(!id) return;
+          const row = items[id];
+          _renderDashboardMiniSysPayload(card, row);
+        });
+        continue;
+      }
+
+      // Fallback to per-node API when batch API is unavailable.
+      await _forEachWithConcurrency(chunk, DASHBOARD_MINI_SYS_CONCURRENCY, async (card)=>{
+        const nodeId = card.getAttribute('data-node-id');
+        if(!nodeId) return;
+        try{
+          const res = await fetchJSONTimeout(`/api/nodes/${nodeId}/sys?cached=1`, 2200);
+          _renderDashboardMiniSysPayload(card, res);
+        }catch(_e){
+          renderSysMini(card, { error: 'timeout' });
+        }
+      });
     }
-  }));
+  } finally {
+    DASHBOARD_MINI_SYS_INFLIGHT = false;
+  }
 }
 
 function initDashboardMiniSys(){
   const grid = document.getElementById('dashboardGrid');
   if(!grid) return;
+  const cards = Array.from(document.querySelectorAll('.node-card[data-node-id]'));
+  const intervalMs = dashboardMiniSysIntervalMs(cards.length) + Math.floor(Math.random() * 1200);
+  const tick = () => {
+    if(document.hidden) return;
+    refreshDashboardMiniSys();
+  };
   // First paint for compact "last seen" time
   try{ refreshDashboardLastSeenShort(); }catch(_e){}
   // First paint
-  refreshDashboardMiniSys();
-  // Same refresh cadence as rules: 3s
-  setInterval(refreshDashboardMiniSys, 3000);
+  tick();
+  // Polling interval is adaptive by node count to avoid request storms on large dashboards.
+  setInterval(tick, intervalMs);
+  document.addEventListener('visibilitychange', ()=>{
+    if(document.hidden) return;
+    tick();
+  });
   // Update "last seen" display every 5s (no network request)
   setInterval(()=>{ try{ refreshDashboardLastSeenShort(); }catch(_e){} }, 5000);
 }
@@ -2345,8 +3329,7 @@ function renderHealth(healthList, statsError, idx){
   const chips = shown.map((item)=>{
     const isUnknown = item && item.ok == null;
     const ok = !!item.ok;
-    const latencyMs = item && item.latency_ms != null ? item.latency_ms : item && item.latency != null ? item.latency : null;
-    const label = isUnknown ? (item.message || '不可检测') : (ok ? `${latencyMs != null ? latencyMs : '—'} ms` : ((item && item.kind === 'handshake') ? '未连接' : '离线'));
+    const label = healthStatusText(item);
     const reason = (!isUnknown && !ok) ? friendlyError(item.error || item.message) : '';
     const title = !isUnknown && !ok ? `${(item && item.kind === 'handshake') ? '未连接' : '离线'}原因：${String(item.error || item.message || '').trim()}` : '';
     return `<div class="health-item" title="${escapeHtml(title)}">
@@ -2361,8 +3344,7 @@ function renderHealth(healthList, statsError, idx){
     ${healthList.slice(MAX_SHOW).map((item)=>{
       const isUnknown = item && item.ok == null;
       const ok = !!item.ok;
-      const latencyMs = item && item.latency_ms != null ? item.latency_ms : item && item.latency != null ? item.latency : null;
-      const label = isUnknown ? (item.message || '不可检测') : (ok ? `${latencyMs != null ? latencyMs : '—'} ms` : ((item && item.kind === 'handshake') ? '未连接' : '离线'));
+      const label = healthStatusText(item);
       const reason = (!isUnknown && !ok) ? friendlyError(item.error || item.message) : '';
       const title = !isUnknown && !ok ? `${(item && item.kind === 'handshake') ? '未连接' : '离线'}原因：${String(item.error || item.message || '').trim()}` : '';
       return `<div class="health-item" title="${escapeHtml(title)}">
@@ -2426,8 +3408,7 @@ function renderHealthMobile(healthList, statsError, idx){
   const chips = shown.map((item)=>{
     const isUnknown = item && item.ok == null;
     const ok = !!item.ok;
-    const latencyMs = item && item.latency_ms != null ? item.latency_ms : item && item.latency != null ? item.latency : null;
-    const label = isUnknown ? (item.message || '不可检测') : (ok ? `${latencyMs != null ? latencyMs : '—'} ms` : ((item && item.kind === 'handshake') ? '未连接' : '离线'));
+    const label = healthStatusText(item);
     const reason = (!isUnknown && !ok) ? friendlyError(item.error || item.message) : '';
     const title = (!isUnknown && !ok) ? `${(item && item.kind === 'handshake') ? '未连接' : '离线'}原因：${String(item.error || item.message || '').trim()}` : '';
 
@@ -2445,8 +3426,7 @@ function renderHealthMobile(healthList, statsError, idx){
     ${healthList.slice(MAX_SHOW).map((item)=>{
       const isUnknown = item && item.ok == null;
       const ok = !!item.ok;
-      const latencyMs = item && item.latency_ms != null ? item.latency_ms : item && item.latency != null ? item.latency : null;
-      const label = isUnknown ? (item.message || '不可检测') : (ok ? `${latencyMs != null ? latencyMs : '—'} ms` : ((item && item.kind === 'handshake') ? '未连接' : '离线'));
+      const label = healthStatusText(item);
       const reason = (!isUnknown && !ok) ? friendlyError(item.error || item.message) : '';
       const title = (!isUnknown && !ok) ? `${(item && item.kind === 'handshake') ? '未连接' : '离线'}原因：${String(item.error || item.message || '').trim()}` : '';
 
@@ -2468,17 +3448,19 @@ function showHealthDetail(idx){
     const statsLookup = buildStatsLookup();
     const eps = (CURRENT_POOL && CURRENT_POOL.endpoints) ? CURRENT_POOL.endpoints : [];
     const lis = (eps[idx] && eps[idx].listen != null) ? String(eps[idx].listen).trim() : '';
-    const stats = (statsLookup.byIdx[idx] || (lis ? statsLookup.byListen[lis] : null) || {});
+    const stats = ((lis ? statsLookup.byListen[lis] : null) || statsLookup.byIdx[idx] || {});
     const list = Array.isArray(stats.health) ? stats.health : [];
     const lines = list.map((it)=>{
       const ok = it && it.ok === true;
       const isUnknown = it && it.ok == null;
-      const latency = it && it.latency_ms != null ? `${it.latency_ms} ms` : (it && it.latency != null ? `${it.latency} ms` : '—');
+      const meta = healthPreferredTargetMeta(it);
+      const latency = meta.rttMs != null ? `RTT ${formatLatencyMsText(meta.rttMs)}` : 'RTT —';
       const avail = formatHealthAvailability(it);
-      const isHandshake = it && it.kind === 'handshake';
-      const state = isUnknown ? '不可检测' : (ok ? (isHandshake ? '已连接' : '在线') : (isHandshake ? '未连接' : '离线'));
+      const state = healthStatusText(it);
       const reason = (!isUnknown && !ok) ? (it.error || it.message || '') : '';
-      return `${state}  ${latency}  ${it.target}${avail ? `  ${avail}` : ''}${reason ? `\n  原因：${reason}` : ''}`;
+      const secondary = String(meta.secondaryText || '').trim();
+      const targetTxt = String(meta.primaryText || it.target || '—');
+      return `${state}  ${latency}  ${targetTxt}${secondary ? `  (${secondary})` : ''}${avail ? `  ${avail}` : ''}${reason ? `\n  原因：${reason}` : ''}`;
     });
     openCommandModal('连通检测详情', lines.join('\n\n'));
   }catch(e){
@@ -2535,6 +3517,7 @@ function renderRuleCard(e, idx, rowNo, stats, statsError){
   const remark = getRuleRemark(e);
   const remarkHtml = remark ? `<div class="rule-remark" title="${escapeHtml(remark)}">${escapeHtml(remark)}</div>` : '';
   const sourceHtml = renderRuleSourceInfo(e);
+  const forwardHtml = renderForwardTargetsLine(e, idx, false);
   const lockBtn = renderRuleLockBtn(e, idx, lockInfo);
 
   const actionsHtml = (!modeAllowed) ? `
@@ -2571,6 +3554,7 @@ function renderRuleCard(e, idx, rowNo, stats, statsError){
         <div class="rule-listen mono">${escapeHtml(displayListenText(e))}</div>
         <div class="rule-sub muted sm">${endpointType(e)}</div>
         ${sourceHtml}
+        ${forwardHtml}
         ${remarkHtml}
       </div>
       <div class="rule-right">
@@ -2601,6 +3585,10 @@ function renderIntranetHealthCard(statsLookup){
   const statsError = String((lookup && lookup.error) || '').trim();
 
   const rows = [];
+  const toNum = (v)=>{
+    const n = Number(v);
+    return Number.isFinite(n) ? n : null;
+  };
   function intranetFriendlyError(err){
     const s = String(err || '').trim();
     if(!s) return '';
@@ -2620,7 +3608,7 @@ function renderIntranetHealthCard(statsLookup){
   }
   for(let idx=0; idx<eps.length; idx++){
     const e = eps[idx];
-    if(wssMode(e) !== 'intranet') continue;
+    if(wssMode(e) !== 'intranet' && !isRelayTunnelRule(e)) continue;
     const ex = (e && e.extra_config) ? e.extra_config : {};
     const role = String(ex.intranet_role || '').trim();
     const listen = String(e && e.listen || '').trim();
@@ -2630,8 +3618,16 @@ function renderIntranetHealthCard(statsLookup){
       ex.intranet_peer_node_id ||
       ''
     ).trim();
-    const roleLabel = role === 'server' ? '公网入口' : (role === 'client' ? '内网出口' : '内网穿透');
-    const stats = byIdx[idx] || (listen ? byListen[listen] : null) || {};
+    const roleLabel = isRelayTunnelRule(e)
+      ? (role === 'server' ? '隧道监听端' : (role === 'client' ? '隧道拨号端' : '隧道转发'))
+      : (
+        isIntranetSyncSenderRule(e)
+          ? '发送端'
+          : (isIntranetSyncReceiverRule(e)
+            ? '接收端'
+            : (role === 'server' ? '服务端' : (role === 'client' ? '客户端' : '内网穿透')))
+      );
+    const stats = (listen ? byListen[listen] : null) || byIdx[idx] || {};
     const health = Array.isArray(stats && stats.health) ? stats.health : [];
     let hs = null;
     for(const item of health){
@@ -2652,6 +3648,41 @@ function renderIntranetHealthCard(statsLookup){
     const dialMode = hs ? String(hs.dial_mode || '').trim() : '';
     const err = hs ? String(hs.error || '').trim() : '';
     const msg = hs ? String(hs.message || '').trim() : '';
+    const heRaw = (hs && hs.happy_eyeballs && typeof hs.happy_eyeballs === 'object') ? hs.happy_eyeballs : null;
+    const he = heRaw ? {
+      enabled: !!heRaw.enabled,
+      mode: String(heRaw.mode || '').trim(),
+      family: String(heRaw.winner_family || '').trim(),
+      addr: String(heRaw.winner_addr || '').trim(),
+      attempts: parseInt(heRaw.attempts || 0, 10) || 0,
+      lastAt: parseInt(heRaw.last_at || 0, 10) || 0,
+    } : null;
+    const routeCardsRaw = Array.isArray(hs && hs.route_cards) ? hs.route_cards : [];
+    const routeCards = routeCardsRaw
+      .filter(x=>x && typeof x === 'object')
+      .map((card)=>{
+        const remotesRaw = Array.isArray(card.remotes) ? card.remotes : [];
+        const remotes = remotesRaw
+          .filter(it=>it && typeof it === 'object')
+          .map((it)=>({
+            target: String(it.target || '').trim(),
+            score: toNum(it.score),
+            latency: toNum(it.latency_ms),
+            jitter: toNum(it.jitter_ms),
+            lossPct: toNum(it.loss_pct),
+            samples: parseInt(it.samples || 0, 10) || 0,
+            active: parseInt(it.active || 0, 10) || 0,
+            selected: !!it.selected,
+          }))
+          .filter(it=>!!it.target);
+        return {
+          proto: String(card.proto || '').trim().toUpperCase(),
+          algo: String(card.algo || '').trim(),
+          lastTarget: String(card.last_selected_target || '').trim(),
+          remotes,
+        };
+      })
+      .filter(card=>card.remotes.length > 0 || !!card.lastTarget);
 
     const title = hs && hs.target ? String(hs.target || '').trim() : `${roleLabel}${peer ? ` · ${peer}` : ''}`;
     const meta = [];
@@ -2673,6 +3704,8 @@ function renderIntranetHealthCard(statsLookup){
       pongRecv: Number.isFinite(pongRecv) ? pongRecv : 0,
       title,
       meta: meta.join(' · '),
+      he,
+      routeCards,
     });
   }
 
@@ -2702,6 +3735,8 @@ function renderIntranetHealthCard(statsLookup){
   const avgLatency = latArr.length ? Math.round(latArr.reduce((a,b)=>a + b, 0) / latArr.length) : null;
   const avgLoss = lossArr.length ? (lossArr.reduce((a,b)=>a + b, 0) / lossArr.length) : null;
   const reconnectTotal = rows.reduce((a,b)=>a + (Number.isFinite(b.reconnects) ? b.reconnects : 0), 0);
+  const heEnabledCount = rows.filter(r=>r.he && r.he.enabled).length;
+  const routeCardCount = rows.reduce((a,b)=>a + ((Array.isArray(b.routeCards) ? b.routeCards.length : 0)), 0);
 
   const summaryParts = [];
   summaryParts.push(`<span class="pill xs ghost">链路 ${rows.length}</span>`);
@@ -2714,6 +3749,12 @@ function renderIntranetHealthCard(statsLookup){
     summaryParts.push(`<span class="pill xs ${lossCls}">均丢包 ${avgLoss >= 10 ? avgLoss.toFixed(0) : avgLoss.toFixed(1)}%</span>`);
   }
   summaryParts.push(`<span class="pill xs ghost">重连 ${reconnectTotal}</span>`);
+  if(heEnabledCount > 0){
+    summaryParts.push(`<span class="pill xs ghost">HE ${heEnabledCount}/${rows.length}</span>`);
+  }
+  if(routeCardCount > 0){
+    summaryParts.push(`<span class="pill xs ghost">选路视图 ${routeCardCount}</span>`);
+  }
   if(statsError){
     summaryParts.push(`<span class="pill xs warn" title="${escapeHtml(statsError)}">统计异常</span>`);
   }
@@ -2737,6 +3778,55 @@ function renderIntranetHealthCard(statsLookup){
     if(row.pingSent > 0 || row.pongRecv > 0){
       pills.push(`<span class="pill xs ghost">心跳 ${row.pongRecv}/${row.pingSent}</span>`);
     }
+    const extras = [];
+    if(row.he && row.he.enabled){
+      const heItems = [];
+      heItems.push(`<span class="pill xs ghost">HE ${escapeHtml(row.he.mode || 'enabled')}</span>`);
+      if(row.he.attempts > 0){
+        heItems.push(`<span class="pill xs ghost">尝试 ${row.he.attempts}</span>`);
+      }
+      if(row.he.family){
+        heItems.push(`<span class="pill xs ghost">${escapeHtml(row.he.family.toUpperCase())}</span>`);
+      }
+      if(row.he.addr){
+        heItems.push(`<span class="pill xs ghost mono" title="${escapeHtml(row.he.addr)}">${escapeHtml(row.he.addr)}</span>`);
+      }
+      extras.push(`<div class="intra-extra-block"><div class="intra-extra-title">Happy Eyeballs</div><div class="intra-extra-pills">${heItems.join('')}</div></div>`);
+    }
+    const rcList = Array.isArray(row.routeCards) ? row.routeCards : [];
+    if(rcList.length){
+      const cardsHtml = rcList.map((card)=>{
+        const rowsHtml = (Array.isArray(card.remotes) ? card.remotes : []).map((it)=>{
+          const scoreText = Number.isFinite(it.score) ? it.score.toFixed(3) : '—';
+          const latText = Number.isFinite(it.latency) ? `${Math.round(it.latency)}ms` : '—';
+          const jitText = Number.isFinite(it.jitter) ? `${Math.round(it.jitter)}ms` : '—';
+          const lossText = Number.isFinite(it.lossPct) ? `${it.lossPct.toFixed(it.lossPct >= 10 ? 0 : 1)}%` : '—';
+          const chosen = it.selected ? '<span class="pill xs ok">命中</span>' : '';
+          return `<div class="intra-route-row${it.selected ? ' active' : ''}">
+            <div class="intra-route-target mono" title="${escapeHtml(it.target)}">${escapeHtml(it.target)}</div>
+            <div class="intra-route-metrics">
+              <span class="pill xs ghost" title="综合评分">Score ${scoreText}</span>
+              <span class="pill xs ghost" title="RTT 平滑值">RTT ${latText}</span>
+              <span class="pill xs ghost" title="抖动平滑值">Jitter ${jitText}</span>
+              <span class="pill xs ghost" title="丢包平滑值">Loss ${lossText}</span>
+              <span class="pill xs ghost" title="样本数">N ${it.samples}</span>
+              <span class="pill xs ghost" title="活跃连接/会话">Act ${it.active}</span>
+              ${chosen}
+            </div>
+          </div>`;
+        }).join('');
+        const algoTxt = balanceAlgoLabel(card.algo || '') || String(card.algo || '');
+        return `<div class="intra-route-card">
+          <div class="intra-route-head">
+            <div class="intra-route-title">${escapeHtml(card.proto || 'ROUTE')} · ${escapeHtml(algoTxt || '策略')}</div>
+            ${card.lastTarget ? `<span class="pill xs ghost mono" title="${escapeHtml(card.lastTarget)}">当前 ${escapeHtml(card.lastTarget)}</span>` : ''}
+          </div>
+          <div class="intra-route-body">${rowsHtml}</div>
+        </div>`;
+      }).join('');
+      extras.push(`<div class="intra-extra-block"><div class="intra-extra-title">实时选路</div>${cardsHtml}</div>`);
+    }
+    const extraHtml = extras.length ? `<div class="intra-health-extra">${extras.join('')}</div>` : '';
 
     return `<div class="hist-chart intra-health-row">
       <div class="hist-chart-head">
@@ -2747,6 +3837,7 @@ function renderIntranetHealthCard(statsLookup){
         <div class="intra-health-meta">${escapeHtml(row.meta)}</div>
       </div>
       <div class="intra-health-pills">${pills.join('')}</div>
+      ${extraHtml}
     </div>`;
   }).join('');
 }
@@ -2770,6 +3861,7 @@ function renderRules(){
   const queryText = String(RULE_FILTER_TEXT || '').trim();
   const qobj = parseRuleQuery(queryText);
   const hasAnyFilter = !!quick || !!queryText;
+  syncRuleRenderOrder(eps);
 
   const items = [];
   eps.forEach((e, idx)=>{
@@ -2779,6 +3871,7 @@ function renderRules(){
       if(quick === 'running' && !!e.disabled) return;
       if(quick === 'disabled' && !e.disabled) return;
       if(quick === 'tcp' && wssMode(e) !== 'tcp') return;
+      if(quick === 'mptcp' && wssMode(e) !== 'mptcp') return;
       if(quick === 'wss' && wssMode(e) !== 'wss') return;
       if(quick === 'intranet' && wssMode(e) !== 'intranet') return;
       if(quick === 'lb' && !isLoadBalanceRule(e)) return;
@@ -2788,7 +3881,15 @@ function renderRules(){
     if(queryText){
       if(!matchRuleQuery(e, qobj)) return;
     }
-    items.push({e, idx, key: getRuleKey(e)});
+    const key = getRuleKey(e);
+    const order = (key && RULE_RENDER_ORDER.has(key)) ? Number(RULE_RENDER_ORDER.get(key) || 0) : (1000000000 + idx);
+    items.push({e, idx, key, order});
+  });
+  items.sort((a, b)=>{
+    const ao = Number.isFinite(a && a.order) ? Number(a.order) : Number.MAX_SAFE_INTEGER;
+    const bo = Number.isFinite(b && b.order) ? Number(b.order) : Number.MAX_SAFE_INTEGER;
+    if(ao !== bo) return ao - bo;
+    return Number(a && a.idx) - Number(b && b.idx);
   });
 
   // Update visible keys for bulk selection helpers
@@ -2828,7 +3929,7 @@ function renderRules(){
     const idx = it.idx;
     const rowNo = i + 1;
     const lis = (e && e.listen != null) ? String(e.listen).trim() : '';
-    const stats = statsLookup.byIdx[idx] || (lis ? statsLookup.byListen[lis] : null) || {};
+    const stats = (lis ? statsLookup.byListen[lis] : null) || statsLookup.byIdx[idx] || {};
     const statsError = statsLookup.error;
 
     if(isMobile && mobileWrap){
@@ -2859,6 +3960,7 @@ function renderRules(){
       const fav = isRuleFavorite(e);
       const remark = getRuleRemark(e);
       const sourceHtml = renderRuleSourceInfo(e);
+      const forwardHtml = renderForwardTargetsLine(e, idx, false);
       const lockBtn = renderRuleLockBtn(e, idx, lockInfo);
       const noPermPill = !modeAllowed ? `<span class="pill ghost" title="${escapeHtml(modeReason)}">🔒 无权限</span>` : '';
 
@@ -2874,6 +3976,7 @@ function renderRules(){
           </div>
           <div class="muted sm">${endpointType(e)}</div>
           ${sourceHtml}
+          ${forwardHtml}
           ${remark ? `<div class="rule-remark" title="${escapeHtml(remark)}">${escapeHtml(remark)}</div>` : ''}
         </td>
         <td class="health">${healthHtml}${adaptiveHtml}</td>
@@ -3471,35 +4574,10 @@ function syncListenComputed(){
   }catch(_e){}
 }
 
-
-// Read WSS params from the form.
-// IMPORTANT: This must match panel backend API expectations:
-// {host, path, sni, tls, insecure}
-function readWssFields(){
-  return {
-    host: q('f_wss_host').value.trim(),
-    path: q('f_wss_path').value.trim(),
-    sni: q('f_wss_sni').value.trim(),
-    tls: q('f_wss_tls').value === '1',
-    insecure: !!q('f_wss_insecure').checked,
-  };
-}
-
 function fillWssFields(e){
-  const ex = e.extra_config || {};
-  // For WSS 隧道：发送端主要用 remote_*；接收端用 listen_*。
-  // 这里做一次兜底，优先 remote_*，没有则读 listen_*。
-  const host = ex.remote_ws_host || ex.listen_ws_host || '';
-  const path = ex.remote_ws_path || ex.listen_ws_path || '';
-  const sni = ex.remote_tls_sni || ex.listen_tls_servername || '';
-  const tls = (ex.remote_tls_enabled !== undefined) ? ex.remote_tls_enabled : ex.listen_tls_enabled;
-  const insecure = (ex.remote_tls_insecure !== undefined) ? ex.remote_tls_insecure : ex.listen_tls_insecure;
-
-  setField('f_wss_host', host || '');
-  setField('f_wss_path', path || '');
-  setField('f_wss_sni', sni || '');
-  q('f_wss_tls').value = (tls === false) ? '0' : '1';
-  q('f_wss_insecure').checked = (insecure !== false);
+  const ex = (e && e.extra_config && typeof e.extra_config === 'object') ? e.extra_config : {};
+  const host = String(ex.intranet_peer_host || ex.intranet_public_host || '').trim();
+  if(q('f_wss_receiver_host')) setField('f_wss_receiver_host', host);
 }
 
 function fillIntranetFields(e){
@@ -3518,6 +4596,1041 @@ function fillIntranetFields(e){
   if(q('f_intranet_acl_allow_hours')) setField('f_intranet_acl_allow_hours', toMulti(acl.allow_hours));
   if(q('f_intranet_acl_allow_tokens')) setField('f_intranet_acl_allow_tokens', toMulti(acl.allow_tokens));
   populateIntranetReceiverSelect();
+}
+
+function fillMptcpFields(e){
+  const ex = (e && e.extra_config && typeof e.extra_config === 'object' && !Array.isArray(e.extra_config)) ? e.extra_config : {};
+  const membersRaw = Array.isArray(ex.mptcp_member_node_ids) ? ex.mptcp_member_node_ids : [];
+  const members = membersRaw
+    .map((v)=>parseInt(v, 10))
+    .filter((v)=>Number.isFinite(v) && v > 0)
+    .map((v)=>String(v));
+  const agg = parseInt(ex.mptcp_aggregator_node_id || 0, 10);
+  const aggHost = String(ex.mptcp_aggregator_host || '').trim();
+  const scheduler = String(ex.mptcp_scheduler || 'aggregate').trim().toLowerCase();
+  const aggPort = parseInt(ex.mptcp_aggregator_port || 0, 10);
+  const rtt = parseInt(ex.mptcp_failover_rtt_ms || 0, 10);
+  const jitter = parseInt(ex.mptcp_failover_jitter_ms || 0, 10);
+  const lossRaw = (ex.mptcp_failover_loss_pct != null) ? String(ex.mptcp_failover_loss_pct).trim() : '';
+
+  populateMptcpMembersSelect();
+  populateMptcpAggregatorSelect();
+
+  const membersSel = q('f_mptcp_member_nodes');
+  if(membersSel) setMultiSelectValues(membersSel, members);
+  if(q('f_mptcp_aggregator_node')) setField('f_mptcp_aggregator_node', agg > 0 ? String(agg) : '');
+  if(q('f_mptcp_aggregator_host')) setField('f_mptcp_aggregator_host', aggHost);
+  syncMptcpMemberExclusions();
+  applyMptcpMemberFilter();
+  renderMptcpAggregatorCards();
+  updateMptcpMembersCount();
+  if(q('f_mptcp_scheduler')){
+    const ok = new Set(['aggregate', 'backup', 'hybrid']);
+    q('f_mptcp_scheduler').value = ok.has(scheduler) ? scheduler : 'aggregate';
+  }
+  if(q('f_mptcp_aggregator_port')) setField('f_mptcp_aggregator_port', (aggPort >= 1 && aggPort <= 65535) ? String(aggPort) : '');
+  if(q('f_mptcp_failover_rtt_ms')) setField('f_mptcp_failover_rtt_ms', (rtt >= 0 && Number.isFinite(rtt) && rtt > 0) ? String(rtt) : '');
+  if(q('f_mptcp_failover_jitter_ms')) setField('f_mptcp_failover_jitter_ms', (jitter >= 0 && Number.isFinite(jitter) && jitter > 0) ? String(jitter) : '');
+  if(q('f_mptcp_failover_loss_pct')) setField('f_mptcp_failover_loss_pct', lossRaw);
+}
+
+function readMptcpFields(){
+  const membersSel = q('f_mptcp_member_nodes');
+  const memberIds = getMultiSelectValues(membersSel)
+    .map((v)=>parseInt(v, 10))
+    .filter((v)=>Number.isFinite(v) && v > 0);
+  const memberSet = new Set(memberIds);
+  const members = Array.from(memberSet);
+  if(members.length < 2){
+    return {ok:false, error:'多链路聚合至少需要选择 2 个成员链路节点（B）'};
+  }
+
+  const aggTxt = q('f_mptcp_aggregator_node') ? String(q('f_mptcp_aggregator_node').value || '').trim() : '';
+  const agg = parseInt(aggTxt || '0', 10);
+  if(!(agg > 0)){
+    return {ok:false, error:'多链路聚合必须选择汇聚节点（C）'};
+  }
+  if(agg === parseInt(String(window.__NODE_ID__ || '0'), 10)){
+    return {ok:false, error:'汇聚节点（C）不能是当前入口节点（A）'};
+  }
+  if(memberSet.has(agg)){
+    return {ok:false, error:'汇聚节点（C）不能与成员链路节点（B）重复'};
+  }
+
+  const schedulerRaw = q('f_mptcp_scheduler') ? String(q('f_mptcp_scheduler').value || 'aggregate').trim().toLowerCase() : 'aggregate';
+  const schedulerSet = new Set(['aggregate', 'backup', 'hybrid']);
+  const scheduler = schedulerSet.has(schedulerRaw) ? schedulerRaw : 'aggregate';
+
+  const aggPortTxt = q('f_mptcp_aggregator_port') ? String(q('f_mptcp_aggregator_port').value || '').trim() : '';
+  let aggPort = null;
+  if(aggPortTxt){
+    if(!/^\d+$/.test(aggPortTxt)) return {ok:false, error:'聚合端口必须是 1-65535 的整数'};
+    const n = parseInt(aggPortTxt, 10);
+    if(!(n >= 1 && n <= 65535)) return {ok:false, error:'聚合端口必须是 1-65535 的整数'};
+    aggPort = n;
+  }
+
+  const aggHostTxt = q('f_mptcp_aggregator_host') ? String(q('f_mptcp_aggregator_host').value || '').trim() : '';
+  let aggHost = '';
+  if(aggHostTxt){
+    if(/\s/.test(aggHostTxt)){
+      return {ok:false, error:'C 数据地址不能包含空白字符'};
+    }
+    aggHost = aggHostTxt;
+  }
+
+  const rttRead = readNonnegIntInput('f_mptcp_failover_rtt_ms', 'RTT 阈值');
+  if(rttRead.error) return {ok:false, error:rttRead.error};
+  const jitterRead = readNonnegIntInput('f_mptcp_failover_jitter_ms', '抖动阈值');
+  if(jitterRead.error) return {ok:false, error:jitterRead.error};
+  const lossTxt = q('f_mptcp_failover_loss_pct') ? String(q('f_mptcp_failover_loss_pct').value || '').trim() : '';
+  let lossPct = null;
+  if(lossTxt){
+    const n = Number(lossTxt);
+    if(!Number.isFinite(n) || n < 0 || n > 100){
+      return {ok:false, error:'丢包阈值必须是 0-100 的数字'};
+    }
+    lossPct = Number(n.toFixed(2));
+  }
+
+  return {
+    ok:true,
+    cfg:{
+      members,
+      aggregator_node_id: agg,
+      aggregator_host: aggHost || null,
+      scheduler,
+      aggregator_port: aggPort,
+      failover_rtt_ms: rttRead.set ? rttRead.value : null,
+      failover_jitter_ms: jitterRead.set ? jitterRead.value : null,
+      failover_loss_pct: lossPct,
+    }
+  };
+}
+
+function _mptcpGroupDefaults(){
+  const d = (MPTCP_GROUP_STATE && MPTCP_GROUP_STATE.defaults && typeof MPTCP_GROUP_STATE.defaults === 'object')
+    ? MPTCP_GROUP_STATE.defaults
+    : {};
+  const fixedEnabled = (d.fixed_tunnel_port_enabled !== false);
+  let tunnelPort = parseInt(String(d.tunnel_port || '38443'), 10);
+  if(!(tunnelPort >= 1 && tunnelPort <= 65535)) tunnelPort = 38443;
+  let overlayExitPort = parseInt(String(d.overlay_exit_port || '38444'), 10);
+  if(!(overlayExitPort >= 1 && overlayExitPort <= 65535)) overlayExitPort = 38444;
+  const overlayExitHost = String(d.overlay_exit_host || '127.0.0.1').trim() || '127.0.0.1';
+  return { fixedEnabled, tunnelPort, overlayExitPort, overlayExitHost };
+}
+
+function _mptcpGroupShowMsg(msg, isErr=false){
+  const el = q('mptcpGroupMsg');
+  if(!el) return;
+  const text = String(msg || '').trim();
+  el.textContent = text;
+  el.style.color = isErr ? 'var(--bad)' : 'var(--muted)';
+}
+
+function _mptcpGroupSortNodes(list){
+  const arr = Array.isArray(list) ? list.slice() : [];
+  arr.sort((a, b)=>{
+    const ao = (a && (a.online === true || a.is_online === true)) ? 1 : 0;
+    const bo = (b && (b.online === true || b.is_online === true)) ? 1 : 0;
+    if(ao !== bo) return bo - ao;
+    const an = String((a && (a.name || a.display_ip || a.id)) || '').toLowerCase();
+    const bn = String((b && (b.name || b.display_ip || b.id)) || '').toLowerCase();
+    if(an < bn) return -1;
+    if(an > bn) return 1;
+    return parseInt(a?.id || 0, 10) - parseInt(b?.id || 0, 10);
+  });
+  return arr;
+}
+
+function _mptcpGroupAllNodes(){
+  const list = Array.isArray(NODES_LIST) ? NODES_LIST : [];
+  return _mptcpGroupSortNodes(list.filter((n)=>n && n.id != null));
+}
+
+function _mptcpGroupNodeLabel(node){
+  if(!node || node.id == null) return '';
+  const name = String(node.name || node.display_ip || `节点-${node.id}`);
+  let host = '';
+  try{
+    const base = String(node.base_url || '');
+    const u = new URL(base.includes('://') ? base : ('http://' + base));
+    host = String(u.hostname || '').trim();
+  }catch(_e){}
+  if(!host) host = String(node.display_ip || '').trim();
+  const st = (node.online === true || node.is_online === true) ? '在线' : '离线';
+  if(host) return `${name} · ${host} · ${st}`;
+  return `${name} · ${st}`;
+}
+
+function _mptcpGroupFillNodeOptions(sel, nodes, placeholder=''){
+  if(!sel) return;
+  sel.innerHTML = '';
+  const isMulti = !!sel.multiple;
+  if(!isMulti && placeholder){
+    const opt = document.createElement('option');
+    opt.value = '';
+    opt.textContent = placeholder;
+    sel.appendChild(opt);
+  }
+  for(const n of (nodes || [])){
+    if(!n || n.id == null) continue;
+    const opt = document.createElement('option');
+    opt.value = String(n.id);
+    opt.textContent = _mptcpGroupNodeLabel(n);
+    opt.dataset.online = (n.online === true || n.is_online === true) ? '1' : '0';
+    sel.appendChild(opt);
+  }
+}
+
+function _mptcpGroupBySyncId(syncId){
+  const sid = String(syncId || '').trim();
+  if(!sid) return null;
+  const groups = Array.isArray(MPTCP_GROUP_STATE?.groups) ? MPTCP_GROUP_STATE.groups : [];
+  for(const g of groups){
+    if(String((g && g.sync_id) || '').trim() === sid) return g;
+  }
+  return null;
+}
+
+function _mptcpGroupCurrentSenderId(){
+  const sel = q('mptcpGroupSenderFilter');
+  const fromSel = parseInt(String(sel?.value || '0'), 10);
+  if(fromSel > 0) return fromSel;
+  const fromState = parseInt(String(MPTCP_GROUP_STATE?.sender_filter_node_id || '0'), 10);
+  if(fromState > 0) return fromState;
+  const nodeId = parseInt(String(window.__NODE_ID__ || '0'), 10);
+  if(nodeId > 0) return nodeId;
+  return 0;
+}
+
+function _mptcpGroupFillSenderFilterOptions(){
+  const sel = q('mptcpGroupSenderFilter');
+  if(!sel) return;
+  const keep = String(_mptcpGroupCurrentSenderId() || '').trim();
+  const nodes = _mptcpGroupAllNodes();
+  sel.innerHTML = '';
+  if(!nodes.length){
+    const fallbackId = intOrZero(window.__NODE_ID__);
+    if(fallbackId > 0){
+      const opt = document.createElement('option');
+      opt.value = String(fallbackId);
+      opt.textContent = `当前节点-${fallbackId}`;
+      sel.appendChild(opt);
+    }
+  }
+  for(const n of nodes){
+    if(!n || n.id == null) continue;
+    const opt = document.createElement('option');
+    opt.value = String(n.id);
+    opt.textContent = _mptcpGroupNodeLabel(n);
+    sel.appendChild(opt);
+  }
+  if(keep){
+    sel.value = keep;
+  }else if(sel.options.length > 0){
+    sel.value = String(sel.options[0].value || '');
+  }
+}
+
+function _mptcpGroupReuseTarget(group){
+  const g = (group && typeof group === 'object') ? group : {};
+  const defs = _mptcpGroupDefaults();
+  const senderHost = String(g.sender_host || g?.sender_node?.host || '').trim();
+  let port = parseInt(String(g.channel_port || defs.tunnelPort), 10);
+  if(!(port >= 1 && port <= 65535)) port = defs.tunnelPort;
+  if(!senderHost) return '';
+  return normalizeHostPort(senderHost, String(port));
+}
+
+function _mptcpGroupSetEditorMode(mode){
+  const m = String(mode || 'edit').trim().toLowerCase() === 'create' ? 'create' : 'edit';
+  MPTCP_GROUP_STATE.editor_mode = m;
+  const saveBtn = q('btnMptcpGroupSave');
+  if(saveBtn){
+    saveBtn.textContent = (m === 'create') ? '创建隧道组' : '保存隧道组';
+  }
+}
+
+function _mptcpGroupRenderList(){
+  const box = q('mptcpGroupList');
+  if(!box) return;
+  const groups = Array.isArray(MPTCP_GROUP_STATE?.groups) ? MPTCP_GROUP_STATE.groups : [];
+  const { fixedEnabled, tunnelPort } = _mptcpGroupDefaults();
+  const senderLabel = String(MPTCP_GROUP_STATE?.sender_node?.name || '').trim() || `节点-${_mptcpGroupCurrentSenderId()}`;
+  if(!groups.length){
+    box.innerHTML = `
+      <div class="mptcp-group-empty">
+        当前入口节点 A（${escapeHtml(senderLabel)}）暂无 MPTCP 隧道组。你可以直接新建固定 38443 隧道组用于复用。
+        <div style="margin-top:8px;">
+          <button class="btn xs" type="button" onclick="openMptcpGroupCreate()">新建固定隧道组</button>
+        </div>
+      </div>
+    `;
+    return;
+  }
+
+  const rows = [];
+  for(const g of groups){
+    const sid = String((g && g.sync_id) || '').trim();
+    if(!sid) continue;
+    const sender = g && g.sender_node ? g.sender_node : {};
+    const members = Array.isArray(g?.member_nodes) ? g.member_nodes : [];
+    const agg = g && g.aggregator_node ? g.aggregator_node : {};
+    const remotes = Array.isArray(g?.remotes) ? g.remotes : [];
+    const listen = String(g?.listen || '').trim();
+    const channelPort = parseInt(String(g?.channel_port || tunnelPort), 10) || tunnelPort;
+    const aggPort = parseInt(String(g?.aggregator_port || channelPort), 10) || channelPort;
+    const memberNames = members.map((n)=>String(n?.name || `节点-${n?.id || ''}`)).filter(Boolean);
+    const updatedAt = String(g?.updated_at || '').trim();
+    const senderName = String(sender?.name || g?.sender_node_name || `节点-${g?.sender_node_id || ''}`);
+    const aggName = String(agg?.name || g?.aggregator_node_name || `节点-${g?.aggregator_node_id || ''}`);
+    const senderOnline = !!(sender && (sender.online === true));
+    const aggOnline = !!(agg && (agg.online === true));
+    const memberOnline = members.filter((n)=>n && n.online === true).length;
+    const memberTotal = members.length;
+    const listenShow = listen || `0.0.0.0:${channelPort}`;
+    const reuseTarget = _mptcpGroupReuseTarget(g);
+    const overlayEnabled = !!(g && g.overlay_enabled === true);
+    const overlayToken = String(g?.overlay_token || '').trim();
+    const overlayExitPort = parseInt(String(g?.overlay_exit_port || 0), 10) || 0;
+    rows.push(`
+      <div class="mptcp-group-card">
+        <div class="mptcp-group-head">
+          <div class="mptcp-group-title-wrap">
+            <div class="mptcp-group-title mono">${escapeHtml(sid)}</div>
+            <div class="mptcp-group-meta">
+              <span class="pill xs ${senderOnline ? 'ok' : 'warn'}">A ${escapeHtml(senderName)}</span>
+              <span class="pill xs ${memberOnline === memberTotal && memberTotal > 0 ? 'ok' : 'warn'}">B ${memberOnline}/${memberTotal}</span>
+              <span class="pill xs ${aggOnline ? 'ok' : 'warn'}">C ${escapeHtml(aggName)}</span>
+              <span class="pill xs ghost">入口 ${escapeHtml(listenShow)}</span>
+              <span class="pill xs ghost">通道 ${escapeHtml(String(channelPort))}</span>
+              <span class="pill xs ghost">出口 ${escapeHtml(String(aggPort))}</span>
+              ${fixedEnabled ? `<span class="pill xs ok">固定组 ${escapeHtml(String(tunnelPort))}</span>` : ''}
+              ${overlayEnabled ? `<span class="pill xs ok">Overlay${overlayExitPort ? `:${escapeHtml(String(overlayExitPort))}` : ''}</span>` : ''}
+            </div>
+          </div>
+          <div class="mptcp-group-tools">
+            <button class="btn xs ghost" type="button" onclick="probeMptcpGroup('${escapeHtml(sid)}')">检测</button>
+            <button class="btn xs ghost" type="button" onclick="openMptcpGroupEditor('${escapeHtml(sid)}')">编辑</button>
+            ${reuseTarget ? `<button class="btn xs ghost" type="button" onclick="copyMptcpGroupReuseTarget('${escapeHtml(sid)}')">复制复用入口</button>` : ''}
+            ${(overlayEnabled && reuseTarget && overlayToken) ? `<button class="btn xs ghost" type="button" onclick="copyMptcpGroupOverlayParams('${escapeHtml(sid)}')">复制复用参数</button>` : ''}
+            ${(overlayEnabled && reuseTarget && overlayToken) ? `<button class="btn xs ghost" type="button" onclick="newOverlayRuleFromMptcpGroup('${escapeHtml(sid)}')">用于当前节点新 Overlay 规则</button>`
+              : (reuseTarget ? `<button class="btn xs ghost" type="button" onclick="newRuleFromMptcpGroup('${escapeHtml(sid)}')">用于当前节点新规则</button>` : '')}
+            <button class="btn xs ghost" type="button" onclick="deleteMptcpGroup('${escapeHtml(sid)}')">删除</button>
+          </div>
+        </div>
+        <div class="mptcp-group-body">
+          <div class="mptcp-group-line"><span class="k">B 通道：</span><span class="v">${escapeHtml(memberNames.join(' / ') || '未配置')}</span></div>
+          ${reuseTarget ? `<div class="mptcp-group-line"><span class="k">复用入口：</span><span class="v mono">${escapeHtml(reuseTarget)}</span></div>` : ''}
+          ${overlayEnabled && overlayExitPort ? `<div class="mptcp-group-line"><span class="k">Overlay 出口：</span><span class="v mono">127.0.0.1:${escapeHtml(String(overlayExitPort))}</span></div>` : ''}
+          <div class="mptcp-group-line"><span class="k">${overlayEnabled ? '允许目标：' : '最终目标：'}</span><span class="v">${escapeHtml(remotes.slice(0, 3).join('，') || (overlayEnabled ? '（不限制）' : '-'))}</span>${remotes.length > 3 ? `<span class="muted sm"> 等 ${remotes.length} 个</span>` : ''}</div>
+          ${updatedAt ? `<div class="mptcp-group-line"><span class="k">更新时间：</span><span class="v">${escapeHtml(updatedAt)}</span></div>` : ''}
+        </div>
+      </div>
+    `);
+  }
+  box.innerHTML = rows.join('');
+}
+
+function _mptcpRenderProbeInto(box, data){
+  if(!box) return;
+  if(!(data && typeof data === 'object' && data.ok)){
+    box.innerHTML = '';
+    return;
+  }
+  const summary = (data.summary && typeof data.summary === 'object') ? data.summary : {};
+  const stages = Array.isArray(data.stages) ? data.stages : [];
+
+  const statCls = (st)=>{
+    const s = String(st || '').trim().toLowerCase();
+    if(s === 'ok') return 'ok';
+    if(s === 'warn') return 'warn';
+    if(s === 'fail') return 'bad';
+    return 'ghost';
+  };
+  const fmtMs = (v)=>{
+    if(v == null || v === '') return '-';
+    const n = Number(v);
+    if(!Number.isFinite(n)) return '-';
+    return `${n.toFixed(2)} ms`;
+  };
+  const fmtPct = (v)=>{
+    const n = Number(v);
+    if(!Number.isFinite(n)) return '-';
+    return `${n.toFixed(2)}%`;
+  };
+
+  const stageHtml = stages.map((st)=>{
+    const s = (st && st.summary && typeof st.summary === 'object') ? st.summary : {};
+    const details = Array.isArray(st?.details) ? st.details : [];
+    const rows = details.slice(0, 12).map((it)=>{
+      const ok = !!(it && it.ok === true);
+      return `<tr>
+        <td>${ok ? '<span class="pill xs ok">OK</span>' : '<span class="pill xs bad">FAIL</span>'}</td>
+        <td class="mono">${escapeHtml(String(it?.target || '-'))}</td>
+        <td>${escapeHtml(fmtMs(it?.latency_ms))}</td>
+        <td>${escapeHtml(String(it?.error || '-'))}</td>
+      </tr>`;
+    }).join('');
+    return `
+      <div class="mptcp-probe-stage">
+        <div class="mptcp-probe-stage-head">
+          <div class="mptcp-probe-stage-title">${escapeHtml(String(st?.label || st?.stage || '阶段'))}</div>
+          <div class="mptcp-probe-stage-kpis">
+            <span class="pill xs ${statCls(s.status)}">${escapeHtml(String(s.status || 'skip').toUpperCase())}</span>
+            <span class="pill xs ghost">成功 ${escapeHtml(String(s.ok ?? 0))}/${escapeHtml(String(s.total ?? 0))}</span>
+            <span class="pill xs ghost">可用率 ${escapeHtml(fmtPct(s.availability_pct))}</span>
+            <span class="pill xs ghost">均值 ${escapeHtml(fmtMs(s.avg_rtt_ms))}</span>
+          </div>
+        </div>
+        <div class="table-wrap mptcp-probe-table-wrap">
+          <table class="table dense no-sticky">
+            <thead>
+              <tr><th>状态</th><th>目标</th><th>延迟</th><th>错误</th></tr>
+            </thead>
+            <tbody>
+              ${rows || '<tr><td colspan="4" class="muted">暂无明细</td></tr>'}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    `;
+  }).join('');
+
+  const warns = Array.isArray(data.warnings) ? data.warnings : [];
+  const warnHtml = warns.length
+    ? `<div class="mptcp-probe-warns">${warns.map((w)=>`<div class="muted sm">• ${escapeHtml(String(w || ''))}</div>`).join('')}</div>`
+    : '';
+
+  box.innerHTML = `
+    <div class="mptcp-probe-summary">
+      <span class="pill xs ${statCls(summary.status)}">总体 ${escapeHtml(String(summary.status || 'skip').toUpperCase())}</span>
+      <span class="pill xs ghost">成功 ${escapeHtml(String(summary.ok ?? 0))}/${escapeHtml(String(summary.total ?? 0))}</span>
+      <span class="pill xs ghost">可用率 ${escapeHtml(fmtPct(summary.availability_pct))}</span>
+      <span class="pill xs ghost">平均 RTT ${escapeHtml(fmtMs(summary.avg_rtt_ms))}</span>
+      <span class="pill xs ghost">最佳 ${escapeHtml(fmtMs(summary.best_rtt_ms))}</span>
+      <span class="pill xs ghost">最差 ${escapeHtml(fmtMs(summary.worst_rtt_ms))}</span>
+    </div>
+    ${warnHtml}
+    ${stageHtml}
+  `;
+}
+
+function _mptcpGroupRenderProbe(data){
+  _mptcpRenderProbeInto(q('mptcpGroupProbe'), data);
+}
+
+function _mptcpGroupSyncEditorSelectors(){
+  const senderSel = q('mg_sender_node_id');
+  const memberSel = q('mg_member_node_ids');
+  const aggSel = q('mg_aggregator_node_id');
+  if(!senderSel || !memberSel || !aggSel) return;
+
+  const senderId = String(senderSel.value || '').trim();
+  const selectedMembers = new Set(getMultiSelectValues(memberSel));
+  const aggId = String(aggSel.value || '').trim();
+
+  let memberChanged = false;
+  Array.from(memberSel.options || []).forEach((opt)=>{
+    const id = String(opt.value || '').trim();
+    const disabled = !id || (senderId && id === senderId) || (aggId && id === aggId);
+    if(disabled && opt.selected){
+      opt.selected = false;
+      memberChanged = true;
+    }
+    opt.disabled = disabled;
+  });
+  if(memberChanged){
+    selectedMembers.clear();
+    for(const v of getMultiSelectValues(memberSel)) selectedMembers.add(v);
+  }
+
+  let aggInvalid = false;
+  Array.from(aggSel.options || []).forEach((opt)=>{
+    const id = String(opt.value || '').trim();
+    if(!id){
+      opt.disabled = false;
+      return;
+    }
+    const disabled = (senderId && id === senderId) || selectedMembers.has(id);
+    opt.disabled = disabled;
+    if(disabled && aggId === id){
+      aggInvalid = true;
+    }
+  });
+  if(aggInvalid){
+    aggSel.value = '';
+  }
+}
+
+function _mptcpGroupBuildEditorPayload(probeOnly=false){
+  const editorMode = String(MPTCP_GROUP_STATE?.editor_mode || 'edit').trim().toLowerCase();
+  const isCreate = (editorMode === 'create' && !probeOnly);
+  const syncId = String(q('mg_sync_id')?.value || '').trim();
+  if(!isCreate && !syncId) return {ok:false, error:'缺少 sync_id'};
+  const oldSenderId = parseInt(String(q('mg_old_sender_node_id')?.value || '0'), 10);
+  if(!isCreate && !(oldSenderId > 0)) return {ok:false, error:'缺少原入口节点信息'};
+  const senderId = parseInt(String(q('mg_sender_node_id')?.value || '0'), 10);
+  if(!(senderId > 0)) return {ok:false, error:'请选择入口节点（A）'};
+
+  const memberIds = _parseNodeIdList(getMultiSelectValues(q('mg_member_node_ids')).map((v)=>parseInt(v, 10)));
+  if(memberIds.length < 2) return {ok:false, error:'成员链路节点（B）至少需要 2 个'};
+  if(memberIds.includes(senderId)) return {ok:false, error:'成员链路节点（B）不能包含入口节点（A）'};
+
+  const aggId = parseInt(String(q('mg_aggregator_node_id')?.value || '0'), 10);
+  if(!(aggId > 0)) return {ok:false, error:'请选择汇聚节点（C）'};
+  if(aggId === senderId) return {ok:false, error:'汇聚节点（C）不能是入口节点（A）'};
+  if(memberIds.includes(aggId)) return {ok:false, error:'汇聚节点（C）不能与成员链路节点（B）重复'};
+
+  const defs = _mptcpGroupDefaults();
+  let listen = String(q('mg_listen')?.value || '').trim();
+  if(defs.fixedEnabled){
+    listen = `0.0.0.0:${defs.tunnelPort}`;
+  }
+  if(!listen){
+    return {ok:false, error:'监听地址不能为空'};
+  }
+  const lp = parseListenToHostPort(listen);
+  const p = parseInt(String(lp.port || ''), 10);
+  if(!(p >= 1 && p <= 65535)){
+    return {ok:false, error:'监听地址格式无效，请使用 host:port'};
+  }
+  listen = normalizeHostPort(lp.host || '0.0.0.0', String(p));
+
+  // Route B overlay mode (optional)
+  const overlayEnabled = !!(q('mg_overlay_enabled') && q('mg_overlay_enabled').checked);
+  let overlayExitPort = 0;
+  let overlayToken = '';
+  if(overlayEnabled){
+    const exitPortTxt = String(q('mg_overlay_exit_port')?.value || '').trim();
+    if(exitPortTxt){
+      if(!/^\d+$/.test(exitPortTxt)) return {ok:false, error:'Overlay 出口端口必须是 1-65535 的整数'};
+      const pp = parseInt(exitPortTxt, 10);
+      if(!(pp >= 1 && pp <= 65535)) return {ok:false, error:'Overlay 出口端口必须是 1-65535 的整数'};
+      overlayExitPort = pp;
+    }
+    overlayToken = String(q('mg_overlay_token')?.value || '').trim();
+  }
+
+  const remText = String(q('mg_remotes')?.value || '').trim();
+  const remCheck = normalizeRemotesText(remText);
+  if(remCheck.errors && remCheck.errors.length){
+    const first = remCheck.errors[0];
+    return {ok:false, error:`目标地址第 ${first.line} 行无效：${first.error}`};
+  }
+  const remotes = Array.isArray(remCheck.remotes) ? remCheck.remotes : [];
+  if(!overlayEnabled && !remotes.length){
+    return {ok:false, error:'最终目标不能为空'};
+  }
+
+  const schedulerRaw = String(q('mg_scheduler')?.value || 'aggregate').trim().toLowerCase();
+  const scheduler = (schedulerRaw === 'backup' || schedulerRaw === 'hybrid') ? schedulerRaw : 'aggregate';
+
+  const payload = {
+    sender_node_id: intOrZero(senderId),
+    member_node_ids: memberIds,
+    aggregator_node_id: intOrZero(aggId),
+    listen,
+    remotes,
+    scheduler,
+    overlay_enabled: overlayEnabled,
+  };
+  if(overlayEnabled){
+    if(overlayExitPort > 0) payload.overlay_exit_port = overlayExitPort;
+    if(overlayToken) payload.overlay_token = overlayToken;
+  }
+  if(syncId) payload.sync_id = syncId;
+  if(!isCreate){
+    payload.old_sender_node_id = intOrZero(oldSenderId);
+  }
+  const aggHost = String(q('mg_aggregator_host')?.value || '').trim();
+  if(aggHost){
+    if(/\s/.test(aggHost)) return {ok:false, error:'C 数据地址不能包含空白字符'};
+    payload.aggregator_host = aggHost;
+  }
+  const aggPortTxt = String(q('mg_aggregator_port')?.value || '').trim();
+  if(aggPortTxt && !defs.fixedEnabled){
+    if(!/^\d+$/.test(aggPortTxt)) return {ok:false, error:'C 端口必须是 1-65535 的整数'};
+    const aggPort = parseInt(aggPortTxt, 10);
+    if(!(aggPort >= 1 && aggPort <= 65535)) return {ok:false, error:'C 端口必须是 1-65535 的整数'};
+    payload.aggregator_port = aggPort;
+  }
+
+  const rttRead = readNonnegIntInput('mg_failover_rtt_ms', 'RTT 阈值');
+  if(rttRead.error) return {ok:false, error:rttRead.error};
+  if(rttRead.set) payload.failover_rtt_ms = rttRead.value;
+
+  const jitterRead = readNonnegIntInput('mg_failover_jitter_ms', '抖动阈值');
+  if(jitterRead.error) return {ok:false, error:jitterRead.error};
+  if(jitterRead.set) payload.failover_jitter_ms = jitterRead.value;
+
+  const lossTxt = String(q('mg_failover_loss_pct')?.value || '').trim();
+  if(lossTxt){
+    const loss = Number(lossTxt);
+    if(!Number.isFinite(loss) || loss < 0 || loss > 100){
+      return {ok:false, error:'丢包阈值必须是 0-100 的数字'};
+    }
+    payload.failover_loss_pct = Number(loss.toFixed(2));
+  }
+
+  if(!probeOnly){
+    const remark = String(q('mg_remark')?.value || '').trim();
+    if(remark) payload.remark = remark;
+    if(!!q('mg_favorite')?.checked) payload.favorite = true;
+  }
+  return {ok:true, payload};
+}
+
+function _mptcpGroupFillEditor(group, mode='edit'){
+  const g = (group && typeof group === 'object') ? group : {};
+  const isCreate = (String(mode || 'edit').trim().toLowerCase() === 'create');
+  const sid = String(g.sync_id || '').trim();
+
+  MPTCP_GROUP_STATE.active_sync_id = sid || '';
+  _mptcpGroupSetEditorMode(isCreate ? 'create' : 'edit');
+  const defs = _mptcpGroupDefaults();
+  const nodes = _mptcpGroupAllNodes();
+
+  const senderSel = q('mg_sender_node_id');
+  const memberSel = q('mg_member_node_ids');
+  const aggSel = q('mg_aggregator_node_id');
+  if(!senderSel || !memberSel || !aggSel) return;
+
+  _mptcpGroupFillNodeOptions(senderSel, nodes, '请选择入口节点（A）');
+  _mptcpGroupFillNodeOptions(memberSel, nodes);
+  _mptcpGroupFillNodeOptions(aggSel, nodes, '请选择汇聚节点（C）');
+
+  let senderId = String(g.sender_node_id || '').trim();
+  if(!senderId){
+    const pickSender = _mptcpGroupCurrentSenderId();
+    senderId = pickSender > 0 ? String(pickSender) : String(window.__NODE_ID__ || '');
+  }
+  const aggId = String(g.aggregator_node_id || '').trim();
+  const memberIds = _parseNodeIdList(g.member_node_ids).map((v)=>String(v));
+  senderSel.value = senderId;
+  setMultiSelectValues(memberSel, memberIds);
+  aggSel.value = aggId;
+  _mptcpGroupSyncEditorSelectors();
+
+  if(q('mg_sync_id')) q('mg_sync_id').value = sid;
+  if(q('mg_old_sender_node_id')) q('mg_old_sender_node_id').value = String(g.sender_node_id || senderId || '');
+  if(q('mg_sync_short')){
+    q('mg_sync_short').textContent = isCreate ? '新建' : sid.slice(0, 12);
+  }
+  if(q('mg_listen')){
+    const listen = String(g.listen || '').trim();
+    q('mg_listen').value = defs.fixedEnabled ? `0.0.0.0:${defs.tunnelPort}` : (listen || `0.0.0.0:${defs.tunnelPort}`);
+    q('mg_listen').readOnly = !!defs.fixedEnabled;
+  }
+  if(q('mg_remotes')){
+    const remotes = Array.isArray(g.remotes) ? g.remotes : [];
+    q('mg_remotes').value = remotes.join('\n');
+  }
+
+  // Route B overlay
+  const overlayDefault = (!!isCreate && !!defs.fixedEnabled);
+  if(q('mg_overlay_enabled')){
+    q('mg_overlay_enabled').checked = (g.overlay_enabled === true) || overlayDefault;
+  }
+  if(q('mg_overlay_exit_port')){
+    const p0 = parseInt(String(g.overlay_exit_port || defs.overlayExitPort || ''), 10);
+    q('mg_overlay_exit_port').value = String((p0 >= 1 && p0 <= 65535) ? p0 : (defs.overlayExitPort || 38444));
+  }
+  if(q('mg_overlay_token')) q('mg_overlay_token').value = String(g.overlay_token || '').trim();
+  try{ _mptcpGroupSyncOverlayUI(); }catch(_e){}
+  if(q('mg_scheduler')){
+    const sch = String(g.scheduler || 'aggregate').trim().toLowerCase();
+    q('mg_scheduler').value = (sch === 'backup' || sch === 'hybrid') ? sch : 'aggregate';
+  }
+  if(q('mg_aggregator_host')) q('mg_aggregator_host').value = String(g.aggregator_host || '').trim();
+  if(q('mg_aggregator_port')){
+    const p = parseInt(String(g.aggregator_port || defs.tunnelPort), 10);
+    q('mg_aggregator_port').value = String((p >= 1 && p <= 65535) ? p : defs.tunnelPort);
+    q('mg_aggregator_port').readOnly = !!defs.fixedEnabled;
+  }
+  if(q('mg_failover_rtt_ms')) q('mg_failover_rtt_ms').value = (g.failover_rtt_ms != null && g.failover_rtt_ms !== '') ? String(g.failover_rtt_ms) : '';
+  if(q('mg_failover_jitter_ms')) q('mg_failover_jitter_ms').value = (g.failover_jitter_ms != null && g.failover_jitter_ms !== '') ? String(g.failover_jitter_ms) : '';
+  if(q('mg_failover_loss_pct')) q('mg_failover_loss_pct').value = (g.failover_loss_pct != null && g.failover_loss_pct !== '') ? String(g.failover_loss_pct) : '';
+  if(q('mg_remark')) q('mg_remark').value = String(g.remark || '').trim();
+  if(q('mg_favorite')) q('mg_favorite').checked = !!g.favorite;
+
+  const editor = q('mptcpGroupEditor');
+  if(editor) editor.style.display = '';
+  const probeBox = q('mptcpGroupProbe');
+  if(probeBox) probeBox.innerHTML = '';
+}
+
+function _mptcpGroupSyncOverlayUI(){
+  const enabled = !!(q('mg_overlay_enabled') && q('mg_overlay_enabled').checked);
+  const box = q('mg_overlay_fields');
+  if(box) box.style.display = enabled ? 'block' : 'none';
+  const lab = q('mg_remotes_label');
+  if(lab) lab.textContent = enabled ? '允许目标（可选，每行一个 host:port）' : '最终目标（每行一个 host:port）';
+  const help = q('mg_remotes_help');
+  if(help) help.textContent = enabled
+    ? 'Overlay 模式：这里是允许目标白名单，留空表示不限制。最终目标由复用规则在连接头中指定。'
+    : '非 Overlay 模式：C 汇聚会转发到这些目标。';
+  const ta = q('mg_remotes');
+  if(ta) ta.placeholder = enabled ? '（可选）每行一个允许目标，例如：203.0.113.10:443' : '203.0.113.10:443';
+}
+
+async function loadMptcpTunnelGroups(){
+  if(MPTCP_GROUP_STATE.loading) return;
+  MPTCP_GROUP_STATE.loading = true;
+  _mptcpGroupShowMsg('正在加载隧道组…', false);
+  try{
+    const senderNodeId = _mptcpGroupCurrentSenderId();
+    if(!(senderNodeId > 0)){
+      throw new Error('请选择入口节点（A）');
+    }
+    const data = await fetchJSON(`/api/mptcp_tunnel/groups?sender_node_id=${encodeURIComponent(senderNodeId)}`);
+    if(!(data && data.ok)){
+      throw new Error((data && data.error) ? String(data.error) : '加载失败');
+    }
+    MPTCP_GROUP_STATE.sender_node = (data.sender_node && typeof data.sender_node === 'object') ? data.sender_node : null;
+    MPTCP_GROUP_STATE.sender_filter_node_id = intOrZero(senderNodeId);
+    MPTCP_GROUP_STATE.groups = Array.isArray(data.groups) ? data.groups : [];
+    MPTCP_GROUP_STATE.defaults = (data.defaults && typeof data.defaults === 'object')
+      ? data.defaults
+      : { fixed_tunnel_port_enabled: true, tunnel_port: 38443 };
+    _mptcpGroupFillSenderFilterOptions();
+    const senderSel = q('mptcpGroupSenderFilter');
+    if(senderSel){
+      senderSel.value = String(senderNodeId);
+    }
+    _mptcpGroupRenderList();
+    const defs = _mptcpGroupDefaults();
+    const hint = q('mptcpGroupHint');
+    const senderName = String(data?.sender_node?.name || `节点-${senderNodeId}`);
+    if(hint){
+      hint.textContent = defs.fixedEnabled
+        ? `固定隧道组端口 ${defs.tunnelPort}：A/B/C 同端口，可复用这组通道做统一中继。当前查看 A=${senderName}`
+        : `当前为自定义端口模式，可按组分别设置 A/B/C 通道端口。当前查看 A=${senderName}`;
+    }
+    _mptcpGroupShowMsg(`已加载 ${MPTCP_GROUP_STATE.groups.length} 个隧道组（A=${senderName}）`, false);
+  }catch(err){
+    const msg = formatRequestError(err, '加载 MPTCP 隧道组失败');
+    _mptcpGroupShowMsg(msg, true);
+    const box = q('mptcpGroupList');
+    if(box) box.innerHTML = `<div class="mptcp-group-empty">${escapeHtml(msg)}</div>`;
+  }finally{
+    MPTCP_GROUP_STATE.loading = false;
+  }
+}
+
+function openMptcpGroupModal(){
+  const modal = q('mptcpGroupModal');
+  if(!modal){
+    toast('MPTCP 隧道组界面未加载', true);
+    return;
+  }
+  if(!Array.isArray(NODES_LIST) || NODES_LIST.length <= 0){
+    try{ loadNodesList(); }catch(_e){}
+  }
+  modal.style.display = 'flex';
+  MPTCP_GROUP_STATE.last_probe = null;
+  if(!(MPTCP_GROUP_STATE.sender_filter_node_id > 0)){
+    MPTCP_GROUP_STATE.sender_filter_node_id = intOrZero(window.__NODE_ID__);
+  }
+  _mptcpGroupFillSenderFilterOptions();
+  const senderSel = q('mptcpGroupSenderFilter');
+  if(senderSel && !(parseInt(String(senderSel.value || '0'), 10) > 0)){
+    senderSel.value = String(_mptcpGroupCurrentSenderId());
+  }
+  const editor = q('mptcpGroupEditor');
+  if(editor) editor.style.display = 'none';
+  _mptcpGroupSetEditorMode('edit');
+  const probeBox = q('mptcpGroupProbe');
+  if(probeBox) probeBox.innerHTML = '';
+  loadMptcpTunnelGroups();
+}
+
+function closeMptcpGroupModal(){
+  const modal = q('mptcpGroupModal');
+  if(!modal) return;
+  modal.style.display = 'none';
+}
+
+function openMptcpGroupCreate(){
+  const defaults = _mptcpGroupDefaults();
+  _mptcpGroupFillEditor(
+    {
+      sender_node_id: _mptcpGroupCurrentSenderId(),
+      member_node_ids: [],
+      aggregator_node_id: 0,
+      listen: `0.0.0.0:${defaults.tunnelPort}`,
+      remotes: [],
+      scheduler: 'aggregate',
+      aggregator_port: defaults.tunnelPort,
+      aggregator_host: '',
+      failover_rtt_ms: null,
+      failover_jitter_ms: null,
+      failover_loss_pct: null,
+      remark: '',
+      favorite: false,
+    },
+    'create'
+  );
+  const probeBox = q('mptcpGroupProbe');
+  if(probeBox) probeBox.innerHTML = '';
+}
+
+function openMptcpGroupEditor(syncId){
+  const sid = String(syncId || '').trim();
+  if(!sid){
+    toast('sync_id 为空，无法编辑', true);
+    return;
+  }
+  const g = _mptcpGroupBySyncId(sid);
+  if(!g){
+    toast('隧道组不存在，请刷新列表后重试', true);
+    return;
+  }
+  _mptcpGroupFillEditor(g, 'edit');
+}
+
+async function saveMptcpGroup(){
+  const read = _mptcpGroupBuildEditorPayload(false);
+  if(!read.ok){
+    toast(read.error || '参数无效', true);
+    return;
+  }
+  const payload = dictOrNull(read.payload) || {};
+  const isCreate = String(MPTCP_GROUP_STATE?.editor_mode || 'edit').trim().toLowerCase() === 'create';
+  let sid = String(payload.sync_id || '').trim();
+  if(isCreate && !sid){
+    sid = genLocalSyncId();
+    payload.sync_id = sid;
+  }
+  if(!sid){
+    toast('缺少 sync_id', true);
+    return;
+  }
+  const apiPath = isCreate ? '/api/mptcp_tunnel/save_async' : '/api/mptcp_tunnel/group_update_async';
+  const taskKind = isCreate ? 'mptcp_save' : 'mptcp_group_update';
+  const okMsg = isCreate ? 'MPTCP 隧道组创建任务已提交' : 'MPTCP 隧道组更新任务已提交';
+  const errPrefix = isCreate ? 'MPTCP 隧道组创建失败' : 'MPTCP 隧道组更新失败';
+  _setSyncPendingSubmit('mptcp', sid, true);
+  try{
+    await enqueueSyncTask(apiPath, payload, {
+      kind: taskKind,
+      ok_msg: okMsg,
+      error_prefix: errPrefix,
+      status_url_template: '/api/sync_jobs/{job_id}',
+      retry_url_template: '/api/sync_jobs/{job_id}/retry',
+      meta: {
+        sync_id: sid,
+        sender_node_id: payload.sender_node_id,
+        receiver_node_id: payload.aggregator_node_id,
+        listen: payload.listen,
+      },
+    });
+    MPTCP_GROUP_STATE.active_sync_id = sid;
+    _mptcpGroupShowMsg(
+      isCreate
+        ? '创建任务已提交，正在后台下发到 A/B/C 节点…'
+        : '更新任务已提交，正在后台下发到 A/B/C 节点…',
+      false
+    );
+    toast(isCreate ? '已提交 MPTCP 隧道组创建任务' : '已提交 MPTCP 隧道组更新任务');
+    setTimeout(()=>{
+      try{ loadMptcpTunnelGroups(); }catch(_e){}
+      if(intOrZero(payload.sender_node_id) === intOrZero(window.__NODE_ID__)){
+        try{ loadPool(); }catch(_e){}
+      }
+    }, 1200);
+  }catch(err){
+    const msg = formatRequestError(err, isCreate ? 'MPTCP 隧道组创建失败' : 'MPTCP 隧道组更新失败');
+    _mptcpGroupShowMsg(msg, true);
+    toast(msg, true);
+  }finally{
+    _setSyncPendingSubmit('mptcp', sid, false);
+  }
+}
+
+async function copyMptcpGroupReuseTarget(syncId){
+  const sid = String(syncId || '').trim();
+  const g = _mptcpGroupBySyncId(sid);
+  if(!g){
+    toast('隧道组不存在，请刷新后重试', true);
+    return;
+  }
+  const target = _mptcpGroupReuseTarget(g);
+  if(!target){
+    toast('未找到可复用入口地址（请检查 A 节点数据地址）', true);
+    return;
+  }
+  await copyText(target);
+}
+
+// Route B: copy overlay reuse params as 3 lines (entry, sync_id, token)
+async function copyMptcpGroupOverlayParams(syncId){
+  const sid = String(syncId || '').trim();
+  const g = _mptcpGroupBySyncId(sid);
+  if(!g){
+    toast('隧道组不存在，请刷新后重试', true);
+    return;
+  }
+  const target = _mptcpGroupReuseTarget(g);
+  if(!target){
+    toast('未找到可复用入口地址（请检查 A 节点数据地址）', true);
+    return;
+  }
+  const token = String(g?.overlay_token || '').trim();
+  if(!(g && g.overlay_enabled === true && token)){
+    toast('该隧道组未启用 Overlay 或缺少 Token', true);
+    return;
+  }
+  await copyText(`${target}\n${sid}\n${token}`);
+}
+
+function newRuleFromMptcpGroup(syncId){
+  const sid = String(syncId || '').trim();
+  const g = _mptcpGroupBySyncId(sid);
+  if(!g){
+    toast('隧道组不存在，请刷新后重试', true);
+    return;
+  }
+  const target = _mptcpGroupReuseTarget(g);
+  if(!target){
+    toast('未找到可复用入口地址（请检查 A 节点数据地址）', true);
+    return;
+  }
+  try{
+    newRule();
+    if(q('f_type')) q('f_type').value = 'tcp';
+    showWssBox();
+    setField('f_remotes', target);
+    const remarkEl = q('f_remark');
+    if(remarkEl && !String(remarkEl.value || '').trim()){
+      setField('f_remark', `via mptcp:${sid.slice(0, 8)}`);
+    }
+    closeMptcpGroupModal();
+    toast(`已带入复用入口 ${target}`);
+  }catch(err){
+    toast(formatRequestError(err, '带入复用入口失败'), true);
+  }
+}
+
+async function newOverlayRuleFromMptcpGroup(syncId){
+  const sid = String(syncId || '').trim();
+  if(!sid){
+    toast('sync_id 为空', true);
+    return;
+  }
+  try{
+    await openOverlayQuickCreateModal(sid);
+    // Reduce stacking
+    try{ closeMptcpGroupModal(); }catch(_e){}
+  }catch(err){
+    toast(formatRequestError(err, '打开快速复用失败'), true);
+  }
+}
+
+async function probeMptcpGroup(syncId=''){
+  const sid0 = String(syncId || q('mg_sync_id')?.value || MPTCP_GROUP_STATE.active_sync_id || '').trim();
+  if(!sid0){
+    toast('请先选择隧道组', true);
+    return;
+  }
+
+  let payload = null;
+  const read = _mptcpGroupBuildEditorPayload(true);
+  if(read.ok && String(read.payload.sync_id || '').trim() === sid0){
+    payload = dictOrNull(read.payload);
+  }else{
+    const g = _mptcpGroupBySyncId(sid0);
+    if(!g){
+      toast('隧道组不存在，请刷新后重试', true);
+      return;
+    }
+    payload = {
+      sync_id: sid0,
+      old_sender_node_id: intOrZero(g.sender_node_id),
+      sender_node_id: intOrZero(g.sender_node_id),
+      member_node_ids: _parseNodeIdList(g.member_node_ids),
+      aggregator_node_id: intOrZero(g.aggregator_node_id),
+    };
+    const remotes = Array.isArray(g.remotes) ? g.remotes : [];
+    if(remotes.length) payload.remotes = remotes;
+  }
+  if(!(payload && payload.old_sender_node_id > 0)){
+    toast('缺少探测入口节点信息', true);
+    return;
+  }
+
+  const probeBox = q('mptcpGroupProbe');
+  if(probeBox){
+    probeBox.innerHTML = '<div class="mptcp-group-empty">正在执行 A→B→C→目标 连通与时延探测…</div>';
+  }
+  try{
+    const data = await fetchJSON('/api/mptcp_tunnel/group_probe', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+    if(!(data && data.ok)){
+      throw new Error((data && data.error) ? String(data.error) : '探测失败');
+    }
+    MPTCP_GROUP_STATE.last_probe = data;
+    _mptcpGroupRenderProbe(data);
+    _mptcpGroupShowMsg('探测完成', false);
+  }catch(err){
+    const msg = formatRequestError(err, '隧道组探测失败');
+    _mptcpGroupShowMsg(msg, true);
+    if(probeBox){
+      probeBox.innerHTML = `<div class="mptcp-group-empty">${escapeHtml(msg)}</div>`;
+    }
+    toast(msg, true);
+  }
+}
+
+async function deleteMptcpGroup(syncId){
+  const sid = String(syncId || '').trim();
+  if(!sid){
+    toast('sync_id 为空，无法删除', true);
+    return;
+  }
+  const g = _mptcpGroupBySyncId(sid);
+  if(!g){
+    toast('隧道组不存在，请刷新后重试', true);
+    return;
+  }
+  if(!confirm(`确定删除 MPTCP 隧道组 ${sid.slice(0, 12)}… 吗？将同步删除 A/B/C 三段规则。`)){
+    return;
+  }
+  const payload = {
+    sender_node_id: intOrZero(g.sender_node_id),
+    receiver_node_id: intOrZero(g.aggregator_node_id),
+    aggregator_node_id: intOrZero(g.aggregator_node_id),
+    member_node_ids: _parseNodeIdList(g.member_node_ids),
+    sync_id: sid,
+  };
+  try{
+    await enqueueSyncDeleteTask('mptcp', payload, 'MPTCP 隧道组删除任务已提交');
+    if(String(MPTCP_GROUP_STATE.active_sync_id || '').trim() === sid){
+      MPTCP_GROUP_STATE.active_sync_id = '';
+      const editor = q('mptcpGroupEditor');
+      if(editor) editor.style.display = 'none';
+    }
+    toast('已提交删除任务');
+    setTimeout(()=>{
+      try{ loadMptcpTunnelGroups(); }catch(_e){}
+      try{ loadPool(); }catch(_e){}
+    }, 1000);
+  }catch(err){
+    toast(formatRequestError(err, '删除 MPTCP 隧道组失败'), true);
+  }
+}
+
+function intOrZero(v){
+  const n = parseInt(String(v || '0'), 10);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function dictOrNull(v){
+  return (v && typeof v === 'object' && !Array.isArray(v)) ? v : null;
 }
 
 function readIntranetAclFields(){
@@ -3715,12 +5828,27 @@ function fillCommonAdvancedFields(e){
   const ex = (ep.extra_config && typeof ep.extra_config === 'object' && !Array.isArray(ep.extra_config)) ? ep.extra_config : {};
   const hasSourceData = !!(ep && typeof ep === 'object' && Object.keys(ep).length > 0);
   const sourceMode = hasSourceData ? wssMode(ep) : 'tcp';
-  const forwardTool = getForwardToolFromEndpoint(ep, (hasSourceData && sourceMode === 'tcp') ? 'realm' : 'iptables');
+  const forwardTool = getForwardToolFromEndpoint(
+    ep,
+    (hasSourceData && (sourceMode === 'tcp' || sourceMode === 'mptcp')) ? 'realm' : 'iptables',
+  );
 
   if(q('f_through')) setField('f_through', ep.through || '');
   if(q('f_interface')) setField('f_interface', ep.interface || '');
   if(q('f_listen_interface')) setField('f_listen_interface', ep.listen_interface || '');
   if(q('f_forward_tool')) setField('f_forward_tool', forwardTool);
+
+  // Route B overlay fields
+  if(forwardTool === 'overlay'){
+    if(q('f_overlay_entry')) setField('f_overlay_entry', ex.overlay_entry || '');
+    if(q('f_overlay_sync_id')) setField('f_overlay_sync_id', ex.overlay_sync_id || '');
+    if(q('f_overlay_token')) setField('f_overlay_token', ex.overlay_token || '');
+  }else{
+    if(q('f_overlay_entry')) setField('f_overlay_entry', '');
+    if(q('f_overlay_sync_id')) setField('f_overlay_sync_id', '');
+    if(q('f_overlay_token')) setField('f_overlay_token', '');
+  }
+  try{ syncForwardToolAdvancedBoxes(); }catch(_e){}
 
   setTriBoolSelect('f_accept_proxy', ep.accept_proxy);
   if(q('f_accept_proxy_timeout')) setField('f_accept_proxy_timeout', ep.accept_proxy_timeout != null ? ep.accept_proxy_timeout : '');
@@ -3800,9 +5928,25 @@ function applyCommonAdvancedToEndpoint(endpoint){
 
   // normal rules only: select forwarding engine
   delete ep.forward_tool;
-  if(mode === 'tcp'){
-    const tool = normalizeForwardTool(q('f_forward_tool') ? q('f_forward_tool').value : 'iptables', 'iptables');
+  if(mode === 'tcp' || mode === 'mptcp'){
+    const tool = (mode === 'mptcp')
+      ? 'realm'
+      : normalizeForwardTool(q('f_forward_tool') ? q('f_forward_tool').value : 'iptables', 'iptables');
     ex.forward_tool = tool;
+
+    // Route B overlay config (normal tcp only)
+    if(mode === 'tcp' && tool === 'overlay'){
+      const oEntry = _trim(q('f_overlay_entry') ? q('f_overlay_entry').value : '');
+      const oSid = _trim(q('f_overlay_sync_id') ? q('f_overlay_sync_id').value : '');
+      const oTok = _trim(q('f_overlay_token') ? q('f_overlay_token').value : '');
+      if(oEntry) ex.overlay_entry = oEntry; else delete ex.overlay_entry;
+      if(oSid) ex.overlay_sync_id = oSid; else delete ex.overlay_sync_id;
+      if(oTok) ex.overlay_token = oTok; else delete ex.overlay_token;
+    }else{
+      delete ex.overlay_entry;
+      delete ex.overlay_sync_id;
+      delete ex.overlay_token;
+    }
   }
 
   // endpoint.network overrides
@@ -3879,32 +6023,683 @@ function applyCommonAdvancedToEndpoint(endpoint){
   return {ok:true};
 }
 
+function clearMptcpExtraConfig(ex){
+  if(!(ex && typeof ex === 'object')) return;
+  if(String(ex.forward_mode || '').trim().toLowerCase() === 'mptcp'){
+    try{ delete ex.forward_mode; }catch(_e){}
+  }
+  try{ delete ex.mptcp_member_node_ids; }catch(_e){}
+  try{ delete ex.mptcp_member_node_names; }catch(_e){}
+  try{ delete ex.mptcp_aggregator_node_id; }catch(_e){}
+  try{ delete ex.mptcp_aggregator_node_name; }catch(_e){}
+  try{ delete ex.mptcp_aggregator_host; }catch(_e){}
+  try{ delete ex.mptcp_scheduler; }catch(_e){}
+  try{ delete ex.mptcp_aggregator_port; }catch(_e){}
+  try{ delete ex.mptcp_failover_rtt_ms; }catch(_e){}
+  try{ delete ex.mptcp_failover_jitter_ms; }catch(_e){}
+  try{ delete ex.mptcp_failover_loss_pct; }catch(_e){}
+}
+
+function applyMptcpConfigToEndpoint(endpoint, cfg){
+  const ep = endpoint || {};
+  let ex = (ep.extra_config && typeof ep.extra_config === 'object' && !Array.isArray(ep.extra_config))
+    ? {...ep.extra_config}
+    : {};
+
+  clearMptcpExtraConfig(ex);
+
+  if(cfg && typeof cfg === 'object'){
+    const members = Array.isArray(cfg.members)
+      ? cfg.members.map((v)=>parseInt(v, 10)).filter((v)=>Number.isFinite(v) && v > 0)
+      : [];
+    const agg = parseInt(cfg.aggregator_node_id || 0, 10);
+    if(members.length > 0 && agg > 0){
+      ex.forward_mode = 'mptcp';
+      ex.mptcp_member_node_ids = members;
+      ex.mptcp_aggregator_node_id = agg;
+
+      const memberNames = members
+        .map((id)=>_findNodeNameById(id) || (`节点-${id}`))
+        .map((s)=>String(s || '').trim())
+        .filter(Boolean);
+      if(memberNames.length) ex.mptcp_member_node_names = memberNames;
+
+      const aggName = String(_findNodeNameById(agg) || (`节点-${agg}`)).trim();
+      if(aggName) ex.mptcp_aggregator_node_name = aggName;
+
+      const aggHost = String(cfg.aggregator_host || '').trim();
+      if(aggHost) ex.mptcp_aggregator_host = aggHost;
+
+      const schedulerRaw = String(cfg.scheduler || 'aggregate').trim().toLowerCase();
+      ex.mptcp_scheduler = (schedulerRaw === 'backup' || schedulerRaw === 'hybrid') ? schedulerRaw : 'aggregate';
+
+      const aggPort = parseInt(cfg.aggregator_port || 0, 10);
+      if(aggPort >= 1 && aggPort <= 65535){
+        ex.mptcp_aggregator_port = aggPort;
+      }
+
+      const rtt = parseInt(cfg.failover_rtt_ms || 0, 10);
+      if(Number.isFinite(rtt) && rtt >= 0) ex.mptcp_failover_rtt_ms = rtt;
+
+      const jitter = parseInt(cfg.failover_jitter_ms || 0, 10);
+      if(Number.isFinite(jitter) && jitter >= 0) ex.mptcp_failover_jitter_ms = jitter;
+
+      const loss = Number(cfg.failover_loss_pct);
+      if(Number.isFinite(loss) && loss >= 0 && loss <= 100){
+        ex.mptcp_failover_loss_pct = Number(loss.toFixed(2));
+      }
+
+      ep.send_mptcp = true;
+    }
+  }
+
+  try{
+    if(Object.keys(ex).length > 0) ep.extra_config = ex;
+    else delete ep.extra_config;
+  }catch(_e){}
+}
+
 function showWssBox(){
   const mode = q('f_type').value;
+  if(mode === 'wss' && q('f_protocol')){
+    // Relay tunnel now supports both stream and datagram forwarding.
+    q('f_protocol').value = 'tcp+udp';
+  }
+  if(mode === 'mptcp' && q('f_protocol')){
+    q('f_protocol').value = 'tcp';
+  }
   if(q('wssBox')) q('wssBox').style.display = (mode === 'wss') ? 'block' : 'none';
   if(q('intranetBox')) q('intranetBox').style.display = (mode === 'intranet') ? 'block' : 'none';
+  if(q('mptcpMembersBox')) q('mptcpMembersBox').style.display = (mode === 'mptcp') ? 'block' : 'none';
+  if(q('mptcpAggregatorBox')) q('mptcpAggregatorBox').style.display = (mode === 'mptcp') ? 'block' : 'none';
   if(q('forwardToolBox')) q('forwardToolBox').style.display = (mode === 'tcp') ? '' : 'none';
 
   // Advanced sections (collapsed area)
   const commonAdv = document.getElementById('commonAdvancedBox');
-  if(commonAdv) commonAdv.style.display = (mode === 'tcp') ? 'block' : 'none';
+  if(commonAdv) commonAdv.style.display = (mode === 'tcp' || mode === 'mptcp') ? 'block' : 'none';
   const wssAdv = document.getElementById('wssAdvancedBox');
   if(wssAdv) wssAdv.style.display = (mode === 'wss') ? 'block' : 'none';
   const intrAdv = document.getElementById('intranetAdvancedBox');
   if(intrAdv) intrAdv.style.display = (mode === 'intranet') ? 'block' : 'none';
+  const mptcpAdv = document.getElementById('mptcpAdvancedBox');
+  if(mptcpAdv) mptcpAdv.style.display = (mode === 'mptcp') ? 'block' : 'none';
+  if(mode === 'mptcp'){
+    syncMptcpMemberExclusions();
+    applyMptcpMemberFilter();
+    updateMptcpMembersCount();
+  }
 
   // Update mode cards / guide / dynamic hints (new UI)
   try{ syncTunnelModeUI(); }catch(_e){}
+
+  // Tool-specific advanced boxes
+  try{ syncForwardToolAdvancedBoxes(); }catch(_e){}
+}
+
+// Toggle tool-specific advanced boxes (based on normal forward tool selection)
+function syncForwardToolAdvancedBoxes(){
+  const mode = q('f_type') ? String(q('f_type').value || 'tcp').trim() : 'tcp';
+  const tool = normalizeForwardTool(q('f_forward_tool') ? q('f_forward_tool').value : 'iptables', 'iptables');
+  const overlayBox = document.getElementById('overlayAdvancedBox');
+  if(overlayBox){
+    const show = (mode === 'tcp' && tool === 'overlay');
+    overlayBox.style.display = show ? 'block' : 'none';
+    if(show){
+      try{ refreshOverlayGroupsPick(false); }catch(_e){}
+      try{ renderOverlaySummary(); }catch(_e){}
+    }
+  }
+}
+
+function clearOverlayReuseParams(){
+  const sel = q('f_overlay_group_pick');
+  if(sel) sel.value = '';
+  if(q('f_overlay_entry')) setField('f_overlay_entry', '');
+  if(q('f_overlay_sync_id')) setField('f_overlay_sync_id', '');
+  if(q('f_overlay_token')) setField('f_overlay_token', '');
+  try{ renderOverlaySummary(); }catch(_e){}
+}
+
+async function _fetchOverlayGroupsAll(force){
+  const now = Date.now();
+  const ttl = 15000;
+  if(!force && Array.isArray(OVERLAY_GROUPS_PICK_STATE.groups) && OVERLAY_GROUPS_PICK_STATE.groups.length && (now - (OVERLAY_GROUPS_PICK_STATE.ts || 0) < ttl)){
+    return OVERLAY_GROUPS_PICK_STATE.groups;
+  }
+  if(OVERLAY_GROUPS_PICK_STATE.inflight){
+    return OVERLAY_GROUPS_PICK_STATE.inflight;
+  }
+  OVERLAY_GROUPS_PICK_STATE.inflight = (async ()=>{
+    const data = await fetchJSON('/api/mptcp_tunnel/groups_all?overlay_only=1');
+    OVERLAY_GROUPS_PICK_STATE.inflight = null;
+    if(!(data && data.ok && Array.isArray(data.groups))){
+      throw new Error((data && data.error) ? data.error : '加载隧道组失败');
+    }
+    OVERLAY_GROUPS_PICK_STATE.ts = now;
+    OVERLAY_GROUPS_PICK_STATE.groups = data.groups;
+    return data.groups;
+  })().catch((err)=>{
+    OVERLAY_GROUPS_PICK_STATE.inflight = null;
+    throw err;
+  });
+  return OVERLAY_GROUPS_PICK_STATE.inflight;
+}
+
+function _overlayGroupPickLabel(g){
+  const sid = String(g?.sync_id || '').trim();
+  const senderName = String(g?.sender_node?.name || g?.sender_node_name || g?.sender_name || '').trim() || `A#${g?.sender_node_id || ''}`;
+  const aggName = String(g?.aggregator_node?.name || g?.aggregator_node_name || g?.aggregator_name || '').trim() || `C#${g?.aggregator_node_id || ''}`;
+  const entry = _mptcpGroupReuseTarget(g);
+  const short = sid ? sid.slice(0, 8) : '';
+  return `${senderName} → ${aggName}${entry ? (' · ' + entry) : ''}${short ? (' · ' + short) : ''}`;
+}
+
+function applyOverlayGroupPick(){
+  const sel = q('f_overlay_group_pick');
+  if(!sel) return;
+  const sid = String(sel.value || '').trim();
+  if(!sid) return;
+  const opt = sel.options[sel.selectedIndex];
+  const entry = opt ? String(opt.dataset.entry || '').trim() : '';
+  const token = opt ? String(opt.dataset.token || '').trim() : '';
+  if(entry) setField('f_overlay_entry', entry);
+  if(sid) setField('f_overlay_sync_id', sid);
+  if(token) setField('f_overlay_token', token);
+  _lsSet(LS_OVERLAY_LAST_GROUP_SID, sid);
+  try{ renderOverlaySummary(); }catch(_e){}
+}
+
+async function refreshOverlayGroupsPick(force){
+  const sel = q('f_overlay_group_pick');
+  if(!sel) return;
+  const keepSid = String(q('f_overlay_sync_id')?.value || '').trim();
+  sel.innerHTML = '<option value="">（可选）选择一个可复用隧道组…</option>';
+  try{
+    const groups = await _fetchOverlayGroupsAll(!!force);
+    const usable = (Array.isArray(groups) ? groups : []).filter((g)=>{
+      if(!(g && typeof g === 'object')) return false;
+      if(!(g.overlay_enabled === true)) return false;
+      const sid = String(g.sync_id || '').trim();
+      const token = String(g.overlay_token || '').trim();
+      const entry = _mptcpGroupReuseTarget(g);
+      return !!(sid && token && entry);
+    });
+
+    for(const g of usable){
+      const sid = String(g.sync_id || '').trim();
+      if(!sid) continue;
+      const opt = document.createElement('option');
+      opt.value = sid;
+      opt.textContent = _overlayGroupPickLabel(g);
+      opt.dataset.entry = _mptcpGroupReuseTarget(g);
+      opt.dataset.token = String(g.overlay_token || '').trim();
+      sel.appendChild(opt);
+    }
+    // Prefer current field -> last used -> keep default empty
+    if(keepSid){
+      sel.value = keepSid;
+    }else{
+      const lastSid = String(_lsGet(LS_OVERLAY_LAST_GROUP_SID, '') || '').trim();
+      if(lastSid) sel.value = lastSid;
+    }
+    if(sel.value){
+      applyOverlayGroupPick();
+    }
+  }catch(err){
+    // Keep manual fields usable even if list loading fails.
+    console.warn('refreshOverlayGroupsPick failed:', err);
+    try{ renderOverlaySummary(); }catch(_e){}
+  }
+}
+
+function _setPillStat(el, cls){
+  if(!el) return;
+  const classes = ['ok','bad','warn','info','ghost','muted'];
+  for(const c of classes){
+    el.classList.toggle(c, c === cls);
+  }
+}
+
+function renderOverlaySummary(){
+  const entry = String(q('f_overlay_entry')?.value || '').trim();
+  const sid = String(q('f_overlay_sync_id')?.value || '').trim();
+  const tok = String(q('f_overlay_token')?.value || '').trim();
+
+  const eVal = q('ovSumEntryVal');
+  const sVal = q('ovSumSidVal');
+  const tVal = q('ovSumTokVal');
+  if(eVal) eVal.textContent = entry || '—';
+  if(sVal) sVal.textContent = sid ? (sid.length > 16 ? (sid.slice(0, 8) + '…' + sid.slice(-6)) : sid) : '—';
+  if(tVal) tVal.textContent = tok ? (tok.length > 22 ? (tok.slice(0, 10) + '…' + tok.slice(-8)) : tok) : '—';
+
+  _setPillStat(q('ovSumEntry'), entry ? 'info' : '');
+  _setPillStat(q('ovSumSid'), sid ? '' : 'muted');
+  _setPillStat(q('ovSumTok'), tok ? '' : 'muted');
+}
+
+async function copyOverlayReuseParams3(){
+  const entry = String(q('f_overlay_entry')?.value || '').trim();
+  const sid = String(q('f_overlay_sync_id')?.value || '').trim();
+  const tok = String(q('f_overlay_token')?.value || '').trim();
+  if(!(entry && sid && tok)){
+    toast('缺少复用参数：请先选择隧道组或粘贴参数', true);
+    return;
+  }
+  await copyText(`${entry}\n${sid}\n${tok}`);
+}
+window.copyOverlayReuseParams3 = copyOverlayReuseParams3;
+
+async function probeOverlaySelectedGroup(){
+  // Use the premium quick modal probe view
+  const sid = String(q('f_overlay_sync_id')?.value || q('f_overlay_group_pick')?.value || '').trim();
+  if(!sid){
+    toast('请先选择一个可复用隧道组', true);
+    return;
+  }
+  await openOverlayQuickCreateModal(sid, {probeOnly:true});
+  try{ await overlayQuickTestGroup(); }catch(_e){}
+}
+window.probeOverlaySelectedGroup = probeOverlaySelectedGroup;
+
+// ------------------------------
+// Quick Overlay (Route B) Wizard
+
+function _usableOverlayGroupsFromCache(){
+  const groups = Array.isArray(OVERLAY_GROUPS_PICK_STATE.groups) ? OVERLAY_GROUPS_PICK_STATE.groups : [];
+  return groups.filter((g)=>{
+    if(!(g && typeof g === 'object')) return false;
+    if(!(g.overlay_enabled === true)) return false;
+    const sid = String(g.sync_id || '').trim();
+    const token = String(g.overlay_token || '').trim();
+    const entry = _mptcpGroupReuseTarget(g);
+    return !!(sid && token && entry);
+  });
+}
+
+function _overlayGroupFromCache(syncId){
+  const sid = String(syncId || '').trim();
+  if(!sid) return null;
+  const groups = Array.isArray(OVERLAY_GROUPS_PICK_STATE.groups) ? OVERLAY_GROUPS_PICK_STATE.groups : [];
+  for(const g of groups){
+    if(String(g?.sync_id || '').trim() === sid) return g;
+  }
+  return null;
+}
+
+function _suggestFreeListenPort(preferStart=10080){
+  const used = new Set();
+  const eps = (CURRENT_POOL && Array.isArray(CURRENT_POOL.endpoints)) ? CURRENT_POOL.endpoints : [];
+  for(const ep of eps){
+    const listen = String(ep?.listen || '').trim();
+    if(!listen) continue;
+    const lp = parseListenToHostPort(listen);
+    const p = parseInt(String(lp.port || '0'), 10);
+    if(p > 0 && p <= 65535) used.add(p);
+  }
+  let start = parseInt(String(preferStart || '10080'), 10);
+  if(!(start >= 1 && start <= 65535)) start = 10080;
+  for(let p=start; p<=65535; p++){
+    if(!used.has(p)) return p;
+    if(p - start > 2400) break;
+  }
+  // fallback
+  for(let p=1024; p<=65535; p++){
+    if(!used.has(p)) return p;
+  }
+  return 10080;
+}
+
+function _oqSetMsg(msg, isErr=false){
+  const el = q('oq_msg');
+  if(!el) return;
+  el.textContent = String(msg || '');
+  el.style.color = isErr ? 'var(--bad)' : '';
+}
+
+function _oqClearProbe(){
+  const box = q('oq_probe');
+  if(box) box.innerHTML = '';
+}
+
+function overlayQuickRenderStats(){
+  const box = q('oq_stats');
+  if(!box) return;
+  box.innerHTML = '';
+  const sel = q('oq_group');
+  const sid = String(sel?.value || '').trim();
+  const opt = sel ? sel.options[sel.selectedIndex] : null;
+  const entry = opt ? String(opt.dataset.entry || '').trim() : '';
+  const tok = opt ? String(opt.dataset.token || '').trim() : '';
+
+  const mk = (cls, label, val, display)=>{
+    const sp = document.createElement('span');
+    sp.className = `pill-stat ${cls}`;
+    sp.title = val ? '点击复制' : '';
+    sp.innerHTML = `${escapeHtml(label)} <strong class="mono">${escapeHtml(display)}</strong>`;
+    if(val){
+      sp.style.cursor = 'copy';
+      sp.addEventListener('click', async ()=>{
+        try{ await copyText(String(val || '')); }catch(_e){}
+      });
+    }
+    box.appendChild(sp);
+  };
+
+  mk(entry ? 'info' : '', '入口', entry, entry || '—');
+  mk(sid ? '' : 'muted', 'Sync', sid, sid ? (sid.length > 16 ? (sid.slice(0, 8) + '…' + sid.slice(-6)) : sid) : '—');
+  mk(tok ? '' : 'muted', 'Token', tok, tok ? (tok.length > 22 ? (tok.slice(0, 10) + '…' + tok.slice(-8)) : tok) : '—');
+}
+
+async function _overlayQuickRefreshPick(force=false, preferSid=''){
+  const sel = q('oq_group');
+  if(!sel) return [];
+  sel.innerHTML = '<option value="">（选择隧道组…）</option>';
+  const groups = await _fetchOverlayGroupsAll(!!force);
+  const usable = _usableOverlayGroupsFromCache();
+  for(const g of usable){
+    const sid = String(g?.sync_id || '').trim();
+    if(!sid) continue;
+    const opt = document.createElement('option');
+    opt.value = sid;
+    opt.textContent = _overlayGroupPickLabel(g);
+    opt.dataset.entry = _mptcpGroupReuseTarget(g);
+    opt.dataset.token = String(g?.overlay_token || '').trim();
+    opt.dataset.sender_id = String(g?.sender_node_id || '');
+    opt.dataset.aggregator_id = String(g?.aggregator_node_id || '');
+    opt.dataset.member_ids = JSON.stringify(Array.isArray(g?.member_node_ids) ? g.member_node_ids : []);
+    sel.appendChild(opt);
+  }
+
+  const want = String(preferSid || '').trim() || String(_lsGet(LS_OVERLAY_LAST_GROUP_SID, '') || '').trim();
+  if(want) sel.value = want;
+  if(!String(sel.value || '').trim()){
+    // auto pick first usable
+    if(sel.options.length > 1) sel.value = String(sel.options[1].value || '').trim();
+  }
+  const picked = String(sel.value || '').trim();
+  if(picked) _lsSet(LS_OVERLAY_LAST_GROUP_SID, picked);
+  overlayQuickRenderStats();
+  return usable;
+}
+
+async function openOverlayQuickCreateModal(preferSid='', opts=null){
+  const modal = q('overlayQuickModal');
+  if(!modal){
+    toast('缺少快速复用窗口（overlayQuickModal）', true);
+    return;
+  }
+  modal.style.display = 'block';
+  _oqSetMsg('', false);
+  _oqClearProbe();
+
+  const probeOnly = !!(opts && typeof opts === 'object' && opts.probeOnly === true);
+  try{
+    await _overlayQuickRefreshPick(false, String(preferSid || '').trim());
+  }catch(err){
+    _oqSetMsg(formatRequestError(err, '加载隧道组失败'), true);
+  }
+
+  if(!probeOnly){
+    const portEl = q('oq_listen_port');
+    if(portEl && !String(portEl.value || '').trim()){
+      portEl.value = String(_suggestFreeListenPort(10080));
+    }
+    const remarkEl = q('oq_remark');
+    const sel = q('oq_group');
+    const sid = String(sel?.value || '').trim();
+    if(remarkEl && sid && !String(remarkEl.value || '').trim()){
+      remarkEl.value = `via mptcp_overlay:${sid.slice(0, 8)}`;
+    }
+  }
+  overlayQuickRenderStats();
+}
+window.openOverlayQuickCreateModal = openOverlayQuickCreateModal;
+
+function closeOverlayQuickModal(){
+  const modal = q('overlayQuickModal');
+  if(modal) modal.style.display = 'none';
+}
+window.closeOverlayQuickModal = closeOverlayQuickModal;
+
+function overlayQuickPickPort(){
+  const portEl = q('oq_listen_port');
+  if(!portEl) return;
+  portEl.value = String(_suggestFreeListenPort(10080));
+}
+window.overlayQuickPickPort = overlayQuickPickPort;
+
+async function overlayQuickTestGroup(){
+  const sel = q('oq_group');
+  const sid = String(sel?.value || '').trim();
+  if(!sid){
+    _oqSetMsg('请选择隧道组', true);
+    return;
+  }
+  const g = _overlayGroupFromCache(sid);
+  if(!g){
+    _oqSetMsg('隧道组不存在，请刷新后重试', true);
+    return;
+  }
+
+  const box = q('oq_probe');
+  if(box){
+    box.innerHTML = '<div class="mptcp-group-empty">正在执行 A→B→C→出口/目标 连通与时延探测…</div>';
+  }
+  _oqSetMsg('正在探测…', false);
+
+  const payload = {
+    sync_id: String(g.sync_id || '').trim(),
+    old_sender_node_id: intOrZero(g.sender_node_id),
+    sender_node_id: intOrZero(g.sender_node_id),
+    member_node_ids: _parseNodeIdList(g.member_node_ids),
+    aggregator_node_id: intOrZero(g.aggregator_node_id),
+  };
+  const remotes = Array.isArray(g.remotes) ? g.remotes : [];
+  if(remotes.length) payload.remotes = remotes;
+
+  try{
+    const data = await fetchJSON('/api/mptcp_tunnel/group_probe', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+    if(!(data && data.ok)){
+      throw new Error((data && data.error) ? String(data.error) : '探测失败');
+    }
+    _mptcpRenderProbeInto(q('oq_probe'), data);
+    const st = String(data?.summary?.status || '').trim().toUpperCase();
+    _oqSetMsg(`探测完成：${st || 'OK'}`, false);
+  }catch(err){
+    const msg = formatRequestError(err, '隧道组探测失败');
+    _oqSetMsg(msg, true);
+    if(box) box.innerHTML = `<div class="mptcp-group-empty">${escapeHtml(msg)}</div>`;
+  }
+}
+window.overlayQuickTestGroup = overlayQuickTestGroup;
+
+async function overlayQuickCreateRule(){
+  const btn = q('oq_create_btn');
+  if(btn) btn.disabled = true;
+  _oqSetMsg('', false);
+  _oqClearProbe();
+  try{
+    const sel = q('oq_group');
+    const sid = String(sel?.value || '').trim();
+    if(!sid) throw new Error('请选择隧道组');
+    const opt = sel.options[sel.selectedIndex];
+    const entry = opt ? String(opt.dataset.entry || '').trim() : '';
+    const tok = opt ? String(opt.dataset.token || '').trim() : '';
+    if(!(entry && tok)) throw new Error('隧道组参数不完整（缺少入口或 Token）');
+
+    const portEl = q('oq_listen_port');
+    let port = parseInt(String(portEl?.value || ''), 10);
+    if(!(port >= 1 && port <= 65535)){
+      port = _suggestFreeListenPort(10080);
+      if(portEl) portEl.value = String(port);
+    }
+    const listen = `0.0.0.0:${port}`;
+
+    const rText = String(q('oq_remotes')?.value || '').trim();
+    const { remotes, errors } = normalizeRemotesText(rText);
+    if(!remotes.length){
+      throw new Error('请填写最终目标 Remote（host:port，每行一个）');
+    }
+    if(errors.length){
+      const e0 = errors[0];
+      throw new Error(`Remote 第 ${e0.line} 行格式无效：${e0.raw}（${e0.error}）`);
+    }
+
+    // Conflict check (best-effort)
+    const c = findPortConflict(listen, 'tcp', -1);
+    if(c){
+      const n = (c && Number.isFinite(c.idx)) ? (c.idx + 1) : '?';
+      throw new Error(`端口冲突：${listen} 已被规则 #${n} 占用（${String(c.protocolText || '').trim() || 'TCP'}）`);
+    }
+
+    const remark = String(q('oq_remark')?.value || '').trim();
+    const favorite = !!(q('oq_fav') && q('oq_fav').checked);
+
+    const ep = {
+      listen,
+      remotes,
+      protocol: 'tcp',
+      balance: 'roundrobin',
+      disabled: false,
+    };
+    if(remark) ep.remark = remark;
+    if(favorite) ep.favorite = true;
+    ep.extra_config = {
+      forward_tool: 'overlay',
+      overlay_entry: entry,
+      overlay_sync_id: sid,
+      overlay_token: tok,
+    };
+
+    const nextPool = clonePool(CURRENT_POOL || {endpoints:[]});
+    if(!Array.isArray(nextPool.endpoints)) nextPool.endpoints = [];
+    nextPool.endpoints.push(ep);
+
+    // optimistic render
+    CURRENT_POOL = nextPool;
+    try{ renderRules(); }catch(_e){}
+
+    await enqueueNodePoolTask('pool_save', {
+      pool: nextPool,
+      unlock_sync_ids: collectUnlockSyncIds(),
+    }, '保存已生效');
+
+    toast('已提交保存任务');
+    closeOverlayQuickModal();
+  }catch(err){
+    const msg = formatRequestError(err, '创建复用规则失败');
+    _oqSetMsg(msg, true);
+    toast(msg, true);
+    try{ loadPool(); }catch(_e){}
+  }finally{
+    if(btn) btn.disabled = false;
+  }
+}
+window.overlayQuickCreateRule = overlayQuickCreateRule;
+
+// close quick overlay modal on backdrop click / ESC
+document.addEventListener('click', (e)=>{
+  const m = document.getElementById('overlayQuickModal');
+  if(!m || m.style.display === 'none') return;
+  if(e.target === m) closeOverlayQuickModal();
+});
+
+document.addEventListener('keydown', (e)=>{
+  const m = document.getElementById('overlayQuickModal');
+  if(!m || m.style.display === 'none') return;
+  if(e.key === 'Escape') closeOverlayQuickModal();
+});
+
+function _parseOverlayReuseText(txt){
+  const out = {entry:'', sync_id:'', token:''};
+  const raw = String(txt || '').trim();
+  if(!raw) return out;
+  // JSON form
+  try{
+    if(raw.startsWith('{') && raw.endsWith('}')){
+      const obj = JSON.parse(raw);
+      if(obj && typeof obj === 'object'){
+        out.entry = String(obj.entry || obj.overlay_entry || obj.reuse_entry || '').trim();
+        out.sync_id = String(obj.sync_id || obj.overlay_sync_id || '').trim();
+        out.token = String(obj.token || obj.overlay_token || '').trim();
+        return out;
+      }
+    }
+  }catch(_e){
+    // ignore
+  }
+
+  const lines = raw.split(/\r?\n/).map(s=>String(s||'').trim()).filter(Boolean);
+  for(const line of lines){
+    const kv = line.split(/\s*[:=]\s*/);
+    if(kv.length >= 2){
+      const k = String(kv[0] || '').trim().toLowerCase();
+      const v = String(kv.slice(1).join(':') || '').trim();
+      if(!out.entry && (k.includes('entry') || k.includes('入口') || k.includes('reuse'))){
+        out.entry = v;
+        continue;
+      }
+      if(!out.sync_id && (k.includes('sync') || k.includes('id'))){
+        out.sync_id = v;
+        continue;
+      }
+      if(!out.token && k.includes('token')){
+        out.token = v;
+        continue;
+      }
+    }
+  }
+  if(!out.entry && lines.length >= 1) out.entry = lines[0];
+  if(!out.sync_id && lines.length >= 2) out.sync_id = lines[1];
+  if(!out.token && lines.length >= 3) out.token = lines[2];
+  return out;
+}
+
+async function pasteOverlayReuseParams(){
+  try{
+    if(!(navigator.clipboard && navigator.clipboard.readText)){
+      toast('当前浏览器不支持读取剪贴板', true);
+      return;
+    }
+    const txt = await navigator.clipboard.readText();
+    const p = _parseOverlayReuseText(txt);
+    if(!(p.entry || p.sync_id || p.token)){
+      toast('剪贴板内容无法识别（需要：入口、Sync ID、Token）', true);
+      return;
+    }
+    // ensure tcp + overlay mode
+    if(q('f_type')){
+      q('f_type').value = 'tcp';
+      showWssBox();
+    }
+    if(q('f_forward_tool')) q('f_forward_tool').value = 'overlay';
+    syncForwardToolAdvancedBoxes();
+    if(q('f_overlay_group_pick')) q('f_overlay_group_pick').value = '';
+    if(p.entry) setField('f_overlay_entry', p.entry);
+    if(p.sync_id) setField('f_overlay_sync_id', p.sync_id);
+    if(p.token) setField('f_overlay_token', p.token);
+    toast('已粘贴 Overlay 复用参数');
+  }catch(err){
+    toast(formatRequestError(err, '读取剪贴板失败'), true);
+  }
 }
 
 
 
-// -------------------- Tunnel mode UX (3 modes) --------------------
+// -------------------- Tunnel mode UX (4 modes) --------------------
 
 function setTunnelMode(mode){
-  const req = ['tcp','wss','intranet'].includes(String(mode||'').trim()) ? String(mode||'').trim() : defaultTunnelMode();
-  const m = isModeAllowed(req) ? req : defaultTunnelMode();
-  if(!isModeAllowed(m)){
+  const req = ['tcp','mptcp','wss','intranet'].includes(String(mode||'').trim()) ? String(mode||'').trim() : defaultVisibleTunnelMode();
+  const m = isModeVisible(req) ? req : defaultVisibleTunnelMode();
+  if(!isModeVisible(m)){
+    const deny = modeVisibilityDenyReason(req);
+    if(deny){
+      toast(deny, true);
+      return;
+    }
     toast('当前账号无可用转发模式', true);
     return;
   }
@@ -3923,16 +6718,28 @@ function syncTunnelModeUI(){
       mode = fallback;
       sel.value = fallback;
     }
+  }else if(CURRENT_EDIT_INDEX < 0 && !isModeVisible(mode)){
+    const fallback = defaultVisibleTunnelMode();
+    if(isModeVisible(fallback)){
+      mode = fallback;
+      sel.value = fallback;
+    }
   }
 
   // Compact mode pill (params screen)
   const modePill = document.getElementById('currentModePill');
   const modeSub = document.getElementById('currentModeSub');
   if(modePill){
-    modePill.textContent = (mode === 'wss') ? 'WSS 隧道' : (mode === 'intranet') ? '内网穿透' : '普通转发';
+    if(mode === 'wss') modePill.textContent = '隧道转发';
+    else if(mode === 'intranet') modePill.textContent = '内网穿透';
+    else if(mode === 'mptcp') modePill.textContent = '多链路聚合';
+    else modePill.textContent = '普通转发';
   }
   if(modeSub){
-    modeSub.textContent = (mode === 'wss') ? '发送机 ↔ 接收机' : (mode === 'intranet') ? '公网入口 ↔ 内网出口' : '单机监听 → 目标';
+    if(mode === 'wss') modeSub.textContent = '本机监听 → 隧道 → 出口转发';
+    else if(mode === 'intranet') modeSub.textContent = '公网入口 ↔ 内网出口';
+    else if(mode === 'mptcp') modeSub.textContent = 'A 入口 → B 多链路 → C 汇聚';
+    else modeSub.textContent = '单机监听 → 目标';
   }
 
   // Mode cards
@@ -3940,7 +6747,7 @@ function syncTunnelModeUI(){
   if(wrap){
     wrap.querySelectorAll('.mode-card').forEach((btn)=>{
       const m = btn.getAttribute('data-mode');
-      if(!isModeAllowed(m)){
+      if(!isModeVisible(m)){
         btn.style.display = 'none';
         return;
       }
@@ -3948,6 +6755,8 @@ function syncTunnelModeUI(){
       btn.classList.toggle('active', m === mode);
     });
   }
+
+  try{ syncRuleQuickFilterModes(); }catch(_e){}
 
   // Re-render intro guide for selected mode
   try{ renderModeGuide(mode); }catch(_e){}
@@ -3965,6 +6774,7 @@ function syncTunnelModeUI(){
   const listenExample = document.getElementById('listenLabelExample');
   const baseHelp = document.getElementById('baseHelp');
   const portEl = q('f_listen_port');
+  const adaptiveLbRow = document.getElementById('adaptiveLbRow');
 
   // Ensure default listen host exists (advanced)
   if(q('f_listen_host') && !q('f_listen_host').value.trim()){
@@ -3973,23 +6783,29 @@ function syncTunnelModeUI(){
 
   // Keep prefix + hidden listen updated
   syncListenComputed();
+  if(adaptiveLbRow){
+    adaptiveLbRow.style.display = (mode === 'tcp') ? '' : 'none';
+  }
+  if(mode !== 'tcp' && q('f_adaptive_lb')){
+    q('f_adaptive_lb').checked = true;
+  }
 
   if(mode === 'wss'){
     setText(remoteMain, '最终目标');
-    setText(remoteExtra, '（接收机转发，每行一个 host:port）');
+    setText(remoteExtra, '（出口节点转发，每行一个 host:port）');
 
     setText(listenMain, '监听端口');
-    setText(listenExample, '（发送机对外端口，例如 443）');
+    setText(listenExample, '（本机监听端口，例如 443）');
 
     if(remEl) remEl.placeholder = '例如：10.0.0.10:443\n10.0.0.11:443';
     if(portEl && !portEl.placeholder) portEl.placeholder = '443';
 
-    setText(baseHelp, '默认监听 0.0.0.0；保存/删除会同步到接收机。监听 IP / 隧道参数在高级参数。');
+    setText(baseHelp, '本机监听该端口并拨号到出口节点隧道端口；出口节点再转发到最终目标。可在高级参数指定出口 IP。');
 
-    let h = 'Remote 填最终目标（接收机可达）。多行可启用负载均衡。';
+    let h = 'Remote 填最终目标（出口节点可达）。多行可启用负载均衡。';
     const optCount = q('f_wss_receiver_node') ? q('f_wss_receiver_node').querySelectorAll('option').length : 0;
     if(optCount <= 1){
-      h += '<br><span class="muted sm">接收机列表为空？请先在面板接入另一台节点。</span>';
+      h += '<br><span class="muted sm">出口节点列表为空？请先在面板接入另一台节点。</span>';
     }
     setHtml(remoteHelp, h);
 
@@ -4012,6 +6828,29 @@ function syncTunnelModeUI(){
     }
     setHtml(remoteHelp, h);
 
+  }else if(mode === 'mptcp'){
+    setText(remoteMain, '最终目标');
+    setText(remoteExtra, '（由 C 节点再转发，每行一个 host:port）');
+
+    setText(listenMain, '监听端口');
+    setText(listenExample, '（A 节点入口端口，例如 443）');
+
+    if(remEl) remEl.placeholder = '例如：198.51.100.10:443\n198.51.100.11:443';
+    if(portEl && !portEl.placeholder) portEl.placeholder = '443';
+
+    setText(baseHelp, 'A 入口同时经 B1/B2/B3 多链路承载到 C 汇聚节点，并由 C 继续转发到最终目标。');
+
+    const memberCount = q('f_mptcp_member_nodes')
+      ? q('f_mptcp_member_nodes').querySelectorAll('option').length
+      : 0;
+    const aggCount = q('f_mptcp_aggregator_node')
+      ? q('f_mptcp_aggregator_node').querySelectorAll('option').length
+      : 0;
+    let h = '先选成员链路节点（B）和汇聚节点（C），再填写最终目标。';
+    if(memberCount <= 1 || aggCount <= 1){
+      h += '<br><span class="muted sm">可选节点不足？请先接入更多 VPS 节点。</span>';
+    }
+    setHtml(remoteHelp, h);
   }else{
     setText(remoteMain, '目标地址');
     setText(remoteExtra, '（每行一个 host:port，多行启用负载均衡）');
@@ -4023,20 +6862,55 @@ function syncTunnelModeUI(){
     if(portEl && !portEl.placeholder) portEl.placeholder = '443';
 
     setText(baseHelp, '默认监听 0.0.0.0；普通转发默认使用 iptables 工具，可在基础参数切换 realm。');
-    setText(remoteHelp, '多目标时默认轮询；需要按来源 IP 固定落点可选 IP Hash。');
+    setText(remoteHelp, '多目标可选轮询/加权随机/IP Hash/最少连接/最低延迟/一致性哈希。');
   }
 
   try{ updateModePreview(); }catch(_e){}
 }
 
+function syncRuleQuickFilterModes(){
+  const sel = q('ruleQuickFilter');
+  if(!sel) return;
+  const modeVals = new Set(['tcp', 'mptcp', 'wss', 'intranet']);
+  Array.from(sel.options || []).forEach((opt)=>{
+    const mv = String((opt && opt.value) || '').trim().toLowerCase();
+    if(!modeVals.has(mv)) return;
+    const visible = isModeVisible(mv);
+    opt.hidden = !visible;
+    if(!visible && sel.value === mv){
+      sel.value = '';
+    }
+  });
+}
+
 function _findNodeNameById(id){
   const rid = String(id || '').trim();
   if(!rid) return '';
-  const list = Array.isArray(window.NODES_LIST) ? window.NODES_LIST : [];
+  const list = Array.isArray(NODES_LIST) ? NODES_LIST : (Array.isArray(window.NODES_LIST) ? window.NODES_LIST : []);
   for(const n of list){
     if(String(n.id) === rid){
       return n.name || n.display_ip || ('节点-' + n.id);
     }
+  }
+  return '';
+}
+
+function _findNodeHostById(id){
+  const rid = String(id || '').trim();
+  if(!rid) return '';
+  const list = Array.isArray(NODES_LIST) ? NODES_LIST : (Array.isArray(window.NODES_LIST) ? window.NODES_LIST : []);
+  for(const n of list){
+    if(String(n.id) !== rid) continue;
+    try{
+      const base = String(n.base_url || '').trim();
+      if(!base) break;
+      const u = new URL(base.includes('://') ? base : ('http://' + base));
+      if(u && u.hostname){
+        if(u.hostname.includes(':')) return `[${u.hostname}]`;
+        return u.hostname;
+      }
+    }catch(_e){}
+    break;
   }
   return '';
 }
@@ -4057,13 +6931,13 @@ function renderModeGuide(mode){
 
   if(mode === 'wss'){
     ico = '🛡️';
-    title = 'WSS 隧道（发送机 ↔ 接收机）';
-    desc = '发送机对外监听；面板自动在接收机生成对应规则。Host/Path/SNI 可留空自动生成。';
-    diagram = `客户端 → 发送机 ${nodeName} Listen  ⇢  WSS  ⇢  接收机 Receiver → 最终目标 Remotes`;
+    title = '隧道转发';
+    desc = '本机监听流量并通过隧道拨号到出口节点，由出口节点继续转发到最终目标。';
+    diagram = `客户端 → 当前节点 ${nodeName} Listen  ⇢  隧道端口(默认 28443)  ⇢  出口节点 → 最终目标 Remotes`;
     steps = [
-      '选择 <b>接收机节点</b>（自动同步配置）。',
-      'Remote 填 <b>最终目标</b>（接收机可达地址）。',
-      '更多细节在「高级参数」：接收机端口 / Host / Path / TLS。',
+      '选择 <b>出口节点</b>（自动同步配置）。',
+      '填写 <b>监听端口</b>：当前节点会在该端口监听流量。',
+      'Remote 填 <b>最终目标</b>（出口节点可达地址）；高级参数可设置隧道端口/出口 IP。',
     ];
   } else if(mode === 'intranet'){
     ico = '🏠';
@@ -4074,6 +6948,16 @@ function renderModeGuide(mode){
       '先在内网节点 B 的节点设置里勾选 <b>内网机器</b>，再回来选择它。',
       'Remote 填 <b>内网目标</b>（B 可达地址，如 192.168.x.x:80）。',
       '隧道端口/公网地址可在「高级参数」调整。',
+    ];
+  } else if(mode === 'mptcp'){
+    ico = '🧩';
+    title = '多链路聚合（MPTCP）';
+    desc = 'A 入口将单连接拆分为多子流，经 B1/B2/B3 承载到 C 节点汇聚后再转发。';
+    diagram = `客户端 → 入口A ${nodeName} Listen  ⇢  B1/B2/B3 多链路  ⇢  汇聚节点C → 最终目标 Remotes`;
+    steps = [
+      '在基础参数里选择 <b>成员链路节点 B</b>（建议 2 个以上）。',
+      '选择 <b>汇聚节点 C</b>，并按需设置调度策略/迁移阈值。',
+      'Remote 填写 <b>C 节点最终转发目标</b>（每行一个 host:port）。',
     ];
   } else {
     ico = '⚡';
@@ -4114,6 +6998,7 @@ function updateModePreview(){
 
   // keep listen fields synced (host prefix + hidden full listen)
   syncListenComputed();
+  try{ syncForwardToolAdvancedBoxes(); }catch(_e){}
 
   const mode = q('f_type') ? String(q('f_type').value || 'tcp').trim() : 'tcp';
   const listen = getListenString();
@@ -4127,8 +7012,9 @@ function updateModePreview(){
     const rid = q('f_wss_receiver_node') ? q('f_wss_receiver_node').value.trim() : '';
     const recvName = _findNodeNameById(rid) || (rid ? ('节点-' + rid) : '未选择');
     const rport = q('f_wss_receiver_port') ? q('f_wss_receiver_port').value.trim() : '';
-    const portText = rport ? rport : '（同发送机端口）';
-    el.innerHTML = `预览：发送机 <b>${escapeHtml(nodeName)}</b> 监听 <span class="mono">${escapeHtml(listen||'—')}</span> ⇒ WSS ⇒ 接收机 <b>${escapeHtml(recvName)}</b> 端口 <span class="mono">${escapeHtml(portText)}</span> → 目标 <b>${n}</b> 个`;
+    const rhost = q('f_wss_receiver_host') ? q('f_wss_receiver_host').value.trim() : '';
+    const portText = rport ? rport : '28443';
+    el.innerHTML = `预览：当前节点 <b>${escapeHtml(nodeName)}</b> 监听 <span class="mono">${escapeHtml(listen||'—')}</span>，并拨号到出口节点 <b>${escapeHtml(recvName)}</b> 的隧道端口 <span class="mono">${escapeHtml(portText)}</span>${rhost ? (' · 出口地址 <span class="mono">' + escapeHtml(rhost) + '</span>') : ''}，再转发到目标 <b>${n}</b> 个`;
     return;
   }
 
@@ -4141,106 +7027,31 @@ function updateModePreview(){
     return;
   }
 
+  if(mode === 'mptcp'){
+    const membersSel = q('f_mptcp_member_nodes');
+    const memberIds = getMultiSelectValues(membersSel);
+    const memberNames = memberIds.map((id)=>_findNodeNameById(id) || (`节点-${id}`));
+    const aggId = q('f_mptcp_aggregator_node') ? q('f_mptcp_aggregator_node').value.trim() : '';
+    const aggName = _findNodeNameById(aggId) || (aggId ? ('节点-' + aggId) : '未选择');
+    const aggPort = q('f_mptcp_aggregator_port') ? q('f_mptcp_aggregator_port').value.trim() : '';
+    const aggHost = q('f_mptcp_aggregator_host') ? q('f_mptcp_aggregator_host').value.trim() : '';
+    const schedulerRaw = q('f_mptcp_scheduler') ? String(q('f_mptcp_scheduler').value || 'aggregate').trim().toLowerCase() : 'aggregate';
+    const schedulerText = (schedulerRaw === 'backup') ? '主备切换' : (schedulerRaw === 'hybrid') ? '混合策略' : '带宽聚合';
+    const memberText = memberNames.length ? memberNames.join(' / ') : '未选择';
+    const viaNode = aggPort ? `${escapeHtml(aggName)}:${escapeHtml(aggPort)}` : escapeHtml(aggName);
+    const viaData = aggHost
+      ? (`${escapeHtml(aggHost)}${aggPort ? (':' + escapeHtml(aggPort)) : ''}`)
+      : '';
+    const via = viaData ? `${viaNode}（数据地址 ${viaData}）` : viaNode;
+    el.innerHTML = `预览：入口 <b>${escapeHtml(nodeName)}</b> 监听 <span class="mono">${escapeHtml(listen||'—')}</span> ⇒ 成员链路 <b>${memberNames.length}</b> 个（<span class="mono">${escapeHtml(memberText)}</span>） ⇒ 汇聚 <span class="mono">${via}</span> · ${escapeHtml(schedulerText)} ⇒ 最终目标 <b>${n}</b> 个`;
+    return;
+  }
+
   const tool = normalizeForwardTool(q('f_forward_tool') ? q('f_forward_tool').value : 'iptables', 'iptables');
   el.innerHTML = `预览：当前节点 <b>${escapeHtml(nodeName)}</b> 监听 <span class="mono">${escapeHtml(listen||'—')}</span> → 目标 <b>${n}</b> 个 · 工具 <span class="mono">${tool}</span>`;
 }
 
 window.setTunnelMode = setTunnelMode;
-
-function randomToken(len){
-  return Math.random().toString(36).slice(2, 2 + len);
-}
-
-// WSS 参数：随机生成（用于一键填充/留空自动补全）
-const WSS_RANDOM_HOSTS = [
-  'cdn.jsdelivr.net',
-  'assets.cloudflare.com',
-  'edge.microsoft.com',
-  'static.cloudflareinsights.com',
-  'ajax.googleapis.com',
-  'fonts.gstatic.com',
-  'images.unsplash.com',
-  'cdn.discordapp.com',
-];
-
-const WSS_RANDOM_PATH_TPL = [
-  '/ws',
-  '/ws/{token}',
-  '/socket',
-  '/socket/{token}',
-  '/connect',
-  '/gateway',
-  '/api/ws',
-  '/v1/ws/{token}',
-  '/edge/{token}',
-];
-
-function genWssRandomParams(){
-  const host = WSS_RANDOM_HOSTS[Math.floor(Math.random() * WSS_RANDOM_HOSTS.length)];
-  const token = randomToken(10);
-  const tpl = WSS_RANDOM_PATH_TPL[Math.floor(Math.random() * WSS_RANDOM_PATH_TPL.length)];
-  let path = String(tpl || '/ws').replace('{token}', token);
-  if(path && !path.startsWith('/')) path = '/' + path;
-  return { host, path, sni: host };
-}
-
-// If user leaves host/path/sni empty, auto-fill on save.
-// Return true if any field was auto-filled.
-function autoFillWssIfBlank(){
-  try{
-    const hostEl = q('f_wss_host');
-    const pathEl = q('f_wss_path');
-    const sniEl = q('f_wss_sni');
-    if(!hostEl || !pathEl || !sniEl) return false;
-
-    let host = hostEl.value.trim();
-    let path = pathEl.value.trim();
-    let sni = sniEl.value.trim();
-
-    // Normalize: path must start with /
-    if(path && !path.startsWith('/')){
-      path = '/' + path;
-      pathEl.value = path;
-    }
-
-    if(host && path && sni) return false;
-
-    const rnd = genWssRandomParams();
-    let changed = false;
-
-    if(!host){
-      // If user only filled SNI, use it as host for consistency
-      host = sni || rnd.host;
-      hostEl.value = host;
-      changed = true;
-    }
-
-    if(!path){
-      path = rnd.path;
-      pathEl.value = path;
-      changed = true;
-    }
-
-    if(!sni){
-      sni = host || rnd.sni;
-      sniEl.value = sni;
-      changed = true;
-    }
-
-    return changed;
-  }catch(_e){
-    return false;
-  }
-}
-
-function randomizeWss(){
-  const p = genWssRandomParams();
-  setField('f_wss_host', p.host);
-  setField('f_wss_path', p.path);
-  setField('f_wss_sni', p.sni);
-  q('f_wss_tls').value = '1';
-  q('f_wss_insecure').checked = true;
-}
 
 // ------------------------------
 // Save-time validations (Feature 2)
@@ -4397,12 +7208,13 @@ function getSkipIndexForPortCheck(mode){
   if(!old) return -1;
   const ex = old.extra_config || {};
   if(mode === 'tcp') return CURRENT_EDIT_INDEX;
+  if(mode === 'mptcp') return CURRENT_EDIT_INDEX;
   if(mode === 'wss'){
     if(ex && ex.sync_id && ex.sync_role === 'sender') return CURRENT_EDIT_INDEX;
     return -1;
   }
   if(mode === 'intranet'){
-    if(ex && ex.sync_id && ex.intranet_role === 'server') return CURRENT_EDIT_INDEX;
+    if(isIntranetSyncSenderRule(old)) return CURRENT_EDIT_INDEX;
     return -1;
   }
   return -1;
@@ -4419,8 +7231,7 @@ function findPortConflict(newListen, newProtocol, skipIdx){
     if(i === skipIdx) continue;
     const e = eps[i];
     if(!e) continue;
-    const ex = e.extra_config || {};
-    if(ex && ex.intranet_role === 'client') continue; // placeholder, doesn't bind
+    if(isIntranetSyncReceiverRule(e)) continue; // generated receiver side is placeholder
     const lp2 = parseListenToHostPort(e.listen || '');
     const port2 = parseInt(lp2.port || '0', 10);
     if(port2 !== newPort) continue;
@@ -4435,7 +7246,7 @@ function findPortConflict(newListen, newProtocol, skipIdx){
 }
 
 function newRule(){
-  if(allowedTunnelModes().length <= 0){
+  if(visibleTunnelModes().length <= 0){
     toast('当前账号无可用转发模式', true);
     return;
   }
@@ -4461,13 +7272,24 @@ function newRule(){
   q('f_protocol').value = 'tcp+udp';
 
   // Mode default
-  q('f_type').value = defaultTunnelMode();
+  q('f_type').value = defaultVisibleTunnelMode();
 
   // reset autosync receiver fields
   if(q('f_wss_receiver_node')) setField('f_wss_receiver_node','');
   if(q('f_wss_receiver_port')) setField('f_wss_receiver_port','');
+  if(q('f_wss_receiver_host')) setField('f_wss_receiver_host','');
   if(q('f_intranet_receiver_node')) setField('f_intranet_receiver_node','');
   if(q('f_intranet_server_port')) setField('f_intranet_server_port','18443');
+  if(q('f_mptcp_aggregator_node')) setField('f_mptcp_aggregator_node', '');
+  if(q('f_mptcp_scheduler')) setField('f_mptcp_scheduler', 'aggregate');
+  if(q('f_mptcp_aggregator_port')) setField('f_mptcp_aggregator_port', '');
+  if(q('f_mptcp_aggregator_host')) setField('f_mptcp_aggregator_host', '');
+  if(q('f_mptcp_failover_rtt_ms')) setField('f_mptcp_failover_rtt_ms', '');
+  if(q('f_mptcp_failover_jitter_ms')) setField('f_mptcp_failover_jitter_ms', '');
+  if(q('f_mptcp_failover_loss_pct')) setField('f_mptcp_failover_loss_pct', '');
+  if(q('f_mptcp_member_nodes')) setMultiSelectValues(q('f_mptcp_member_nodes'), []);
+  if(q('f_mptcp_member_filter')) setField('f_mptcp_member_filter', '');
+  if(q('f_mptcp_aggregator_filter')) setField('f_mptcp_aggregator_filter', '');
 
   // Close advanced by default
   const adv = document.getElementById('advancedDetails');
@@ -4475,8 +7297,11 @@ function newRule(){
 
   populateReceiverSelect();
   populateIntranetReceiverSelect();
+  populateMptcpMembersSelect();
+  populateMptcpAggregatorSelect();
   fillWssFields({});
   fillIntranetFields({});
+  fillMptcpFields({});
   fillCommonAdvancedFields({});
   showWssBox();
   openModal();
@@ -4499,9 +7324,13 @@ function copyRule(idx){
   try{ const sc = q('statusCol'); if(sc) sc.style.display = ''; }catch(_e){}
 
   q('modalTitle').textContent = `复制规则 #${idx+1}`;
+  const ex = (src && src.extra_config) ? src.extra_config : {};
 
   // Listen: port-only UI
-  const lp = parseListenToHostPort(src.listen || '');
+  const srcListen = (isRelayTunnelRule(src) && ex && ex.sync_role === 'sender')
+    ? String(ex.sync_sender_listen || ex.intranet_sender_listen || src.listen || '')
+    : (isIntranetSyncSenderRule(src) ? getIntranetSenderListen(src) : String(src.listen || ''));
+  const lp = parseListenToHostPort(srcListen);
   if(q('f_listen_host')) setField('f_listen_host', lp.host || '0.0.0.0');
   if(q('f_listen_port')) setField('f_listen_port', lp.port || '');
   syncListenComputed();
@@ -4517,32 +7346,44 @@ function copyRule(idx){
   q('f_disabled').value = src.disabled ? '1' : '0';
 
   // balance + weights
-  const balance = src.balance || 'roundrobin';
-  q('f_balance').value = balance.startsWith('iphash') ? 'iphash' : 'roundrobin';
-  const weights = balance.startsWith('roundrobin:')
-    ? balance.split(':').slice(1).join(':').trim().split(',').map(x=>x.trim()).filter(Boolean)
-    : [];
+  const parsedBalance = parseRuleBalance(src.balance, collectRuleRemotes(src).length);
+  q('f_balance').value = parsedBalance.algo || 'roundrobin';
+  const weights = parseExplicitBalanceWeights(src.balance, parsedBalance.algo);
   setField('f_weights', weights.join(','));
   q('f_protocol').value = src.protocol || 'tcp+udp';
 
   // Decide which mode to copy:
-  // - tunnel sender/server rules keep their mode
-  // - receiver/client generated rules are copied as "tcp" to avoid incomplete peer metadata
-  const ex = (src && src.extra_config) ? src.extra_config : {};
+  // - synced sender rules keep their mode
+  // - generated receiver rules are copied as "tcp" to avoid incomplete peer metadata
   let mode = wssMode(src);
   if(mode === 'wss'){
     if(!(ex && ex.sync_role === 'sender')) mode = 'tcp';
   }
   if(mode === 'intranet'){
-    if(!(ex && ex.intranet_role === 'server')) mode = 'tcp';
+    if(!isIntranetSyncSenderRule(src)) mode = 'tcp';
+  }
+  if(mode === 'mptcp'){
+    const mrole = String(ex.mptcp_role || ex.sync_role || '').trim().toLowerCase();
+    if(mrole !== 'sender') mode = 'tcp';
   }
   q('f_type').value = mode;
 
   // Reset peer selectors first
   if(q('f_wss_receiver_node')) setField('f_wss_receiver_node','');
   if(q('f_wss_receiver_port')) setField('f_wss_receiver_port','');
+  if(q('f_wss_receiver_host')) setField('f_wss_receiver_host','');
   if(q('f_intranet_receiver_node')) setField('f_intranet_receiver_node','');
   if(q('f_intranet_server_port')) setField('f_intranet_server_port','18443');
+  if(q('f_mptcp_aggregator_node')) setField('f_mptcp_aggregator_node', '');
+  if(q('f_mptcp_scheduler')) setField('f_mptcp_scheduler', 'aggregate');
+  if(q('f_mptcp_aggregator_port')) setField('f_mptcp_aggregator_port', '');
+  if(q('f_mptcp_aggregator_host')) setField('f_mptcp_aggregator_host', '');
+  if(q('f_mptcp_failover_rtt_ms')) setField('f_mptcp_failover_rtt_ms', '');
+  if(q('f_mptcp_failover_jitter_ms')) setField('f_mptcp_failover_jitter_ms', '');
+  if(q('f_mptcp_failover_loss_pct')) setField('f_mptcp_failover_loss_pct', '');
+  if(q('f_mptcp_member_nodes')) setMultiSelectValues(q('f_mptcp_member_nodes'), []);
+  if(q('f_mptcp_member_filter')) setField('f_mptcp_member_filter', '');
+  if(q('f_mptcp_aggregator_filter')) setField('f_mptcp_aggregator_filter', '');
 
   // Fill mode-specific fields
   if(mode === 'wss'){
@@ -4551,18 +7392,28 @@ function copyRule(idx){
     populateReceiverSelect();
     fillWssFields(src);
     fillIntranetFields({});
+    fillMptcpFields({});
     fillCommonAdvancedFields({});
     fillQosFields(src);
   }else if(mode === 'intranet'){
     populateIntranetReceiverSelect();
     fillIntranetFields(src);
     fillWssFields({});
+    fillMptcpFields({});
     fillCommonAdvancedFields({});
     fillQosFields(src);
+  }else if(mode === 'mptcp'){
+    populateMptcpMembersSelect();
+    populateMptcpAggregatorSelect();
+    fillMptcpFields(src);
+    fillWssFields({});
+    fillIntranetFields({});
+    fillCommonAdvancedFields(src);
   }else{
     // normal
     fillWssFields({});
     fillIntranetFields({});
+    fillMptcpFields({});
     fillCommonAdvancedFields(src);
   }
 
@@ -4590,8 +7441,33 @@ function copyRule(idx){
         if(q('f_intranet_acl_allow_tokens') && String(q('f_intranet_acl_allow_tokens').value || '').trim()) openAdv = true;
       }else if(m === 'wss'){
         if(q('f_wss_receiver_port') && String(q('f_wss_receiver_port').value || '').trim()) openAdv = true;
-        if(q('f_wss_tls') && String(q('f_wss_tls').value || '1') !== '1') openAdv = true;
-        if(q('f_wss_insecure') && q('f_wss_insecure').checked === false) openAdv = true;
+        if(q('f_wss_receiver_host') && String(q('f_wss_receiver_host').value || '').trim()) openAdv = true;
+      }else if(m === 'mptcp'){
+        if(q('f_mptcp_aggregator_port') && String(q('f_mptcp_aggregator_port').value || '').trim()) openAdv = true;
+        if(q('f_mptcp_aggregator_host') && String(q('f_mptcp_aggregator_host').value || '').trim()) openAdv = true;
+        if(q('f_mptcp_scheduler') && String(q('f_mptcp_scheduler').value || 'aggregate').trim() !== 'aggregate') openAdv = true;
+        if(q('f_mptcp_failover_rtt_ms') && String(q('f_mptcp_failover_rtt_ms').value || '').trim()) openAdv = true;
+        if(q('f_mptcp_failover_jitter_ms') && String(q('f_mptcp_failover_jitter_ms').value || '').trim()) openAdv = true;
+        if(q('f_mptcp_failover_loss_pct') && String(q('f_mptcp_failover_loss_pct').value || '').trim()) openAdv = true;
+        if(getMultiSelectValues(q('f_mptcp_member_nodes')).length > 0) openAdv = true;
+        if(q('f_mptcp_aggregator_node') && String(q('f_mptcp_aggregator_node').value || '').trim()) openAdv = true;
+
+        if(q('f_through') && String(q('f_through').value || '').trim()) openAdv = true;
+        if(q('f_interface') && String(q('f_interface').value || '').trim()) openAdv = true;
+        if(q('f_listen_interface') && String(q('f_listen_interface').value || '').trim()) openAdv = true;
+        if(q('f_accept_proxy') && String(q('f_accept_proxy').value || '').trim()) openAdv = true;
+        if(q('f_accept_proxy_timeout') && String(q('f_accept_proxy_timeout').value || '').trim()) openAdv = true;
+        if(q('f_send_proxy') && String(q('f_send_proxy').value || '').trim()) openAdv = true;
+        if(q('f_send_proxy_version') && String(q('f_send_proxy_version').value || '').trim()) openAdv = true;
+        if(q('f_send_mptcp') && String(q('f_send_mptcp').value || '').trim()) openAdv = true;
+        if(q('f_accept_mptcp') && String(q('f_accept_mptcp').value || '').trim()) openAdv = true;
+        if(q('f_net_tcp_timeout') && String(q('f_net_tcp_timeout').value || '').trim()) openAdv = true;
+        if(q('f_net_udp_timeout') && String(q('f_net_udp_timeout').value || '').trim()) openAdv = true;
+        if(q('f_net_tcp_keepalive') && String(q('f_net_tcp_keepalive').value || '').trim()) openAdv = true;
+        if(q('f_net_tcp_keepalive_probe') && String(q('f_net_tcp_keepalive_probe').value || '').trim()) openAdv = true;
+        if(q('f_net_ipv6_only') && String(q('f_net_ipv6_only').value || '').trim()) openAdv = true;
+        if(q('f_listen_transport') && String(q('f_listen_transport').value || '').trim()) openAdv = true;
+        if(q('f_remote_transport') && String(q('f_remote_transport').value || '').trim()) openAdv = true;
       }else{
         // tcp/common advanced
         if(q('f_through') && String(q('f_through').value || '').trim()) openAdv = true;
@@ -4630,7 +7506,11 @@ function toggleRuleTempUnlock(idx, ev){
   const e = eps[idx];
   if(!e) return;
   const ex = (e && e.extra_config) ? e.extra_config : {};
-  if(!(ex && (ex.sync_lock === true || ex.sync_role === 'receiver'))){
+  if(!(ex && (
+    ex.sync_lock === true ||
+    ex.sync_role === 'receiver' ||
+    isIntranetSyncReceiverRule(e)
+  ))){
     return;
   }
   const key = getRuleKey(e);
@@ -4676,7 +7556,10 @@ function editRule(idx){
 
   q('modalTitle').textContent = `编辑规则 #${idx+1}`;
   // Listen: port-only UI
-  const lp = parseListenToHostPort(e.listen || '');
+  const editListen = (isRelayTunnelRule(e) && ex && ex.sync_role === 'sender')
+    ? String(ex.sync_sender_listen || ex.intranet_sender_listen || e.listen || '')
+    : (isIntranetSyncSenderRule(e) ? getIntranetSenderListen(e) : String(e.listen || ''));
+  const lp = parseListenToHostPort(editListen);
   if(q('f_listen_host')) setField('f_listen_host', lp.host || '0.0.0.0');
   if(q('f_listen_port')) setField('f_listen_port', lp.port || '');
   syncListenComputed();
@@ -4688,9 +7571,9 @@ function editRule(idx){
   if(q('f_favorite')) q('f_favorite').checked = isRuleFavorite(e);
 
   q('f_disabled').value = e.disabled ? '1':'0';
-  const balance = e.balance || 'roundrobin';
-  q('f_balance').value = balance.startsWith('iphash') ? 'iphash' : 'roundrobin';
-  const weights = balance.startsWith('roundrobin:') ? balance.split(':').slice(1).join(':').trim().split(',').map(x=>x.trim()).filter(Boolean) : [];
+  const parsedBalance = parseRuleBalance(e.balance, collectRuleRemotes(e).length);
+  q('f_balance').value = parsedBalance.algo || 'roundrobin';
+  const weights = parseExplicitBalanceWeights(e.balance, parsedBalance.algo);
   setField('f_weights', weights.join(','));
   q('f_protocol').value = e.protocol || 'tcp+udp';
 
@@ -4707,6 +7590,7 @@ function editRule(idx){
   }else{
     if(q('f_wss_receiver_node')) setField('f_wss_receiver_node','');
     if(q('f_wss_receiver_port')) setField('f_wss_receiver_port','');
+    if(q('f_wss_receiver_host')) setField('f_wss_receiver_host','');
     fillWssFields({});
   }
 
@@ -4717,8 +7601,15 @@ function editRule(idx){
     fillIntranetFields({});
   }
 
+  // mptcp fields
+  if(mode === 'mptcp'){
+    fillMptcpFields(e);
+  }else{
+    fillMptcpFields({});
+  }
+
   // common advanced fields (only meaningful for normal rules)
-  if(mode === 'tcp') fillCommonAdvancedFields(e);
+  if(mode === 'tcp' || mode === 'mptcp') fillCommonAdvancedFields(e);
   else{
     fillCommonAdvancedFields({});
     fillQosFields(e);
@@ -4747,8 +7638,33 @@ function editRule(idx){
         if(q('f_intranet_acl_allow_tokens') && String(q('f_intranet_acl_allow_tokens').value || '').trim()) openAdv = true;
       }else if(mode === 'wss'){
         if(q('f_wss_receiver_port') && String(q('f_wss_receiver_port').value || '').trim()) openAdv = true;
-        if(q('f_wss_tls') && String(q('f_wss_tls').value || '1') !== '1') openAdv = true;
-        if(q('f_wss_insecure') && q('f_wss_insecure').checked === false) openAdv = true;
+        if(q('f_wss_receiver_host') && String(q('f_wss_receiver_host').value || '').trim()) openAdv = true;
+      }else if(mode === 'mptcp'){
+        if(q('f_mptcp_aggregator_port') && String(q('f_mptcp_aggregator_port').value || '').trim()) openAdv = true;
+        if(q('f_mptcp_aggregator_host') && String(q('f_mptcp_aggregator_host').value || '').trim()) openAdv = true;
+        if(q('f_mptcp_scheduler') && String(q('f_mptcp_scheduler').value || 'aggregate').trim() !== 'aggregate') openAdv = true;
+        if(q('f_mptcp_failover_rtt_ms') && String(q('f_mptcp_failover_rtt_ms').value || '').trim()) openAdv = true;
+        if(q('f_mptcp_failover_jitter_ms') && String(q('f_mptcp_failover_jitter_ms').value || '').trim()) openAdv = true;
+        if(q('f_mptcp_failover_loss_pct') && String(q('f_mptcp_failover_loss_pct').value || '').trim()) openAdv = true;
+
+        if(q('f_through') && String(q('f_through').value || '').trim()) openAdv = true;
+        if(q('f_interface') && String(q('f_interface').value || '').trim()) openAdv = true;
+        if(q('f_listen_interface') && String(q('f_listen_interface').value || '').trim()) openAdv = true;
+
+        if(q('f_accept_proxy') && String(q('f_accept_proxy').value || '').trim()) openAdv = true;
+        if(q('f_accept_proxy_timeout') && String(q('f_accept_proxy_timeout').value || '').trim()) openAdv = true;
+        if(q('f_send_proxy') && String(q('f_send_proxy').value || '').trim()) openAdv = true;
+        if(q('f_send_proxy_version') && String(q('f_send_proxy_version').value || '').trim()) openAdv = true;
+        if(q('f_send_mptcp') && String(q('f_send_mptcp').value || '').trim()) openAdv = true;
+        if(q('f_accept_mptcp') && String(q('f_accept_mptcp').value || '').trim()) openAdv = true;
+
+        if(q('f_net_tcp_timeout') && String(q('f_net_tcp_timeout').value || '').trim()) openAdv = true;
+        if(q('f_net_udp_timeout') && String(q('f_net_udp_timeout').value || '').trim()) openAdv = true;
+        if(q('f_net_tcp_keepalive') && String(q('f_net_tcp_keepalive').value || '').trim()) openAdv = true;
+        if(q('f_net_tcp_keepalive_probe') && String(q('f_net_tcp_keepalive_probe').value || '').trim()) openAdv = true;
+        if(q('f_net_ipv6_only') && String(q('f_net_ipv6_only').value || '').trim()) openAdv = true;
+        if(q('f_listen_transport') && String(q('f_listen_transport').value || '').trim()) openAdv = true;
+        if(q('f_remote_transport') && String(q('f_remote_transport').value || '').trim()) openAdv = true;
       }else{
         // tcp/common advanced
         if(q('f_through') && String(q('f_through').value || '').trim()) openAdv = true;
@@ -4797,36 +7713,50 @@ async function toggleRule(idx){
 
   const newDisabled = !e.disabled;
 
+  // MPTCP sender: update A/B/C via panel API
+  if(isMptcpSyncSenderRule(e)){
+    try{
+      setLoading(true);
+      const payloadRead = buildMptcpSyncPayloadFromEndpoint(e, { disabled: newDisabled });
+      if(!payloadRead.ok){
+        throw new Error(payloadRead.error || '多链路聚合同步参数无效');
+      }
+      const payload = payloadRead.payload;
+      const qos = collectQosFromEndpoint(e);
+      if(Object.keys(qos).length > 0) payload.qos = qos;
+      await enqueueSyncSaveTask('mptcp', payload, '已同步更新（A/B/C 三段）');
+      toast('已提交同步任务（A/B/C 三段）');
+    }catch(err){
+      toast(formatRequestError(err, '多链路聚合保存失败'), true);
+    }finally{
+      setLoading(false);
+    }
+    return;
+  }
+
   // Synced WSS sender: update both sides via panel API
-  if(ex && ex.sync_id && ex.sync_role === 'sender' && ex.sync_peer_node_id){
+  if(isRelayTunnelRule(e) && ex && ex.sync_id && ex.sync_role === 'sender' && ex.sync_peer_node_id){
     try{
       setLoading(true);
       const qos = collectQosFromEndpoint(e);
       const payload = {
         sender_node_id: window.__NODE_ID__,
         receiver_node_id: ex.sync_peer_node_id,
-        listen: e.listen,
+        listen: String(ex.sync_sender_listen || ex.intranet_sender_listen || e.listen || ''),
         remotes: ex.sync_original_remotes || [],
         disabled: newDisabled,
         balance: e.balance || 'roundrobin',
-        protocol: e.protocol || 'tcp+udp',
+        protocol: 'tcp',
         remark: getRuleRemark(e),
         favorite: isRuleFavorite(e),
-        receiver_port: ex.sync_receiver_port,
-        sync_id: ex.sync_id,
-        wss: {
-          host: ex.remote_ws_host || '',
-          path: ex.remote_ws_path || '',
-          sni: ex.remote_tls_sni || '',
-          tls: ex.remote_tls_enabled !== false,
-          insecure: ex.remote_tls_insecure === true
-        }
+        tunnel_port: ex.intranet_server_port || ex.sync_receiver_port || null,
+        sync_id: ex.sync_id
       };
       if(Object.keys(qos).length > 0) payload.qos = qos;
       await enqueueSyncSaveTask('wss', payload, '已同步更新（发送/接收两端）');
       toast('已提交同步任务（发送/接收两端）');
     }catch(err){
-      toast(formatRequestError(err, 'WSS 隧道保存失败'), true);
+      toast(formatRequestError(err, '隧道转发保存失败'), true);
     }finally{
       setLoading(false);
     }
@@ -4834,7 +7764,7 @@ async function toggleRule(idx){
   }
 
   // Intranet tunnel sender: update both sides via panel API
-  if(ex && ex.sync_id && ex.intranet_role === 'server' && ex.intranet_peer_node_id){
+  if(isIntranetSyncSenderRule(e) && ex.intranet_peer_node_id){
     try{
       setLoading(true);
       const qos = collectQosFromEndpoint(e);
@@ -4842,7 +7772,7 @@ async function toggleRule(idx){
       const payload = {
         sender_node_id: window.__NODE_ID__,
         receiver_node_id: ex.intranet_peer_node_id,
-        listen: e.listen,
+        listen: getIntranetSenderListen(e),
         remotes: ex.intranet_original_remotes || e.remotes || [],
         disabled: newDisabled,
         balance: e.balance || 'roundrobin',
@@ -4854,8 +7784,8 @@ async function toggleRule(idx){
       };
       if(Object.keys(qos).length > 0) payload.qos = qos;
       if(Object.keys(acl).length > 0) payload.acl = acl;
-      await enqueueSyncSaveTask('intranet', payload, '已同步更新（公网入口/内网出口两端）');
-      toast('已提交同步任务（公网入口/内网出口两端）');
+      await enqueueSyncSaveTask('intranet', payload, '已同步更新（发送/接收两端）');
+      toast('已提交同步任务（发送/接收两端）');
     }catch(err){
       toast(formatRequestError(err, '内网穿透保存失败'), true);
     }finally{
@@ -4966,16 +7896,42 @@ async function deleteRule(idx){
     return;
   }
 
+  // MPTCP sender: delete A/B/C
+  if(isMptcpSyncSenderRule(e)){
+    if(!confirm('这将同时删除 A/B/C 三段规则，确定继续？（不可恢复）')) return;
+    try{
+      setLoading(true);
+      const payloadRead = buildMptcpSyncPayloadFromEndpoint(e);
+      if(!payloadRead.ok){
+        throw new Error(payloadRead.error || '多链路聚合删除参数无效');
+      }
+      const payload = {
+        sender_node_id: payloadRead.payload.sender_node_id,
+        receiver_node_id: payloadRead.payload.aggregator_node_id,
+        aggregator_node_id: payloadRead.payload.aggregator_node_id,
+        member_node_ids: payloadRead.payload.member_node_ids,
+        sync_id: payloadRead.payload.sync_id
+      };
+      await enqueueSyncDeleteTask('mptcp', payload, '已删除（A/B/C 三段）');
+      toast('已提交删除任务（A/B/C 三段）');
+    }catch(err){
+      toast(formatRequestError(err, '多链路聚合删除失败'), true);
+    }finally{
+      setLoading(false);
+    }
+    return;
+  }
+
   // Synced sender: delete both sides
-  if(ex && ex.sync_id && ex.sync_role === 'sender' && ex.sync_peer_node_id){
-    if(!confirm('这将同时删除接收机对应规则，确定继续？（不可恢复）')) return;
+  if(isRelayTunnelRule(e) && ex && ex.sync_id && ex.sync_role === 'sender' && ex.sync_peer_node_id){
+    if(!confirm('这将同时删除出口节点对应规则，确定继续？（不可恢复）')) return;
     try{
       setLoading(true);
       const payload = { sender_node_id: window.__NODE_ID__, receiver_node_id: ex.sync_peer_node_id, sync_id: ex.sync_id };
       await enqueueSyncDeleteTask('wss', payload, '已删除（发送/接收两端）');
       toast('已提交删除任务（发送/接收两端）');
     }catch(err){
-      toast(formatRequestError(err, 'WSS 隧道删除失败'), true);
+      toast(formatRequestError(err, '隧道转发删除失败'), true);
     }finally{
       setLoading(false);
     }
@@ -4983,13 +7939,13 @@ async function deleteRule(idx){
   }
 
   // Intranet tunnel sender: delete both sides
-  if(ex && ex.sync_id && ex.intranet_role === 'server' && ex.intranet_peer_node_id){
+  if(isIntranetSyncSenderRule(e) && ex.intranet_peer_node_id){
     if(!confirm('这将同时删除内网出口节点对应配置，确定继续？（不可恢复）')) return;
     try{
       setLoading(true);
       const payload = { sender_node_id: window.__NODE_ID__, receiver_node_id: ex.intranet_peer_node_id, sync_id: ex.sync_id };
-      await enqueueSyncDeleteTask('intranet', payload, '已删除（公网入口/内网出口两端）');
-      toast('已提交删除任务（公网入口/内网出口两端）');
+      await enqueueSyncDeleteTask('intranet', payload, '已删除（发送/接收两端）');
+      toast('已提交删除任务（发送/接收两端）');
     }catch(err){
       toast(formatRequestError(err, '内网穿透删除失败'), true);
     }finally{
@@ -5058,32 +8014,15 @@ async function bulkSetDisabled(disabled){
       }
       const ex = (e && e.extra_config) ? e.extra_config : {};
 
-      // WSS sender: update both sides
-      if(ex && ex.sync_id && ex.sync_role === 'sender' && ex.sync_peer_node_id){
+      // MPTCP sender: update A/B/C
+      if(isMptcpSyncSenderRule(e)){
         try{
+          const payloadRead = buildMptcpSyncPayloadFromEndpoint(e, { disabled: wantDisabled });
+          if(!payloadRead.ok) throw new Error(payloadRead.error || '参数无效');
+          const payload = payloadRead.payload;
           const qos = collectQosFromEndpoint(e);
-          const payload = {
-            sender_node_id: window.__NODE_ID__,
-            receiver_node_id: ex.sync_peer_node_id,
-            listen: e.listen,
-            remotes: ex.sync_original_remotes || [],
-            disabled: wantDisabled,
-            balance: e.balance || 'roundrobin',
-            protocol: e.protocol || 'tcp+udp',
-            remark: getRuleRemark(e),
-            favorite: isRuleFavorite(e),
-            receiver_port: ex.sync_receiver_port,
-            sync_id: ex.sync_id,
-            wss: {
-              host: ex.remote_ws_host || '',
-              path: ex.remote_ws_path || '',
-              sni: ex.remote_tls_sni || '',
-              tls: ex.remote_tls_enabled !== false,
-              insecure: ex.remote_tls_insecure === true
-            }
-          };
           if(Object.keys(qos).length > 0) payload.qos = qos;
-          await enqueueSyncSaveTask('wss', payload, 'WSS 批量同步已完成');
+          await enqueueSyncSaveTask('mptcp', payload, '多链路聚合批量同步已完成');
           ok += 1;
           queued += 1;
         }catch(err){
@@ -5092,15 +8031,42 @@ async function bulkSetDisabled(disabled){
         continue;
       }
 
-      // Intranet server: update both sides
-      if(ex && ex.sync_id && ex.intranet_role === 'server' && ex.intranet_peer_node_id){
+      // WSS sender: update both sides
+      if(isRelayTunnelRule(e) && ex && ex.sync_id && ex.sync_role === 'sender' && ex.sync_peer_node_id){
+        try{
+          const qos = collectQosFromEndpoint(e);
+          const payload = {
+            sender_node_id: window.__NODE_ID__,
+            receiver_node_id: ex.sync_peer_node_id,
+            listen: String(ex.sync_sender_listen || ex.intranet_sender_listen || e.listen || ''),
+            remotes: ex.sync_original_remotes || [],
+            disabled: wantDisabled,
+            balance: e.balance || 'roundrobin',
+            protocol: 'tcp',
+            remark: getRuleRemark(e),
+            favorite: isRuleFavorite(e),
+            tunnel_port: ex.intranet_server_port || ex.sync_receiver_port || null,
+            sync_id: ex.sync_id
+          };
+          if(Object.keys(qos).length > 0) payload.qos = qos;
+          await enqueueSyncSaveTask('wss', payload, '隧道转发批量同步已完成');
+          ok += 1;
+          queued += 1;
+        }catch(err){
+          failed += 1;
+        }
+        continue;
+      }
+
+      // Intranet sender: update both sides
+      if(isIntranetSyncSenderRule(e) && ex.intranet_peer_node_id){
         try{
           const qos = collectQosFromEndpoint(e);
           const acl = (ex.intranet_acl && typeof ex.intranet_acl === 'object' && !Array.isArray(ex.intranet_acl)) ? ex.intranet_acl : {};
           const payload = {
             sender_node_id: window.__NODE_ID__,
             receiver_node_id: ex.intranet_peer_node_id,
-            listen: e.listen,
+            listen: getIntranetSenderListen(e),
             remotes: ex.intranet_original_remotes || e.remotes || [],
             disabled: wantDisabled,
             balance: e.balance || 'roundrobin',
@@ -5164,6 +8130,7 @@ async function bulkDeleteSelected(){
   }
 
   let hasWssSender = false;
+  let hasMptcpSender = false;
   let hasIntranetSender = false;
   let lockedCount = 0;
   for(const it of items){
@@ -5172,14 +8139,16 @@ async function bulkDeleteSelected(){
     const li = getRuleLockInfo(e);
     if(li && li.locked){ lockedCount += 1; continue; }
     const ex = (e && e.extra_config) ? e.extra_config : {};
-    if(ex && ex.sync_id && ex.sync_role === 'sender' && ex.sync_peer_node_id) hasWssSender = true;
-    if(ex && ex.sync_id && ex.intranet_role === 'server' && ex.intranet_peer_node_id) hasIntranetSender = true;
+    if(isMptcpSyncSenderRule(e)) hasMptcpSender = true;
+    if(isRelayTunnelRule(e) && ex && ex.sync_id && ex.sync_role === 'sender' && ex.sync_peer_node_id) hasWssSender = true;
+    if(isIntranetSyncSenderRule(e) && ex.intranet_peer_node_id) hasIntranetSender = true;
   }
 
   const n = items.length;
   let msg = `确定删除选中的 ${n} 条规则吗？（不可恢复）`;
-  if(hasWssSender) msg += `\n\n注意：包含 WSS 隧道发送机规则，删除将同步删除接收机对应规则。`;
-  if(hasIntranetSender) msg += `\n\n注意：包含内网穿透公网入口规则，删除将同步删除内网出口对应配置。`;
+  if(hasMptcpSender) msg += `\n\n注意：包含多链路聚合发送端规则，删除将同步删除 A/B/C 三段规则。`;
+  if(hasWssSender) msg += `\n\n注意：包含隧道转发送机规则，删除将同步删除出口节点对应规则。`;
+  if(hasIntranetSender) msg += `\n\n注意：包含内网隧道发送端规则，删除将同步删除接收端对应配置。`;
   if(lockedCount) msg += `\n\n其中 ${lockedCount} 条为锁定规则，将自动跳过。`;
   if(!confirm(msg)) return;
 
@@ -5207,10 +8176,18 @@ async function bulkDeleteSelected(){
       }
       const ex = (e && e.extra_config) ? e.extra_config : {};
 
-      if(ex && ex.sync_id && ex.sync_role === 'sender' && ex.sync_peer_node_id){
+      if(isMptcpSyncSenderRule(e)){
         try{
-          const payload = { sender_node_id: window.__NODE_ID__, receiver_node_id: ex.sync_peer_node_id, sync_id: ex.sync_id };
-          await enqueueSyncDeleteTask('wss', payload, 'WSS 批量删除已完成');
+          const payloadRead = buildMptcpSyncPayloadFromEndpoint(e);
+          if(!payloadRead.ok) throw new Error(payloadRead.error || '参数无效');
+          const payload = {
+            sender_node_id: payloadRead.payload.sender_node_id,
+            receiver_node_id: payloadRead.payload.aggregator_node_id,
+            aggregator_node_id: payloadRead.payload.aggregator_node_id,
+            member_node_ids: payloadRead.payload.member_node_ids,
+            sync_id: payloadRead.payload.sync_id
+          };
+          await enqueueSyncDeleteTask('mptcp', payload, '多链路聚合批量删除已完成');
           ok += 1;
         }catch(err){
           failed += 1;
@@ -5218,7 +8195,18 @@ async function bulkDeleteSelected(){
         continue;
       }
 
-      if(ex && ex.sync_id && ex.intranet_role === 'server' && ex.intranet_peer_node_id){
+      if(isRelayTunnelRule(e) && ex && ex.sync_id && ex.sync_role === 'sender' && ex.sync_peer_node_id){
+        try{
+          const payload = { sender_node_id: window.__NODE_ID__, receiver_node_id: ex.sync_peer_node_id, sync_id: ex.sync_id };
+          await enqueueSyncDeleteTask('wss', payload, '隧道转发批量删除已完成');
+          ok += 1;
+        }catch(err){
+          failed += 1;
+        }
+        continue;
+      }
+
+      if(isIntranetSyncSenderRule(e) && ex.intranet_peer_node_id){
         try{
           const payload = { sender_node_id: window.__NODE_ID__, receiver_node_id: ex.intranet_peer_node_id, sync_id: ex.sync_id };
           await enqueueSyncDeleteTask('intranet', payload, '内网穿透批量删除已完成');
@@ -5271,6 +8259,11 @@ async function saveRule(){
     toast(modeDenyReason(typeSel), true);
     return;
   }
+  if(CURRENT_EDIT_INDEX < 0 && !isModeVisible(typeSel)){
+    const deny = modeVisibilityDenyReason(typeSel) || '当前节点无可用转发模式';
+    toast(deny, true);
+    return;
+  }
   // Listen: port-only UI
   syncListenComputed();
   const listen = getListenString();
@@ -5299,48 +8292,52 @@ async function saveRule(){
   const remark = q('f_remark') ? String(q('f_remark').value || '').trim() : '';
   const favorite = q('f_favorite') ? !!q('f_favorite').checked : false;
 
-  // optional weights for roundrobin (comma separated)
+  // optional weights for weighted algorithms (comma separated)
   const weightsRaw = q('f_weights') ? (q('f_weights').value || '').trim() : '';
   let weightTokens = parseWeightTokens(weightsRaw);
 
-  let balTxt = (q('f_balance').value || '').trim();
-  let balance = balTxt ? balTxt.split(':')[0].trim() : 'roundrobin';
-  if(!balance) balance = 'roundrobin';
+  let balance = normalizeBalanceAlgo(q('f_balance').value) || 'roundrobin';
 
   let balanceStr = balance;
-  if(balance !== 'roundrobin'){
+  if(!WEIGHTED_BALANCE_ALGOS.has(balance)){
     if(weightTokens.length){
-      toast('IP Hash 不支持权重，已忽略权重');
+      toast(`${balanceAlgoLabel(balance)} 不支持权重，已忽略权重`);
     }
     weightTokens = [];
   }
   const wv = validateWeights(weightTokens, remotes.length);
   if(!wv.ok){ toast(wv.error, true); return; }
   if(wv.ignored && weightTokens.length){ toast('只有一个目标时无需权重，已忽略权重'); }
-  if(balance === 'roundrobin' && wv.weights.length > 0){
-    balanceStr = `roundrobin: ${wv.weights.join(',')}`;
+  if(WEIGHTED_BALANCE_ALGOS.has(balance) && wv.weights.length > 0){
+    balanceStr = `${balance}: ${wv.weights.join(',')}`;
   }
   // Keep weights input clean
   try{
-    if(q('f_weights')) q('f_weights').value = (balance === 'roundrobin' && wv.weights.length) ? wv.weights.join(',') : '';
+    if(q('f_weights')) q('f_weights').value = (WEIGHTED_BALANCE_ALGOS.has(balance) && wv.weights.length) ? wv.weights.join(',') : '';
   }catch(_e){}
 
-  const protocol = q('f_protocol').value || 'tcp+udp';
+  const protocol = (typeSel === 'wss')
+    ? 'tcp+udp'
+    : (typeSel === 'mptcp')
+      ? 'tcp'
+      : (q('f_protocol').value || 'tcp+udp');
   const selectedForwardTool = normalizeForwardTool(
     q('f_forward_tool') ? q('f_forward_tool').value : 'iptables',
     'iptables',
   );
-  if(typeSel === 'tcp' && selectedForwardTool === 'iptables' && balance === 'iphash'){
-    toast('iptables 工具暂不支持 IP Hash，请改用轮询或切换 realm', true);
+  if(typeSel === 'tcp' && selectedForwardTool === 'iptables' && !IPTABLES_BALANCE_ALGOS.has(balance)){
+    toast('iptables 工具仅支持 roundrobin / random_weight，请切换 realm 工具或调整算法', true);
     return;
   }
 
   // Listen port conflict validation (against current node pool)
-  const skipIdx = getSkipIndexForPortCheck(typeSel);
-  const conflict = findPortConflict(listen, protocol, skipIdx);
-  if(conflict){
-    toast(`端口冲突：端口 ${listenPortNum} 已被规则 #${conflict.idx+1}（${conflict.listen}）占用（协议：${conflict.protocolText}）`, true);
-    return;
+  if(typeSel !== 'wss'){
+    const skipIdx = getSkipIndexForPortCheck(typeSel);
+    const conflict = findPortConflict(listen, protocol, skipIdx);
+    if(conflict){
+      toast(`端口冲突：端口 ${listenPortNum} 已被规则 #${conflict.idx+1}（${conflict.listen}）占用（协议：${conflict.protocolText}）`, true);
+      return;
+    }
   }
 
   const editingOld = (CURRENT_EDIT_INDEX >= 0 && CURRENT_POOL && Array.isArray(CURRENT_POOL.endpoints))
@@ -5359,8 +8356,18 @@ async function saveRule(){
     editingLockInfo &&
     !editingLockInfo.locked
   );
+  const allowLocalEditForUnlockedIntranetReceiver = !!(
+    typeSel === 'intranet' &&
+    CURRENT_EDIT_INDEX >= 0 &&
+    editingEx &&
+    editingEx.sync_id &&
+    editingOld &&
+    isIntranetSyncReceiverRule(editingOld) &&
+    editingLockInfo &&
+    !editingLockInfo.locked
+  );
 
-  // WSS 隧道：必须选择接收机，自动同步生成接收端规则
+  // 隧道转发：必须选择出口节点，自动同步生成出口端规则
   if(typeSel === 'wss'){
     // Receiver side: when temporarily unlocked, allow direct local save on current node.
     if(allowLocalEditForUnlockedWssReceiver){
@@ -5395,7 +8402,7 @@ async function saveRule(){
           throw new Error('规则不存在或已删除');
         }
         draft.endpoints[CURRENT_EDIT_INDEX] = endpoint;
-        await savePool('接收端保存任务已提交', draft);
+        await savePool('出口端保存任务已提交', draft);
         closeModal();
       }catch(err){
         const msg = (err && err.message) ? err.message : String(err || '保存失败');
@@ -5414,29 +8421,21 @@ async function saveRule(){
       editingEx.sync_id &&
       (editingEx.sync_role === 'receiver' || editingEx.sync_lock === true)
     ){
-      toast('该接收端规则已重新锁定，请先点击“锁定”按钮临时解锁后再保存。', true);
+      toast('该出口端规则已重新锁定，请先点击“锁定”按钮临时解锁后再保存。', true);
       return;
     }
 
     const receiverNodeId = q('f_wss_receiver_node') ? q('f_wss_receiver_node').value.trim() : '';
     if(!receiverNodeId){
-      toast('WSS 隧道必须选择接收机节点', true);
+      toast('隧道转发必须选择出口节点', true);
       return;
     }
     const receiverPortTxt = q('f_wss_receiver_port') ? q('f_wss_receiver_port').value.trim() : '';
-    const autoFilled = autoFillWssIfBlank();
-    const wss = readWssFields();
+    const receiverHostTxt = q('f_wss_receiver_host') ? q('f_wss_receiver_host').value.trim() : '';
     const qosRead = readQosFields();
     if(!qosRead.ok){
       toast(qosRead.error || 'QoS 参数无效', true);
       return;
-    }
-    if(!wss.host || !wss.path){
-      toast('WSS Host / Path 不能为空', true);
-      return;
-    }
-    if(autoFilled){
-      toast('WSS Host/Path/SNI 留空已自动生成');
     }
     let syncId = '';
     if(CURRENT_EDIT_INDEX >= 0){
@@ -5456,9 +8455,9 @@ async function saveRule(){
       remark,
       favorite,
       qos: qosRead.qos,
-      receiver_port: receiverPortTxt ? parseInt(receiverPortTxt,10) : null,
-      sync_id: syncId,
-      wss
+      tunnel_port: receiverPortTxt ? parseInt(receiverPortTxt,10) : null,
+      server_host: receiverHostTxt || null,
+      sync_id: syncId
     };
 
     _setSyncPendingSubmit('wss', syncId, true);
@@ -5467,15 +8466,15 @@ async function saveRule(){
       renderRules();
     }catch(_e){}
     closeModal();
-    toast('已提交同步任务，规则正在后台同步到接收机');
-    enqueueSyncSaveTask('wss', payload, '已保存，并自动同步到接收机')
+    toast('已提交隧道转发同步任务，规则正在后台同步到出口节点');
+    enqueueSyncSaveTask('wss', payload, '已保存，并自动同步到出口节点')
       .then(()=>{
         _setSyncPendingSubmit('wss', syncId, false);
         renderRules();
       })
       .catch(async (err)=>{
         _setSyncPendingSubmit('wss', syncId, false);
-        toast(formatRequestError(err, 'WSS 隧道保存失败'), true);
+        toast(formatRequestError(err, '隧道转发保存失败'), true);
         let loaded = false;
         try{
           await loadPool();
@@ -5489,8 +8488,65 @@ async function saveRule(){
     return;
   }
 
-  // 内网穿透：公网入口(本节点) -> 选择的内网节点（内网节点主动连回公网入口）
+  // 内网隧道转发：本节点监听 -> 通过接收节点固定端口建立隧道 -> 转发到接收节点目标服务
   if(typeSel === 'intranet'){
+    // Client side: when temporarily unlocked, allow direct local save on current node.
+    if(allowLocalEditForUnlockedIntranetReceiver){
+      let endpoint = {};
+      try{
+        endpoint = editingOld ? JSON.parse(JSON.stringify(editingOld)) : {};
+      }catch(_e){
+        endpoint = {};
+      }
+
+      endpoint.listen = listen;
+      endpoint.remotes = remotes;
+      endpoint.disabled = disabled;
+      endpoint.balance = balanceStr;
+      endpoint.protocol = protocol;
+
+      try{ delete endpoint.remote; }catch(_e){}
+      try{ delete endpoint.extra_remotes; }catch(_e){}
+      try{ delete endpoint.balanceStr; }catch(_e){}
+
+      if(remark) endpoint.remark = remark; else { try{ delete endpoint.remark; }catch(_e){} }
+      if(favorite) endpoint.favorite = true; else { try{ delete endpoint.favorite; }catch(_e){} }
+
+      const advApply = applyCommonAdvancedToEndpoint(endpoint);
+      if(!advApply.ok){ toast(advApply.error || '高级参数无效', true); return; }
+
+      try{
+        setLoading(true);
+        const draft = clonePool(CURRENT_POOL);
+        if(!Array.isArray(draft.endpoints)) draft.endpoints = [];
+        if(CURRENT_EDIT_INDEX < 0 || CURRENT_EDIT_INDEX >= draft.endpoints.length){
+          throw new Error('规则不存在或已删除');
+        }
+        draft.endpoints[CURRENT_EDIT_INDEX] = endpoint;
+        await savePool('内网接收端保存任务已提交', draft);
+        closeModal();
+      }catch(err){
+        const msg = (err && err.message) ? err.message : String(err || '保存失败');
+        toast(msg, true);
+        try{ await loadPool(); }catch(_e){}
+      }finally{
+        setLoading(false);
+      }
+      return;
+    }
+
+    // Receiver-side lock has expired while modal stays open.
+    if(
+      CURRENT_EDIT_INDEX >= 0 &&
+      editingEx &&
+      editingEx.sync_id &&
+      editingOld &&
+      isIntranetSyncReceiverRule(editingOld)
+    ){
+      toast('该内网接收端规则已重新锁定，请先点击“锁定”按钮临时解锁后再保存。', true);
+      return;
+    }
+
     const receiverNodeId = q('f_intranet_receiver_node') ? q('f_intranet_receiver_node').value.trim() : '';
     if(!receiverNodeId){
       toast('内网穿透必须选择内网节点', true);
@@ -5561,13 +8617,86 @@ async function saveRule(){
     return;
   }
 
+  let mptcpCfg = null;
+  if(typeSel === 'mptcp'){
+    const mptcpRead = readMptcpFields();
+    if(!mptcpRead.ok){
+      toast(mptcpRead.error || '多链路聚合参数无效', true);
+      return;
+    }
+    mptcpCfg = mptcpRead.cfg;
+
+    const qosRead = readQosFields();
+    if(!qosRead.ok){
+      toast(qosRead.error || 'QoS 参数无效', true);
+      return;
+    }
+
+    let syncId = '';
+    if(CURRENT_EDIT_INDEX >= 0){
+      const old = CURRENT_POOL.endpoints[CURRENT_EDIT_INDEX];
+      const ex = (old && old.extra_config) ? old.extra_config : {};
+      if(ex && ex.sync_id) syncId = ex.sync_id;
+    }
+    if(!syncId) syncId = genLocalSyncId();
+
+    const payload = {
+      sender_node_id: window.__NODE_ID__,
+      receiver_node_id: mptcpCfg.aggregator_node_id,
+      member_node_ids: mptcpCfg.members,
+      aggregator_node_id: mptcpCfg.aggregator_node_id,
+      listen,
+      remotes,
+      disabled,
+      balance: balanceStr,
+      protocol: 'tcp',
+      remark,
+      favorite,
+      scheduler: mptcpCfg.scheduler || 'aggregate',
+      sync_id: syncId
+    };
+    payload.aggregator_host = mptcpCfg.aggregator_host || null;
+    if(mptcpCfg.aggregator_port != null) payload.aggregator_port = mptcpCfg.aggregator_port;
+    if(mptcpCfg.failover_rtt_ms != null) payload.failover_rtt_ms = mptcpCfg.failover_rtt_ms;
+    if(mptcpCfg.failover_jitter_ms != null) payload.failover_jitter_ms = mptcpCfg.failover_jitter_ms;
+    if(mptcpCfg.failover_loss_pct != null) payload.failover_loss_pct = mptcpCfg.failover_loss_pct;
+    if(Object.keys(qosRead.qos).length > 0) payload.qos = qosRead.qos;
+
+    _setSyncPendingSubmit('mptcp', syncId, true);
+    try{
+      upsertLocalSyncSenderRule('mptcp', payload);
+      renderRules();
+    }catch(_e){}
+    closeModal();
+    toast('已提交多链路聚合同步任务，规则正在后台下发到成员与汇聚节点');
+    enqueueSyncSaveTask('mptcp', payload, '已保存，并自动同步到多链路节点')
+      .then(()=>{
+        _setSyncPendingSubmit('mptcp', syncId, false);
+        renderRules();
+      })
+      .catch(async (err)=>{
+        _setSyncPendingSubmit('mptcp', syncId, false);
+        toast(formatRequestError(err, '多链路聚合保存失败'), true);
+        let loaded = false;
+        try{
+          await loadPool();
+          loaded = true;
+        }catch(_e){}
+        if(!loaded){
+          try{ removeLocalSyncRuleById('mptcp', syncId); }catch(_e){}
+        }
+        renderRules();
+      });
+    return;
+  }
+
   // 普通转发（单机）
   let endpoint = {};
   if(CURRENT_EDIT_INDEX >= 0){
     try{
       const old = (CURRENT_POOL && CURRENT_POOL.endpoints) ? CURRENT_POOL.endpoints[CURRENT_EDIT_INDEX] : null;
-      // Only preserve extra fields when editing an existing normal rule.
-      if(old && wssMode(old) === 'tcp'){
+      // Preserve existing extra fields for normal/mptcp edits.
+      if(old && (wssMode(old) === 'tcp' || wssMode(old) === 'mptcp')){
         endpoint = JSON.parse(JSON.stringify(old));
       }
     }catch(_e){ endpoint = {}; }
@@ -5592,6 +8721,12 @@ async function saveRule(){
   // Apply common advanced params
   const advApply = applyCommonAdvancedToEndpoint(endpoint);
   if(!advApply.ok){ toast(advApply.error || '高级参数无效', true); return; }
+
+  if(typeSel === 'mptcp'){
+    applyMptcpConfigToEndpoint(endpoint, mptcpCfg);
+  }else{
+    applyMptcpConfigToEndpoint(endpoint, null);
+  }
 
   try{
     setLoading(true);
@@ -5669,10 +8804,11 @@ function upsertLocalSyncSenderRule(kind, payload){
   const remotes = Array.isArray(p.remotes)
     ? p.remotes.map((x)=>String(x || '').trim()).filter(Boolean)
     : [];
-  const protocol = String(p.protocol || 'tcp+udp').trim() || 'tcp+udp';
+  let protocol = String(p.protocol || 'tcp+udp').trim() || 'tcp+udp';
   const balance = String(p.balance || 'roundrobin').trim() || 'roundrobin';
   const disabled = !!p.disabled;
   const receiverId = parseInt(p.receiver_node_id || 0, 10) || 0;
+  const aggregatorId = parseInt(p.aggregator_node_id || p.mptcp_aggregator_node_id || 0, 10) || 0;
 
   const ep = {
     listen,
@@ -5684,24 +8820,96 @@ function upsertLocalSyncSenderRule(kind, payload){
   const nowIso = new Date().toISOString();
   const ex = { sync_id: syncId };
   if(kk === 'wss'){
+    protocol = 'tcp+udp';
+    ep.protocol = 'tcp+udp';
+    ex.intranet_role = 'client';
+    ex.sync_tunnel_mode = 'relay';
+    ex.sync_tunnel_type = 'wss_relay';
     ex.sync_role = 'sender';
     if(receiverId > 0) ex.sync_peer_node_id = receiverId;
-    ex.sync_original_remotes = remotes.slice();
-    ex.sync_updated_at = nowIso;
-    const wss = (p.wss && typeof p.wss === 'object') ? p.wss : {};
-    if(wss.host != null) ex.remote_ws_host = String(wss.host || '').trim();
-    if(wss.path != null) ex.remote_ws_path = String(wss.path || '').trim();
-    if(wss.sni != null) ex.remote_tls_sni = String(wss.sni || '').trim();
-    if(wss.tls != null) ex.remote_tls_enabled = !!wss.tls;
-    if(wss.insecure != null) ex.remote_tls_insecure = !!wss.insecure;
-  }else if(kk === 'intranet'){
-    ex.intranet_role = 'server';
     if(receiverId > 0) ex.intranet_peer_node_id = receiverId;
-    ex.intranet_server_port = parseInt(p.server_port || 18443, 10) || 18443;
+    ex.sync_sender_listen = listen;
+    ex.intranet_sender_listen = listen;
+    ex.sync_original_remotes = remotes.slice();
     ex.intranet_original_remotes = remotes.slice();
+    const tunnelPort = parseInt(p.tunnel_port || p.server_port || 28443, 10) || 28443;
+    ex.sync_receiver_port = tunnelPort;
+    ex.intranet_server_port = tunnelPort;
+    ex.sync_updated_at = nowIso;
     ex.intranet_updated_at = nowIso;
     const host = String(p.server_host || '').trim();
-    if(host) ex.intranet_public_host = host;
+    if(host){
+      ex.intranet_peer_host = host;
+      ex.intranet_public_host = host;
+    }
+  }else if(kk === 'intranet'){
+    ex.intranet_role = 'client';
+    ex.sync_role = 'sender';
+    if(receiverId > 0) ex.sync_peer_node_id = receiverId;
+    if(receiverId > 0) ex.intranet_peer_node_id = receiverId;
+    ex.sync_sender_listen = listen;
+    ex.intranet_sender_listen = listen;
+    ex.sync_original_remotes = remotes.slice();
+    ex.intranet_server_port = parseInt(p.server_port || 18443, 10) || 18443;
+    ex.intranet_original_remotes = remotes.slice();
+    ex.sync_updated_at = nowIso;
+    ex.intranet_updated_at = nowIso;
+    const host = String(p.server_host || '').trim();
+    if(host) ex.intranet_peer_host = host;
+  }else if(kk === 'mptcp'){
+    ep.protocol = 'tcp';
+    ex.forward_mode = 'mptcp';
+    ex.mptcp_role = 'sender';
+    ex.sync_tunnel_mode = 'mptcp';
+    ex.sync_tunnel_type = 'mptcp';
+    ex.sync_role = 'sender';
+    if(aggregatorId > 0) ex.sync_peer_node_id = aggregatorId;
+    if(aggregatorId > 0) ex.mptcp_aggregator_node_id = aggregatorId;
+    if(aggregatorId > 0) ex.mptcp_aggregator_node_name = _findNodeNameById(aggregatorId) || (`节点-${aggregatorId}`);
+    ex.sync_sender_listen = listen;
+    ex.sync_original_remotes = remotes.slice();
+    ex.mptcp_updated_at = nowIso;
+    ex.sync_updated_at = nowIso;
+
+    const memberIds = _parseNodeIdList(Array.isArray(p.member_node_ids) ? p.member_node_ids : p.mptcp_member_node_ids);
+    const memberNames = memberIds.map((id)=>_findNodeNameById(id) || (`节点-${id}`));
+    ex.mptcp_member_node_ids = memberIds;
+    if(memberNames.length) ex.mptcp_member_node_names = memberNames;
+
+    const schedulerRaw = String(p.scheduler || p.mptcp_scheduler || 'aggregate').trim().toLowerCase();
+    ex.mptcp_scheduler = (schedulerRaw === 'backup' || schedulerRaw === 'hybrid') ? schedulerRaw : 'aggregate';
+
+    const aggHost = String(p.aggregator_host || p.mptcp_aggregator_host || '').trim();
+    if(aggHost) ex.mptcp_aggregator_host = aggHost;
+    const aggPort = parseInt(p.aggregator_port || p.mptcp_aggregator_port || 0, 10);
+    if(aggPort > 0) ex.mptcp_aggregator_port = aggPort;
+    const rtt = parseInt(p.failover_rtt_ms || p.mptcp_failover_rtt_ms || 0, 10);
+    if(Number.isFinite(rtt) && rtt >= 0) ex.mptcp_failover_rtt_ms = rtt;
+    const jitter = parseInt(p.failover_jitter_ms || p.mptcp_failover_jitter_ms || 0, 10);
+    if(Number.isFinite(jitter) && jitter >= 0) ex.mptcp_failover_jitter_ms = jitter;
+    const loss = Number(p.failover_loss_pct != null ? p.failover_loss_pct : p.mptcp_failover_loss_pct);
+    if(Number.isFinite(loss) && loss >= 0 && loss <= 100) ex.mptcp_failover_loss_pct = Number(loss.toFixed(2));
+
+    const defaultMemberPort = parseInt(parseListenToHostPort(listen).port || '0', 10) || 0;
+    const memberPorts = (p.member_ports && typeof p.member_ports === 'object') ? p.member_ports : {};
+    const senderTargets = [];
+    const senderPorts = {};
+    for(const mid of memberIds){
+      let mport = parseInt(memberPorts[mid] || memberPorts[String(mid)] || 0, 10);
+      if(!(mport > 0 && mport <= 65535)) mport = defaultMemberPort;
+      if(!(mport > 0 && mport <= 65535)) mport = 28000;
+      senderPorts[String(mid)] = mport;
+      const host = _findNodeHostById(mid);
+      if(host){
+        senderTargets.push(format_addr(host, mport));
+      }
+    }
+    ex.mptcp_member_ports = senderPorts;
+    if(senderTargets.length){
+      ep.remotes = senderTargets;
+      ex.mptcp_member_targets = senderTargets.slice();
+    }
+    ep.send_mptcp = true;
   }else{
     return false;
   }
@@ -5721,6 +8929,12 @@ function upsertLocalSyncSenderRule(kind, payload){
     if(String(oldEx.sync_id || '').trim() !== syncId) continue;
     if(kk === 'wss' && !(oldEx.sync_role || oldEx.sync_peer_node_id || oldEx.sync_lock)) continue;
     if(kk === 'intranet' && !(oldEx.intranet_role || oldEx.intranet_peer_node_id || oldEx.intranet_lock)) continue;
+    if(kk === 'mptcp' && !(
+      String(oldEx.forward_mode || '').trim().toLowerCase() === 'mptcp' ||
+      String(oldEx.mptcp_role || '').trim() ||
+      Array.isArray(oldEx.mptcp_member_node_ids) ||
+      parseInt(oldEx.mptcp_aggregator_node_id || 0, 10) > 0
+    )) continue;
     draft.endpoints[i] = ep;
     replaced = true;
     break;
@@ -5746,6 +8960,14 @@ function removeLocalSyncRuleById(kind, syncId){
     }
     if(kk === 'intranet'){
       return !(ex.intranet_role || ex.intranet_peer_node_id || ex.intranet_lock);
+    }
+    if(kk === 'mptcp'){
+      return !(
+        String(ex.forward_mode || '').trim().toLowerCase() === 'mptcp' ||
+        String(ex.mptcp_role || '').trim() ||
+        Array.isArray(ex.mptcp_member_node_ids) ||
+        parseInt(ex.mptcp_aggregator_node_id || 0, 10) > 0
+      );
     }
     return true;
   });
@@ -5801,13 +9023,13 @@ function toast(text, isError=false, durationMs){
 }
 
 async function restoreRules(file){
-  if(!file) return;
-  const id = window.__NODE_ID__;
+  if(!file) return false;
+  const nodeId = window.__NODE_ID__;
   const formData = new FormData();
   formData.append('file', file);
   try{
-    toast('正在恢复…');
-    const res = await fetch(`/api/nodes/${id}/restore`, {
+    toast('正在上传并创建恢复任务…');
+    const res = await fetch(`/api/nodes/${nodeId}/restore`, {
       method: 'POST',
       body: formData,
       credentials: 'same-origin',
@@ -5822,9 +9044,29 @@ async function restoreRules(file){
     if(!data.ok){
       throw new Error(data.error || '恢复失败');
     }
-    await loadPool();
-  await loadNodesList();
-    toast('规则恢复完成');
+    const job = (data.job && typeof data.job === 'object') ? data.job : null;
+    if(!(job && job.job_id)){
+      throw new Error(data.error || '恢复任务提交失败：缺少 job_id');
+    }
+    const fallback = {
+      kind: 'rule_restore',
+      ok_msg: '规则恢复完成',
+      error_prefix: '规则恢复失败',
+      status_url_template: `/api/nodes/${encodeURIComponent(nodeId)}/pool_jobs/{job_id}`,
+      retry_url_template: `/api/nodes/${encodeURIComponent(nodeId)}/pool_jobs/{job_id}/retry`,
+    };
+    const task = _syncJobToTask(job, fallback);
+    if(!task.status) task.status = 'queued';
+    if(!task.kind) task.kind = 'rule_restore';
+    if(!task.status_url){
+      task.status_url = _jobUrlWithId(task.status_url_template, task.job_id) || `/api/nodes/${encodeURIComponent(nodeId)}/pool_jobs/${encodeURIComponent(task.job_id)}`;
+    }
+    if(!task.retry_url){
+      task.retry_url = _jobUrlWithId(task.retry_url_template, task.job_id) || `/api/nodes/${encodeURIComponent(nodeId)}/pool_jobs/${encodeURIComponent(task.job_id)}/retry`;
+    }
+    _setSyncTask(task);
+    pollSyncTask(task.job_id);
+    toast('规则恢复任务已提交，正在后台执行');
     return true;
   }catch(e){
     toast('恢复失败：' + e.message, true);
@@ -5841,9 +9083,10 @@ function openRestoreModal(){
   if(modal){
     modal.style.display = '';
   }
-  const textarea = q('restoreText');
-  if(textarea){
-    textarea.focus();
+  const input = q('restoreFile');
+  if(input){
+    input.value = '';
+    input.focus();
   }
 }
 
@@ -5854,26 +9097,17 @@ function closeRestoreModal(){
   }
 }
 
-async function restoreFromText(){
-  const textarea = q('restoreText');
-  if(!textarea) return;
-  const raw = textarea.value.trim();
-  if(!raw){
-    alert('请先粘贴备份内容（JSON）');
+async function restoreFromFile(){
+  const input = q('restoreFile');
+  if(!input) return;
+  const file = (input.files && input.files[0]) ? input.files[0] : null;
+  if(!file){
+    alert('请先选择备份规则文件（JSON）');
     return;
   }
-  let payload;
-  try{
-    payload = JSON.parse(raw);
-  }catch(e){
-    alert('备份内容不是有效的 JSON：' + e.message);
-    return;
-  }
-  const blob = new Blob([JSON.stringify(payload)], { type: 'application/json' });
-  const file = new File([blob], 'realm-rules.json', { type: 'application/json' });
   const ok = await restoreRules(file);
   if(ok){
-    textarea.value = '';
+    input.value = '';
     closeRestoreModal();
   }
 }
@@ -7102,6 +10336,128 @@ function initNodePage(){
   }
   q('f_type').addEventListener('change', showWssBox);
   if(q('f_wss_receiver_node')) q('f_wss_receiver_node').addEventListener('change', showWssBox);
+  if(q('f_mptcp_aggregator_node')){
+    q('f_mptcp_aggregator_node').addEventListener('change', ()=>{
+      syncMptcpMemberExclusions();
+      applyMptcpMemberFilter();
+      renderMptcpAggregatorCards();
+      updateMptcpMembersCount();
+      try{ updateModePreview(); }catch(_e){}
+    });
+  }
+  if(q('f_mptcp_member_nodes')){
+    q('f_mptcp_member_nodes').addEventListener('change', ()=>{
+      updateMptcpMembersCount();
+      try{ updateModePreview(); }catch(_e){}
+    });
+  }
+  if(q('f_mptcp_member_filter')){
+    q('f_mptcp_member_filter').addEventListener('input', ()=>{
+      applyMptcpMemberFilter();
+    });
+  }
+  if(q('f_mptcp_aggregator_filter')){
+    q('f_mptcp_aggregator_filter').addEventListener('input', ()=>{
+      renderMptcpAggregatorCards();
+    });
+  }
+  if(q('btnMptcpMembersToggleOffline')){
+    _setMptcpShowOffline(_mptcpShowOffline());
+    q('btnMptcpMembersToggleOffline').addEventListener('click', ()=>{
+      _setMptcpShowOffline(!_mptcpShowOffline());
+      populateMptcpMembersSelect();
+      populateMptcpAggregatorSelect();
+      try{ updateModePreview(); }catch(_e){}
+    });
+  }
+  if(q('btnMptcpMembersOnline')){
+    q('btnMptcpMembersOnline').addEventListener('click', ()=>selectVisibleMptcpMembers('online'));
+  }
+  if(q('btnMptcpMembersAll')){
+    q('btnMptcpMembersAll').addEventListener('click', ()=>selectVisibleMptcpMembers('all'));
+  }
+  if(q('btnMptcpMembersClear')){
+    q('btnMptcpMembersClear').addEventListener('click', ()=>selectVisibleMptcpMembers('clear'));
+  }
+  if(q('mg_sender_node_id')){
+    q('mg_sender_node_id').addEventListener('change', ()=>{
+      _mptcpGroupSyncEditorSelectors();
+    });
+  }
+  if(q('mptcpGroupSenderFilter')){
+    q('mptcpGroupSenderFilter').addEventListener('change', ()=>{
+      const senderId = parseInt(String(q('mptcpGroupSenderFilter')?.value || '0'), 10);
+      if(senderId > 0) MPTCP_GROUP_STATE.sender_filter_node_id = senderId;
+      MPTCP_GROUP_STATE.active_sync_id = '';
+      const editor = q('mptcpGroupEditor');
+      if(editor) editor.style.display = 'none';
+      const probeBox = q('mptcpGroupProbe');
+      if(probeBox) probeBox.innerHTML = '';
+      loadMptcpTunnelGroups();
+    });
+  }
+  if(q('mg_member_node_ids')){
+    q('mg_member_node_ids').addEventListener('change', ()=>{
+      _mptcpGroupSyncEditorSelectors();
+    });
+  }
+  if(q('mg_aggregator_node_id')){
+    q('mg_aggregator_node_id').addEventListener('change', ()=>{
+      _mptcpGroupSyncEditorSelectors();
+    });
+  }
+  if(q('mg_overlay_enabled')){
+    q('mg_overlay_enabled').addEventListener('change', ()=>{
+      try{ _mptcpGroupSyncOverlayUI(); }catch(_e){}
+    });
+  }
+
+  // Overlay rule helper: pick a reusable MPTCP group and auto-fill params.
+  if(q('f_overlay_group_pick')){
+    q('f_overlay_group_pick').addEventListener('change', ()=>{
+      try{ applyOverlayGroupPick(); }catch(_e){}
+      try{ renderOverlaySummary(); }catch(_e){}
+    });
+  }
+
+  // Overlay summary pills (click to copy)
+  ['f_overlay_entry','f_overlay_sync_id','f_overlay_token'].forEach((id)=>{
+    const el = q(id);
+    if(!el) return;
+    const fn = ()=>{ try{ renderOverlaySummary(); }catch(_e){} };
+    el.addEventListener('input', fn);
+    el.addEventListener('change', fn);
+  });
+  const _bindCopy = (pillId, readFn)=>{
+    const el = q(pillId);
+    if(!el) return;
+    el.style.cursor = 'copy';
+    el.addEventListener('click', async ()=>{
+      try{
+        const v = String(readFn() || '').trim();
+        if(!v) return;
+        await copyText(v);
+      }catch(_e){}
+    });
+  };
+  _bindCopy('ovSumEntry', ()=>String(q('f_overlay_entry')?.value || ''));
+  _bindCopy('ovSumSid', ()=>String(q('f_overlay_sync_id')?.value || ''));
+  _bindCopy('ovSumTok', ()=>String(q('f_overlay_token')?.value || ''));
+
+  // Quick Overlay modal
+  if(q('oq_group')){
+    q('oq_group').addEventListener('change', ()=>{
+      const sid = String(q('oq_group')?.value || '').trim();
+      if(sid) _lsSet(LS_OVERLAY_LAST_GROUP_SID, sid);
+      try{ overlayQuickRenderStats(); }catch(_e){}
+      try{
+        const remarkEl = q('oq_remark');
+        if(remarkEl && sid && !String(remarkEl.value || '').trim()){
+          remarkEl.value = `via mptcp_overlay:${sid.slice(0, 8)}`;
+        }
+      }catch(_e){}
+    });
+  }
 
   // Tunnel mode switcher cards (new UI)
   document.querySelectorAll('#modeSwitch .mode-card').forEach(btn=>{
@@ -7112,7 +10468,14 @@ function initNodePage(){
   });
 
   // Update mode preview as you type/select
-  ['f_listen_port','f_listen_host','f_remotes','f_wss_receiver_node','f_wss_receiver_port','f_intranet_receiver_node','f_intranet_server_port','f_intranet_server_host','f_forward_tool'].forEach((id)=>{
+  [
+    'f_listen_port','f_listen_host','f_remotes',
+    'f_wss_receiver_node','f_wss_receiver_port','f_wss_receiver_host',
+    'f_intranet_receiver_node','f_intranet_server_port','f_intranet_server_host',
+    'f_mptcp_member_nodes','f_mptcp_aggregator_node','f_mptcp_aggregator_port','f_mptcp_aggregator_host','f_mptcp_scheduler',
+    'f_mptcp_failover_rtt_ms','f_mptcp_failover_jitter_ms','f_mptcp_failover_loss_pct',
+    'f_forward_tool'
+  ].forEach((id)=>{
     const el = document.getElementById(id);
     if(!el) return;
     const fn = ()=>{ try{ updateModePreview(); }catch(_e){} };
@@ -7122,6 +10485,8 @@ function initNodePage(){
 
   // Initial render for mode guide/hints
   try{ syncTunnelModeUI(); }catch(_e){}
+  try{ updateMptcpMembersCount(); }catch(_e){}
+  try{ syncRuleQuickFilterModes(); }catch(_e){}
 
   // ✅ Load nodes list for WSS auto-sync receiver selector
   // (otherwise the receiver dropdown stays empty and cannot be selected)
@@ -7182,6 +10547,23 @@ function initNodePage(){
       }, 80);
     }
   }catch(_e){}
+  try{ _renderDirectTunnelMenuHint(); }catch(_e){}
+  try{ _renderNodeDirectBadge(window.__NODE_DIRECT_TUNNEL__ || {}); }catch(_e){}
+  try{
+    document.querySelectorAll('.node-item-row').forEach((row)=>{
+      const ds = row && row.dataset ? row.dataset : {};
+      const dt = _normalizeDirectTunnel({
+        enabled: String(ds.nodeDirectEnabled || '0') === '1',
+        sync_id: ds.nodeDirectSyncId || '',
+        relay_node_id: ds.nodeDirectRelayId || '0',
+        listen_port: ds.nodeDirectListenPort || '0',
+        public_host: ds.nodeDirectPublicHost || '',
+        scheme: ds.nodeDirectScheme || '',
+        verify_tls: String(ds.nodeDirectVerifyTls || '0') === '1',
+      });
+      _renderNodeRowDirectPill(row, dt);
+    });
+  }catch(_e){}
 }
 
 window.initNodePage = initNodePage;
@@ -7194,13 +10576,26 @@ window.deleteRule = deleteRule;
 window.triggerRestore = triggerRestore;
 window.openRestoreModal = openRestoreModal;
 window.closeRestoreModal = closeRestoreModal;
-window.restoreFromText = restoreFromText;
+window.restoreFromFile = restoreFromFile;
 window.refreshStats = refreshStats;
 window.openCommandModal = openCommandModal;
 window.closeCommandModal = closeCommandModal;
 window.openTraceRouteModal = openTraceRouteModal;
 window.closeTraceRouteModal = closeTraceRouteModal;
-window.randomizeWss = randomizeWss;
+window.openMptcpGroupModal = openMptcpGroupModal;
+window.closeMptcpGroupModal = closeMptcpGroupModal;
+window.loadMptcpTunnelGroups = loadMptcpTunnelGroups;
+window.openMptcpGroupCreate = openMptcpGroupCreate;
+window.openMptcpGroupEditor = openMptcpGroupEditor;
+window.saveMptcpGroup = saveMptcpGroup;
+window.probeMptcpGroup = probeMptcpGroup;
+window.deleteMptcpGroup = deleteMptcpGroup;
+window.copyMptcpGroupReuseTarget = copyMptcpGroupReuseTarget;
+window.copyMptcpGroupOverlayParams = copyMptcpGroupOverlayParams;
+window.newRuleFromMptcpGroup = newRuleFromMptcpGroup;
+window.newOverlayRuleFromMptcpGroup = newOverlayRuleFromMptcpGroup;
+window.pasteOverlayReuseParams = pasteOverlayReuseParams;
+window.clearOverlayReuseParams = clearOverlayReuseParams;
 
 // -------------------- Small UX enhancements --------------------
 
@@ -7335,6 +10730,63 @@ document.addEventListener('keydown', (e)=>{
   }
 });
 
+function _setSectionVisible(el, visible){
+  if(!el) return;
+  el.style.display = visible ? '' : 'none';
+}
+
+function syncAddNodeCapabilityUI(){
+  const systemEl = document.getElementById('addNodeSystemType');
+  if(!systemEl) return;
+  const isMac = isMacNodeSystemType(systemEl.value);
+
+  const roleBox = document.getElementById('addNodeWebsiteRoleBox');
+  const rootBox = document.getElementById('addNodeWebsiteRootBox');
+  _setSectionVisible(roleBox, !isMac);
+  _setSectionVisible(rootBox, !isMac);
+
+  const websiteEl = document.getElementById('addNodeIsWebsite');
+  if(websiteEl){
+    websiteEl.disabled = isMac;
+    if(isMac) websiteEl.checked = false;
+  }
+  const rootEl = document.getElementById('addNodeWebsiteRoot');
+  if(rootEl){
+    if(isMac){
+      rootEl.value = '';
+      rootEl.disabled = true;
+    }else{
+      rootEl.disabled = false;
+      if(!String(rootEl.value || '').trim()) rootEl.value = '/www';
+    }
+  }
+}
+
+function syncEditNodeCapabilityUI(systemTypeRaw){
+  const isMac = isMacNodeSystemType(systemTypeRaw);
+
+  const roleBox = document.getElementById('editNodeWebsiteRoleBox');
+  const rootBox = document.getElementById('editNodeWebsiteRootBox');
+  _setSectionVisible(roleBox, !isMac);
+  _setSectionVisible(rootBox, !isMac);
+
+  const websiteEl = document.getElementById('editNodeIsWebsite');
+  if(websiteEl){
+    websiteEl.disabled = isMac;
+    if(isMac) websiteEl.checked = false;
+  }
+  const rootEl = document.getElementById('editNodeWebsiteRoot');
+  if(rootEl){
+    if(isMac){
+      rootEl.value = '';
+      rootEl.disabled = true;
+    }else{
+      rootEl.disabled = false;
+      if(!String(rootEl.value || '').trim()) rootEl.value = '/www';
+    }
+  }
+}
+
 // Close group modal on backdrop click
 document.addEventListener('click', (e)=>{
   const m = document.getElementById('groupOrderModal');
@@ -7365,12 +10817,18 @@ function openAddNodeModal(){
   const m = document.getElementById("addNodeModal");
   if(!m) return;
   m.style.display = "flex";
+  const systemEl = document.getElementById('addNodeSystemType');
+  if(systemEl && !systemEl.dataset._capBound){
+    systemEl.addEventListener('change', syncAddNodeCapabilityUI);
+    systemEl.dataset._capBound = '1';
+  }
   // prefill group
   try{
     const g = localStorage.getItem("realm_last_group") || "";
     const gi = document.getElementById("addNodeGroup");
     if(gi && g) gi.value = g;
   }catch(_e){}
+  try{ syncAddNodeCapabilityUI(); }catch(_e){}
   // focus
   const ip = document.getElementById("addNodeIp");
   if(ip) setTimeout(()=>ip.focus(), 30);
@@ -7391,6 +10849,14 @@ function openEditNodeModalFromCard(btn){
       is_private: String(ds.nodeIsPrivate || '0') === '1',
       role: ds.nodeRole || 'normal',
       website_root_base: ds.nodeWebsiteRoot || '',
+      system_type: ds.nodeSystemType || 'auto',
+      direct_tunnel_enabled: String(ds.nodeDirectEnabled || '0') === '1',
+      direct_tunnel_sync_id: ds.nodeDirectSyncId || '',
+      direct_tunnel_relay_node_id: ds.nodeDirectRelayId || '0',
+      direct_tunnel_listen_port: ds.nodeDirectListenPort || '0',
+      direct_tunnel_public_host: ds.nodeDirectPublicHost || '',
+      direct_tunnel_scheme: ds.nodeDirectScheme || '',
+      direct_tunnel_verify_tls: String(ds.nodeDirectVerifyTls || '0') === '1',
       auto_restart_enabled: String(ds.nodeArEnabled || '1') === '1',
       auto_restart_schedule_type: ds.nodeArSchedule || 'daily',
       auto_restart_interval: ds.nodeArInterval || '1',
@@ -7446,6 +10912,110 @@ function toggleAutoRestartEditor(){
 }
 window.toggleAutoRestartEditor = toggleAutoRestartEditor;
 
+function _normalizeDirectTunnel(raw){
+  const dt = (raw && typeof raw === 'object') ? raw : {};
+  const enabled = !!dt.enabled;
+  const relayNodeId = parseInt(String(dt.relay_node_id || dt.relayNodeId || 0), 10);
+  const listenPort = parseInt(String(dt.listen_port || dt.listenPort || 0), 10);
+  const schemeRaw = String(dt.scheme || '').trim().toLowerCase();
+  const scheme = (schemeRaw === 'https' || schemeRaw === 'http') ? schemeRaw : 'http';
+  const verifyTls = !!dt.verify_tls;
+  const publicHost = String(dt.public_host || dt.publicHost || '').trim();
+  let directBaseUrl = String(dt.direct_base_url || dt.directBaseUrl || '').trim();
+  if(!directBaseUrl && enabled && publicHost && Number.isFinite(listenPort) && listenPort > 0){
+    directBaseUrl = `${scheme}://${publicHost}:${listenPort}`;
+  }
+  return {
+    enabled,
+    sync_id: String(dt.sync_id || dt.syncId || '').trim(),
+    relay_node_id: (Number.isFinite(relayNodeId) && relayNodeId > 0) ? relayNodeId : 0,
+    listen_port: (Number.isFinite(listenPort) && listenPort > 0 && listenPort <= 65535) ? listenPort : 0,
+    public_host: publicHost,
+    scheme,
+    verify_tls: verifyTls,
+    updated_at: String(dt.updated_at || dt.updatedAt || '').trim(),
+    direct_base_url: directBaseUrl
+  };
+}
+
+function _directTunnelMenuHintText(dt){
+  const d = _normalizeDirectTunnel(dt);
+  if(!d.enabled) return '未开启';
+  if(d.direct_base_url) return `已开启 · ${d.direct_base_url}`;
+  if(d.listen_port > 0) return `已开启 · :${d.listen_port}`;
+  return '已开启';
+}
+
+function _renderDirectTunnelMenuHint(){
+  const el = document.getElementById('directTunnelMenuHint');
+  if(!el) return;
+  el.textContent = _directTunnelMenuHintText(window.__NODE_DIRECT_TUNNEL__ || {});
+}
+
+function _renderNodeDirectBadge(dt){
+  const el = document.getElementById('nodeDirectTunnelBadge');
+  if(!el) return;
+  const d = _normalizeDirectTunnel(dt);
+  if(!d.enabled){
+    el.style.display = 'none';
+    return;
+  }
+  el.style.display = '';
+  if(d.direct_base_url){
+    el.textContent = `直连通道已开启 · ${d.direct_base_url}`;
+    return;
+  }
+  if(d.listen_port > 0){
+    el.textContent = `直连通道已开启 · 端口 ${d.listen_port}`;
+    return;
+  }
+  el.textContent = '直连通道已开启';
+}
+
+function _renderNodeRowDirectPill(row, dt){
+  if(!row || !row.classList) return;
+  const d = _normalizeDirectTunnel(dt);
+  row.classList.toggle('direct-enabled', !!d.enabled);
+  const pill = row.querySelector('.node-direct-pill');
+  if(!pill) return;
+  pill.style.display = d.enabled ? '' : 'none';
+}
+
+function applyDirectTunnelToPage(dt, nodeId){
+  try{
+    const normalized = _normalizeDirectTunnel(dt);
+    const id = (nodeId !== undefined && nodeId !== null) ? String(nodeId) : String(window.__NODE_ID__ || '');
+    // update sidebar dataset
+    try{
+      const row = id ? document.querySelector(`.node-item-row[data-node-id="${id}"]`) : null;
+      if(row){
+        row.dataset.nodeDirectEnabled = normalized.enabled ? '1' : '0';
+        row.dataset.nodeDirectSyncId = normalized.sync_id || '';
+        row.dataset.nodeDirectRelayId = String(normalized.relay_node_id || 0);
+        row.dataset.nodeDirectListenPort = String(normalized.listen_port || 0);
+        row.dataset.nodeDirectPublicHost = normalized.public_host || '';
+        row.dataset.nodeDirectScheme = normalized.scheme || '';
+        row.dataset.nodeDirectVerifyTls = normalized.verify_tls ? '1' : '0';
+        _renderNodeRowDirectPill(row, normalized);
+      }
+    }catch(_e){}
+    if(window.__NODE_ID__ && id && String(window.__NODE_ID__) === String(id)){
+      window.__NODE_DIRECT_TUNNEL__ = normalized;
+      _renderDirectTunnelMenuHint();
+      _renderNodeDirectBadge(normalized);
+      try{
+        if(__DIRECT_TUNNEL_OPTIONS__ && typeof __DIRECT_TUNNEL_OPTIONS__ === 'object'){
+          __DIRECT_TUNNEL_OPTIONS__.current = normalized;
+          __DIRECT_TUNNEL_OPTIONS_AT__ = Date.now();
+        }
+      }catch(_e){}
+    }
+  }catch(_e){}
+}
+
+let __DIRECT_TUNNEL_OPTIONS__ = null;
+let __DIRECT_TUNNEL_OPTIONS_AT__ = 0;
+
 // ---------------- Node: Edit Node Modal ----------------
 function openEditNodeModal(nodeObj){
   const m = document.getElementById('editNodeModal');
@@ -7459,6 +11029,11 @@ function openEditNodeModal(nodeObj){
   const ipri = hasObj ? !!nodeObj.is_private : !!window.__NODE_IS_PRIVATE__;
   const role = hasObj ? (nodeObj.role || '') : (window.__NODE_ROLE__ || '');
   const websiteRoot = hasObj ? (nodeObj.website_root_base || nodeObj.website_root || '') : (window.__NODE_WEBSITE_ROOT__ || '');
+  const systemType = normalizeNodeSystemType(
+    hasObj
+      ? (nodeObj.system_type || nodeObj.systemType || 'auto')
+      : (window.__NODE_SYSTEM_TYPE__ || 'auto')
+  );
   const arEnabled = hasObj
     ? !!nodeObj.auto_restart_enabled
     : !!window.__NODE_AUTO_RESTART_ENABLED__;
@@ -7483,6 +11058,7 @@ function openEditNodeModal(nodeObj){
   window.__EDITING_NODE_ID__ = editId;
   window.__EDITING_NODE_CONTEXT__ = hasObj ? 'dashboard' : 'node';
   window.__EDITING_NODE_PREV_GROUP__ = String(group || '默认分组').trim() || '默认分组';
+  window.__EDITING_NODE_SYSTEM_TYPE__ = systemType;
 
   let scheme = 'http';
   let host = '';
@@ -7522,6 +11098,7 @@ function openEditNodeModal(nodeObj){
   if(iprEl) iprEl.checked = !!ipri;
   if(websiteEl) websiteEl.checked = String(role || '').toLowerCase() === 'website';
   if(websiteRootEl) websiteRootEl.value = String(websiteRoot || '').trim() || '/www';
+  try{ syncEditNodeCapabilityUI(systemType); }catch(_e){}
   if(arEnableEl) arEnableEl.checked = !!arEnabled;
   if(arScheduleEl){
     arScheduleEl.value = ['daily','weekly','monthly'].includes(arSchedule) ? arSchedule : 'daily';
@@ -7571,6 +11148,8 @@ function applyEditedNodeToPage(data, nodeId){
     const isPrivate = !!data.is_private;
     const role = String(data.role || data.node_role || data.nodeRole || 'normal').trim() || 'normal';
     const websiteRoot = String(data.website_root_base || data.website_root || '').trim();
+    const systemType = normalizeNodeSystemType(data.system_type || data.systemType || window.__NODE_SYSTEM_TYPE__ || 'auto');
+    const directTunnel = _normalizeDirectTunnel(data.direct_tunnel || (window.__NODE_DIRECT_TUNNEL__ || {}));
     const ar = (data.auto_restart_policy && typeof data.auto_restart_policy === 'object') ? data.auto_restart_policy : {};
     const arEnabled = !!ar.enabled;
     const arSchedule = String(ar.schedule_type || 'daily').trim().toLowerCase() || 'daily';
@@ -7593,6 +11172,14 @@ function applyEditedNodeToPage(data, nodeId){
         card.dataset.nodeIsPrivate = isPrivate ? '1' : '0';
         card.dataset.nodeRole = role;
         card.dataset.nodeWebsiteRoot = websiteRoot;
+        card.dataset.nodeSystemType = systemType;
+        card.dataset.nodeDirectEnabled = directTunnel.enabled ? '1' : '0';
+        card.dataset.nodeDirectSyncId = directTunnel.sync_id || '';
+        card.dataset.nodeDirectRelayId = String(directTunnel.relay_node_id || 0);
+        card.dataset.nodeDirectListenPort = String(directTunnel.listen_port || 0);
+        card.dataset.nodeDirectPublicHost = directTunnel.public_host || '';
+        card.dataset.nodeDirectScheme = directTunnel.scheme || '';
+        card.dataset.nodeDirectVerifyTls = directTunnel.verify_tls ? '1' : '0';
         card.dataset.nodeArEnabled = arEnabled ? '1' : '0';
         card.dataset.nodeArSchedule = arSchedule;
         card.dataset.nodeArInterval = String(Number.isFinite(arInterval) ? arInterval : 1);
@@ -7601,7 +11188,7 @@ function applyEditedNodeToPage(data, nodeId){
         card.dataset.nodeArWeekdays = arWeekdays.join(',');
         card.dataset.nodeArMonthdays = arMonthdays.join(',');
 
-        const nm = card.querySelector('.node-name');
+        const nm = card.querySelector('.node-name-text, .node-name');
         if(nm && name){ nm.textContent = name; nm.title = name; }
         const hostEl = card.querySelector('.node-host');
         if(hostEl && displayIp){ hostEl.textContent = displayIp; hostEl.title = displayIp; }
@@ -7620,6 +11207,14 @@ function applyEditedNodeToPage(data, nodeId){
         row.dataset.nodeIsPrivate = isPrivate ? '1' : '0';
         row.dataset.nodeRole = role;
         row.dataset.nodeWebsiteRoot = websiteRoot;
+        row.dataset.nodeSystemType = systemType;
+        row.dataset.nodeDirectEnabled = directTunnel.enabled ? '1' : '0';
+        row.dataset.nodeDirectSyncId = directTunnel.sync_id || '';
+        row.dataset.nodeDirectRelayId = String(directTunnel.relay_node_id || 0);
+        row.dataset.nodeDirectListenPort = String(directTunnel.listen_port || 0);
+        row.dataset.nodeDirectPublicHost = directTunnel.public_host || '';
+        row.dataset.nodeDirectScheme = directTunnel.scheme || '';
+        row.dataset.nodeDirectVerifyTls = directTunnel.verify_tls ? '1' : '0';
         row.dataset.nodeArEnabled = arEnabled ? '1' : '0';
         row.dataset.nodeArSchedule = arSchedule;
         row.dataset.nodeArInterval = String(Number.isFinite(arInterval) ? arInterval : 1);
@@ -7628,7 +11223,7 @@ function applyEditedNodeToPage(data, nodeId){
         row.dataset.nodeArWeekdays = arWeekdays.join(',');
         row.dataset.nodeArMonthdays = arMonthdays.join(',');
 
-        const nm = row.querySelector('.node-name');
+        const nm = row.querySelector('.node-name-text, .node-name');
         if(nm){
           nm.textContent = name || displayIp || nm.textContent;
         }
@@ -7640,6 +11235,7 @@ function applyEditedNodeToPage(data, nodeId){
         if(gg){
           gg.textContent = group;
         }
+        _renderNodeRowDirectPill(row, directTunnel);
       }
     }catch(_e){}
 
@@ -7654,6 +11250,9 @@ function applyEditedNodeToPage(data, nodeId){
         window.__NODE_IS_PRIVATE__ = isPrivate ? 1 : 0;
         window.__NODE_ROLE__ = role;
         window.__NODE_WEBSITE_ROOT__ = websiteRoot;
+        window.__NODE_SYSTEM_TYPE__ = systemType;
+        window.__EDITING_NODE_SYSTEM_TYPE__ = systemType;
+        window.__NODE_DIRECT_TUNNEL__ = directTunnel;
         window.__NODE_AUTO_RESTART_ENABLED__ = arEnabled ? 1 : 0;
         window.__NODE_AUTO_RESTART_SCHEDULE__ = arSchedule;
         window.__NODE_AUTO_RESTART_INTERVAL__ = Number.isFinite(arInterval) ? arInterval : 1;
@@ -7677,11 +11276,14 @@ function applyEditedNodeToPage(data, nodeId){
         if(grpEl){
           grpEl.textContent = group;
         }
+        try{ syncEditNodeCapabilityUI(systemType); }catch(_e){}
+        _renderDirectTunnelMenuHint();
+        _renderNodeDirectBadge(directTunnel);
 
         // sidebar active item
         const active = document.querySelector('.node-item.active');
         if(active){
-          const nm = active.querySelector('.node-name');
+          const nm = active.querySelector('.node-name-text, .node-name');
           if(nm) nm.textContent = name || displayIp || nm.textContent;
           const meta = active.querySelector('.node-meta');
           if(meta) meta.textContent = displayIp || meta.textContent;
@@ -7709,8 +11311,15 @@ async function saveEditNode(){
     const ip_address = (document.getElementById('editNodeIp')?.value || '').trim();
     const verify_tls = !!document.getElementById('editNodeVerifyTls')?.checked;
     const is_private = !!document.getElementById('editNodeIsPrivate')?.checked;
-    const is_website = !!document.getElementById('editNodeIsWebsite')?.checked;
-    const website_root_base = (document.getElementById('editNodeWebsiteRoot')?.value || '').trim();
+    let is_website = !!document.getElementById('editNodeIsWebsite')?.checked;
+    let website_root_base = (document.getElementById('editNodeWebsiteRoot')?.value || '').trim();
+    const editingSystemType = normalizeNodeSystemType(
+      window.__EDITING_NODE_SYSTEM_TYPE__ || window.__NODE_SYSTEM_TYPE__ || 'auto'
+    );
+    if(isMacNodeSystemType(editingSystemType)){
+      is_website = false;
+      website_root_base = '';
+    }
     const auto_restart_enabled = !!document.getElementById('editNodeAutoRestartEnabled')?.checked;
     const auto_restart_schedule_type = String(document.getElementById('editNodeAutoRestartSchedule')?.value || 'daily').trim().toLowerCase();
     let auto_restart_interval = parseInt(String(document.getElementById('editNodeAutoRestartInterval')?.value || '1').trim(), 10);
@@ -7776,7 +11385,15 @@ async function saveEditNode(){
         display_ip = u.hostname || '';
         base_url = raw;
       }catch(_e){}
-      patch = { name, group_name, display_ip, base_url, verify_tls, is_private };
+      patch = {
+        name,
+        group_name,
+        display_ip,
+        base_url,
+        verify_tls,
+        is_private,
+        system_type: normalizeNodeSystemType(window.__EDITING_NODE_SYSTEM_TYPE__ || window.__NODE_SYSTEM_TYPE__ || 'auto')
+      };
     }
     try{ applyEditedNodeToPage(patch, nodeId); }catch(_e){}
     try{ stripEditQueryParam(); }catch(_e){}
@@ -7803,6 +11420,357 @@ window.openEditNodeModal = openEditNodeModal;
 window.closeEditNodeModal = closeEditNodeModal;
 window.saveEditNode = saveEditNode;
 
+function _directTunnelCurrentText(dt){
+  const d = _normalizeDirectTunnel(dt);
+  if(!d.enabled) return '当前状态：未开启（文件管理将走队列模式）';
+  const relayTxt = d.relay_node_id > 0 ? `中继节点#${d.relay_node_id}` : '中继节点#?';
+  const urlTxt = d.direct_base_url ? d.direct_base_url : `${d.scheme || 'http'}://<中继地址>:${d.listen_port || 0}`;
+  return `当前状态：已开启 · ${relayTxt} · ${urlTxt} · TLS校验=${d.verify_tls ? '开启' : '关闭'}`;
+}
+
+function _directTunnelFillRelayOptions(rows, currentRelayId, recommendedRelayId){
+  const sel = document.getElementById('directTunnelRelayNode');
+  if(!sel) return;
+  const list = Array.isArray(rows) ? rows : [];
+  const cur = parseInt(String(currentRelayId || 0), 10);
+  const rec = parseInt(String(recommendedRelayId || 0), 10);
+  sel.innerHTML = '<option value="">请选择中继节点（中转机）…</option>' + list.map((r)=>{
+    const id = parseInt(String((r && r.id) || 0), 10) || 0;
+    const name = escapeHtml(String((r && r.name) || (`节点-${id}`)));
+    const host = escapeHtml(String((r && (r.display_ip || r.base_url)) || '-'));
+    const tags = [];
+    if(r && r.online) tags.push('在线');
+    if(r && r.is_private) tags.push('内网');
+    const tail = tags.length ? (' · ' + tags.join('/')) : '';
+    return `<option value="${id}">${name} · ${host}${tail}</option>`;
+  }).join('');
+  let pick = 0;
+  if(Number.isFinite(cur) && cur > 0) pick = cur;
+  else if(Number.isFinite(rec) && rec > 0) pick = rec;
+  if(pick > 0) sel.value = String(pick);
+}
+
+function _directTunnelSelectedRelayId(){
+  const sel = document.getElementById('directTunnelRelayNode');
+  const id = parseInt(String(sel?.value || '0'), 10);
+  return Number.isFinite(id) && id > 0 ? id : 0;
+}
+
+let __DIRECT_TUNNEL_ACTIVE_JOB__ = '';
+
+function _directTunnelResetModalButtons(){
+  const btnSubmit = document.getElementById('directTunnelSubmit');
+  const btnDisable = document.getElementById('directTunnelDisableBtn');
+  const current = _normalizeDirectTunnel(window.__NODE_DIRECT_TUNNEL__ || {});
+  if(btnSubmit){
+    btnSubmit.disabled = false;
+    btnSubmit.textContent = '保存并开启';
+  }
+  if(btnDisable){
+    btnDisable.disabled = !current.enabled;
+    btnDisable.textContent = current.enabled ? '关闭直连' : '未开启';
+  }
+}
+
+function _directTunnelJobStatusText(st){
+  const s = String(st || '').trim().toLowerCase();
+  if(s === 'queued') return '排队中';
+  if(s === 'retrying') return '重试中';
+  if(s === 'running') return '执行中';
+  if(s === 'success') return '已完成';
+  if(s === 'error') return '失败';
+  return '处理中';
+}
+
+async function _pollDirectTunnelJob(nodeId, jobId, action){
+  const err = document.getElementById('directTunnelError');
+  const cur = document.getElementById('directTunnelCurrent');
+  const startedAt = Date.now();
+  const timeoutMs = 12 * 60 * 1000;
+  const job = String(jobId || '').trim();
+  const op = String(action || 'configure').trim().toLowerCase();
+  if(!job) return;
+  __DIRECT_TUNNEL_ACTIVE_JOB__ = job;
+  if(cur) cur.textContent = `后台任务 #${job} 已提交，正在执行…`;
+  if(err) err.textContent = '';
+  while(true){
+    if(__DIRECT_TUNNEL_ACTIVE_JOB__ !== job){
+      return;
+    }
+    if((Date.now() - startedAt) > timeoutMs){
+      if(err) err.textContent = `后台任务等待超时（job_id=${job}）`;
+      __DIRECT_TUNNEL_ACTIVE_JOB__ = '';
+      _directTunnelResetModalButtons();
+      return;
+    }
+    try{
+      const resp = await fetch(`/api/nodes/${encodeURIComponent(nodeId)}/pool_jobs/${encodeURIComponent(job)}`, {
+        credentials: 'same-origin'
+      });
+      const data = await resp.json().catch(()=>({ok:false,error:'接口返回异常'}));
+      if(!resp.ok || !data.ok){
+        if(resp.status === 404){
+          if(err) err.textContent = `后台任务不存在或已过期（job_id=${job}）`;
+          __DIRECT_TUNNEL_ACTIVE_JOB__ = '';
+          _directTunnelResetModalButtons();
+          return;
+        }
+        throw new Error(data.error || ('查询任务失败（HTTP ' + resp.status + '）'));
+      }
+      const row = (data && data.job && typeof data.job === 'object') ? data.job : {};
+      const st = String(row.status || '').trim().toLowerCase();
+      if(cur) cur.textContent = `后台任务 #${job}：${_directTunnelJobStatusText(st)}`;
+      if(st === 'success'){
+        const result = (row.result && typeof row.result === 'object') ? row.result : {};
+        const current = _normalizeDirectTunnel(
+          result.current || (op === 'disable' ? {} : (window.__NODE_DIRECT_TUNNEL__ || {}))
+        );
+        applyDirectTunnelToPage(current, nodeId);
+        if(cur) cur.textContent = _directTunnelCurrentText(current);
+        _directTunnelResetModalButtons();
+        if(op === 'disable'){
+          try{ toast('文件直连已关闭'); }catch(_e){}
+        }else{
+          try{ toast('文件直连已开启'); }catch(_e){}
+        }
+        __DIRECT_TUNNEL_ACTIVE_JOB__ = '';
+        closeDirectTunnelModal();
+        return;
+      }
+      if(st === 'error'){
+        const reason = String(row.error || ((row.result && row.result.error) ? row.result.error : '任务失败')).trim() || '任务失败';
+        if(err) err.textContent = reason;
+        _directTunnelResetModalButtons();
+        __DIRECT_TUNNEL_ACTIVE_JOB__ = '';
+        return;
+      }
+    }catch(e){
+      if(err) err.textContent = (e && e.message) ? e.message : String(e || '任务状态查询失败');
+    }
+    await _sleep(900);
+  }
+}
+
+async function openDirectTunnelModal(){
+  const m = document.getElementById('directTunnelModal');
+  if(!m) return;
+  const err = document.getElementById('directTunnelError');
+  const cur = document.getElementById('directTunnelCurrent');
+  const inPort = document.getElementById('directTunnelListenPort');
+  const chkTls = document.getElementById('directTunnelVerifyTls');
+  const btnDisable = document.getElementById('directTunnelDisableBtn');
+  const btnSubmit = document.getElementById('directTunnelSubmit');
+  if(err) err.textContent = '';
+  if(cur) cur.textContent = '正在加载…';
+  if(inPort) inPort.value = '';
+  if(chkTls) chkTls.checked = false;
+  if(btnDisable){ btnDisable.disabled = true; btnDisable.textContent = '关闭直连'; }
+  if(btnSubmit){ btnSubmit.disabled = false; btnSubmit.textContent = '保存并开启'; }
+  m.style.display = 'flex';
+
+  const nodeId = window.__NODE_ID__;
+  if(!nodeId){
+    if(err) err.textContent = '当前页面未找到节点 ID';
+    return;
+  }
+  const useCache = !!(__DIRECT_TUNNEL_OPTIONS__ && (Date.now() - Number(__DIRECT_TUNNEL_OPTIONS_AT__ || 0)) < 15000);
+  if(useCache){
+    try{
+      const data = __DIRECT_TUNNEL_OPTIONS__ || {};
+      const current = _normalizeDirectTunnel((data && data.current) || (window.__NODE_DIRECT_TUNNEL__ || {}));
+      _directTunnelFillRelayOptions(data.relay_nodes || [], current.relay_node_id, data.recommended_relay_node_id || 0);
+      if(inPort) inPort.value = current.listen_port > 0 ? String(current.listen_port) : '';
+      if(chkTls) chkTls.checked = !!current.verify_tls;
+      if(cur) cur.textContent = _directTunnelCurrentText(current);
+      if(btnDisable){
+        btnDisable.disabled = !current.enabled;
+        btnDisable.textContent = current.enabled ? '关闭直连' : '未开启';
+      }
+      return;
+    }catch(_e){}
+  }
+  try{
+    const resp = await fetch(`/api/nodes/${nodeId}/direct_tunnel/options`, { credentials: 'same-origin' });
+    const data = await resp.json().catch(()=>({ok:false,error:'接口返回异常'}));
+    if(!resp.ok || !data.ok){
+      if(err) err.textContent = data.error || ('加载失败（HTTP ' + resp.status + '）');
+      if(cur) cur.textContent = '';
+      return;
+    }
+    __DIRECT_TUNNEL_OPTIONS__ = data;
+    __DIRECT_TUNNEL_OPTIONS_AT__ = Date.now();
+    const current = _normalizeDirectTunnel((data && data.current) || (window.__NODE_DIRECT_TUNNEL__ || {}));
+    _directTunnelFillRelayOptions(data.relay_nodes || [], current.relay_node_id, data.recommended_relay_node_id || 0);
+    if(inPort) inPort.value = current.listen_port > 0 ? String(current.listen_port) : '';
+    if(chkTls) chkTls.checked = !!current.verify_tls;
+    if(cur) cur.textContent = _directTunnelCurrentText(current);
+    if(btnDisable){
+      btnDisable.disabled = !current.enabled;
+      btnDisable.textContent = current.enabled ? '关闭直连' : '未开启';
+    }
+  }catch(e){
+    if(err) err.textContent = (e && e.message) ? e.message : String(e || '加载失败');
+    if(cur) cur.textContent = '';
+  }
+}
+
+function closeDirectTunnelModal(){
+  const m = document.getElementById('directTunnelModal');
+  if(!m) return;
+  m.style.display = 'none';
+}
+
+async function suggestDirectTunnelPort(){
+  const err = document.getElementById('directTunnelError');
+  const btn = document.getElementById('directTunnelSuggestBtn');
+  const inPort = document.getElementById('directTunnelListenPort');
+  try{
+    if(err) err.textContent = '';
+    if(btn){ btn.disabled = true; btn.textContent = '选择中…'; }
+    const nodeId = window.__NODE_ID__;
+    const relayNodeId = _directTunnelSelectedRelayId();
+    if(!nodeId || relayNodeId <= 0){
+      if(err) err.textContent = '请先选择中继节点（中转机）';
+      return;
+    }
+    const curPort = parseInt(String(inPort?.value || '0'), 10);
+    const resp = await fetch(`/api/nodes/${nodeId}/direct_tunnel/suggest_port`, {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      credentials: 'same-origin',
+      body: JSON.stringify({
+        relay_node_id: relayNodeId,
+        preferred_port: (Number.isFinite(curPort) && curPort > 0) ? curPort : null
+      })
+    });
+    const data = await resp.json().catch(()=>({ok:false,error:'接口返回异常'}));
+    if(!resp.ok || !data.ok){
+      if(err) err.textContent = data.error || ('自动选端口失败（HTTP ' + resp.status + '）');
+      return;
+    }
+    const p = parseInt(String(data.listen_port || 0), 10);
+    if(inPort) inPort.value = (Number.isFinite(p) && p > 0) ? String(p) : '';
+  }catch(e){
+    if(err) err.textContent = (e && e.message) ? e.message : String(e || '自动选端口失败');
+  }finally{
+    if(btn){ btn.disabled = false; btn.textContent = '自动选择'; }
+  }
+}
+
+async function saveDirectTunnelConfig(){
+  const err = document.getElementById('directTunnelError');
+  const cur = document.getElementById('directTunnelCurrent');
+  const btn = document.getElementById('directTunnelSubmit');
+  const btnDisable = document.getElementById('directTunnelDisableBtn');
+  let keepBusy = false;
+  try{
+    if(err) err.textContent = '';
+    if(btn){ btn.disabled = true; btn.textContent = '保存中…'; }
+    if(btnDisable){ btnDisable.disabled = true; btnDisable.textContent = '关闭直连'; }
+    const nodeId = window.__NODE_ID__;
+    if(!nodeId){
+      if(err) err.textContent = '当前页面未找到节点 ID';
+      return;
+    }
+    const relayNodeId = _directTunnelSelectedRelayId();
+    if(relayNodeId <= 0){
+      if(err) err.textContent = '请选择中继节点（中转机）';
+      return;
+    }
+    const portRaw = String(document.getElementById('directTunnelListenPort')?.value || '').trim();
+    let listenPort = 0;
+    if(portRaw){
+      const p = parseInt(portRaw, 10);
+      if(!Number.isFinite(p) || p < 1 || p > 65535){
+        if(err) err.textContent = '端口范围必须是 1-65535';
+        return;
+      }
+      listenPort = p;
+    }
+    const verifyTls = !!document.getElementById('directTunnelVerifyTls')?.checked;
+    const resp = await fetch(`/api/nodes/${nodeId}/direct_tunnel/configure_async`, {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      credentials: 'same-origin',
+      body: JSON.stringify({
+        relay_node_id: relayNodeId,
+        listen_port: listenPort || null,
+        verify_tls: verifyTls
+      })
+    });
+    const data = await resp.json().catch(()=>({ok:false,error:'接口返回异常'}));
+    if(!resp.ok || !data.ok){
+      if(err) err.textContent = data.error || ('提交失败（HTTP ' + resp.status + '）');
+      return;
+    }
+    const job = (data && data.job && typeof data.job === 'object') ? data.job : {};
+    const jobId = String(job.job_id || '').trim();
+    if(!jobId){
+      if(err) err.textContent = '后台任务提交失败：缺少 job_id';
+      return;
+    }
+    keepBusy = true;
+    if(cur) cur.textContent = `后台任务 #${jobId} 已提交，正在执行…`;
+    _pollDirectTunnelJob(nodeId, jobId, 'configure');
+  }catch(e){
+    if(err) err.textContent = (e && e.message) ? e.message : String(e || '保存失败');
+  }finally{
+    if(!keepBusy){
+      _directTunnelResetModalButtons();
+    }
+  }
+}
+
+async function disableDirectTunnelConfig(){
+  const err = document.getElementById('directTunnelError');
+  const cur = document.getElementById('directTunnelCurrent');
+  const btn = document.getElementById('directTunnelDisableBtn');
+  const btnSubmit = document.getElementById('directTunnelSubmit');
+  let keepBusy = false;
+  try{
+    if(err) err.textContent = '';
+    if(btn){ btn.disabled = true; btn.textContent = '关闭中…'; }
+    if(btnSubmit){ btnSubmit.disabled = true; btnSubmit.textContent = '保存并开启'; }
+    const nodeId = window.__NODE_ID__;
+    if(!nodeId){
+      if(err) err.textContent = '当前页面未找到节点 ID';
+      return;
+    }
+    const yes = confirm('确认关闭该节点的文件管理直连吗？');
+    if(!yes) return;
+    const resp = await fetch(`/api/nodes/${nodeId}/direct_tunnel/disable_async`, {
+      method: 'POST',
+      credentials: 'same-origin'
+    });
+    const data = await resp.json().catch(()=>({ok:false,error:'接口返回异常'}));
+    if(!resp.ok || !data.ok){
+      if(err) err.textContent = data.error || ('提交失败（HTTP ' + resp.status + '）');
+      return;
+    }
+    const job = (data && data.job && typeof data.job === 'object') ? data.job : {};
+    const jobId = String(job.job_id || '').trim();
+    if(!jobId){
+      if(err) err.textContent = '后台任务提交失败：缺少 job_id';
+      return;
+    }
+    keepBusy = true;
+    if(cur) cur.textContent = `后台任务 #${jobId} 已提交，正在执行…`;
+    _pollDirectTunnelJob(nodeId, jobId, 'disable');
+  }catch(e){
+    if(err) err.textContent = (e && e.message) ? e.message : String(e || '关闭失败');
+  }finally{
+    if(!keepBusy){
+      _directTunnelResetModalButtons();
+    }
+  }
+}
+
+window.openDirectTunnelModal = openDirectTunnelModal;
+window.closeDirectTunnelModal = closeDirectTunnelModal;
+window.suggestDirectTunnelPort = suggestDirectTunnelPort;
+window.saveDirectTunnelConfig = saveDirectTunnelConfig;
+window.disableDirectTunnelConfig = disableDirectTunnelConfig;
+
 // click backdrop to close
 
 document.addEventListener('click', (e)=>{
@@ -7828,6 +11796,22 @@ document.addEventListener('keydown', (e)=>{
       e.preventDefault();
       try{ saveEditNode(); }catch(_e){}
     }
+  }
+});
+
+// close direct tunnel modal on backdrop click
+document.addEventListener('click', (e)=>{
+  const m = document.getElementById('directTunnelModal');
+  if(!m || m.style.display === 'none') return;
+  if(e.target === m) closeDirectTunnelModal();
+});
+
+// ESC to close direct tunnel modal
+document.addEventListener('keydown', (e)=>{
+  const m = document.getElementById('directTunnelModal');
+  if(!m || m.style.display === 'none') return;
+  if(e.key === 'Escape'){
+    closeDirectTunnelModal();
   }
 });
 // ---------------- Dashboard: Agent Update Modal ----------------
@@ -7860,15 +11844,24 @@ function openAgentUpdateModal(){
   const seg = document.getElementById('agentUpdateSegBar');
   const list = document.getElementById('agentUpdateList');
   const pills = document.getElementById('agentUpdatePills');
+  const pct = document.getElementById('agentUpdatePercent');
+  const status = document.getElementById('agentUpdateStatusText');
+  const badge = document.getElementById('agentUpdateStateBadge');
   const btn = document.getElementById('agentUpdateStartBtn');
 
   if(t) t.textContent = '—';
   if(id) id.textContent = '';
-  if(sum) sum.textContent = '—';
+  if(sum) sum.textContent = '未开始';
   if(bar) bar.style.width = '0%';
   if(seg) seg.innerHTML = '';
   if(list) list.innerHTML = '';
   if(pills) pills.innerHTML = '';
+  if(pct) pct.textContent = '0%';
+  if(status) status.textContent = '进度 0% · 状态 待命';
+  if(badge){
+    badge.textContent = '待命';
+    badge.className = 'panel-update-badge au-state-badge';
+  }
   if(btn){ btn.disabled = false; btn.textContent = '开始更新'; }
 
   // Bind handlers once
@@ -8015,6 +12008,26 @@ function _countStates(rows){
   return out;
 }
 
+function _agentUpdateBatchStatus(summary){
+  const s = summary || {};
+  const total = Number(s.total || 0) || 0;
+  const done = Number(s.done || 0) || 0;
+  const failed = Number(s.failed || 0) || 0;
+  const expired = Number(s.expired || 0) || 0;
+  const running = Number(s.running || s.installing || 0) || 0;
+  const accepted = Number(s.accepted || 0) || 0;
+  const delivered = Number(s.delivered || s.sent || 0) || 0;
+  const retrying = Number(s.retrying || 0) || 0;
+  const queued = Number(s.queued || 0) || 0;
+  const inFlight = running + accepted + delivered + retrying + queued;
+  const failedAll = failed + expired;
+  if(total <= 0) return { text: '待命', cls: '' };
+  if(inFlight > 0) return { text: '更新中', cls: 'info' };
+  if(failedAll > 0 && done <= 0) return { text: '失败', cls: 'bad' };
+  if(failedAll > 0 && done > 0) return { text: '部分完成', cls: 'warn' };
+  return { text: '已完成', cls: 'ok' };
+}
+
 function _renderRow(n){
   const name = (n.name || ('节点-' + n.id));
   const stRaw = (n.state || '');
@@ -8027,7 +12040,7 @@ function _renderRow(n){
   const online = !!n.online;
   const dotCls = online ? 'on' : 'off';
   const last = String(n.last_seen_at || '').trim();
-  const lastTxt = last ? (`心跳 ${last}`) : '未上报';
+  const lastTxt = last ? (`心跳 ${formatDateTimeLocal(last)}`) : '未上报';
   const retryCnt = Number(n.retry_count || 0) || 0;
   const retryMax = Number(n.max_retries || 0) || 0;
   const nextRetryAt = String(n.next_retry_at || '').trim();
@@ -8119,6 +12132,9 @@ async function _pollAgentUpdate(){
   const sumEl = document.getElementById('agentUpdateSummary');
   const bar = document.getElementById('agentUpdateBar');
   const id = document.getElementById('agentUpdateId');
+  const pctEl = document.getElementById('agentUpdatePercent');
+  const stEl = document.getElementById('agentUpdateStatusText');
+  const badgeEl = document.getElementById('agentUpdateStateBadge');
   const btn = document.getElementById('agentUpdateStartBtn');
 
   if(id) id.textContent = __AGENT_UPDATE_ID__ ? ('批次：' + __AGENT_UPDATE_ID__) : '';
@@ -8145,9 +12161,20 @@ async function _pollAgentUpdate(){
         `${done}/${total} 完成 · 执行中 ${running} · 已确认 ${accepted} · 已投递 ${delivered} · 重试 ${retrying} · 失败 ${failed} · 过期 ${expired} · 离线 ${offline} · 排队 ${queued}`;
     }
 
+    const finished = done + failed + expired;
+    const pct = total ? Math.max(0, Math.min(100, Math.round(finished * 100 / total))) : 0;
     if(bar){
-      const pct = total ? Math.max(0, Math.min(100, Math.round(done * 100 / total))) : 0;
       bar.style.width = pct + '%';
+    }
+    if(pctEl) pctEl.textContent = `${pct}%`;
+
+    const batchStatus = _agentUpdateBatchStatus(s);
+    if(stEl) stEl.textContent = `进度 ${pct}% · 状态 ${batchStatus.text}`;
+    if(badgeEl){
+      badgeEl.textContent = batchStatus.text;
+      badgeEl.className = batchStatus.cls
+        ? `panel-update-badge au-state-badge ${batchStatus.cls}`
+        : 'panel-update-badge au-state-badge';
     }
 
     __AU_LAST_SUMMARY__ = s;
@@ -8228,9 +12255,359 @@ document.addEventListener('keydown', (e)=>{
 });
 
 
+// ---------------- Dashboard: Panel Self Update ----------------
+let __PANEL_UPDATE_TIMER__ = null;
+let __PANEL_UPDATE_JOB_ID__ = '';
+let __PANEL_UPDATE_RELOAD_TIMER__ = null;
+let __PANEL_UPDATE_RELOAD_SCHEDULED__ = false;
+let __PANEL_UPDATE_AUTO_RELOAD_ENABLED__ = false;
+let __PANEL_UPDATE_LOG_VIEW__ = 'pretty';
+let __PANEL_UPDATE_VIEW_BOUND__ = false;
+
+function _panelUpdateReloadKey(jid){
+  const id = String(jid || __PANEL_UPDATE_JOB_ID__ || '').trim();
+  if(!id) return '';
+  return 'panelUpdateReloaded:' + id;
+}
+
+function _panelUpdateReloadedOnce(jid){
+  try{
+    const key = _panelUpdateReloadKey(jid);
+    if(!key) return false;
+    return String(sessionStorage.getItem(key) || '') === '1';
+  }catch(_e){
+    return false;
+  }
+}
+
+function _panelUpdateMarkReloaded(jid){
+  try{
+    const key = _panelUpdateReloadKey(jid);
+    if(!key) return;
+    sessionStorage.setItem(key, '1');
+  }catch(_e){}
+}
+
+function _panelUpdateResetReloadMark(jid){
+  try{
+    const key = _panelUpdateReloadKey(jid);
+    if(!key) return;
+    sessionStorage.removeItem(key);
+  }catch(_e){}
+}
+
+function _panelUpdateStatusText(st){
+  const s = String(st || '').toLowerCase();
+  if(s === 'running') return '更新中';
+  if(s === 'restarting') return '重启中';
+  if(s === 'done') return '已完成';
+  if(s === 'failed') return '失败';
+  return '待命';
+}
+
+function _panelUpdateStatusClass(st){
+  const s = String(st || '').toLowerCase();
+  if(s === 'done') return 'ok';
+  if(s === 'failed') return 'bad';
+  if(s === 'restarting') return 'warn';
+  if(s === 'running') return 'info';
+  return 'muted';
+}
+
+function _panelUpdateSetLogView(view){
+  const v = (String(view || '').toLowerCase() === 'raw') ? 'raw' : 'pretty';
+  __PANEL_UPDATE_LOG_VIEW__ = v;
+  const prettyBtn = document.getElementById('panelUpdateViewPrettyBtn');
+  const rawBtn = document.getElementById('panelUpdateViewRawBtn');
+  const prettyBox = document.getElementById('panelUpdateLogsPretty');
+  const rawBox = document.getElementById('panelUpdateLogsRaw');
+  if(prettyBtn) prettyBtn.classList.toggle('active', v === 'pretty');
+  if(rawBtn) rawBtn.classList.toggle('active', v === 'raw');
+  if(prettyBox) prettyBox.style.display = (v === 'pretty') ? 'block' : 'none';
+  if(rawBox) rawBox.style.display = (v === 'raw') ? 'block' : 'none';
+}
+
+function _panelUpdateBindViewSwitch(){
+  if(__PANEL_UPDATE_VIEW_BOUND__) return;
+  __PANEL_UPDATE_VIEW_BOUND__ = true;
+  const prettyBtn = document.getElementById('panelUpdateViewPrettyBtn');
+  const rawBtn = document.getElementById('panelUpdateViewRawBtn');
+  if(prettyBtn){
+    prettyBtn.addEventListener('click', ()=>_panelUpdateSetLogView('pretty'));
+  }
+  if(rawBtn){
+    rawBtn.addEventListener('click', ()=>_panelUpdateSetLogView('raw'));
+  }
+}
+
+function _panelUpdateStartProbeReload(){
+  if(__PANEL_UPDATE_RELOAD_TIMER__) return;
+  __PANEL_UPDATE_RELOAD_TIMER__ = setInterval(async ()=>{
+    try{
+      const r = await fetch('/login?probe=' + Date.now(), { credentials: 'include', cache: 'no-store' });
+      if(r && (r.ok || r.status === 200 || r.status === 302 || r.status === 401 || r.status === 403)){
+        clearInterval(__PANEL_UPDATE_RELOAD_TIMER__);
+        __PANEL_UPDATE_RELOAD_TIMER__ = null;
+        _panelUpdateMarkReloaded();
+        window.location.reload();
+      }
+    }catch(_e){}
+  }, 1200);
+}
+
+function _panelUpdateStopProbeReload(){
+  if(!__PANEL_UPDATE_RELOAD_TIMER__) return;
+  clearInterval(__PANEL_UPDATE_RELOAD_TIMER__);
+  __PANEL_UPDATE_RELOAD_TIMER__ = null;
+}
+
+function _panelUpdateSetStartBtn(disabled, text){
+  const btn = document.getElementById('panelUpdateStartBtn');
+  if(!btn) return;
+  btn.disabled = !!disabled;
+  if(text) btn.textContent = text;
+}
+
+function _panelUpdateLineKind(line){
+  const text = String(line || '');
+  const lower = text.toLowerCase();
+  if(text.startsWith('[错误]') || lower.includes('失败') || lower.includes('error')) return 'bad';
+  if(text.startsWith('[OK]') || lower.includes('更新完成') || lower.includes('已更新并重启')) return 'ok';
+  if(lower.includes('进度') || lower.includes('拉取更新文件')) return 'progress';
+  if(text.startsWith('[提示]')) return 'hint';
+  return 'info';
+}
+
+function _panelUpdateKindLabel(kind){
+  const k = String(kind || '').toLowerCase();
+  if(k === 'bad') return '错误';
+  if(k === 'ok') return '成功';
+  if(k === 'progress') return '进度';
+  if(k === 'hint') return '提示';
+  return '信息';
+}
+
+function _panelUpdateBuildPrettyLogs(logs){
+  const src = Array.isArray(logs) ? logs : [];
+  const items = [];
+  let latestProgress = '';
+  src.forEach(raw=>{
+    const line = String(raw || '').trim();
+    if(!line) return;
+    if(/文件拉取进度/.test(line)){
+      latestProgress = line;
+      return;
+    }
+    const text = line.replace(/^\[(提示|OK|错误)\]\s*/,'').trim() || line;
+    items.push({ kind: _panelUpdateLineKind(line), text });
+  });
+
+  if(latestProgress){
+    let ptxt = latestProgress.replace(/^\[(提示|OK|错误)\]\s*/,'').trim();
+    const m = /(\d+)%\s*\((\d+)\s*\/\s*(\d+)\)/.exec(latestProgress);
+    if(m){
+      ptxt = `文件拉取进度 ${m[1]}%（${m[2]}/${m[3]}）`;
+    }
+    items.push({ kind: 'progress', text: ptxt });
+  }
+
+  const slim = [];
+  items.forEach(it=>{
+    const prev = slim[slim.length - 1];
+    if(prev && prev.kind === it.kind && prev.text === it.text) return;
+    slim.push(it);
+  });
+  return slim.slice(-200);
+}
+
+function _renderPanelUpdatePrettyLogs(logs){
+  const box = document.getElementById('panelUpdateLogsPretty');
+  if(!box) return 0;
+  const arr = _panelUpdateBuildPrettyLogs(logs);
+  if(!arr.length){
+    box.innerHTML = '<div class="panel-update-log-empty">等待任务启动…</div>';
+    return 0;
+  }
+  box.innerHTML = arr.map(it=>{
+    const kind = String(it.kind || 'info').toLowerCase();
+    const label = _panelUpdateKindLabel(kind);
+    return `<div class="panel-update-line ${escapeHtml(kind)}">
+      <span class="panel-update-line-badge">${escapeHtml(label)}</span>
+      <span class="panel-update-line-text">${escapeHtml(it.text)}</span>
+    </div>`;
+  }).join('');
+  box.scrollTop = box.scrollHeight;
+  return arr.length;
+}
+
+function _renderPanelUpdate(state){
+  const data = (state && typeof state === 'object') ? state : {};
+  const st = String(data.status || 'idle').toLowerCase();
+  const progress = Math.max(0, Math.min(100, Number(data.progress || 0) || 0));
+  const stage = String(data.stage || '').trim();
+  const msg = String(data.message || '').trim();
+  const jobId = String(data.job_id || '').trim();
+  const source = String(data.source || '').trim();
+  const logs = Array.isArray(data.logs) ? data.logs.map(x=>String(x || '')).filter(Boolean) : [];
+
+  const stageEl = document.getElementById('panelUpdateStage');
+  const metaEl = document.getElementById('panelUpdateMeta');
+  const barEl = document.getElementById('panelUpdateBar');
+  const statusEl = document.getElementById('panelUpdateStatusText');
+  const percentEl = document.getElementById('panelUpdatePercent');
+  const badgeEl = document.getElementById('panelUpdateStateBadge');
+  const errEl = document.getElementById('panelUpdateError');
+  const rawLogsEl = document.getElementById('panelUpdateLogsRaw');
+  const logMetaEl = document.getElementById('panelUpdateLogMeta');
+
+  if(stageEl) stageEl.textContent = stage || _panelUpdateStatusText(st);
+  if(metaEl){
+    const segs = [];
+    if(jobId) segs.push('任务 ' + jobId);
+    if(source) segs.push(source);
+    if(data.updated_at) segs.push('更新时间 ' + String(data.updated_at));
+    metaEl.textContent = segs.length ? segs.join(' · ') : '未开始';
+  }
+  if(barEl) barEl.style.width = `${progress}%`;
+  if(statusEl) statusEl.textContent = `进度 ${Math.round(progress)}% · 状态 ${_panelUpdateStatusText(st)}`;
+  if(percentEl) percentEl.textContent = `${Math.round(progress)}%`;
+  if(badgeEl){
+    badgeEl.textContent = _panelUpdateStatusText(st);
+    badgeEl.className = `panel-update-badge ${_panelUpdateStatusClass(st)}`;
+  }
+  if(errEl) errEl.textContent = (st === 'failed' && msg) ? msg : '';
+  const prettyCount = _renderPanelUpdatePrettyLogs(logs);
+  if(rawLogsEl){
+    rawLogsEl.textContent = logs.length ? logs.join('\n') : '暂无日志';
+    rawLogsEl.scrollTop = rawLogsEl.scrollHeight;
+  }
+  if(logMetaEl) logMetaEl.textContent = `${prettyCount}/${logs.length} 行`;
+
+  if(st === 'running' || st === 'restarting'){
+    __PANEL_UPDATE_AUTO_RELOAD_ENABLED__ = true;
+    _panelUpdateSetStartBtn(true, '更新中…');
+  }else if(st === 'done'){
+    _panelUpdateSetStartBtn(false, '再次更新');
+  }else{
+    _panelUpdateSetStartBtn(false, '开始更新');
+  }
+
+  if(st === 'restarting' && __PANEL_UPDATE_AUTO_RELOAD_ENABLED__){
+    if(!_panelUpdateReloadedOnce()){
+      _panelUpdateStartProbeReload();
+    }
+  }else if(st === 'done' && __PANEL_UPDATE_AUTO_RELOAD_ENABLED__){
+    _panelUpdateStopProbeReload();
+    if(!__PANEL_UPDATE_RELOAD_SCHEDULED__ && !_panelUpdateReloadedOnce()){
+      __PANEL_UPDATE_RELOAD_SCHEDULED__ = true;
+      _panelUpdateMarkReloaded();
+      setTimeout(()=>{ window.location.reload(); }, 1200);
+    }
+  }else if(st === 'failed'){
+    __PANEL_UPDATE_AUTO_RELOAD_ENABLED__ = false;
+    _panelUpdateStopProbeReload();
+  }
+}
+
+async function _pollPanelUpdate(){
+  const q = __PANEL_UPDATE_JOB_ID__ ? ('?job_id=' + encodeURIComponent(__PANEL_UPDATE_JOB_ID__)) : '';
+  const url = '/api/panel/update/progress' + q;
+  try{
+    const r = await fetch(url, { credentials: 'include', cache: 'no-store' });
+    const d = await r.json().catch(()=>({ok:false}));
+    if(!r.ok || !d.ok){
+      if(__PANEL_UPDATE_RELOAD_TIMER__) return;
+      return;
+    }
+    const jobId = String(d.job_id || '').trim();
+    if(jobId) __PANEL_UPDATE_JOB_ID__ = jobId;
+    _renderPanelUpdate(d);
+  }catch(_e){
+    if(__PANEL_UPDATE_RELOAD_TIMER__) return;
+  }
+}
+
+function openPanelUpdateModal(){
+  const m = document.getElementById('panelUpdateModal');
+  if(!m) return;
+  m.style.display = 'flex';
+  document.body.classList.add('modal-open');
+  __PANEL_UPDATE_RELOAD_SCHEDULED__ = false;
+  __PANEL_UPDATE_AUTO_RELOAD_ENABLED__ = false;
+  __PANEL_UPDATE_JOB_ID__ = '';
+  _panelUpdateBindViewSwitch();
+  _panelUpdateSetLogView('pretty');
+  _panelUpdateSetStartBtn(false, '开始更新');
+  _renderPanelUpdate({ status: 'idle', progress: 0, stage: '等待开始', logs: [] });
+  if(__PANEL_UPDATE_TIMER__){ clearInterval(__PANEL_UPDATE_TIMER__); }
+  __PANEL_UPDATE_TIMER__ = setInterval(_pollPanelUpdate, 1000);
+  _pollPanelUpdate();
+}
+
+function closePanelUpdateModal(){
+  const m = document.getElementById('panelUpdateModal');
+  if(!m) return;
+  m.style.display = 'none';
+  document.body.classList.remove('modal-open');
+  __PANEL_UPDATE_AUTO_RELOAD_ENABLED__ = false;
+  _panelUpdateStopProbeReload();
+  if(__PANEL_UPDATE_TIMER__){
+    clearInterval(__PANEL_UPDATE_TIMER__);
+    __PANEL_UPDATE_TIMER__ = null;
+  }
+}
+
+async function startPanelUpdate(){
+  try{
+    _panelUpdateSetStartBtn(true, '更新中…');
+    const r = await fetch('/api/panel/update/start', { method: 'POST', credentials: 'include' });
+    const d = await r.json().catch(()=>({ok:false}));
+    if(!r.ok || !d.ok){
+      const errText = String((d && d.error) || ('更新失败（HTTP ' + r.status + '）'));
+      const errEl = document.getElementById('panelUpdateError');
+      if(errEl) errEl.textContent = errText;
+      _panelUpdateSetStartBtn(false, '开始更新');
+      return;
+    }
+    __PANEL_UPDATE_RELOAD_SCHEDULED__ = false;
+    __PANEL_UPDATE_AUTO_RELOAD_ENABLED__ = true;
+    __PANEL_UPDATE_JOB_ID__ = String(d.job_id || __PANEL_UPDATE_JOB_ID__ || '').trim();
+    if(!d.reused){
+      _panelUpdateResetReloadMark(__PANEL_UPDATE_JOB_ID__);
+    }
+    _renderPanelUpdate(d);
+    if(__PANEL_UPDATE_TIMER__){ clearInterval(__PANEL_UPDATE_TIMER__); }
+    __PANEL_UPDATE_TIMER__ = setInterval(_pollPanelUpdate, 1000);
+    await _pollPanelUpdate();
+  }catch(e){
+    const errEl = document.getElementById('panelUpdateError');
+    if(errEl) errEl.textContent = (e && e.message) ? e.message : '更新失败';
+    _panelUpdateSetStartBtn(false, '开始更新');
+  }
+}
+
+window.openPanelUpdateModal = openPanelUpdateModal;
+window.closePanelUpdateModal = closePanelUpdateModal;
+window.startPanelUpdate = startPanelUpdate;
+
+document.addEventListener('click', (e)=>{
+  const m = document.getElementById('panelUpdateModal');
+  if(!m || m.style.display === 'none') return;
+  if(e.target === m) closePanelUpdateModal();
+});
+
+document.addEventListener('keydown', (e)=>{
+  const m = document.getElementById('panelUpdateModal');
+  if(!m || m.style.display === 'none') return;
+  if(e.key === 'Escape') closePanelUpdateModal();
+});
+
+
 // ---------------- Dashboard: Full Backup / Restore ----------------
 let __FULL_BACKUP_JOB_ID__ = '';
 let __FULL_BACKUP_TIMER__ = null;
+let __FULL_BACKUP_POLL_ERR_STREAK__ = 0;
+const __FULL_BACKUP_POLL_ERR_LIMIT__ = 8;
 
 function _extractDownloadFilename(contentDisposition, fallback){
   let filename = String(fallback || 'download.bin');
@@ -8266,9 +12643,11 @@ function _renderFullBackupCounts(counts){
     ['nodes', '节点'],
     ['rules', '规则快照'],
     ['sites', '网站'],
+    ['remote_storage_profiles', '远程挂载'],
     ['site_files', '网站文件'],
     ['certificates', '证书'],
     ['netmon_monitors', '网络波动'],
+    ['netmon_samples', '波动样本'],
     ['panel_items', '面板状态'],
     ['files', '备份文件'],
   ];
@@ -8305,11 +12684,63 @@ function _renderFullBackupSteps(steps){
   }).join('');
 }
 
+function _formatBackupEventTime(tsMs){
+  const n = Number(tsMs || 0);
+  if(!Number.isFinite(n) || n <= 0) return '--:--:--';
+  const d = new Date(n);
+  if(Number.isNaN(d.getTime())) return '--:--:--';
+  const hh = String(d.getHours()).padStart(2, '0');
+  const mm = String(d.getMinutes()).padStart(2, '0');
+  const ss = String(d.getSeconds()).padStart(2, '0');
+  return `${hh}:${mm}:${ss}`;
+}
+
+function _renderFullBackupEvents(events, eventTotal){
+  const box = document.getElementById('backupFullEvents');
+  const meta = document.getElementById('backupFullEventsMeta');
+  if(!box) return;
+  const arr = Array.isArray(events) ? events : [];
+  const total = Number(eventTotal || arr.length || 0);
+  if(meta){
+    if(total > arr.length){
+      meta.textContent = `显示 ${arr.length}/${total} 条`;
+    }else{
+      meta.textContent = `${arr.length} 条`;
+    }
+  }
+  if(!arr.length){
+    box.innerHTML = '<div class="muted sm">等待过程事件…</div>';
+    return;
+  }
+  const nearBottom = (box.scrollHeight - box.clientHeight - box.scrollTop) < 28;
+  box.innerHTML = arr.map((e)=>{
+    const ts = _formatBackupEventTime((e && e.ts_ms) || 0);
+    const lv = String((e && e.level) || 'info').trim().toLowerCase();
+    const stage = String((e && e.stage) || '').trim();
+    const detail = String((e && e.detail) || '').trim();
+    const repeatN = Math.max(1, Number((e && e.repeat) || 1));
+    const repTxt = repeatN > 1 ? ` ×${repeatN}` : '';
+    const msg = stage && detail && detail.indexOf(stage) !== 0
+      ? `${stage} · ${detail}${repTxt}`
+      : `${detail || stage || '-'}${repTxt}`;
+    const lvCls = ['warn','error'].includes(lv) ? lv : 'info';
+    return (
+      `<div class="backup-full-event">` +
+        `<span class="ts mono">${escapeHtml(ts)}</span>` +
+        `<span class="lv ${lvCls}">${escapeHtml(lvCls)}</span>` +
+        `<span class="msg">${escapeHtml(msg)}</span>` +
+      `</div>`
+    );
+  }).join('');
+  if(nearBottom) box.scrollTop = box.scrollHeight;
+}
+
 function _stopFullBackupPolling(){
   if(__FULL_BACKUP_TIMER__){
     clearInterval(__FULL_BACKUP_TIMER__);
     __FULL_BACKUP_TIMER__ = null;
   }
+  __FULL_BACKUP_POLL_ERR_STREAK__ = 0;
 }
 
 function _syncFullBackupView(data){
@@ -8346,6 +12777,7 @@ function _syncFullBackupView(data){
 
   _renderFullBackupCounts((data && data.counts) || {});
   _renderFullBackupSteps((data && data.steps) || []);
+  _renderFullBackupEvents((data && data.events) || [], Number((data && data.event_total) || 0));
 }
 
 async function _pollFullBackupProgress(){
@@ -8353,30 +12785,61 @@ async function _pollFullBackupProgress(){
   if(!jid) return;
   try{
     const r = await fetch(`/api/backup/full/progress?job_id=${encodeURIComponent(jid)}`, { credentials: 'include' });
-    const d = await r.json().catch(()=>({ ok:false, error:'接口返回异常' }));
-    if(!r.ok || !d.ok){
-      const msg = d.error || ('进度查询失败（HTTP ' + r.status + '）');
+    const rawTextP = r.clone().text().catch(()=>'');
+    let d = null;
+    try{
+      d = await r.json();
+    }catch(_e){
+      const raw = String(await rawTextP || '').replace(/\s+/g, ' ').trim();
+      __FULL_BACKUP_POLL_ERR_STREAK__ += 1;
+      const suffix = __FULL_BACKUP_POLL_ERR_STREAK__ >= __FULL_BACKUP_POLL_ERR_LIMIT__
+        ? ''
+        : `（自动重试 ${__FULL_BACKUP_POLL_ERR_STREAK__}/${__FULL_BACKUP_POLL_ERR_LIMIT__}）`;
+      const msg = raw
+        ? `进度接口返回非 JSON（HTTP ${r.status}）：${raw.slice(0, 140)}${suffix}`
+        : `进度接口返回非 JSON（HTTP ${r.status}）${suffix}`;
       const errEl = document.getElementById('backupFullError');
       if(errEl){
         errEl.style.color = 'var(--bad)';
         errEl.textContent = msg;
       }
-      _stopFullBackupPolling();
+      if(__FULL_BACKUP_POLL_ERR_STREAK__ >= __FULL_BACKUP_POLL_ERR_LIMIT__) _stopFullBackupPolling();
       return;
     }
+    if(!r.ok || !d.ok){
+      __FULL_BACKUP_POLL_ERR_STREAK__ += 1;
+      const suffix = __FULL_BACKUP_POLL_ERR_STREAK__ >= __FULL_BACKUP_POLL_ERR_LIMIT__
+        ? ''
+        : `（自动重试 ${__FULL_BACKUP_POLL_ERR_STREAK__}/${__FULL_BACKUP_POLL_ERR_LIMIT__}）`;
+      const msg = d.error || ('进度查询失败（HTTP ' + r.status + '）');
+      const errEl = document.getElementById('backupFullError');
+      if(errEl){
+        errEl.style.color = 'var(--bad)';
+        errEl.textContent = msg + suffix;
+      }
+      const code = Number(r.status || 0);
+      const terminalHttp = [400, 401, 403, 404, 409, 410].includes(code);
+      if(terminalHttp || __FULL_BACKUP_POLL_ERR_STREAK__ >= __FULL_BACKUP_POLL_ERR_LIMIT__) _stopFullBackupPolling();
+      return;
+    }
+    __FULL_BACKUP_POLL_ERR_STREAK__ = 0;
     _syncFullBackupView(d);
     const st = String(d.status || '').trim();
     if(st === 'done' || st === 'failed'){
       _stopFullBackupPolling();
     }
   }catch(e){
+    __FULL_BACKUP_POLL_ERR_STREAK__ += 1;
+    const suffix = __FULL_BACKUP_POLL_ERR_STREAK__ >= __FULL_BACKUP_POLL_ERR_LIMIT__
+      ? ''
+      : `（自动重试 ${__FULL_BACKUP_POLL_ERR_STREAK__}/${__FULL_BACKUP_POLL_ERR_LIMIT__}）`;
     const msg = (e && e.message) ? e.message : String(e || '进度查询失败');
     const errEl = document.getElementById('backupFullError');
     if(errEl){
       errEl.style.color = 'var(--bad)';
-      errEl.textContent = msg;
+      errEl.textContent = msg + suffix;
     }
-    _stopFullBackupPolling();
+    if(__FULL_BACKUP_POLL_ERR_STREAK__ >= __FULL_BACKUP_POLL_ERR_LIMIT__) _stopFullBackupPolling();
   }
 }
 
@@ -8391,6 +12854,7 @@ async function _startFullBackupJob(){
     if(dlBtn) dlBtn.disabled = true;
     __FULL_BACKUP_JOB_ID__ = '';
     _stopFullBackupPolling();
+    __FULL_BACKUP_POLL_ERR_STREAK__ = 0;
 
     const r = await fetch('/api/backup/full/start', { method: 'POST', credentials: 'include' });
     const d = await r.json().catch(()=>({ ok:false, error:'接口返回异常' }));
@@ -8406,6 +12870,13 @@ async function _startFullBackupJob(){
 
     __FULL_BACKUP_JOB_ID__ = String(d.job_id || '').trim();
     _syncFullBackupView(d);
+    if(d.reused){
+      const note = '已复用进行中的备份任务，继续同步实时进度。';
+      if(errEl){
+        errEl.style.color = 'var(--muted)';
+        errEl.textContent = note;
+      }
+    }
 
     __FULL_BACKUP_TIMER__ = setInterval(_pollFullBackupProgress, 1200);
     await _pollFullBackupProgress();
@@ -8429,6 +12900,7 @@ function openFullBackupModal(){
   }catch(_e){}
   _renderFullBackupCounts({});
   _renderFullBackupSteps([]);
+  _renderFullBackupEvents([], 0);
   const stageEl = document.getElementById('backupFullStage');
   const barEl = document.getElementById('backupFullBar');
   const ptxEl = document.getElementById('backupFullProgressText');
@@ -8594,6 +13066,7 @@ function _buildRestoreFullSummary(result){
     `目录 恢复 ${Number(siteFiles.dirs_restored||0)} / 未匹配 ${Number(siteFiles.dirs_unmatched||0)} / 失败 ${Number(siteFiles.dirs_failed||0)} / 跳过 ${Number(siteFiles.dirs_skipped||0)}\n` +
     `证书 新增 ${Number(certs.added||0)} / 更新 ${Number(certs.updated||0)} / 跳过 ${Number(certs.skipped||0)}\n` +
     `网络波动 新增 ${Number(netmon.added||0)} / 更新 ${Number(netmon.updated||0)} / 跳过 ${Number(netmon.skipped||0)}\n` +
+    `网络波动样本 恢复 ${Number(netmon.samples_restored||0)} / 跳过 ${Number(netmon.samples_skipped||0)} / 失败 ${Number(netmon.samples_failed||0)} / 清理监控 ${Number(netmon.sample_monitors_cleared||0)}\n` +
     `面板状态 角色 +${Number(panelRoles.added||0)}/~${Number(panelRoles.updated||0)}，用户 +${Number(panelUsers.added||0)}/~${Number(panelUsers.updated||0)}，Token +${Number(panelTokens.added||0)}/~${Number(panelTokens.updated||0)}\n` +
     `面板状态 规则归属 +${Number(panelOwners.added||0)}/~${Number(panelOwners.updated||0)}，收藏 +${Number(panelFavs.added||0)}/~${Number(panelFavs.updated||0)}，短链 +${Number(panelLinks.added||0)}/~${Number(panelLinks.updated||0)}，撤销 +${Number(panelRevoked.added||0)}/~${Number(panelRevoked.updated||0)}\n` +
     `面板状态 站点事件 ${Number(panelEvents.restored||0)}，站点检查 ${Number(panelChecks.restored||0)}` +
@@ -8783,7 +13256,7 @@ async function restoreFullNow(){
     }
     const f = fileInput && fileInput.files ? fileInput.files[0] : null;
     if(!f){
-      if(err) err.textContent = '请选择 nexus-backup-*.zip 全量备份包';
+      if(err) err.textContent = '请选择全量备份 ZIP（支持 nexus-backup-*.zip 与 nexus-auto-backup-*.zip）';
       return;
     }
     _stopRestoreFullPolling();
@@ -8870,14 +13343,23 @@ async function createNodeFromModal(){
     const scheme = inferAddNodeScheme(ip_address);
     const verifyEl = document.getElementById("addNodeVerifyTls");
     const is_private = !!document.getElementById("addNodeIsPrivate")?.checked;
-    const is_website = !!document.getElementById("addNodeIsWebsite")?.checked;
+    let is_website = !!document.getElementById("addNodeIsWebsite")?.checked;
     const group_name = (document.getElementById("addNodeGroup")?.value || "默认分组").trim() || "默认分组";
     let website_root_base = (document.getElementById("addNodeWebsiteRoot")?.value || "").trim();
+    const systemTypeRaw = String(document.getElementById("addNodeSystemType")?.value || "auto").trim().toLowerCase();
+    const system_type = (systemTypeRaw === "linux" || systemTypeRaw === "macos" || systemTypeRaw === "windows")
+      ? systemTypeRaw
+      : "auto";
 
     if(!ip_address){
       if(err) err.textContent = "节点地址不能为空";
       if(btn){ btn.disabled = false; btn.textContent = "创建并进入"; }
       return;
+    }
+
+    if(system_type === 'macos'){
+      is_website = false;
+      website_root_base = '';
     }
 
     if(is_website && !website_root_base){
@@ -8894,7 +13376,8 @@ async function createNodeFromModal(){
       is_private,
       is_website,
       group_name,
-      website_root_base
+      website_root_base,
+      system_type
     };
     if(verifyEl){
       payload.verify_tls = !!verifyEl.checked;
@@ -8956,6 +13439,12 @@ document.addEventListener("click", (e)=>{
   if(e.target === m) closeTraceRouteModal();
 });
 
+document.addEventListener("click", (e)=>{
+  const m = document.getElementById("mptcpGroupModal");
+  if(!m || m.style.display === "none") return;
+  if(e.target === m) closeMptcpGroupModal();
+});
+
 // ESC 关闭
 document.addEventListener("keydown", (e)=>{
   if(e.key === "Escape"){
@@ -8967,6 +13456,8 @@ document.addEventListener("keydown", (e)=>{
     if(r && r.style.display !== "none") closeRestoreFullModal();
     const tr = document.getElementById("traceRouteModal");
     if(tr && tr.style.display !== "none") closeTraceRouteModal();
+    const mg = document.getElementById("mptcpGroupModal");
+    if(mg && mg.style.display !== "none") closeMptcpGroupModal();
   }
 });
 

@@ -277,7 +277,7 @@
           <div class="wm-node-row">
             <div style="min-width:0;">
               <div class="wm-node-name">{{ n.name }}</div>
-              <div class="wm-node-url mono" title="{{ (n.base_url|mask_url) if n.base_url else '-' }}">{{ (n.base_url|mask_url) if n.base_url else '-' }}</div>
+              <div class="wm-node-url mono" title="{{ n.base_url or '-' }}">{{ n.base_url or '-' }}</div>
               <div class="wm-node-meta">根目录基准：<span class="mono">{{ n.website_root_base or '/www' }}</span></div>
 
               {% if caps.list %}
@@ -375,7 +375,7 @@
               <label class="label">网站机节点</label>
               <select class="select" name="node_id" required>
                 {% for n in nodes %}
-                  <option value="{{ n.id }}">{{ n.name }} · {{ (n.base_url|mask_url) if n.base_url else '-' }}</option>
+                  <option value="{{ n.id }}">{{ n.name }} · {{ n.base_url or '-' }}</option>
                 {% endfor %}
               </select>
               {% if not nodes %}

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import time
@@ -9,10 +10,13 @@ from typing import Any, Dict, List, Optional, Tuple
 from fastapi import FastAPI
 
 from ..clients.agent import agent_post
+from ..core.bg_tasks import spawn_background_task
 from ..db import (
+    add_task,
     insert_netmon_samples,
     list_netmon_monitors,
-    list_nodes,
+    list_nodes_runtime,
+    list_tasks,
     prune_netmon_samples,
     update_netmon_monitor,
 )
@@ -56,8 +60,154 @@ if _NETMON_MAX_CONCURRENCY < 4:
 if _NETMON_MAX_CONCURRENCY > 200:
     _NETMON_MAX_CONCURRENCY = 200
 
+try:
+    _NETMON_QUEUE_MAX_ATTEMPTS = int((os.getenv("REALM_NETMON_QUEUE_MAX_ATTEMPTS") or "2").strip() or 2)
+except Exception:
+    _NETMON_QUEUE_MAX_ATTEMPTS = 2
+if _NETMON_QUEUE_MAX_ATTEMPTS < 1:
+    _NETMON_QUEUE_MAX_ATTEMPTS = 1
+if _NETMON_QUEUE_MAX_ATTEMPTS > 10:
+    _NETMON_QUEUE_MAX_ATTEMPTS = 10
+
 _NETMON_SEM = asyncio.Semaphore(_NETMON_MAX_CONCURRENCY)
 _NETMON_BG_LAST_RUN: Dict[int, float] = {}
+
+
+def _netmon_is_dispatch_error(err: Any) -> bool:
+    msg = str(err or "").strip().lower()
+    if not msg:
+        return False
+    if "agent 请求失败" in msg:
+        return True
+    tokens = (
+        "all connection attempts failed",
+        "connection refused",
+        "connect timeout",
+        "read timeout",
+        "timed out",
+        "name or service not known",
+        "temporary failure in name resolution",
+        "network is unreachable",
+        "no route to host",
+        "cannot assign requested address",
+        "tls handshake",
+        "ssl:",
+    )
+    return any(t in msg for t in tokens)
+
+
+def _netmon_clean_mids_by_target(raw: Any) -> Dict[str, List[int]]:
+    out: Dict[str, List[int]] = {}
+    if not isinstance(raw, dict):
+        return out
+    for k, v in raw.items():
+        target = str(k or "").strip()
+        if not target:
+            continue
+        mids: List[int] = []
+        rows = v if isinstance(v, list) else []
+        for x in rows:
+            try:
+                mid = int(x)
+            except Exception:
+                continue
+            if mid > 0 and mid not in mids:
+                mids.append(mid)
+        if mids:
+            out[target] = mids
+    return out
+
+
+def _netmon_private_group_key(node_id: int, mode: str, tcp_port: int, mids_by_target: Dict[str, List[int]]) -> str:
+    rows: List[str] = []
+    for target in sorted(mids_by_target.keys()):
+        mids = sorted(int(x) for x in (mids_by_target.get(target) or []) if int(x) > 0)
+        if not mids:
+            continue
+        rows.append(f"{target}|{','.join(str(x) for x in mids)}")
+    digest = hashlib.sha1("\n".join(rows).encode("utf-8")).hexdigest()[:16] if rows else "none"
+    return f"{int(node_id)}:{str(mode or 'ping')}:{int(tcp_port)}:{digest}"
+
+
+def _queue_private_probe_task(
+    node_id: int,
+    mode: str,
+    tcp_port: int,
+    mids_by_target: Dict[str, List[int]],
+    ts_ms: int,
+) -> bool:
+    node_id_i = int(node_id or 0)
+    if node_id_i <= 0:
+        return False
+
+    mode_s = str(mode or "ping").strip().lower()
+    if mode_s not in ("ping", "tcping"):
+        mode_s = "ping"
+
+    try:
+        tcp_port_i = int(tcp_port)
+    except Exception:
+        tcp_port_i = 443
+    if tcp_port_i < 1 or tcp_port_i > 65535:
+        tcp_port_i = 443
+
+    clean_map = _netmon_clean_mids_by_target(mids_by_target)
+    if not clean_map:
+        return False
+
+    targets = list(clean_map.keys())[:50]
+    clean_map = {t: clean_map.get(t, []) for t in targets}
+    if not targets:
+        return False
+
+    group_key = _netmon_private_group_key(node_id_i, mode_s, tcp_port_i, clean_map)
+
+    try:
+        rows = list_tasks(node_id=node_id_i, limit=200)
+    except Exception:
+        rows = []
+
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("type") or "").strip().lower() != "netmon_probe":
+            continue
+        status = str(row.get("status") or "").strip().lower()
+        if status not in ("queued", "running"):
+            continue
+        payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+        if str(payload.get("group_key") or "") == group_key:
+            return True
+
+    try:
+        add_task(
+            node_id=node_id_i,
+            task_type="netmon_probe",
+            payload={
+                "node_id": node_id_i,
+                "mode": mode_s,
+                "tcp_port": tcp_port_i,
+                "timeout": float(_NETMON_PROBE_TIMEOUT),
+                "targets": targets,
+                "mids_by_target": clean_map,
+                "queued_ts_ms": int(ts_ms),
+                "group_key": group_key,
+                "max_attempts": int(_NETMON_QUEUE_MAX_ATTEMPTS),
+            },
+            status="queued",
+            progress=0,
+            result={
+                "queued": True,
+                "op": "netmon_probe",
+                "attempt": 0,
+                "max_attempts": int(_NETMON_QUEUE_MAX_ATTEMPTS),
+                "group_key": group_key,
+            },
+            error="",
+        )
+        return True
+    except Exception:
+        return False
 
 
 def enabled() -> bool:
@@ -107,8 +257,10 @@ async def _netmon_collect_due(monitors_due: List[Dict[str, Any]], nodes_map: Dic
 
     ts_ms = int(time.time() * 1000)
 
-    # group key: (node_id, mode, tcp_port)
+    # direct-call group key: (node_id, mode, tcp_port)
     groups: Dict[Tuple[int, str, int], Dict[str, Any]] = {}
+    # push-queue group key (private nodes): (node_id, mode, tcp_port)
+    private_groups: Dict[Tuple[int, str, int], Dict[str, Any]] = {}
     # per monitor status for last_run_msg
     mon_stat: Dict[int, Dict[str, Any]] = {}
 
@@ -129,6 +281,14 @@ async def _netmon_collect_due(monitors_due: List[Dict[str, Any]], nodes_map: Dic
             if nid > 0 and nid not in cleaned:
                 cleaned.append(nid)
         return cleaned[:60]
+
+    def _flush_last_run() -> None:
+        for mid, stt in mon_stat.items():
+            try:
+                msg = "ok" if bool(stt.get("ok_any")) else (str(stt.get("err") or "failed"))
+                update_netmon_monitor(int(mid), last_run_ts_ms=int(ts_ms), last_run_msg=msg)
+            except Exception:
+                pass
 
     # build groups
     for mon in monitors_due:
@@ -173,6 +333,19 @@ async def _netmon_collect_due(monitors_due: List[Dict[str, Any]], nodes_map: Dic
                 if not mon_stat[mid]["err"]:
                     mon_stat[mid]["err"] = "node_missing"
                 continue
+            if bool(node.get("is_private") or 0):
+                key = (int(nid), mode, int(tcp_port))
+                g = private_groups.get(key)
+                if not g:
+                    g = {"targets": [], "mids_by_target": {}}
+                    private_groups[key] = g
+                m = g["mids_by_target"].get(target)
+                if not m:
+                    g["mids_by_target"][target] = [mid]
+                    g["targets"].append(target)
+                else:
+                    m.append(mid)
+                continue
             key = (int(nid), mode, int(tcp_port))
             g = groups.get(key)
             if not g:
@@ -184,9 +357,6 @@ async def _netmon_collect_due(monitors_due: List[Dict[str, Any]], nodes_map: Dic
                 g["targets"].append(target)
             else:
                 m.append(mid)
-
-    if not groups:
-        return
 
     rows: List[tuple] = []
 
@@ -324,6 +494,15 @@ async def _netmon_collect_due(monitors_due: List[Dict[str, Any]], nodes_map: Dic
                     err = str(last.get("error"))
                 if len(err) > 200:
                     err = err[:200] + "…"
+                if _netmon_is_dispatch_error(err):
+                    for mid in mids:
+                        mid_i = int(mid)
+                        stt = mon_stat.get(mid_i)
+                        if stt:
+                            stt["seen"] += 1
+                            if not stt["err"]:
+                                stt["err"] = "dispatch_failed"
+                    continue
                 for mid in mids:
                     mid_i = int(mid)
                     stt = mon_stat.get(mid_i)
@@ -346,6 +525,30 @@ async def _netmon_collect_due(monitors_due: List[Dict[str, Any]], nodes_map: Dic
     if tasks:
         await asyncio.gather(*tasks, return_exceptions=True)
 
+    # Private nodes: enqueue probe task to be executed by agent push-report command path.
+    for (nid, mode, tcp_port), g in private_groups.items():
+        mids_map = _netmon_clean_mids_by_target(g.get("mids_by_target") or {})
+        if not mids_map:
+            continue
+        queued = _queue_private_probe_task(int(nid), str(mode), int(tcp_port), mids_map, int(ts_ms))
+        msg = "dispatch_queued" if queued else "dispatch_failed"
+        mids_all: List[int] = []
+        for arr in mids_map.values():
+            for mid in arr:
+                mid_i = int(mid)
+                if mid_i > 0 and mid_i not in mids_all:
+                    mids_all.append(mid_i)
+        for mid_i in mids_all:
+            stt = mon_stat.get(mid_i)
+            if not stt:
+                continue
+            stt["seen"] += 1
+            # Keep direct probe result as higher priority if we already have one.
+            if bool(stt.get("ok_any")):
+                continue
+            if not str(stt.get("err") or "").strip():
+                stt["err"] = msg
+
     # Persist samples (best-effort)
     try:
         if rows:
@@ -354,12 +557,7 @@ async def _netmon_collect_due(monitors_due: List[Dict[str, Any]], nodes_map: Dic
         pass
 
     # Update monitor last_run
-    for mid, stt in mon_stat.items():
-        try:
-            msg = "ok" if bool(stt.get("ok_any")) else (str(stt.get("err") or "failed"))
-            update_netmon_monitor(int(mid), last_run_ts_ms=int(ts_ms), last_run_msg=msg)
-        except Exception:
-            pass
+    _flush_last_run()
 
 
 async def _netmon_bg_loop() -> None:
@@ -379,8 +577,24 @@ async def _netmon_bg_loop() -> None:
                     monitors_cache = list_netmon_monitors()
                 except Exception:
                     monitors_cache = []
+                # Drop stale scheduler state for deleted/invalid monitors to avoid long-term growth.
+                active_ids: set[int] = set()
+                for mon in monitors_cache:
+                    try:
+                        mid = int((mon or {}).get("id") or 0)
+                    except Exception:
+                        mid = 0
+                    if mid > 0:
+                        active_ids.add(mid)
+                for mid in list(_NETMON_BG_LAST_RUN.keys()):
+                    if mid not in active_ids:
+                        _NETMON_BG_LAST_RUN.pop(mid, None)
                 try:
-                    nodes_map = {int(n.get("id") or 0): n for n in list_nodes() if int(n.get("id") or 0) > 0}
+                    nodes_map = {
+                        int(n.get("id") or 0): n
+                        for n in list_nodes_runtime()
+                        if int(n.get("id") or 0) > 0
+                    }
                 except Exception:
                     nodes_map = {}
                 last_refresh = now
@@ -434,10 +648,13 @@ def start_background(app: FastAPI) -> None:
     """Start NetMon background collector (idempotent)."""
     if not _NETMON_BG_ENABLED:
         return
-    if getattr(app.state, "netmon_bg_started", False):
+    task = getattr(app.state, "netmon_bg_task", None)
+    if isinstance(task, asyncio.Task) and not task.done():
         return
-    app.state.netmon_bg_started = True
     try:
-        asyncio.create_task(_netmon_bg_loop())
+        task = spawn_background_task(_netmon_bg_loop(), label="netmon")
     except Exception:
         pass
+        return
+    app.state.netmon_bg_task = task
+    app.state.netmon_bg_started = True

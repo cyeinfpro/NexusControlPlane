@@ -134,8 +134,15 @@ def mask_url(value: Any) -> str:
         return ""
 
     has_scheme = "://" in raw
-    parsed = urlsplit(raw if has_scheme else f"//{raw}")
-    host = str(parsed.hostname or "").strip()
+    try:
+        parsed = urlsplit(raw if has_scheme else f"//{raw}")
+    except Exception:
+        return _mask_middle(raw, keep_start=2, keep_end=2, min_mask=4)
+
+    try:
+        host = str(parsed.hostname or "").strip()
+    except Exception:
+        host = ""
     if not host:
         return _mask_middle(raw, keep_start=2, keep_end=2, min_mask=4)
 
@@ -143,10 +150,18 @@ def mask_url(value: Any) -> str:
     host_for_url = f"[{masked_host}]" if ":" in masked_host else masked_host
 
     user_part = ""
-    if parsed.username:
-        user_part = mask_secret(parsed.username, keep_start=1, keep_end=0)
-        if parsed.password:
-            user_part = f"{user_part}:{mask_secret(parsed.password, keep_start=1, keep_end=0)}"
+    try:
+        parsed_username = parsed.username
+    except Exception:
+        parsed_username = None
+    try:
+        parsed_password = parsed.password
+    except Exception:
+        parsed_password = None
+    if parsed_username:
+        user_part = mask_secret(parsed_username, keep_start=1, keep_end=0)
+        if parsed_password:
+            user_part = f"{user_part}:{mask_secret(parsed_password, keep_start=1, keep_end=0)}"
         user_part = f"{user_part}@"
 
     netloc = f"{user_part}{host_for_url}"

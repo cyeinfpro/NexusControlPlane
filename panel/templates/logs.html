@@ -4,118 +4,1370 @@
   <div class="page-title">
     <h1 class="h1">系统日志</h1>
     <div class="meta">
-      <span class="meta-item">查看面板运行日志与崩溃堆栈，定位异常触发位置。</span>
+      <span class="meta-item">控制台级日志工作台：实时拉取、结构化筛选、异常定位与上下文分析。</span>
     </div>
-  </div>
-  <div class="right">
-    <button class="btn sm ghost" type="button" id="logRefreshBtn">刷新</button>
   </div>
 </div>
 
-<div class="card">
-  <div class="row" style="gap:10px; align-items:end; flex-wrap:wrap;">
-    <div class="col" style="min-width:220px;">
-      <label class="label">日志源</label>
-      <select class="select" id="logSource">
-        {% for s in (log_sources or []) %}
-        <option value="{{ s.key }}" {% if s.key == default_source %}selected{% endif %}>{{ s.title }}</option>
-        {% endfor %}
-      </select>
-    </div>
-    <div class="col" style="max-width:180px;">
-      <label class="label">行数</label>
-      <input class="input" id="logLines" type="number" min="20" max="2000" value="{{ default_lines or 300 }}">
-    </div>
-    <div class="col" style="max-width:220px;">
-      <label class="label">自动刷新（秒）</label>
-      <select class="select" id="logAutoRefresh">
-        <option value="0">关闭</option>
-        <option value="2">2</option>
-        <option value="5" selected>5</option>
-        <option value="10">10</option>
-        <option value="30">30</option>
-      </select>
-    </div>
+<div class="dashboard-toolbar" id="logsViewTabs" style="margin-bottom:12px;">
+  <div class="dash-filters" role="tablist" aria-label="日志视图切换">
+    <button class="chip {{ 'active' if (default_log_tab or 'runtime') != 'audit' else '' }}" type="button" data-view="runtime" aria-selected="{{ 'false' if (default_log_tab or 'runtime') == 'audit' else 'true' }}">系统日志</button>
+    <button class="chip {{ 'active' if (default_log_tab or 'runtime') == 'audit' else '' }}" type="button" data-view="audit" aria-selected="{{ 'true' if (default_log_tab or 'runtime') == 'audit' else 'false' }}">操作审计</button>
   </div>
-
-  <div class="muted sm" id="logMeta" style="margin-top:10px;"></div>
-  <pre id="logText" class="mono" style="margin-top:10px; min-height:380px; max-height:70vh; overflow:auto; border:1px solid var(--border); border-radius:10px; padding:12px; background:rgba(10,14,20,.55);"></pre>
 </div>
+
+<section id="logRuntimePanel" class="{{ 'hidden' if (default_log_tab or 'runtime') == 'audit' else '' }}">
+  <section class="card log-console-hero">
+    <div class="log-console-summary">
+      <div class="log-kpi-grid">
+        <div class="log-kpi">
+          <div class="log-kpi-label">拉取总行数</div>
+          <div class="log-kpi-value mono" id="logKpiTotal">0</div>
+        </div>
+        <div class="log-kpi">
+          <div class="log-kpi-label">筛选后可见</div>
+          <div class="log-kpi-value mono" id="logKpiShown">0</div>
+        </div>
+        <div class="log-kpi">
+          <div class="log-kpi-label">异常等级（ERROR）</div>
+          <div class="log-kpi-value mono" id="logKpiError">0</div>
+        </div>
+        <div class="log-kpi">
+          <div class="log-kpi-label">最近刷新时间</div>
+          <div class="log-kpi-value mono" id="logKpiUpdated">-</div>
+        </div>
+      </div>
+      <div class="right log-console-actions">
+        <span id="logRunState" class="pill xs ok">实时中</span>
+        <button class="btn sm ghost" type="button" id="logRefreshBtn">立即刷新</button>
+        <button class="btn sm secondary" type="button" id="logPauseBtn">暂停</button>
+        <button class="btn sm ghost" type="button" id="logCopyBtn">复制可见</button>
+        <button class="btn sm ghost" type="button" id="logExportBtn">导出可见</button>
+      </div>
+    </div>
+
+    <div class="log-toolbar-grid">
+      <div class="log-field">
+        <label class="label" for="logSource">日志源</label>
+        <select class="select" id="logSource">
+          {% for s in (log_sources or []) %}
+            <option value="{{ s.key }}" {% if s.key == default_source %}selected{% endif %}>{{ s.title }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div class="log-field">
+        <label class="label" for="logLines">拉取行数</label>
+        <input class="input" id="logLines" type="number" min="20" max="2000" value="{{ default_lines or 300 }}">
+      </div>
+      <div class="log-field">
+        <label class="label" for="logAutoRefresh">自动刷新（秒）</label>
+        <select class="select" id="logAutoRefresh">
+          <option value="0">关闭</option>
+          <option value="2">2</option>
+          <option value="5" selected>5</option>
+          <option value="10">10</option>
+          <option value="30">30</option>
+        </select>
+      </div>
+      <div class="log-field log-field-search">
+        <label class="label" for="logSearch">关键词检索</label>
+        <div class="dash-search log-search-box">
+          <span class="dash-search-ico" aria-hidden="true">⌕</span>
+          <input id="logSearch" class="dash-search-input" placeholder="输入关键字（支持模糊匹配）" autocomplete="off" />
+          <button id="logSearchClear" class="dash-search-clear" type="button" title="清空">×</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="dashboard-toolbar log-filter-bar">
+      <div class="dash-filters" id="logLevelChips" role="tablist" aria-label="日志等级筛选">
+        <button class="chip active" type="button" data-level="all" aria-selected="true">全部 <strong id="logCountAll">0</strong></button>
+        <button class="chip" type="button" data-level="error" aria-selected="false">ERROR <strong id="logCountError">0</strong></button>
+        <button class="chip" type="button" data-level="warn" aria-selected="false">WARN <strong id="logCountWarn">0</strong></button>
+        <button class="chip" type="button" data-level="info" aria-selected="false">INFO <strong id="logCountInfo">0</strong></button>
+        <button class="chip" type="button" data-level="debug" aria-selected="false">DEBUG <strong id="logCountDebug">0</strong></button>
+        <button class="chip" type="button" data-level="trace" aria-selected="false">TRACE <strong id="logCountTrace">0</strong></button>
+        <button class="chip" type="button" data-level="other" aria-selected="false">OTHER <strong id="logCountOther">0</strong></button>
+      </div>
+      <div class="log-toggle-group">
+        <label class="log-toggle"><input type="checkbox" id="logFollow" checked> 跟随最新</label>
+        <label class="log-toggle"><input type="checkbox" id="logWrap"> 自动换行</label>
+        <button class="btn xs ghost" type="button" id="logClearFilterBtn">清空筛选</button>
+      </div>
+    </div>
+
+    <div class="muted sm log-source-meta" id="logMeta">等待加载...</div>
+    <div class="muted sm log-hint" id="logHint"></div>
+  </section>
+
+  <section class="log-console-layout">
+    <article class="card log-stream-card">
+      <div class="card-header">
+        <div>
+          <div class="card-title">日志流</div>
+          <div class="card-sub">支持等级筛选、关键词高亮与连续滚动定位。</div>
+        </div>
+        <div class="right">
+          <span class="pill xs ghost" id="logRenderMeta">显示 0 / 0 行</span>
+        </div>
+      </div>
+      <div class="log-stream-wrap" id="logStreamWrap">
+        <div class="log-lines" id="logLinesList" role="listbox" aria-label="日志行列表"></div>
+      </div>
+    </article>
+
+    <aside class="card log-detail-card">
+      <div class="card-header">
+        <div>
+          <div class="card-title">事件详情</div>
+          <div class="card-sub">点击左侧任意日志可查看细节与上下文。</div>
+        </div>
+        <div class="right">
+          <button class="btn xs ghost" type="button" id="logCopyLineBtn">复制该行</button>
+        </div>
+      </div>
+
+      <div id="logDetailEmpty" class="log-detail-empty">尚未选择日志行</div>
+      <div id="logDetailBody" class="log-detail-body hidden">
+        <div class="log-detail-grid">
+          <div class="log-detail-item">
+            <div class="k">行号</div>
+            <div class="v mono" id="logDetailLine">-</div>
+          </div>
+          <div class="log-detail-item">
+            <div class="k">等级</div>
+            <div class="v mono" id="logDetailLevel">-</div>
+          </div>
+          <div class="log-detail-item">
+            <div class="k">时间</div>
+            <div class="v mono" id="logDetailTime">-</div>
+          </div>
+          <div class="log-detail-item">
+            <div class="k">字节</div>
+            <div class="v mono" id="logDetailBytes">-</div>
+          </div>
+        </div>
+
+        <div class="log-detail-block">
+          <div class="log-detail-label">原始内容</div>
+          <pre id="logDetailText" class="mono log-detail-text"></pre>
+        </div>
+        <div class="log-detail-block">
+          <div class="log-detail-label">上下文（前后 2 行）</div>
+          <pre id="logDetailContext" class="mono log-detail-context"></pre>
+        </div>
+      </div>
+    </aside>
+  </section>
+</section>
+
+<section id="logAuditPanel" class="{{ '' if (default_log_tab or 'runtime') == 'audit' else 'hidden' }}">
+  <section class="card">
+    <div class="row audit-filter-row" style="gap:10px; align-items:end; flex-wrap:wrap;">
+      <div class="col" style="max-width:240px;">
+        <label class="label" for="auditStartAt">开始时间</label>
+        <input class="input" id="auditStartAt" type="datetime-local">
+      </div>
+      <div class="col" style="max-width:240px;">
+        <label class="label" for="auditEndAt">结束时间</label>
+        <input class="input" id="auditEndAt" type="datetime-local">
+      </div>
+      <div class="col" style="max-width:220px;">
+        <label class="label" for="auditActor">用户</label>
+        <input class="input" id="auditActor" placeholder="用户名（模糊匹配）" autocomplete="off">
+      </div>
+      <div class="col" style="max-width:220px;">
+        <label class="label" for="auditAction">操作类型</label>
+        <select class="select" id="auditAction">
+          <option value="">全部操作</option>
+          <option value="node.create">创建节点</option>
+          <option value="node.update">更新节点</option>
+          <option value="node.delete">删除节点</option>
+          <option value="rule.create">创建规则</option>
+          <option value="rule.delete">删除规则</option>
+          <option value="rule.batch_change">批量规则变更</option>
+          <option value="rule.purge_all">清空全部规则</option>
+          <option value="pool.save">保存配置</option>
+          <option value="pool.save_async_enqueue">异步保存入队</option>
+          <option value="pool.apply">应用配置</option>
+          <option value="pool.apply_queued">应用排队</option>
+          <option value="traffic.reset">重置流量统计</option>
+          <option value="traffic.reset_queued">重置流量排队</option>
+          <option value="rule.delete_async_enqueue">异步删规则入队</option>
+        </select>
+      </div>
+      <div class="col" style="max-width:240px;">
+        <label class="label" for="auditNodeId">节点</label>
+        <select class="select" id="auditNodeId">
+          <option value="0">全部节点</option>
+          {% for n in (audit_nodes or []) %}
+          <option value="{{ n.id }}">#{{ n.id }} {{ n.name }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div class="col" style="max-width:140px;">
+        <label class="label" for="auditLimit">每页条数</label>
+        <select class="select" id="auditLimit">
+          <option value="50">50</option>
+          <option value="100" selected>100</option>
+          <option value="200">200</option>
+        </select>
+      </div>
+      <div class="col" style="max-width:260px;">
+        <label class="label" for="auditQuery">关键词</label>
+        <input class="input" id="auditQuery" placeholder="匹配详情 / 节点名 / 来源 IP" autocomplete="off">
+      </div>
+    </div>
+
+    <div class="dashboard-toolbar audit-toolbar" style="margin-top:10px; margin-bottom:0;">
+      <div class="dash-filters" id="auditPresetRange">
+        <button class="chip" type="button" data-hours="1">最近 1 小时</button>
+        <button class="chip" type="button" data-hours="6">最近 6 小时</button>
+        <button class="chip active" type="button" data-hours="24" aria-selected="true">最近 24 小时</button>
+        <button class="chip" type="button" data-hours="168">最近 7 天</button>
+        <button class="chip" type="button" data-hours="0">全部</button>
+      </div>
+      <div class="right audit-toolbar-actions" style="gap:8px;">
+        <button class="btn xs ghost" type="button" id="auditRefreshBtn">查询</button>
+        <button class="btn xs ghost" type="button" id="auditResetBtn">重置</button>
+        <button class="btn xs ghost" type="button" id="auditExportBtn">导出当前页</button>
+        <button class="btn xs ghost" type="button" id="auditPrevBtn">上一页</button>
+        <button class="btn xs ghost" type="button" id="auditNextBtn">下一页</button>
+      </div>
+    </div>
+
+    <div class="muted sm" id="auditMeta" style="margin-top:10px;">等待加载...</div>
+    <div class="table-wrap" style="margin-top:10px;">
+      <table class="table dense audit-table">
+        <thead>
+          <tr>
+            <th style="min-width:164px;">时间</th>
+            <th style="min-width:120px;">用户</th>
+            <th style="min-width:160px;">节点</th>
+            <th style="min-width:130px;">操作</th>
+            <th>详情</th>
+            <th style="min-width:120px;">来源 IP</th>
+          </tr>
+        </thead>
+        <tbody id="auditRows">
+          <tr><td colspan="6" class="muted">加载中...</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+</section>
 
 <script>
 (function(){
-  var btn = document.getElementById('logRefreshBtn');
-  var src = document.getElementById('logSource');
-  var lines = document.getElementById('logLines');
-  var auto = document.getElementById('logAutoRefresh');
-  var meta = document.getElementById('logMeta');
-  var box = document.getElementById('logText');
-  var timer = null;
+  var els = {
+    refreshBtn: document.getElementById('logRefreshBtn'),
+    pauseBtn: document.getElementById('logPauseBtn'),
+    copyBtn: document.getElementById('logCopyBtn'),
+    exportBtn: document.getElementById('logExportBtn'),
+    clearFilterBtn: document.getElementById('logClearFilterBtn'),
+    source: document.getElementById('logSource'),
+    lines: document.getElementById('logLines'),
+    auto: document.getElementById('logAutoRefresh'),
+    search: document.getElementById('logSearch'),
+    searchClear: document.getElementById('logSearchClear'),
+    follow: document.getElementById('logFollow'),
+    wrap: document.getElementById('logWrap'),
+    levelChips: document.getElementById('logLevelChips'),
+    meta: document.getElementById('logMeta'),
+    hint: document.getElementById('logHint'),
+    runState: document.getElementById('logRunState'),
+    kpiTotal: document.getElementById('logKpiTotal'),
+    kpiShown: document.getElementById('logKpiShown'),
+    kpiError: document.getElementById('logKpiError'),
+    kpiUpdated: document.getElementById('logKpiUpdated'),
+    renderMeta: document.getElementById('logRenderMeta'),
+    list: document.getElementById('logLinesList'),
+    detailEmpty: document.getElementById('logDetailEmpty'),
+    detailBody: document.getElementById('logDetailBody'),
+    detailLine: document.getElementById('logDetailLine'),
+    detailLevel: document.getElementById('logDetailLevel'),
+    detailTime: document.getElementById('logDetailTime'),
+    detailBytes: document.getElementById('logDetailBytes'),
+    detailText: document.getElementById('logDetailText'),
+    detailContext: document.getElementById('logDetailContext'),
+    copyLineBtn: document.getElementById('logCopyLineBtn'),
+    countAll: document.getElementById('logCountAll'),
+    countError: document.getElementById('logCountError'),
+    countWarn: document.getElementById('logCountWarn'),
+    countInfo: document.getElementById('logCountInfo'),
+    countDebug: document.getElementById('logCountDebug'),
+    countTrace: document.getElementById('logCountTrace'),
+    countOther: document.getElementById('logCountOther')
+  };
 
-  function fmtTime(ts){
-    var n = Number(ts || 0);
-    if(!n) return '-';
+  var LEVEL_LABEL = {
+    all: 'ALL',
+    error: 'ERROR',
+    warn: 'WARN',
+    info: 'INFO',
+    debug: 'DEBUG',
+    trace: 'TRACE',
+    other: 'OTHER'
+  };
+
+  var LEVEL_KEYS = ['all', 'error', 'warn', 'info', 'debug', 'trace', 'other'];
+  var TIME_RE = /\b\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?(?:Z|[+-]\d{2}:?\d{2})?\b/;
+  var LEVEL_RE = /\b(TRACE|DEBUG|INFO|NOTICE|WARN(?:ING)?|ERROR|CRIT(?:ICAL)?|FATAL)\b/i;
+
+  var state = {
+    timer: null,
+    loading: false,
+    paused: false,
+    follow: true,
+    wrap: false,
+    active: true,
+    reqSeq: 0,
+    activeLevel: 'all',
+    records: [],
+    recordMap: {},
+    filtered: [],
+    selectedNo: null,
+    lastFetchMs: 0,
+    meta: {},
+  };
+
+  function clampInt(v, lo, hi, dft){
+    var n = parseInt(String(v == null ? '' : v), 10);
+    if(!Number.isFinite(n)) n = dft;
+    if(n < lo) n = lo;
+    if(n > hi) n = hi;
+    return n;
+  }
+
+  function esc(text){
+    return String(text == null ? '' : text)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  }
+
+  function highlight(text, keyword){
+    var src = String(text == null ? '' : text);
+    var key = String(keyword == null ? '' : keyword);
+    if(!key) return esc(src);
+
+    var lower = src.toLowerCase();
+    var find = key.toLowerCase();
+    if(!find) return esc(src);
+
+    var i = 0;
+    var out = '';
+    while(i < src.length){
+      var idx = lower.indexOf(find, i);
+      if(idx < 0){
+        out += esc(src.slice(i));
+        break;
+      }
+      out += esc(src.slice(i, idx));
+      out += '<mark>' + esc(src.slice(idx, idx + find.length)) + '</mark>';
+      i = idx + find.length;
+    }
+    return out;
+  }
+
+  function fmtUnix(tsSec){
+    var ts = Number(tsSec || 0);
+    if(!ts) return '-';
     try{
-      return new Date(n * 1000).toLocaleString();
+      return new Date(ts * 1000).toLocaleString();
     }catch(_e){
       return '-';
     }
   }
 
-  async function loadLogs(){
-    var source = (src && src.value) ? src.value : 'panel';
-    var lineN = parseInt((lines && lines.value) || '300', 10);
-    if(!Number.isFinite(lineN) || lineN < 20) lineN = 20;
-    if(lineN > 2000) lineN = 2000;
-    if(lines) lines.value = String(lineN);
+  function fmtMs(tsMs){
+    var ts = Number(tsMs || 0);
+    if(!ts) return '-';
+    try{
+      return new Date(ts).toLocaleTimeString();
+    }catch(_e){
+      return '-';
+    }
+  }
 
-    if(btn){ btn.disabled = true; btn.textContent = '加载中...'; }
+  function fmtBytes(v){
+    var n = Number(v || 0);
+    if(!Number.isFinite(n) || n <= 0) return '0 B';
+    if(n < 1024) return String(n) + ' B';
+    if(n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+    if(n < 1024 * 1024 * 1024) return (n / (1024 * 1024)).toFixed(1) + ' MB';
+    return (n / (1024 * 1024 * 1024)).toFixed(1) + ' GB';
+  }
+
+  function normalizeLevel(raw){
+    var v = String(raw || '').trim().toLowerCase();
+    if(!v) return '';
+    if(v.indexOf('warn') === 0) return 'warn';
+    if(v === 'notice' || v === 'info') return 'info';
+    if(v === 'debug') return 'debug';
+    if(v === 'trace') return 'trace';
+    if(v === 'critical' || v === 'crit' || v === 'fatal' || v === 'error') return 'error';
+    return '';
+  }
+
+  function textByteLen(text){
+    var raw = String(text || '');
+    try{
+      if(typeof TextEncoder !== 'undefined'){
+        return (new TextEncoder().encode(raw)).length;
+      }
+    }catch(_e){}
+    try{
+      return unescape(encodeURIComponent(raw)).length;
+    }catch(_e2){
+      return raw.length;
+    }
+  }
+
+  function inferLevel(text, lastLevel){
+    var raw = String(text || '');
+    var m = raw.match(LEVEL_RE);
+    if(m){
+      var lv = normalizeLevel(m[1]);
+      if(lv) return lv;
+    }
+    if(/traceback|exception|panic|segmentation fault|assertionerror/i.test(raw)) return 'error';
+    if(/(?:^|\b)warn(?:ing)?(?:\b|:)/i.test(raw)) return 'warn';
+    if(/(?:^|\b)info(?:\b|:)/i.test(raw)) return 'info';
+    if(/(?:^|\b)debug(?:\b|:)/i.test(raw)) return 'debug';
+    if(/^\s+(?:at\s|File\s|line\s+\d+)/.test(raw) && lastLevel && lastLevel !== 'other') return lastLevel;
+    return 'other';
+  }
+
+  function parseRecords(text){
+    var out = [];
+    var map = {};
+    var lines = String(text || '').split(/\r?\n/);
+    var lastLevel = 'other';
+
+    for(var i = 0; i < lines.length; i++){
+      var raw = lines[i] || '';
+      if(i === lines.length - 1 && raw === '') continue;
+
+      var tm = raw.match(TIME_RE);
+      var level = inferLevel(raw, lastLevel);
+      if(level && level !== 'other') lastLevel = level;
+
+      var rec = {
+        no: i + 1,
+        raw: raw,
+        lower: raw.toLowerCase(),
+        level: level || 'other',
+        time: tm ? tm[0] : '',
+      };
+      out.push(rec);
+      map[rec.no] = rec;
+    }
+    return {records: out, recordMap: map};
+  }
+
+  function levelStats(){
+    var c = {all: state.records.length, error: 0, warn: 0, info: 0, debug: 0, trace: 0, other: 0};
+    for(var i = 0; i < state.records.length; i++){
+      var lv = state.records[i].level || 'other';
+      if(!Object.prototype.hasOwnProperty.call(c, lv)) lv = 'other';
+      c[lv] += 1;
+    }
+    return c;
+  }
+
+  function setHint(text, isError){
+    if(!els.hint) return;
+    els.hint.textContent = String(text || '');
+    els.hint.classList.toggle('error', !!isError);
+  }
+
+  function updateRunState(){
+    if(!els.runState) return;
+    if(!state.active){
+      els.runState.textContent = '待机中';
+      els.runState.className = 'pill xs ghost';
+    }else if(state.paused){
+      els.runState.textContent = '已暂停';
+      els.runState.className = 'pill xs warn';
+    }else{
+      els.runState.textContent = '实时中';
+      els.runState.className = 'pill xs ok';
+    }
+    if(els.pauseBtn){
+      els.pauseBtn.textContent = state.paused ? '恢复' : '暂停';
+      els.pauseBtn.disabled = !state.active;
+    }
+  }
+
+  function updateMeta(){
+    if(!els.meta) return;
+    var m = state.meta || {};
+    var warns = [];
+    if(m.truncated) warns.push('内容已截断');
+    if(m.read_error) warns.push('读取异常: ' + m.read_error);
+
+    var parts = [
+      '日志源: ' + (m.title || '-'),
+      '文件: ' + (m.path || '-'),
+      '大小: ' + fmtBytes(m.size_bytes || 0),
+      '文件更新时间: ' + fmtUnix(m.mtime || 0),
+      '最近拉取: ' + fmtMs(state.lastFetchMs || 0),
+    ];
+    if(warns.length) parts.push('提示: ' + warns.join('；'));
+    els.meta.textContent = parts.join(' | ');
+  }
+
+  function renderFilterChips(){
+    var stats = levelStats();
+    if(els.countAll) els.countAll.textContent = String(stats.all);
+    if(els.countError) els.countError.textContent = String(stats.error);
+    if(els.countWarn) els.countWarn.textContent = String(stats.warn);
+    if(els.countInfo) els.countInfo.textContent = String(stats.info);
+    if(els.countDebug) els.countDebug.textContent = String(stats.debug);
+    if(els.countTrace) els.countTrace.textContent = String(stats.trace);
+    if(els.countOther) els.countOther.textContent = String(stats.other);
+
+    if(!els.levelChips) return;
+    var chips = els.levelChips.querySelectorAll('[data-level]');
+    for(var i = 0; i < chips.length; i++){
+      var lv = String(chips[i].getAttribute('data-level') || 'all');
+      var active = (lv === state.activeLevel);
+      chips[i].classList.toggle('active', active);
+      chips[i].setAttribute('aria-selected', active ? 'true' : 'false');
+    }
+  }
+
+  function findRecordByNo(no){
+    return state.recordMap ? state.recordMap[Number(no || 0)] : null;
+  }
+
+  function buildContext(no, span){
+    var out = [];
+    var base = Number(no || 0);
+    var around = clampInt(span, 0, 8, 2);
+    for(var i = base - around; i <= base + around; i++){
+      var rec = findRecordByNo(i);
+      if(!rec) continue;
+      var prefix = (i === base) ? '>' : ' ';
+      out.push(prefix + ' #' + rec.no + ' ' + rec.raw);
+    }
+    return out.join('\n');
+  }
+
+  function levelClass(level){
+    var lv = String(level || 'other');
+    if(lv === 'error' || lv === 'warn' || lv === 'info' || lv === 'debug' || lv === 'trace') return lv;
+    return 'other';
+  }
+
+  function renderDetail(){
+    var rec = findRecordByNo(state.selectedNo);
+    if(!rec){
+      if(els.detailEmpty) els.detailEmpty.classList.remove('hidden');
+      if(els.detailBody) els.detailBody.classList.add('hidden');
+      return;
+    }
+
+    if(els.detailEmpty) els.detailEmpty.classList.add('hidden');
+    if(els.detailBody) els.detailBody.classList.remove('hidden');
+    if(els.detailLine) els.detailLine.textContent = '#' + rec.no;
+    if(els.detailLevel) els.detailLevel.textContent = LEVEL_LABEL[rec.level] || 'OTHER';
+    if(els.detailTime) els.detailTime.textContent = rec.time || '-';
+    if(els.detailBytes) els.detailBytes.textContent = String(textByteLen(rec.raw || ''));
+    if(els.detailText) els.detailText.textContent = rec.raw || '';
+    if(els.detailContext) els.detailContext.textContent = buildContext(rec.no, 2) || '-';
+  }
+
+  function renderRows(){
+    if(!els.list) return;
+    var host = els.list;
+    var beforeGap = host.scrollHeight - host.scrollTop;
+    var keyword = String((els.search && els.search.value) ? els.search.value.trim() : '');
+
+    host.innerHTML = '';
+    host.classList.toggle('wrap', !!state.wrap);
+
+    if(!state.filtered.length){
+      host.innerHTML = '<div class="log-empty">当前条件下没有匹配日志</div>';
+      if(els.renderMeta) els.renderMeta.textContent = '显示 0 / ' + state.records.length + ' 行';
+      return;
+    }
+
+    var frag = document.createDocumentFragment();
+    for(var i = 0; i < state.filtered.length; i++){
+      var rec = state.filtered[i];
+      var row = document.createElement('button');
+      row.type = 'button';
+      row.className = 'log-row level-' + levelClass(rec.level) + (state.selectedNo === rec.no ? ' active' : '');
+      row.setAttribute('data-no', String(rec.no));
+
+      var raw = String(rec.raw || '');
+      if(!state.wrap && raw.length > 420){
+        raw = raw.slice(0, 420) + ' …';
+      }
+      row.innerHTML = ''
+        + '<span class="log-row-idx mono">#' + rec.no + '</span>'
+        + '<span class="log-row-time mono">' + esc(rec.time || '--') + '</span>'
+        + '<span class="log-row-level ' + levelClass(rec.level) + '">' + esc(LEVEL_LABEL[rec.level] || 'OTHER') + '</span>'
+        + '<span class="log-row-msg mono">' + highlight(raw, keyword) + '</span>';
+      frag.appendChild(row);
+    }
+    host.appendChild(frag);
+
+    if(els.renderMeta){
+      els.renderMeta.textContent = '显示 ' + state.filtered.length + ' / ' + state.records.length + ' 行';
+    }
+
+    if(state.follow){
+      host.scrollTop = host.scrollHeight;
+    }else{
+      host.scrollTop = Math.max(0, host.scrollHeight - beforeGap);
+    }
+  }
+
+  function renderStats(){
+    var stats = levelStats();
+    if(els.kpiTotal) els.kpiTotal.textContent = String(stats.all);
+    if(els.kpiShown) els.kpiShown.textContent = String(state.filtered.length);
+    if(els.kpiError) els.kpiError.textContent = String(stats.error);
+    if(els.kpiUpdated) els.kpiUpdated.textContent = fmtMs(state.lastFetchMs || 0);
+    renderFilterChips();
+  }
+
+  function applyFilters(fromLoad){
+    var lv = String(state.activeLevel || 'all');
+    var keyword = String((els.search && els.search.value) ? els.search.value.trim().toLowerCase() : '');
+
+    var out = [];
+    for(var i = 0; i < state.records.length; i++){
+      var rec = state.records[i];
+      if(lv !== 'all' && rec.level !== lv) continue;
+      if(keyword && rec.lower.indexOf(keyword) < 0) continue;
+      out.push(rec);
+    }
+    state.filtered = out;
+
+    if(fromLoad && state.follow && out.length){
+      state.selectedNo = out[out.length - 1].no;
+    }else if(state.selectedNo != null){
+      var found = false;
+      for(var j = 0; j < out.length; j++){
+        if(out[j].no === state.selectedNo){
+          found = true;
+          break;
+        }
+      }
+      if(!found) state.selectedNo = out.length ? out[out.length - 1].no : null;
+    }else{
+      state.selectedNo = out.length ? out[out.length - 1].no : null;
+    }
+
+    renderStats();
+    renderRows();
+    renderDetail();
+  }
+
+  function setLoading(v){
+    state.loading = !!v;
+    if(els.refreshBtn){
+      els.refreshBtn.disabled = state.loading;
+      els.refreshBtn.textContent = state.loading ? '加载中...' : '立即刷新';
+    }
+  }
+
+  function selectedVisibleText(){
+    var rows = state.filtered || [];
+    if(!rows.length) return '';
+    var out = [];
+    for(var i = 0; i < rows.length; i++){
+      out.push(rows[i].raw || '');
+    }
+    return out.join('\n');
+  }
+
+  async function copyText(text){
+    var raw = String(text || '');
+    if(!raw) return false;
+    try{
+      if(navigator && navigator.clipboard && navigator.clipboard.writeText){
+        await navigator.clipboard.writeText(raw);
+        return true;
+      }
+    }catch(_e){}
+
+    try{
+      var ta = document.createElement('textarea');
+      ta.value = raw;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      var ok = document.execCommand('copy');
+      ta.remove();
+      return !!ok;
+    }catch(_e2){
+      return false;
+    }
+  }
+
+  function exportVisible(){
+    var text = selectedVisibleText();
+    if(!text){
+      setHint('当前无可导出的日志', true);
+      return;
+    }
+    var source = String((els.source && els.source.value) || 'panel').replace(/[^a-zA-Z0-9_-]+/g, '_');
+    var stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    var name = source + '-visible-' + stamp + '.log';
+    var blob = new Blob([text], {type: 'text/plain;charset=utf-8'});
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement('a');
+    a.href = url;
+    a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(function(){
+      URL.revokeObjectURL(url);
+    }, 800);
+    setHint('已导出 ' + state.filtered.length + ' 行到 ' + name, false);
+  }
+
+  async function copyVisible(){
+    var text = selectedVisibleText();
+    if(!text){
+      setHint('当前无可复制日志', true);
+      return;
+    }
+    var ok = await copyText(text);
+    setHint(ok ? ('已复制 ' + state.filtered.length + ' 行日志') : '复制失败，请检查浏览器权限', !ok);
+  }
+
+  async function copyCurrentLine(){
+    var rec = findRecordByNo(state.selectedNo);
+    if(!rec){
+      setHint('请先选择一条日志行', true);
+      return;
+    }
+    var ok = await copyText(rec.raw || '');
+    setHint(ok ? ('已复制第 #' + rec.no + ' 行') : '复制失败，请检查浏览器权限', !ok);
+  }
+
+  async function loadLogs(force){
+    if(!state.active) return;
+    if(state.loading) return;
+    if(state.paused && !force) return;
+
+    var source = (els.source && els.source.value) ? els.source.value : 'panel';
+    var lineN = clampInt((els.lines && els.lines.value) || 300, 20, 2000, 300);
+    if(els.lines) els.lines.value = String(lineN);
+
+    setLoading(true);
+    var reqId = state.reqSeq + 1;
+    state.reqSeq = reqId;
     try{
       var url = '/api/logs/tail?source=' + encodeURIComponent(source) + '&lines=' + encodeURIComponent(String(lineN));
-      var r = await fetch(url, { cache: 'no-store', credentials: 'same-origin' });
+      var r = await fetch(url, {cache: 'no-store', credentials: 'same-origin'});
       var j = await r.json();
       if(!r.ok || !j || j.ok !== true){
         throw new Error((j && (j.error || j.detail)) || ('HTTP ' + r.status));
       }
-      if(box){
-        box.textContent = j.text || '';
-        box.scrollTop = box.scrollHeight;
+      if(reqId !== state.reqSeq || !state.active){
+        return;
       }
-      if(meta){
-        var warn = [];
-        if(j.truncated) warn.push('内容已截断');
-        if(j.read_error) warn.push('读取异常: ' + j.read_error);
-        var info = [
-          '文件: ' + (j.path || '-'),
-          '大小: ' + (j.size_bytes || 0) + ' bytes',
-          '更新时间: ' + fmtTime(j.mtime)
-        ];
-        if(warn.length) info.push('提示: ' + warn.join('；'));
-        meta.textContent = info.join(' | ');
-      }
+
+      var parsed = parseRecords(j.text || '');
+      state.records = parsed.records;
+      state.recordMap = parsed.recordMap;
+      state.meta = j || {};
+      state.lastFetchMs = Date.now();
+      updateMeta();
+      applyFilters(true);
+      setHint('', false);
     }catch(err){
-      if(meta) meta.textContent = '加载失败: ' + (err && err.message ? err.message : String(err));
+      if(reqId !== state.reqSeq || !state.active){
+        return;
+      }
+      setHint('加载失败: ' + (err && err.message ? err.message : String(err)), true);
     }finally{
-      if(btn){ btn.disabled = false; btn.textContent = '刷新'; }
+      if(reqId === state.reqSeq){
+        setLoading(false);
+      }
     }
   }
 
   function resetTimer(){
-    if(timer){ clearInterval(timer); timer = null; }
-    var sec = parseInt((auto && auto.value) || '0', 10);
-    if(Number.isFinite(sec) && sec > 0){
-      timer = setInterval(loadLogs, sec * 1000);
+    if(state.timer){
+      clearInterval(state.timer);
+      state.timer = null;
+    }
+    if(!state.active) return;
+    var sec = clampInt((els.auto && els.auto.value) || 0, 0, 300, 5);
+    if(els.auto) els.auto.value = String(sec);
+    if(sec > 0){
+      state.timer = setInterval(function(){
+        loadLogs(false);
+      }, sec * 1000);
     }
   }
 
-  if(btn) btn.addEventListener('click', loadLogs);
-  if(src) src.addEventListener('change', loadLogs);
-  if(lines) lines.addEventListener('change', loadLogs);
-  if(auto) auto.addEventListener('change', resetTimer);
+  function setRuntimeActive(active){
+    state.active = !!active;
+    if(!state.active){
+      state.reqSeq += 1;
+      state.loading = false;
+      setLoading(false);
+      resetTimer();
+      updateRunState();
+      return;
+    }
+    updateRunState();
+    resetTimer();
+    if(!state.paused){
+      loadLogs(true);
+    }
+  }
 
-  resetTimer();
-  loadLogs();
+  function handleLineClick(target){
+    if(!target) return;
+    var node = target;
+    if(node && node.nodeType === 3) node = node.parentElement;
+    if(!node || !node.closest) return;
+    var row = node.closest('[data-no]');
+    if(!row) return;
+    var no = Number(row.getAttribute('data-no') || 0);
+    if(!Number.isFinite(no) || no <= 0) return;
+    state.selectedNo = no;
+    renderRows();
+    renderDetail();
+  }
+
+  if(els.refreshBtn) els.refreshBtn.addEventListener('click', function(){ loadLogs(true); });
+  if(els.pauseBtn) els.pauseBtn.addEventListener('click', function(){
+    if(!state.active) return;
+    state.paused = !state.paused;
+    updateRunState();
+    if(!state.paused){
+      loadLogs(true);
+    }
+  });
+  if(els.copyBtn) els.copyBtn.addEventListener('click', copyVisible);
+  if(els.exportBtn) els.exportBtn.addEventListener('click', exportVisible);
+  if(els.copyLineBtn) els.copyLineBtn.addEventListener('click', copyCurrentLine);
+
+  if(els.source) els.source.addEventListener('change', function(){ loadLogs(true); });
+  if(els.lines) els.lines.addEventListener('change', function(){ loadLogs(true); });
+  if(els.lines) els.lines.addEventListener('keydown', function(ev){
+    if(ev && ev.key === 'Enter'){
+      ev.preventDefault();
+      loadLogs(true);
+    }
+  });
+  if(els.auto) els.auto.addEventListener('change', function(){
+    resetTimer();
+    loadLogs(true);
+  });
+
+  if(els.search){
+    els.search.addEventListener('input', function(){
+      applyFilters(false);
+      if(els.searchClear){
+        var hasVal = String(els.search.value || '').trim().length > 0;
+        els.searchClear.style.visibility = hasVal ? 'visible' : 'hidden';
+      }
+    });
+  }
+  if(els.searchClear){
+    els.searchClear.addEventListener('click', function(){
+      if(els.search) els.search.value = '';
+      els.searchClear.style.visibility = 'hidden';
+      applyFilters(false);
+      if(els.search) els.search.focus();
+    });
+  }
+
+  if(els.clearFilterBtn){
+    els.clearFilterBtn.addEventListener('click', function(){
+      state.activeLevel = 'all';
+      if(els.search) els.search.value = '';
+      if(els.searchClear) els.searchClear.style.visibility = 'hidden';
+      applyFilters(false);
+    });
+  }
+
+  if(els.follow){
+    els.follow.addEventListener('change', function(){
+      state.follow = !!els.follow.checked;
+      if(state.follow){
+        state.selectedNo = state.filtered.length ? state.filtered[state.filtered.length - 1].no : state.selectedNo;
+        renderRows();
+        renderDetail();
+      }
+    });
+  }
+  if(els.wrap){
+    els.wrap.addEventListener('change', function(){
+      state.wrap = !!els.wrap.checked;
+      renderRows();
+    });
+  }
+
+  if(els.levelChips){
+    els.levelChips.addEventListener('click', function(ev){
+      var t = ev && ev.target ? ev.target : null;
+      if(t && t.nodeType === 3) t = t.parentElement;
+      var target = (t && t.closest) ? t.closest('[data-level]') : null;
+      if(!target) return;
+      var lv = String(target.getAttribute('data-level') || 'all');
+      if(LEVEL_KEYS.indexOf(lv) < 0) lv = 'all';
+      state.activeLevel = lv;
+      applyFilters(false);
+    });
+  }
+
+  if(els.list){
+    els.list.addEventListener('click', function(ev){
+      handleLineClick(ev.target);
+    });
+  }
+
+  state.follow = !!(els.follow && els.follow.checked);
+  state.wrap = !!(els.wrap && els.wrap.checked);
+  var runtimePanel = document.getElementById('logRuntimePanel');
+  state.active = !(runtimePanel && runtimePanel.classList.contains('hidden'));
+  window.__setRuntimeLogsActive = setRuntimeActive;
+  updateRunState();
+})();
+</script>
+<script>
+(function(){
+  var els = {
+    panel: document.getElementById('logAuditPanel'),
+    startAt: document.getElementById('auditStartAt'),
+    endAt: document.getElementById('auditEndAt'),
+    actor: document.getElementById('auditActor'),
+    action: document.getElementById('auditAction'),
+    nodeId: document.getElementById('auditNodeId'),
+    query: document.getElementById('auditQuery'),
+    limit: document.getElementById('auditLimit'),
+    refreshBtn: document.getElementById('auditRefreshBtn'),
+    resetBtn: document.getElementById('auditResetBtn'),
+    exportBtn: document.getElementById('auditExportBtn'),
+    prevBtn: document.getElementById('auditPrevBtn'),
+    nextBtn: document.getElementById('auditNextBtn'),
+    meta: document.getElementById('auditMeta'),
+    rows: document.getElementById('auditRows'),
+    presetRange: document.getElementById('auditPresetRange'),
+  };
+
+  var state = {
+    active: false,
+    loading: false,
+    reqSeq: 0,
+    total: 0,
+    offset: 0,
+    limit: 100,
+    hasLoaded: false,
+    rows: [],
+  };
+  var ACTION_LABEL = {
+    'node.create': '创建节点',
+    'node.update': '更新节点',
+    'node.delete': '删除节点',
+    'pool.save': '保存配置',
+    'pool.save_async_enqueue': '异步保存入队',
+    'pool.apply': '应用配置',
+    'pool.apply_queued': '应用排队',
+    'rule.create': '创建规则',
+    'rule.delete': '删除规则',
+    'rule.delete_async_enqueue': '异步删规则入队',
+    'rule.batch_change': '批量规则变更',
+    'rule.purge_all': '清空全部规则',
+    'traffic.reset': '重置流量统计',
+    'traffic.reset_queued': '重置流量排队',
+  };
+
+  function esc(text){
+    return String(text == null ? '' : text)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  }
+
+  function dtLocalValue(dateObj){
+    var d = dateObj instanceof Date ? dateObj : new Date();
+    var yyyy = d.getFullYear();
+    var mm = String(d.getMonth() + 1).padStart(2, '0');
+    var dd = String(d.getDate()).padStart(2, '0');
+    var hh = String(d.getHours()).padStart(2, '0');
+    var mi = String(d.getMinutes()).padStart(2, '0');
+    return yyyy + '-' + mm + '-' + dd + 'T' + hh + ':' + mi;
+  }
+
+  function setRangeByHours(hours){
+    var h = Number(hours || 0);
+    var now = new Date();
+    if(els.endAt) els.endAt.value = dtLocalValue(now);
+    if(els.startAt){
+      if(h > 0){
+        var start = new Date(now.getTime() - h * 3600 * 1000);
+        els.startAt.value = dtLocalValue(start);
+      }else{
+        els.startAt.value = '';
+      }
+    }
+  }
+
+  function pickPreset(hours){
+    if(!els.presetRange) return;
+    var chips = els.presetRange.querySelectorAll('[data-hours]');
+    for(var i = 0; i < chips.length; i++){
+      var v = Number(chips[i].getAttribute('data-hours') || 0);
+      var active = (v === Number(hours || 0));
+      chips[i].classList.toggle('active', active);
+      chips[i].setAttribute('aria-selected', active ? 'true' : 'false');
+    }
+  }
+
+  function readFilters(){
+    var lim = parseInt((els.limit && els.limit.value) || '100', 10);
+    if(!Number.isFinite(lim) || lim < 1) lim = 100;
+    if(lim > 200) lim = 200;
+    state.limit = lim;
+    return {
+      start_at: (els.startAt && els.startAt.value) ? els.startAt.value : '',
+      end_at: (els.endAt && els.endAt.value) ? els.endAt.value : '',
+      actor: (els.actor && els.actor.value) ? els.actor.value.trim() : '',
+      action: (els.action && els.action.value) ? String(els.action.value).trim() : '',
+      query: (els.query && els.query.value) ? els.query.value.trim() : '',
+      node_id: parseInt((els.nodeId && els.nodeId.value) || '0', 10) || 0,
+      limit: lim,
+      offset: state.offset,
+    };
+  }
+
+  function detailToText(detail){
+    if(!detail || typeof detail !== 'object') return '-';
+    var pairs = [];
+    for(var k in detail){
+      if(!Object.prototype.hasOwnProperty.call(detail, k)) continue;
+      var v = detail[k];
+      if(v == null || v === '') continue;
+      if(typeof v === 'object'){
+        try{
+          pairs.push(k + '=' + JSON.stringify(v));
+        }catch(_e){
+          pairs.push(k + '=[object]');
+        }
+      }else{
+        pairs.push(k + '=' + String(v));
+      }
+    }
+    if(!pairs.length) return '-';
+    return pairs.join(' | ');
+  }
+
+  function toCsvCell(value){
+    var text = String(value == null ? '' : value);
+    if(/["\n,\r]/.test(text)){
+      return '"' + text.replace(/"/g, '""') + '"';
+    }
+    return text;
+  }
+
+  function exportCurrentRows(){
+    var rows = Array.isArray(state.rows) ? state.rows : [];
+    if(!rows.length){
+      return;
+    }
+    var out = [];
+    out.push(['created_at', 'actor', 'node_id', 'node_name', 'action', 'source_ip', 'detail'].join(','));
+    for(var i = 0; i < rows.length; i++){
+      var it = rows[i] || {};
+      out.push([
+        toCsvCell(it.created_at || ''),
+        toCsvCell(it.actor || ''),
+        toCsvCell(it.node_id || ''),
+        toCsvCell(it.node_name || ''),
+        toCsvCell(it.action || ''),
+        toCsvCell(it.source_ip || ''),
+        toCsvCell(detailToText(it.detail)),
+      ].join(','));
+    }
+    var blob = new Blob([out.join('\n')], {type: 'text/csv;charset=utf-8'});
+    var stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    var a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'audit-page-' + stamp + '.csv';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(function(){
+      URL.revokeObjectURL(a.href);
+    }, 800);
+  }
+
+  function resetFilters(){
+    pickPreset(24);
+    setRangeByHours(24);
+    if(els.actor) els.actor.value = '';
+    if(els.action) els.action.value = '';
+    if(els.nodeId) els.nodeId.value = '0';
+    if(els.query) els.query.value = '';
+    if(els.limit) els.limit.value = '100';
+    state.offset = 0;
+  }
+
+  function renderRows(items){
+    if(!els.rows) return;
+    var rows = Array.isArray(items) ? items : [];
+    if(!rows.length){
+      els.rows.innerHTML = '<tr><td colspan="6" class="muted">当前筛选条件下暂无审计记录</td></tr>';
+      return;
+    }
+    var html = '';
+    for(var i = 0; i < rows.length; i++){
+      var it = rows[i] || {};
+      var nid = Number(it.node_id || 0);
+      var nodeText = nid > 0 ? ('#' + nid + ' ' + (it.node_name || '-')) : '-';
+      var actor = String(it.actor || '').trim() || '-';
+      var actionRaw = String(it.action || '').trim();
+      var action = ACTION_LABEL[actionRaw] || actionRaw || '-';
+      var detail = detailToText(it.detail);
+      var created = String(it.created_at || '-');
+      var ip = String(it.source_ip || '').trim() || '-';
+      html += '<tr>'
+        + '<td class="mono">' + esc(created) + '</td>'
+        + '<td>' + esc(actor) + '</td>'
+        + '<td>' + esc(nodeText) + '</td>'
+        + '<td><span class="pill xs ghost" title="' + esc(actionRaw || '-') + '">' + esc(action) + '</span></td>'
+        + '<td class="mono audit-detail-cell">' + esc(detail) + '</td>'
+        + '<td class="mono">' + esc(ip) + '</td>'
+        + '</tr>';
+    }
+    els.rows.innerHTML = html;
+  }
+
+  function setMeta(total, loaded){
+    if(!els.meta) return;
+    var from = state.offset + 1;
+    if(total <= 0){
+      from = 0;
+    }
+    var to = state.offset + loaded;
+    var page = Math.floor(state.offset / state.limit) + 1;
+    els.meta.textContent = '总计 ' + total + ' 条 | 当前第 ' + page + ' 页 | 显示 ' + from + '-' + to;
+  }
+
+  function setLoading(v){
+    state.loading = !!v;
+    var disabled = state.loading || !state.active;
+    var hasNext = state.hasLoaded && ((state.offset + state.limit) < state.total);
+    if(els.refreshBtn){
+      els.refreshBtn.disabled = disabled;
+      els.refreshBtn.textContent = state.loading ? '查询中...' : '查询';
+    }
+    if(els.resetBtn) els.resetBtn.disabled = disabled;
+    if(els.exportBtn) els.exportBtn.disabled = disabled || !Array.isArray(state.rows) || !state.rows.length;
+    if(els.prevBtn) els.prevBtn.disabled = disabled || state.offset <= 0;
+    if(els.nextBtn) els.nextBtn.disabled = disabled || !hasNext;
+  }
+
+  async function loadAudit(resetOffset){
+    if(!state.active) return;
+    if(resetOffset) state.offset = 0;
+    if(state.loading) return;
+    setLoading(true);
+    var reqId = state.reqSeq + 1;
+    state.reqSeq = reqId;
+    try{
+      var f = readFilters();
+      var url = '/api/audit-logs'
+        + '?start_at=' + encodeURIComponent(f.start_at)
+        + '&end_at=' + encodeURIComponent(f.end_at)
+        + '&actor=' + encodeURIComponent(f.actor)
+        + '&action=' + encodeURIComponent(f.action)
+        + '&query=' + encodeURIComponent(f.query)
+        + '&node_id=' + encodeURIComponent(String(f.node_id))
+        + '&limit=' + encodeURIComponent(String(f.limit))
+        + '&offset=' + encodeURIComponent(String(f.offset));
+      var r = await fetch(url, {cache: 'no-store', credentials: 'same-origin'});
+      var j = await r.json();
+      if(!r.ok || !j || j.ok !== true){
+        throw new Error((j && (j.error || j.detail)) || ('HTTP ' + r.status));
+      }
+      if(reqId !== state.reqSeq || !state.active){
+        return;
+      }
+      var items = Array.isArray(j.items) ? j.items : [];
+      state.total = Number(j.total || 0);
+      state.hasLoaded = true;
+      state.rows = items;
+      renderRows(items);
+      setMeta(state.total, items.length);
+    }catch(err){
+      if(reqId !== state.reqSeq || !state.active){
+        return;
+      }
+      state.rows = [];
+      state.total = 0;
+      state.hasLoaded = false;
+      if(els.rows){
+        els.rows.innerHTML = '<tr><td colspan="6" style="color:var(--bad);">加载失败：' + esc((err && err.message) ? err.message : String(err)) + '</td></tr>';
+      }
+      if(els.meta){
+        els.meta.textContent = '加载失败';
+      }
+    }finally{
+      if(reqId === state.reqSeq){
+        setLoading(false);
+      }
+    }
+  }
+
+  function setAuditActive(active){
+    state.active = !!active;
+    if(!state.active){
+      state.reqSeq += 1;
+      state.loading = false;
+      setLoading(false);
+      return;
+    }
+    setLoading(false);
+    loadAudit(!state.hasLoaded);
+  }
+
+  if(els.refreshBtn){
+    els.refreshBtn.addEventListener('click', function(){ loadAudit(true); });
+  }
+  if(els.resetBtn){
+    els.resetBtn.addEventListener('click', function(){
+      resetFilters();
+      loadAudit(true);
+    });
+  }
+  if(els.exportBtn){
+    els.exportBtn.addEventListener('click', function(){
+      exportCurrentRows();
+    });
+  }
+  if(els.prevBtn){
+    els.prevBtn.addEventListener('click', function(){
+      state.offset = Math.max(0, state.offset - state.limit);
+      loadAudit(false);
+    });
+  }
+  if(els.nextBtn){
+    els.nextBtn.addEventListener('click', function(){
+      var maxOffset = state.total > 0 ? (Math.floor((state.total - 1) / state.limit) * state.limit) : 0;
+      state.offset = Math.min(state.offset + state.limit, maxOffset);
+      loadAudit(false);
+    });
+  }
+
+  var changeReloadEls = [els.startAt, els.endAt, els.action, els.nodeId, els.limit];
+  for(var i = 0; i < changeReloadEls.length; i++){
+    if(changeReloadEls[i]){
+      changeReloadEls[i].addEventListener('change', function(){ loadAudit(true); });
+    }
+  }
+  if(els.actor){
+    els.actor.addEventListener('keydown', function(ev){
+      if(ev && ev.key === 'Enter'){
+        ev.preventDefault();
+        loadAudit(true);
+      }
+    });
+  }
+  if(els.query){
+    els.query.addEventListener('keydown', function(ev){
+      if(ev && ev.key === 'Enter'){
+        ev.preventDefault();
+        loadAudit(true);
+      }
+    });
+  }
+
+  if(els.presetRange){
+    els.presetRange.addEventListener('click', function(ev){
+      var t = ev && ev.target ? ev.target.closest('[data-hours]') : null;
+      if(!t) return;
+      var h = Number(t.getAttribute('data-hours') || 0);
+      if(!Number.isFinite(h) || h < 0) h = 24;
+      pickPreset(h);
+      setRangeByHours(h);
+      loadAudit(true);
+    });
+  }
+
+  resetFilters();
+  state.active = !(els.panel && els.panel.classList.contains('hidden'));
+  window.__setAuditLogsActive = setAuditActive;
+  setLoading(false);
+})();
+</script>
+<script>
+(function(){
+  var tabRoot = document.getElementById('logsViewTabs');
+  var runtimePanel = document.getElementById('logRuntimePanel');
+  var auditPanel = document.getElementById('logAuditPanel');
+  if(!tabRoot) return;
+
+  function normalizeView(raw){
+    var v = String(raw || '').trim().toLowerCase();
+    return v === 'audit' ? 'audit' : 'runtime';
+  }
+
+  function updateUrl(view){
+    try{
+      var u = new URL(window.location.href);
+      if(view === 'audit'){
+        u.searchParams.set('tab', 'audit');
+      }else{
+        u.searchParams.delete('tab');
+      }
+      var next = u.pathname + (u.search || '') + (u.hash || '');
+      history.replaceState(null, '', next);
+    }catch(_e){}
+  }
+
+  function applyView(view, syncUrl){
+    var current = normalizeView(view);
+    var toAudit = (current === 'audit');
+    var chips = tabRoot.querySelectorAll('[data-view]');
+    for(var i = 0; i < chips.length; i++){
+      var val = normalizeView(chips[i].getAttribute('data-view'));
+      var active = val === current;
+      chips[i].classList.toggle('active', active);
+      chips[i].setAttribute('aria-selected', active ? 'true' : 'false');
+    }
+    if(runtimePanel) runtimePanel.classList.toggle('hidden', toAudit);
+    if(auditPanel) auditPanel.classList.toggle('hidden', !toAudit);
+    if(typeof window.__setRuntimeLogsActive === 'function'){
+      window.__setRuntimeLogsActive(!toAudit);
+    }
+    if(typeof window.__setAuditLogsActive === 'function'){
+      window.__setAuditLogsActive(toAudit);
+    }
+    if(syncUrl){
+      updateUrl(current);
+    }
+  }
+
+  tabRoot.addEventListener('click', function(ev){
+    var t = ev && ev.target ? ev.target.closest('[data-view]') : null;
+    if(!t) return;
+    applyView(t.getAttribute('data-view'), true);
+  });
+
+  var activeChip = tabRoot.querySelector('[data-view].active');
+  var defaultView = activeChip ? activeChip.getAttribute('data-view') : 'runtime';
+  applyView(defaultView, false);
 })();
 </script>
 {% endblock %}
-

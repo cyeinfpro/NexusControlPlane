@@ -8,11 +8,12 @@ from typing import Any, Dict, List
 from fastapi import FastAPI
 
 from ..clients.agent import agent_post
+from ..core.bg_tasks import spawn_background_task
 from ..db import (
     add_site_check,
     add_site_event,
-    list_nodes,
-    list_sites,
+    list_nodes_runtime,
+    list_sites_runtime,
     prune_site_checks,
     update_site_health,
 )
@@ -54,6 +55,26 @@ if _SITE_MONITOR_RETENTION_DAYS < 1:
     _SITE_MONITOR_RETENTION_DAYS = 1
 if _SITE_MONITOR_RETENTION_DAYS > 90:
     _SITE_MONITOR_RETENTION_DAYS = 90
+
+try:
+    _SITE_MONITOR_PRUNE_EVERY_SEC = float((os.getenv("REALM_SITE_MONITOR_PRUNE_EVERY_SEC") or "900").strip() or 900)
+except Exception:
+    _SITE_MONITOR_PRUNE_EVERY_SEC = 900.0
+if _SITE_MONITOR_PRUNE_EVERY_SEC < 60.0:
+    _SITE_MONITOR_PRUNE_EVERY_SEC = 60.0
+if _SITE_MONITOR_PRUNE_EVERY_SEC > 24 * 3600:
+    _SITE_MONITOR_PRUNE_EVERY_SEC = 24 * 3600
+
+try:
+    _SITE_MONITOR_CACHE_REFRESH_SEC = float(
+        (os.getenv("REALM_SITE_MONITOR_CACHE_REFRESH_SEC") or "10").strip() or 10
+    )
+except Exception:
+    _SITE_MONITOR_CACHE_REFRESH_SEC = 10.0
+if _SITE_MONITOR_CACHE_REFRESH_SEC < 3.0:
+    _SITE_MONITOR_CACHE_REFRESH_SEC = 3.0
+if _SITE_MONITOR_CACHE_REFRESH_SEC > 300.0:
+    _SITE_MONITOR_CACHE_REFRESH_SEC = 300.0
 
 _SEM = asyncio.Semaphore(_SITE_MONITOR_CONCURRENCY)
 _LAST_RUN: Dict[int, float] = {}
@@ -115,49 +136,83 @@ async def _check_site(site: Dict[str, Any], node: Dict[str, Any]) -> None:
             # Panel -> Agent management path may be temporarily unreachable.
             # This does not prove the website itself is down, so mark as unknown.
             if _is_agent_unreachable_error(error):
-                update_site_health(
-                    int(site.get("id") or 0),
-                    "unknown",
-                    health_code=0,
-                    health_latency_ms=0,
-                    health_error=error,
-                )
+                try:
+                    update_site_health(
+                        int(site.get("id") or 0),
+                        "unknown",
+                        health_code=0,
+                        health_latency_ms=0,
+                        health_error=error,
+                    )
+                except Exception:
+                    pass
                 return
             ok = False
             status_code = 0
             latency_ms = 0
 
         new_status = "ok" if ok else "fail"
-        update_site_health(
-            int(site.get("id") or 0),
-            new_status,
-            health_code=status_code,
-            health_latency_ms=latency_ms,
-            health_error=error,
-        )
-        add_site_check(int(site.get("id") or 0), ok, status_code=status_code, latency_ms=latency_ms, error=error)
+        try:
+            update_site_health(
+                int(site.get("id") or 0),
+                new_status,
+                health_code=status_code,
+                health_latency_ms=latency_ms,
+                health_error=error,
+            )
+        except Exception:
+            pass
+        try:
+            add_site_check(int(site.get("id") or 0), ok, status_code=status_code, latency_ms=latency_ms, error=error)
+        except Exception:
+            pass
 
         # status change alerts
         prev = str(site.get("health_status") or "").strip()
         if prev and prev != new_status:
             if new_status == "fail":
-                add_site_event(int(site.get("id") or 0), "health_alert", status="failed", error=error)
+                try:
+                    add_site_event(int(site.get("id") or 0), "health_alert", status="failed", error=error)
+                except Exception:
+                    pass
             elif new_status == "ok":
-                add_site_event(int(site.get("id") or 0), "health_recovered", status="success")
+                try:
+                    add_site_event(int(site.get("id") or 0), "health_recovered", status="success")
+                except Exception:
+                    pass
 
 
 async def _site_monitor_loop() -> None:
+    last_prune = 0.0
+    last_refresh = 0.0
+    sites_cache: List[Dict[str, Any]] = []
+    nodes_map: Dict[int, Dict[str, Any]] = {}
     while True:
         if not enabled():
             await asyncio.sleep(10)
             continue
         try:
-            sites = list_sites()
-            nodes = list_nodes()
-            nodes_map = {int(n.get("id") or 0): n for n in nodes}
             now = time.time()
+            if (not sites_cache) or (not nodes_map) or ((now - last_refresh) >= float(_SITE_MONITOR_CACHE_REFRESH_SEC)):
+                sites_cache = list_sites_runtime()
+                nodes = list_nodes_runtime()
+                nodes_map = {int(n.get("id") or 0): n for n in nodes if int(n.get("id") or 0) > 0}
+                # Drop stale run markers for deleted sites to avoid long-term growth.
+                active_site_ids: set[int] = set()
+                for s in sites_cache:
+                    try:
+                        sid = int((s or {}).get("id") or 0)
+                    except Exception:
+                        sid = 0
+                    if sid > 0:
+                        active_site_ids.add(sid)
+                for sid in list(_LAST_RUN.keys()):
+                    if sid not in active_site_ids:
+                        _LAST_RUN.pop(sid, None)
+                last_refresh = now
+
             due: List[Dict[str, Any]] = []
-            for s in sites:
+            for s in sites_cache:
                 sid = int(s.get("id") or 0)
                 last = _LAST_RUN.get(sid, 0.0)
                 if (now - last) < _SITE_MONITOR_INTERVAL:
@@ -176,21 +231,27 @@ async def _site_monitor_loop() -> None:
                         continue
                     tasks.append(_check_site(s, node))
                 if tasks:
-                    await asyncio.gather(*tasks)
+                    await asyncio.gather(*tasks, return_exceptions=True)
 
-            # prune old checks occasionally
-            try:
-                prune_site_checks(_SITE_MONITOR_RETENTION_DAYS)
-            except Exception:
-                pass
+            # prune old checks periodically (avoid frequent large DELETE locks).
+            if (now - last_prune) >= float(_SITE_MONITOR_PRUNE_EVERY_SEC):
+                try:
+                    prune_site_checks(_SITE_MONITOR_RETENTION_DAYS)
+                except Exception:
+                    pass
+                last_prune = now
         except Exception:
             pass
         await asyncio.sleep(5)
 
 
 async def start_background(app: FastAPI) -> None:
-    if getattr(app.state, "site_monitor_started", False):
+    task = getattr(app.state, "site_monitor_task", None)
+    if isinstance(task, asyncio.Task) and not task.done():
         return
+    try:
+        task = spawn_background_task(_site_monitor_loop(), label="site-monitor")
+    except Exception:
+        return
+    app.state.site_monitor_task = task
     app.state.site_monitor_started = True
-    if enabled():
-        asyncio.create_task(_site_monitor_loop())
