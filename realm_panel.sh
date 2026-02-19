@@ -642,6 +642,11 @@ prepare_agent_bundle(){
     exit 1
   fi
   cp -a "$script_path" /opt/realm-panel/panel/static/realm_agent.sh
+  local script_macos_path
+  script_macos_path="$(find "$extract_root" -maxdepth 6 -type f -name realm_agent_macos.sh -print -quit)"
+  if [[ -n "$script_macos_path" ]]; then
+    cp -a "$script_macos_path" /opt/realm-panel/panel/static/realm_agent_macos.sh
+  fi
   ok "Agent 离线包就绪：/opt/realm-panel/panel/static/realm-agent.zip"
 }
 
